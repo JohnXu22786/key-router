@@ -1,7 +1,9 @@
 package router
 
 import (
+	"bytes"
 	"embed"
+	"io"
 	"io/fs"
 	"log"
 	"net/http"
@@ -113,31 +115,39 @@ func Setup(
 }
 
 // serveStaticFallback serves static files with SPA fallback to index.html
-func serveStaticFallback(prefix string, fs fs.FS) gin.HandlerFunc {
-	fileServer := http.FileServer(http.FS(fs))
-
+// This avoids redirect loops by using http.ServeContent instead of http.FileServer
+func serveStaticFallback(prefix string, fsys fs.FS) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		path := c.Request.URL.Path
-
-		// Always strip prefix
 		if prefix != "/" {
 			path = strings.TrimPrefix(path, prefix)
 		}
+		path = strings.TrimPrefix(path, "/")
 
-		// Try to serve the exact file
-		if _, err := fs.Open(strings.TrimPrefix(path, "/")); err == nil {
-			fileServer.ServeHTTP(c.Writer, c.Request)
-			return
+		// SPA fallback: paths without file extensions serve index.html
+		if path == "" || !strings.Contains(path, ".") {
+			path = "index.html"
 		}
 
-		// Try index.html (SPA fallback)
-		if _, err := fs.Open("index.html"); err == nil {
-			c.Request.URL.Path = "/index.html"
-			fileServer.ServeHTTP(c.Writer, c.Request)
+		f, err := fsys.Open(path)
+		if err != nil {
+			// Try index.html as last-resort fallback
+			f, err = fsys.Open("index.html")
+			if err != nil {
+				c.Status(http.StatusNotFound)
+				return
+			}
+			path = "index.html"
+		}
+		defer f.Close()
+
+		// Read file into memory for ServeContent (fs.File doesn't support Seek)
+		data, err := io.ReadAll(f)
+		if err != nil {
+			c.Status(http.StatusInternalServerError)
 			return
 		}
-
-		// Not found in static files
-		c.Status(http.StatusNotFound)
+		stat, _ := f.Stat()
+		http.ServeContent(c.Writer, c.Request, path, stat.ModTime(), bytes.NewReader(data))
 	}
 }

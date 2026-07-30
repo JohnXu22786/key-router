@@ -2,6 +2,7 @@ package main
 
 import (
 	"embed"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -11,6 +12,8 @@ import (
 	"local-router/router"
 	"local-router/selector"
 	"local-router/server"
+
+	"github.com/webview/webview_go"
 )
 
 //go:embed web/dist/*
@@ -55,11 +58,28 @@ func main() {
 	// Setup HTTP router
 	r := router.Setup(staticFS, engine, checker)
 
-	// Start server
+	// Start HTTP server in background
 	app := server.New(r)
-	if err := app.Start(); err != nil {
+	if err := app.StartBackground(); err != nil {
 		log.Fatalf("[main] server error: %v", err)
 	}
 
+	// Get port for webview URL
+	port := app.GetPort()
+	url := fmt.Sprintf("http://localhost:%d", port)
+
+	log.Printf("[main] opening desktop window: %s", url)
+
+	// Create desktop window with WebView2
+	w := webview.New(false) // false = no devtools
+	defer w.Destroy()
+	w.SetTitle(fmt.Sprintf("LocalRouter v0.1.0 — %s", url))
+	w.SetSize(1200, 800, webview.HintNone)
+	w.Navigate(url)
+	w.Run()
+
+	// When window closes, stop server
+	log.Println("[main] window closed, shutting down...")
+	app.Shutdown()
 	log.Println("[main] LocalRouter stopped")
 }
