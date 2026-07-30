@@ -98,17 +98,17 @@ func Setup(
 	}
 
 	// ===== Static files (React SPA) =====
+	// Use NoRoute so this ONLY runs for unmatched paths (not API routes)
 
-	// Serve static assets
 	staticSubFS, err := fs.Sub(staticFS, "web/dist")
 	if err != nil {
 		log.Printf("[router] no embedded web UI found: %v", err)
 		// Fallback: serve a simple index.html
-		r.GET("/", func(c *gin.Context) {
+		r.NoRoute(func(c *gin.Context) {
 			c.String(http.StatusOK, "<html><body><h1>LocalRouter</h1><p>Web UI not built. Run: cd web && npm install && npm run build</p></body></html>")
 		})
 	} else {
-		r.Use(serveStaticFallback("/", staticSubFS))
+		r.NoRoute(serveStaticFallback("/", staticSubFS))
 	}
 
 	return r
