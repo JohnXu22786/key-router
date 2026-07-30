@@ -152,14 +152,17 @@ func (e *Engine) SelectRoute(modelGroupID string, retry int) *RouteEntry {
 }
 
 // SelectKey selects an available (non-exceeded, non-disabled) key from a route
+// Keys with recovery_strategy=immediate are preferred over lazy keys.
+// Lazy keys are only used when no immediate keys are available.
 func (e *Engine) SelectKey(route *RouteEntry) *model.Key {
 	keys := route.Keys
 	if len(keys) == 0 {
 		return nil
 	}
 
-	// Filter available keys
-	var available []*model.Key
+	var immediateKeys []*model.Key
+	var lazyKeys []*model.Key
+
 	for _, k := range keys {
 		if !e.isKeyAvailable(k) {
 			continue
@@ -171,14 +174,22 @@ func (e *Engine) SelectKey(route *RouteEntry) *model.Key {
 			continue
 		}
 
-		available = append(available, k)
+		switch k.RecoveryStrategy {
+		case model.RecoveryLazy:
+			lazyKeys = append(lazyKeys, k)
+		default:
+			immediateKeys = append(immediateKeys, k)
+		}
 	}
 
-	if len(available) == 0 {
-		return nil
+	// Prefer immediate keys; only use lazy keys when no immediate ones are available
+	if len(immediateKeys) > 0 {
+		return immediateKeys[rand.Intn(len(immediateKeys))]
 	}
-
-	return available[rand.Intn(len(available))]
+	if len(lazyKeys) > 0 {
+		return lazyKeys[rand.Intn(len(lazyKeys))]
+	}
+	return nil
 }
 
 // isKeyAvailable checks if a key can be used

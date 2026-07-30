@@ -201,6 +201,8 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			err = relay.StreamResponse(c.Writer, resp, inputFormat, route.Provider.Type)
 			if err != nil {
 				log.Printf("[relay] streaming error: %v", err)
+				// Send error to downstream client as stream error chunk
+				relay.WriteStreamError(c.Writer, inputFormat, "upstream connection lost")
 			}
 		} else {
 			// Convert format if needed

@@ -164,6 +164,22 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, tar
 	return scanner.Err()
 }
 
+// WriteStreamError sends an error message to the downstream client in stream format
+func WriteStreamError(w http.ResponseWriter, inputFormat string, errMsg string) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		return
+	}
+
+	if inputFormat == "openai" {
+		fmt.Fprintf(w, "data: {\"error\":{\"message\":\"%s\",\"type\":\"stream_error\"}}\n\n", errMsg)
+	} else {
+		// Anthropic format - send as a content_block_delta with error
+		fmt.Fprintf(w, "data: {\"type\":\"error\",\"error\":{\"message\":\"%s\"}}\n\n", errMsg)
+	}
+	flusher.Flush()
+}
+
 // CopyResponse copies a non-streaming response from upstream to client
 func CopyResponse(w http.ResponseWriter, resp *http.Response, meta *model.RequestMetadata, provider *model.Provider) error {
 	body, err := io.ReadAll(resp.Body)
