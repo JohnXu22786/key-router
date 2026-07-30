@@ -133,7 +133,7 @@ const Keys: React.FC = () => {
           </Form.Item>
           <Form.Item name="name" label="Display Name"><Input placeholder="My OpenAI Key 1" /></Form.Item>
           <Form.Item name="key_value" label="API Key" rules={[{ required: true }]}><Input.Password placeholder="sk-..." /></Form.Item>
-          <Form.Item name="recovery_strategy" label="Recovery Strategy" initialValue="immediate">
+          <Form.Item name="recovery_strategy" label="Recovery Strategy" initialValue="lazy">
             <Select options={[
               { value: 'immediate', label: 'Immediate — use as soon as recovered' },
               { value: 'lazy', label: 'Lazy — only use when no immediate keys available' },

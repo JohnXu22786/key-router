@@ -50,9 +50,21 @@ func ForwardRequest(meta *model.RequestMetadata, key *model.Key, provider *model
 		return nil, err
 	}
 
-	// Set headers (discard incoming headers, use provider type)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
+	// Forward incoming headers, replacing auth and skipping local-only headers
+	for k, vals := range meta.Headers {
+		// Skip local-only headers that shouldn't leak upstream
+		if k == "Authorization" || k == "X-Api-Key" || k == "Cookie" || k == "Origin" || k == "Referer" {
+			continue
+		}
+		for _, v := range vals {
+			req.Header.Add(k, v)
+		}
+	}
+
+	// Ensure content-type is set
+	if req.Header.Get("Content-Type") == "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
 
 	// Set auth based on provider type
 	if targetFormat == "anthropic" {

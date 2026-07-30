@@ -1,6 +1,7 @@
 package model
 
 import (
+	"net/http"
 	"time"
 )
 
@@ -42,7 +43,7 @@ type Key struct {
 	Name            string     `gorm:"type:varchar(255)" json:"name"`
 	KeyValue        string     `gorm:"type:varchar(1024);not null" json:"key_value"`
 	Status          string     `gorm:"type:varchar(20);default:'active'" json:"status"`
-	RecoveryStrategy string   `gorm:"type:varchar(20);default:'immediate'" json:"recovery_strategy"`
+	RecoveryStrategy string   `gorm:"type:varchar(20);default:'lazy'" json:"recovery_strategy"`
 	RateLimitedUntil *time.Time `json:"rate_limited_until"`
 	DisabledReason  string     `gorm:"type:varchar(512)" json:"disabled_reason"`
 	RPMLimit        int64      `gorm:"default:0" json:"rpm_limit"`       // 0 = unlimited
@@ -181,13 +182,13 @@ const (
 
 // RequestMetadata holds information about an incoming API request
 type RequestMetadata struct {
-	Format       string // "openai" or "anthropic"
-	Model        string // Model name from request body
-	Stream       bool   // Whether streaming is requested
-	RequestPath  string // Original URL path
-	RequestBody  []byte // Raw request body
-	Headers      map[string]string
-	TargetModel  string // Model name after route resolution
+	Format       string     // "openai" or "anthropic"
+	Model        string     // Model name from request body
+	Stream       bool       // Whether streaming is requested
+	RequestPath  string     // Original URL path
+	RequestBody  []byte     // Raw request body
+	Headers      http.Header // Incoming request headers for forwarding
+	TargetModel  string     // Model name after route resolution
 }
 
 // RelayResult holds the result of a relay operation

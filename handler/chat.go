@@ -116,16 +116,16 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			targetModel = route.Route.TargetModel
 		}
 
-		// Build request metadata
-		meta := &model.RequestMetadata{
-			Format:      inputFormat,
-			Model:       reqMeta.Model,
-			Stream:      reqMeta.Stream,
-			RequestPath: c.Request.URL.Path,
-			RequestBody: body,
-			Headers:     make(map[string]string),
-			TargetModel: targetModel,
-		}
+	// Build request metadata with forwarded headers
+	meta := &model.RequestMetadata{
+		Format:      inputFormat,
+		Model:       reqMeta.Model,
+		Stream:      reqMeta.Stream,
+		RequestPath: c.Request.URL.Path,
+		RequestBody: body,
+		Headers:     c.Request.Header.Clone(),
+		TargetModel: targetModel,
+	}
 
 		// Forward request to upstream
 		resp, err := relay.ForwardRequest(meta, key, route.Provider)
