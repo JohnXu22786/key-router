@@ -45,12 +45,12 @@ const ModelGroups: React.FC = () => {
     { title: 'Enabled', dataIndex: 'enabled', key: 'enabled', render: (e: boolean) => e ? <Tag color="green">Yes</Tag> : <Tag color="red">No</Tag> },
     { title: 'Retry Times', dataIndex: 'retry_times', key: 'retry_times' },
     {
-      title: 'Actions', key: 'actions',
+      title: 'Actions', key: 'actions', width: 80,
       render: (_: unknown, r: ModelGroup) => (
         <Space>
-          <Button icon={<EditOutlined />} size="small" onClick={() => { setEditing(r); form.setFieldsValue(r); setModalOpen(true); }}>Edit</Button>
+          <Button icon={<EditOutlined />} size="small" onClick={() => { setEditing(r); form.setFieldsValue(r); setModalOpen(true); }} title="Edit" />
           <Popconfirm title="Delete?" onConfirm={() => handleDelete(r.id)}>
-            <Button icon={<DeleteOutlined />} size="small" danger>Delete</Button>
+            <Button icon={<DeleteOutlined />} size="small" danger title="Delete" />
           </Popconfirm>
         </Space>
       ),

@@ -116,16 +116,16 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			targetModel = route.Route.TargetModel
 		}
 
-	// Build request metadata with forwarded headers
-	meta := &model.RequestMetadata{
-		Format:      inputFormat,
-		Model:       reqMeta.Model,
-		Stream:      reqMeta.Stream,
-		RequestPath: c.Request.URL.Path,
-		RequestBody: body,
-		Headers:     c.Request.Header.Clone(),
-		TargetModel: targetModel,
-	}
+		// Build request metadata with forwarded headers
+		meta := &model.RequestMetadata{
+			Format:      inputFormat,
+			Model:       reqMeta.Model,
+			Stream:      reqMeta.Stream,
+			RequestPath: c.Request.URL.Path,
+			RequestBody: body,
+			Headers:     c.Request.Header.Clone(),
+			TargetModel: targetModel,
+		}
 
 		// Forward request to upstream
 		resp, err := relay.ForwardRequest(meta, key, route.Provider)
@@ -155,6 +155,8 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 		}
 		if resp.StatusCode >= 500 {
 			log.Printf("[relay] upstream 5xx for key %d: %d (attempt %d/%d)", key.ID, resp.StatusCode, attempt+1, maxRetries+1)
+			// Mark key as temporarily unavailable so another key is picked next attempt
+			h.Engine.MarkKeyRateLimited(key.ID, 30*time.Second)
 			resp.Body.Close()
 			continue
 		}

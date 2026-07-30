@@ -194,6 +194,182 @@ func TestAnthropicToOpenAI_StreamChunk(t *testing.T) {
 	})
 }
 
+func TestOpenAIToAnthropic_Complex(t *testing.T) {
+	t.Run("tool_calls and vision", func(t *testing.T) {
+		oaiReq := `{
+			"model": "gpt-4o",
+			"messages": [
+				{"role": "system", "content": "You are a helpful assistant."},
+				{"role": "user", "content": [
+					{"type": "text", "text": "What's in this image?"},
+					{"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}
+				]},
+				{"role": "assistant", "content": "", "tool_calls": [
+					{"id": "call_123", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Tokyo\"}"}}
+				]},
+				{"role": "tool", "tool_call_id": "call_123", "content": "25°C"}
+			],
+			"max_tokens": 1000,
+			"stream": true
+		}`
+
+		anthReq, err := OpenAIRequestToAnthropic([]byte(oaiReq), "claude-sonnet-4")
+		if err != nil {
+			t.Fatalf("conversion failed: %v", err)
+		}
+
+		var result map[string]interface{}
+		json.Unmarshal(anthReq, &result)
+
+		// Check system prompt
+		if result["system"] != "You are a helpful assistant." {
+			t.Errorf("system = %v", result["system"])
+		}
+		// Check model
+		if result["model"] != "claude-sonnet-4" {
+			t.Errorf("model = %v", result["model"])
+		}
+		// Check max_tokens
+		if result["max_tokens"] != float64(1000) {
+			t.Errorf("max_tokens = %v", result["max_tokens"])
+		}
+		// Check stream
+		if result["stream"] != true {
+			t.Error("stream should be true")
+		}
+
+		// System prompt is extracted to top-level "system", so messages has 3: user, assistant, user(tool_result)
+		msgs := result["messages"].([]interface{})
+		if len(msgs) != 3 {
+			t.Fatalf("expected 3 messages (user, assistant, user[tool_result]), got %d", len(msgs))
+		}
+
+		// User message should have content array with text and image
+		userMsg := msgs[0].(map[string]interface{})
+		userContent := userMsg["content"].([]interface{})
+		if len(userContent) != 2 {
+			t.Fatalf("expected 2 content blocks in user message, got %d", len(userContent))
+		}
+
+		// Assistant message (index 1) should have tool_use
+		asstMsg := msgs[1].(map[string]interface{})
+		asstContent := asstMsg["content"].([]interface{})
+		foundToolUse := false
+		for _, c := range asstContent {
+			block := c.(map[string]interface{})
+			if block["type"] == "tool_use" {
+				foundToolUse = true
+				if block["name"] != "get_weather" {
+					t.Errorf("tool name = %v", block["name"])
+				}
+			}
+		}
+		if !foundToolUse {
+			t.Error("expected tool_use in assistant message")
+		}
+
+		// Tool result should be converted to user/tool_result
+		toolMsg := msgs[2].(map[string]interface{})
+		toolContent := toolMsg["content"].([]interface{})
+		if len(toolContent) > 0 {
+			tr := toolContent[0].(map[string]interface{})
+			if tr["type"] != "tool_result" {
+				t.Errorf("expected tool_result, got %s", tr["type"])
+			}
+		}
+	})
+}
+
+func TestAnthropicToOpenAI_Complex(t *testing.T) {
+	t.Run("tool_use and image messages", func(t *testing.T) {
+		anthReq := `{
+			"model": "claude-sonnet-4",
+			"system": "You are Claude.",
+			"messages": [
+				{"role": "user", "content": [
+					{"type": "text", "text": "Describe this image"},
+					{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}
+				]},
+				{"role": "assistant", "content": [
+					{"type": "text", "text": "I see an image"},
+					{"type": "tool_use", "id": "toolu_123", "name": "get_weather", "input": {"city": "Paris"}}
+				]},
+				{"role": "user", "content": [
+					{"type": "tool_result", "tool_use_id": "toolu_123", "content": "22°C"}
+				]}
+			],
+			"max_tokens": 1000
+		}`
+
+		oaiReq, err := AnthropicRequestToOpenAI([]byte(anthReq), "gpt-4o")
+		if err != nil {
+			t.Fatalf("conversion failed: %v", err)
+		}
+
+		var result map[string]interface{}
+		json.Unmarshal(oaiReq, &result)
+
+		if result["model"] != "gpt-4o" {
+			t.Errorf("model = %v", result["model"])
+		}
+
+		msgs := result["messages"].([]interface{})
+		// system + user + assistant + tool = 4
+		if len(msgs) != 4 {
+			t.Fatalf("expected 4 messages (system, user, assistant, user), got %d", len(msgs))
+		}
+
+		// First message should be system
+		sysMsg := msgs[0].(map[string]interface{})
+		if sysMsg["role"] != "system" {
+			t.Errorf("first message role = %v", sysMsg["role"])
+		}
+
+		// Assistant should have tool_calls
+		asstMsg := msgs[2].(map[string]interface{})
+		toolCalls, ok := asstMsg["tool_calls"].([]interface{})
+		if !ok || len(toolCalls) == 0 {
+			t.Error("expected tool_calls in assistant message")
+		} else {
+			tc := toolCalls[0].(map[string]interface{})
+			if tc["type"] != "function" {
+				t.Errorf("tool_call type = %v", tc["type"])
+			}
+		}
+	})
+}
+
+func TestOpenAIToAnthropic_StreamComplex(t *testing.T) {
+	t.Run("finish_reason length and message_delta", func(t *testing.T) {
+		// OpenAI chunk with finish_reason: length
+		oaiChunk := `{"id":"cmpl-x","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":"length"}]}`
+		anthChunk, err := OpenAIStreamChunkToAnthropic([]byte(oaiChunk))
+		if err != nil {
+			t.Fatalf("conversion failed: %v", err)
+		}
+		var result map[string]interface{}
+		json.Unmarshal(anthChunk, &result)
+		if result["type"] != "message_stop" {
+			t.Errorf("type = %v, want message_stop for length finish_reason", result["type"])
+		}
+	})
+
+	t.Run("anthropic message_delta with stop_reason", func(t *testing.T) {
+		anthEvent := `{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":42}}`
+		oaiChunk, err := AnthropicStreamEventToOpenAI([]byte(anthEvent))
+		if err != nil {
+			t.Fatalf("conversion failed: %v", err)
+		}
+		var result map[string]interface{}
+		json.Unmarshal(oaiChunk, &result)
+		choices := result["choices"].([]interface{})
+		choice := choices[0].(map[string]interface{})
+		if choice["finish_reason"] != "stop" {
+			t.Errorf("finish_reason = %v, want stop", choice["finish_reason"])
+		}
+	})
+}
+
 func TestDetectFormat(t *testing.T) {
 	tests := []struct {
 		name     string

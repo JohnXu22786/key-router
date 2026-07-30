@@ -77,12 +77,17 @@ func OpenAIRequestToAnthropic(body []byte, modelOverride string) ([]byte, error)
 		anthReq["model"] = m
 	}
 
-	// Copy known fields
-	copyFields := []string{"max_tokens", "stream", "stop_sequences", "temperature", "top_p", "metadata"}
+	// Copy known fields (map OpenAI "stop" to Anthropic "stop_sequences")
+	copyFields := []string{"max_tokens", "stream", "temperature", "top_p", "metadata"}
 	for _, f := range copyFields {
 		if v, ok := oaiReq[f]; ok {
 			anthReq[f] = v
 		}
+	}
+	if v, ok := oaiReq["stop"]; ok {
+		anthReq["stop_sequences"] = v
+	} else if v, ok := oaiReq["stop_sequences"]; ok {
+		anthReq["stop_sequences"] = v
 	}
 
 	// Convert messages
@@ -351,14 +356,34 @@ func convertOpenAIContentArray(content []interface{}) []interface{} {
 				continue
 			}
 			url := safeStringOrDefault(imageURL, "url", "")
-			anthContent = append(anthContent, map[string]interface{}{
-				"type": "image",
-				"source": map[string]interface{}{
-					"type":       "base64",
-					"media_type": "image/jpeg",
-					"data":       url,
-				},
-			})
+			if strings.HasPrefix(url, "data:") {
+				// data:image/png;base64,iVBOR... → split into media_type + raw data
+				parts := strings.SplitN(url, ",", 2)
+				if len(parts) == 2 {
+					meta := strings.TrimPrefix(parts[0], "data:")
+					mediaType := strings.Split(meta, ";")[0]
+					if mediaType == "" {
+						mediaType = "image/png"
+					}
+					anthContent = append(anthContent, map[string]interface{}{
+						"type": "image",
+						"source": map[string]interface{}{
+							"type":       "base64",
+							"media_type": mediaType,
+							"data":       parts[1],
+						},
+					})
+				}
+			} else {
+				// HTTP URL
+				anthContent = append(anthContent, map[string]interface{}{
+					"type": "image",
+					"source": map[string]interface{}{
+						"type": "url",
+						"url":  url,
+					},
+				})
+			}
 		}
 	}
 	return anthContent
@@ -470,11 +495,25 @@ func convertAnthropicContentArray(content []interface{}) []interface{} {
 			})
 		case "image":
 			source, ok := safeMap(p["source"])
-			if ok {
+			if !ok {
+				continue
+			}
+			srcType := safeStringOrDefault(source, "type", "")
+			if srcType == "base64" {
+				mediaType := safeStringOrDefault(source, "media_type", "image/png")
+				data, _ := source["data"].(string)
 				oaiContent = append(oaiContent, map[string]interface{}{
 					"type": "image_url",
 					"image_url": map[string]interface{}{
-						"url": source["data"],
+						"url": "data:" + mediaType + ";base64," + data,
+					},
+				})
+			} else if srcType == "url" {
+				url, _ := source["url"].(string)
+				oaiContent = append(oaiContent, map[string]interface{}{
+					"type": "image_url",
+					"image_url": map[string]interface{}{
+						"url": url,
 					},
 				})
 			}

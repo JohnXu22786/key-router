@@ -1,12 +1,14 @@
 import React, { useEffect, useState } from 'react';
-import { Table, Button, Modal, Form, Input, InputNumber, message, Space, Typography, Popconfirm } from 'antd';
+import { Table, Button, Modal, Form, InputNumber, Select, message, Space, Typography, Popconfirm, Tag } from 'antd';
 import { PlusOutlined, EditOutlined, DeleteOutlined } from '@ant-design/icons';
-import { getPricings, createPricing, updatePricing, deletePricing, Pricing as PricingType } from '../api/client';
+import { getPricings, createPricing, updatePricing, deletePricing, getRoutes, getModelGroups, Pricing as PricingType, Route, ModelGroup } from '../api/client';
 
 const { Title } = Typography;
 
 const Pricing: React.FC = () => {
   const [pricings, setPricings] = useState<PricingType[]>([]);
+  const [routes, setRoutes] = useState<Route[]>([]);
+  const [groups, setGroups] = useState<ModelGroup[]>([]);
   const [loading, setLoading] = useState(false);
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState<PricingType | null>(null);
@@ -15,13 +17,19 @@ const Pricing: React.FC = () => {
   const fetch = async () => {
     setLoading(true);
     try {
-      const res = await getPricings();
-      setPricings(res.data);
+      const [p, r, g] = await Promise.all([getPricings(), getRoutes(), getModelGroups()]);
+      setPricings(p.data); setRoutes(r.data); setGroups(g.data);
     } catch { message.error('Failed to load pricing'); }
     finally { setLoading(false); }
   };
 
   useEffect(() => { fetch(); }, []);
+
+  // Collect unique model names: target models from routes + all model group IDs
+  const modelOptions = Array.from(new Set([
+    ...groups.map(g => g.group_id).filter(Boolean),
+    ...routes.map(r => r.target_model).filter(Boolean),
+  ])).sort() as string[];
 
   const handleSave = async () => {
     try {
@@ -40,18 +48,18 @@ const Pricing: React.FC = () => {
 
   const columns = [
     { title: 'ID', dataIndex: 'id', key: 'id', width: 60 },
-    { title: 'Model Name', dataIndex: 'model_name', key: 'model_name' },
+    { title: 'Model', dataIndex: 'model_name', key: 'model_name', render: (v: string) => <Tag color="blue">{v}</Tag> },
     { title: 'Prompt $/1K', dataIndex: 'prompt_per_1k', key: 'prompt_per_1k', render: (v: number) => `$${v?.toFixed(6)}` },
     { title: 'Completion $/1K', dataIndex: 'completion_per_1k', key: 'completion_per_1k', render: (v: number) => `$${v?.toFixed(6)}` },
     { title: 'Cache Read $/1K', dataIndex: 'cache_read_per_1k', key: 'cache_read_per_1k', render: (v: number) => v ? `$${v.toFixed(6)}` : '-' },
     { title: 'Cache Write $/1K', dataIndex: 'cache_write_per_1k', key: 'cache_write_per_1k', render: (v: number) => v ? `$${v.toFixed(6)}` : '-' },
     {
-      title: 'Actions', key: 'actions',
+      title: 'Actions', key: 'actions', width: 80,
       render: (_: unknown, r: PricingType) => (
         <Space>
-          <Button icon={<EditOutlined />} size="small" onClick={() => { setEditing(r); form.setFieldsValue(r); setModalOpen(true); }}>Edit</Button>
+          <Button icon={<EditOutlined />} size="small" onClick={() => { setEditing(r); form.setFieldsValue(r); setModalOpen(true); }} title="Edit" />
           <Popconfirm title="Delete?" onConfirm={() => handleDelete(r.id)}>
-            <Button icon={<DeleteOutlined />} size="small" danger>Delete</Button>
+            <Button icon={<DeleteOutlined />} size="small" danger title="Delete" />
           </Popconfirm>
         </Space>
       ),
@@ -67,8 +75,12 @@ const Pricing: React.FC = () => {
       <Table dataSource={pricings} columns={columns} rowKey="id" loading={loading} />
       <Modal title={editing ? 'Edit Pricing' : 'Add Pricing'} open={modalOpen} onOk={handleSave} onCancel={() => { setModalOpen(false); setEditing(null); }}>
         <Form form={form} layout="vertical">
-          <Form.Item name="model_name" label="Model Name" rules={[{ required: true }]}>
-            <Input placeholder="gpt-4o" />
+          <Form.Item name="model_name" label="Model (select a route's target model)" rules={[{ required: true }]}>
+            <Select
+              showSearch
+              placeholder="Select target model from routes"
+              options={modelOptions.map(m => ({ value: m, label: m }))}
+            />
           </Form.Item>
           <Space size="large">
             <Form.Item name="prompt_per_1k" label="Prompt $/1K"><InputNumber min={0} step={0.0001} style={{ width: 150 }} /></Form.Item>

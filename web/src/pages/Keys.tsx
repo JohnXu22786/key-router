@@ -101,13 +101,13 @@ const Keys: React.FC = () => {
       ),
     },
     {
-      title: 'Actions', key: 'actions', width: 200,
+      title: 'Actions', key: 'actions', width: 120,
       render: (_: unknown, record: Key) => (
         <Space>
-          <Button icon={<EyeOutlined />} size="small" onClick={() => showDetail(record)}>Detail</Button>
-          <Button icon={<EditOutlined />} size="small" onClick={() => openEdit(record)}>Edit</Button>
+          <Button icon={<EyeOutlined />} size="small" onClick={() => showDetail(record)} title="Detail" />
+          <Button icon={<EditOutlined />} size="small" onClick={() => openEdit(record)} title="Edit" />
           <Popconfirm title="Delete?" onConfirm={() => handleDelete(record.id)}>
-            <Button icon={<DeleteOutlined />} size="small" danger>Delete</Button>
+            <Button icon={<DeleteOutlined />} size="small" danger title="Delete" />
           </Popconfirm>
         </Space>
       ),

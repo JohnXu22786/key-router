@@ -67,12 +67,12 @@ const Providers: React.FC = () => {
     { title: 'Type', dataIndex: 'type', key: 'type', render: (t: string) => ({ openai: 'OpenAI', anthropic: 'Anthropic' })[t] || t },
     { title: 'Base URL', dataIndex: 'base_url', key: 'base_url', ellipsis: true },
     {
-      title: 'Actions', key: 'actions',
+      title: 'Actions', key: 'actions', width: 80,
       render: (_: unknown, record: Provider) => (
         <Space>
-          <Button icon={<EditOutlined />} size="small" onClick={() => openEdit(record)}>Edit</Button>
+          <Button icon={<EditOutlined />} size="small" onClick={() => openEdit(record)} title="Edit" />
           <Popconfirm title="Delete?" onConfirm={() => handleDelete(record.id)}>
-            <Button icon={<DeleteOutlined />} size="small" danger>Delete</Button>
+            <Button icon={<DeleteOutlined />} size="small" danger title="Delete" />
           </Popconfirm>
         </Space>
       ),

@@ -82,7 +82,7 @@ const Settings: React.FC = () => {
   return (
     <div>
       <Title level={3}>Settings</Title>
-      <Card style={{ maxWidth: 600 }}>
+      <Card>
         <Form form={form} layout="vertical">
           <Form.Item name="server.port" label="Server Port">
             <InputNumber min={1024} max={65535} style={{ width: '100%' }} />
