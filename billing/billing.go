@@ -1,6 +1,7 @@
 package billing
 
 import (
+	"log"
 	"sync"
 	"time"
 
@@ -105,14 +106,16 @@ func RecordConsumption(keyID int64, modelName string, usage *model.TokenUsage) (
 	}
 
 	consumption := &model.Consumption{
-		KeyID:            keyID,
-		HourBucket:       now,
-		RequestCount:     1,
-		InputTokens:      usage.PromptTokens,
-		OutputTokens:     usage.CompletionTokens,
-		CacheHitTokens:   usage.CacheHitTokens,
-		CacheWriteTokens: usage.CacheWriteTokens,
-		CostUSD:          cost,
+		KeyID:      keyID,
+		HourBucket: now,
+		RequestCount: 1,
+		CostUSD:    cost,
+	}
+	if usage != nil {
+		consumption.InputTokens = usage.PromptTokens
+		consumption.OutputTokens = usage.CompletionTokens
+		consumption.CacheHitTokens = usage.CacheHitTokens
+		consumption.CacheWriteTokens = usage.CacheWriteTokens
 	}
 
 	// Upsert: add to existing or create new
@@ -164,14 +167,31 @@ type OverviewStats struct {
 func GetOverview() (*OverviewStats, error) {
 	stats := &OverviewStats{}
 
-	db.GetDB().Model(&model.Consumption{}).Select("COALESCE(SUM(request_count), 0)").Scan(&stats.TotalRequests)
-	db.GetDB().Model(&model.Consumption{}).Select("COALESCE(SUM(cost_usd), 0)").Scan(&stats.TotalCost)
-	db.GetDB().Model(&model.Consumption{}).Select("COALESCE(SUM(input_tokens), 0)").Scan(&stats.TotalInput)
-	db.GetDB().Model(&model.Consumption{}).Select("COALESCE(SUM(output_tokens), 0)").Scan(&stats.TotalOutput)
-	db.GetDB().Model(&model.Key{}).Where("status = ?", model.KeyStatusActive).Count(&stats.ActiveKeys)
-	db.GetDB().Model(&model.Key{}).Where("status = ?", model.KeyStatusDisabled).Count(&stats.DisabledKeys)
-	db.GetDB().Model(&model.Key{}).Count(&stats.TotalKeyCount)
-	db.GetDB().Model(&model.Provider{}).Count(&stats.TotalProviders)
+	// Each query is best-effort; errors are logged but don't fail the request
+	if err := db.GetDB().Model(&model.Consumption{}).Select("COALESCE(SUM(request_count), 0)").Scan(&stats.TotalRequests).Error; err != nil {
+		log.Printf("[billing] GetOverview TotalRequests: %v", err)
+	}
+	if err := db.GetDB().Model(&model.Consumption{}).Select("COALESCE(SUM(cost_usd), 0)").Scan(&stats.TotalCost).Error; err != nil {
+		log.Printf("[billing] GetOverview TotalCost: %v", err)
+	}
+	if err := db.GetDB().Model(&model.Consumption{}).Select("COALESCE(SUM(input_tokens), 0)").Scan(&stats.TotalInput).Error; err != nil {
+		log.Printf("[billing] GetOverview TotalInput: %v", err)
+	}
+	if err := db.GetDB().Model(&model.Consumption{}).Select("COALESCE(SUM(output_tokens), 0)").Scan(&stats.TotalOutput).Error; err != nil {
+		log.Printf("[billing] GetOverview TotalOutput: %v", err)
+	}
+	if err := db.GetDB().Model(&model.Key{}).Where("status = ?", model.KeyStatusActive).Count(&stats.ActiveKeys).Error; err != nil {
+		log.Printf("[billing] GetOverview ActiveKeys: %v", err)
+	}
+	if err := db.GetDB().Model(&model.Key{}).Where("status = ?", model.KeyStatusDisabled).Count(&stats.DisabledKeys).Error; err != nil {
+		log.Printf("[billing] GetOverview DisabledKeys: %v", err)
+	}
+	if err := db.GetDB().Model(&model.Key{}).Count(&stats.TotalKeyCount).Error; err != nil {
+		log.Printf("[billing] GetOverview TotalKeyCount: %v", err)
+	}
+	if err := db.GetDB().Model(&model.Provider{}).Count(&stats.TotalProviders).Error; err != nil {
+		log.Printf("[billing] GetOverview TotalProviders: %v", err)
+	}
 
 	return stats, nil
 }

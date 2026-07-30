@@ -1,15 +1,11 @@
 import React, { useEffect, useState } from 'react';
 import {
-  Card, Table, Typography, Spin, Tag, message, Row, Col, Statistic,
+  Card, Table, Typography, Spin, message, Row, Col, Statistic,
 } from 'antd';
 import { getConsumptions, getOverview, Consumption, OverviewStats } from '../api/client';
 import dayjs from 'dayjs';
 
 const { Title } = Typography;
-
-const statusColors: Record<string, string> = {
-  active: 'green', rate_limited: 'orange', disabled: 'red', testing: 'blue',
-};
 
 const Stats: React.FC = () => {
   const [consumptions, setConsumptions] = useState<Consumption[]>([]);

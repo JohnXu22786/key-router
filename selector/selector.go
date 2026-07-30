@@ -2,6 +2,7 @@ package selector
 
 import (
 	"fmt"
+	"log"
 	"math/rand"
 	"sort"
 	"sync"
@@ -70,7 +71,9 @@ func (e *Engine) Refresh() {
 
 	// Reload all model groups (one query, no N+1)
 	var allMGs []model.ModelGroup
-	db.GetDB().Find(&allMGs)
+	if err := db.GetDB().Find(&allMGs).Error; err != nil {
+		log.Printf("[selector] failed to load model groups: %v", err)
+	}
 	mgMap := make(map[int64]model.ModelGroup)
 	for i := range allMGs {
 		mgMap[allMGs[i].ID] = allMGs[i]
@@ -151,10 +154,13 @@ func (e *Engine) SelectRoute(modelGroupID string, retry int) *RouteEntry {
 	return weightedSelect(entries)
 }
 
-// SelectKey selects an available (non-exceeded, non-disabled) key from a route
+// SelectKey selects an available (non-exceeded, non-disabled) key from a route.
 // Keys with recovery_strategy=immediate are preferred over lazy keys.
 // Lazy keys are only used when no immediate keys are available.
 func (e *Engine) SelectKey(route *RouteEntry) *model.Key {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
 	keys := route.Keys
 	if len(keys) == 0 {
 		return nil

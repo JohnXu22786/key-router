@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -72,15 +73,23 @@ func (h *AdminHandler) UpdateProvider(c *gin.Context) {
 		return
 	}
 	p.ID = id
-	db.GetDB().Save(&p)
+	if err := db.GetDB().Save(&p).Error; err != nil {
+		log.Printf("[admin] UpdateProvider save error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	h.Engine.Refresh()
 	c.JSON(http.StatusOK, p)
 }
 
-// DeleteProvider deletes a provider
+// DeleteProvider deletes a provider and its keys/routes
 func (h *AdminHandler) DeleteProvider(c *gin.Context) {
 	id, _ := strconv.ParseInt(c.Param("id"), 10, 64)
-	db.GetDB().Delete(&model.Provider{}, id)
+	if err := db.GetDB().Delete(&model.Provider{}, id).Error; err != nil {
+		log.Printf("[admin] DeleteProvider error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	db.GetDB().Where("provider_id = ?", id).Delete(&model.Key{})
 	db.GetDB().Where("provider_id = ?", id).Delete(&model.Route{})
 	h.Engine.Refresh()
@@ -148,7 +157,11 @@ func (h *AdminHandler) UpdateKey(c *gin.Context) {
 		return
 	}
 	k.ID = id
-	db.GetDB().Save(&k)
+	if err := db.GetDB().Save(&k).Error; err != nil {
+		log.Printf("[admin] UpdateKey save error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	h.Engine.Refresh()
 	c.JSON(http.StatusOK, k)
 }
@@ -156,7 +169,11 @@ func (h *AdminHandler) UpdateKey(c *gin.Context) {
 // DeleteKey deletes a key
 func (h *AdminHandler) DeleteKey(c *gin.Context) {
 	id, _ := strconv.ParseInt(c.Param("id"), 10, 64)
-	db.GetDB().Delete(&model.Key{}, id)
+	if err := db.GetDB().Delete(&model.Key{}, id).Error; err != nil {
+		log.Printf("[admin] DeleteKey error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	h.Engine.Refresh()
 	c.JSON(http.StatusNoContent, nil)
 }
@@ -196,7 +213,11 @@ func (h *AdminHandler) UpdateModelGroup(c *gin.Context) {
 		return
 	}
 	mg.ID = id
-	db.GetDB().Save(&mg)
+	if err := db.GetDB().Save(&mg).Error; err != nil {
+		log.Printf("[admin] UpdateModelGroup save error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	h.Engine.Refresh()
 	c.JSON(http.StatusOK, mg)
 }
@@ -204,7 +225,11 @@ func (h *AdminHandler) UpdateModelGroup(c *gin.Context) {
 // DeleteModelGroup deletes a model group
 func (h *AdminHandler) DeleteModelGroup(c *gin.Context) {
 	id, _ := strconv.ParseInt(c.Param("id"), 10, 64)
-	db.GetDB().Delete(&model.ModelGroup{}, id)
+	if err := db.GetDB().Delete(&model.ModelGroup{}, id).Error; err != nil {
+		log.Printf("[admin] DeleteModelGroup error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	db.GetDB().Where("model_group_id = ?", id).Delete(&model.Route{})
 	h.Engine.Refresh()
 	c.JSON(http.StatusNoContent, nil)
@@ -249,7 +274,11 @@ func (h *AdminHandler) UpdateRoute(c *gin.Context) {
 		return
 	}
 	r.ID = id
-	db.GetDB().Save(&r)
+	if err := db.GetDB().Save(&r).Error; err != nil {
+		log.Printf("[admin] UpdateRoute save error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	h.Engine.Refresh()
 	c.JSON(http.StatusOK, r)
 }
@@ -257,7 +286,11 @@ func (h *AdminHandler) UpdateRoute(c *gin.Context) {
 // DeleteRoute deletes a route
 func (h *AdminHandler) DeleteRoute(c *gin.Context) {
 	id, _ := strconv.ParseInt(c.Param("id"), 10, 64)
-	db.GetDB().Delete(&model.Route{}, id)
+	if err := db.GetDB().Delete(&model.Route{}, id).Error; err != nil {
+		log.Printf("[admin] DeleteRoute error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	h.Engine.Refresh()
 	c.JSON(http.StatusNoContent, nil)
 }
@@ -297,7 +330,11 @@ func (h *AdminHandler) UpdatePricing(c *gin.Context) {
 		return
 	}
 	p.ID = id
-	db.GetDB().Save(&p)
+	if err := db.GetDB().Save(&p).Error; err != nil {
+		log.Printf("[admin] UpdatePricing save error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	h.Engine.Calculator.RefreshPricing()
 	c.JSON(http.StatusOK, p)
 }
@@ -305,7 +342,11 @@ func (h *AdminHandler) UpdatePricing(c *gin.Context) {
 // DeletePricing deletes a pricing rule
 func (h *AdminHandler) DeletePricing(c *gin.Context) {
 	id, _ := strconv.ParseInt(c.Param("id"), 10, 64)
-	db.GetDB().Delete(&model.Pricing{}, id)
+	if err := db.GetDB().Delete(&model.Pricing{}, id).Error; err != nil {
+		log.Printf("[admin] DeletePricing error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	h.Engine.Calculator.RefreshPricing()
 	c.JSON(http.StatusNoContent, nil)
 }

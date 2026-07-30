@@ -33,7 +33,9 @@ const ModelGroups: React.FC = () => {
   };
 
   const handleDelete = async (id: number) => {
-    await deleteModelGroup(id); message.success('Deleted'); fetch();
+    try {
+      await deleteModelGroup(id); message.success('Deleted'); fetch();
+    } catch { message.error('Failed to delete model group'); }
   };
 
   const columns = [

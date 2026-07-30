@@ -46,6 +46,9 @@ func main() {
 
 	// Initialize and start health checker
 	checker := health.NewChecker()
+	checker.SetOnKeyRecovered(func(keyID int64) {
+		engine.MarkKeyActive(keyID)
+	})
 	checker.Start()
 	log.Println("[main] health checker started")
 

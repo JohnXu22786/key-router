@@ -33,7 +33,9 @@ const Pricing: React.FC = () => {
   };
 
   const handleDelete = async (id: number) => {
-    await deletePricing(id); message.success('Deleted'); fetch();
+    try {
+      await deletePricing(id); message.success('Deleted'); fetch();
+    } catch { message.error('Failed to delete pricing'); }
   };
 
   const columns = [

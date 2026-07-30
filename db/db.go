@@ -1,6 +1,7 @@
 package db
 
 import (
+	"log"
 	"local-router/model"
 	"os"
 	"path/filepath"
@@ -64,9 +65,14 @@ func seedDefaults(db *gorm.DB) {
 
 	for k, v := range defaults {
 		var count int64
-		db.Model(&model.Setting{}).Where("key = ?", k).Count(&count)
+		if err := db.Model(&model.Setting{}).Where("key = ?", k).Count(&count).Error; err != nil {
+			log.Printf("[db] failed to check setting %s: %v", k, err)
+			continue
+		}
 		if count == 0 {
-			db.Create(&model.Setting{Key: k, Value: v})
+			if err := db.Create(&model.Setting{Key: k, Value: v}).Error; err != nil {
+				log.Printf("[db] failed to create default setting %s: %v", k, err)
+			}
 		}
 	}
 }

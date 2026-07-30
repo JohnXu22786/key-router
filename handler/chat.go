@@ -134,10 +134,8 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			continue
 		}
 
-		// Handle retry-eligible HTTP responses
-		shouldRetry := false
-
-		if resp.StatusCode == http.StatusTooManyRequests { // 429
+		// Handle retry-eligible HTTP responses (close resp before retrying)
+		if resp.StatusCode == http.StatusTooManyRequests {
 			retryAfter := 60 * time.Second
 			if ra := resp.Header.Get("Retry-After"); ra != "" {
 				if sec, err := strconv.Atoi(ra); err == nil {
@@ -145,48 +143,23 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 				}
 			}
 			h.Engine.MarkKeyRateLimited(key.ID, retryAfter)
-			log.Printf("[relay] key %d rate limited, cooling %v (attempt %d/%d)",
-				key.ID, retryAfter, attempt+1, maxRetries+1)
+			log.Printf("[relay] key %d rate limited, cooling %v (attempt %d/%d)", key.ID, retryAfter, attempt+1, maxRetries+1)
 			resp.Body.Close()
-			shouldRetry = true
-		} else if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-			h.Engine.MarkKeyDisabled(key.ID, "auth_failed")
-			log.Printf("[relay] key %d disabled (auth failed, attempt %d/%d)",
-				key.ID, attempt+1, maxRetries+1)
-			resp.Body.Close()
-			shouldRetry = true
-		} else if resp.StatusCode >= 500 {
-			log.Printf("[relay] upstream 5xx for key %d: %d (attempt %d/%d)",
-				key.ID, resp.StatusCode, attempt+1, maxRetries+1)
-			resp.Body.Close()
-			shouldRetry = true
-		}
-
-		if shouldRetry {
 			continue
 		}
-		defer resp.Body.Close()
-
-		// Read response body for non-streaming
-		var responseBody []byte
-		if !reqMeta.Stream {
-			responseBody, err = io.ReadAll(resp.Body)
-			if err != nil {
-				c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read upstream response"})
-				return
-			}
-
-			// Parse token usage
-			usage := relay.ParseTokenUsage(responseBody, route.Provider.Type)
-
-			// Record consumption
-			billing.RecordConsumption(key.ID, targetModel, usage)
-
-			// Update window counters
-			h.Engine.RecordSuccess(key.ID, usage.TotalTokens)
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			h.Engine.MarkKeyDisabled(key.ID, "auth_failed")
+			log.Printf("[relay] key %d disabled (auth failed, attempt %d/%d)", key.ID, attempt+1, maxRetries+1)
+			resp.Body.Close()
+			continue
+		}
+		if resp.StatusCode >= 500 {
+			log.Printf("[relay] upstream 5xx for key %d: %d (attempt %d/%d)", key.ID, resp.StatusCode, attempt+1, maxRetries+1)
+			resp.Body.Close()
+			continue
 		}
 
-		// Set response headers
+		// Set response headers before writing body
 		for k, v := range resp.Header {
 			if k != "Content-Length" && k != "Content-Encoding" {
 				for _, hv := range v {
@@ -197,26 +170,54 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 		c.Status(resp.StatusCode)
 
 		if reqMeta.Stream {
-			// Stream the response (no retry on streaming failure)
-			err = relay.StreamResponse(c.Writer, resp, inputFormat, route.Provider.Type)
-			if err != nil {
-				log.Printf("[relay] streaming error: %v", err)
-				// Send error to downstream client as stream error chunk
+			// Stream response and capture token usage from stream end events
+			usage, streamErr := relay.StreamResponse(c.Writer, resp, inputFormat, route.Provider.Type)
+			resp.Body.Close()
+
+			if streamErr != nil {
+				log.Printf("[relay] streaming error: %v", streamErr)
 				relay.WriteStreamError(c.Writer, inputFormat, "upstream connection lost")
 			}
+
+			// Record consumption for streaming
+			if _, err := billing.RecordConsumption(key.ID, targetModel, usage); err != nil {
+				log.Printf("[relay] failed to record consumption for key %d: %v", key.ID, err)
+			}
+			if usage.TotalTokens > 0 {
+				h.Engine.RecordSuccess(key.ID, usage.TotalTokens)
+			} else {
+				h.Engine.WindowManager.IncrementAll(key.ID, 0)
+			}
 		} else {
+			// Read response body
+			responseBody, readErr := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if readErr != nil {
+				c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read upstream response"})
+				return
+			}
+
+			// Parse token usage and record consumption
+			usage := relay.ParseTokenUsage(responseBody, route.Provider.Type)
+			if _, err := billing.RecordConsumption(key.ID, targetModel, usage); err != nil {
+				log.Printf("[relay] failed to record consumption for key %d: %v", key.ID, err)
+			}
+			h.Engine.RecordSuccess(key.ID, usage.TotalTokens)
+
 			// Convert format if needed
 			if format.NeedConvert(inputFormat, route.Provider.Type) {
 				var converted []byte
+				var convErr error
 				if inputFormat == "openai" {
-					converted, _ = relay.ConvertAnthropicResponseToOpenAI(responseBody, targetModel)
+					converted, convErr = relay.ConvertAnthropicResponseToOpenAI(responseBody, targetModel)
 				} else {
-					converted, _ = relay.ConvertOpenAIResponseToAnthropic(responseBody)
+					converted, convErr = relay.ConvertOpenAIResponseToAnthropic(responseBody)
 				}
-				if converted != nil {
+				if convErr == nil && converted != nil {
 					c.Writer.Write(converted)
 					return
 				}
+				log.Printf("[relay] format conversion error: %v, falling back to original", convErr)
 			}
 			c.Writer.Write(responseBody)
 		}

@@ -45,7 +45,9 @@ const Keys: React.FC = () => {
   };
 
   const handleDelete = async (id: number) => {
-    await deleteKey(id); message.success('Key deleted'); fetch();
+    try {
+      await deleteKey(id); message.success('Key deleted'); fetch();
+    } catch { message.error('Failed to delete key'); }
   };
 
   const showDetail = async (key: Key) => {

@@ -35,7 +35,9 @@ const RoutesPage: React.FC = () => {
   };
 
   const handleDelete = async (id: number) => {
-    await deleteRoute(id); message.success('Deleted'); fetch();
+    try {
+      await deleteRoute(id); message.success('Deleted'); fetch();
+    } catch { message.error('Failed to delete route'); }
   };
 
   const columns = [

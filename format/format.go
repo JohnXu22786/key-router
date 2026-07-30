@@ -7,9 +7,7 @@ import (
 )
 
 var (
-	ErrUnsupportedFormat = errors.New("unsupported format")
-	ErrSkipChunk         = errors.New("skip chunk")
-	ErrNotDeltaChunk     = errors.New("not a delta chunk")
+	ErrSkipChunk = errors.New("skip chunk")
 )
 
 // DetectFormat determines the request format from the URL path

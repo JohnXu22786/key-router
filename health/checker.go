@@ -1,7 +1,6 @@
 package health
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -13,12 +12,16 @@ import (
 	"local-router/model"
 )
 
+// OnKeyRecovered is a callback invoked when a key recovers from disabled/rate-limited status
+type OnKeyRecovered func(keyID int64)
+
 // Checker periodically tests disabled/rate-limited keys for availability
 type Checker struct {
-	mu        sync.Mutex
-	interval  time.Duration
-	stopChan  chan struct{}
-	running   bool
+	mu            sync.Mutex
+	interval      time.Duration
+	stopChan      chan struct{}
+	running       bool
+	onRecovered   OnKeyRecovered
 }
 
 // NewChecker creates a new health checker
@@ -27,6 +30,13 @@ func NewChecker() *Checker {
 		interval: 120 * time.Second, // default
 		stopChan: make(chan struct{}),
 	}
+}
+
+// SetOnKeyRecovered sets a callback for when a key recovers
+func (c *Checker) SetOnKeyRecovered(cb OnKeyRecovered) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onRecovered = cb
 }
 
 // Start begins the periodic health check loop
@@ -121,11 +131,20 @@ func (c *Checker) checkKey(key *model.Key) {
 		log.Printf("[health] key %d (%s...) recovered, marking active",
 			key.ID, truncateKey(key.KeyValue))
 
-		db.GetDB().Model(key).Updates(map[string]interface{}{
+		err := db.GetDB().Model(key).Updates(map[string]interface{}{
 			"status":             model.KeyStatusActive,
 			"rate_limited_until": nil,
 			"disabled_reason":    "",
-		})
+		}).Error
+		if err != nil {
+			log.Printf("[health] failed to update key %d in DB: %v", key.ID, err)
+			return
+		}
+
+		// Notify engine to update in-memory cache
+		if c.onRecovered != nil {
+			c.onRecovered(key.ID)
+		}
 	}
 }
 
@@ -204,7 +223,10 @@ type CheckResult struct {
 // GetKeyStatuses returns current status of all keys
 func GetKeyStatuses() []CheckResult {
 	var keys []model.Key
-	db.GetDB().Find(&keys)
+	if err := db.GetDB().Find(&keys).Error; err != nil {
+		log.Printf("[health] GetKeyStatuses error: %v", err)
+		return nil
+	}
 
 	var results []CheckResult
 	for _, k := range keys {
@@ -217,28 +239,4 @@ func GetKeyStatuses() []CheckResult {
 	return results
 }
 
-// ParseTokenUsageFromBody extracts token usage from a response body (JSON)
-func ParseTokenUsageFromBody(body []byte, apiFormat string) (promptTokens, completionTokens int64) {
-	if apiFormat == "openai" {
-		var resp struct {
-			Usage *struct {
-				PromptTokens     int64 `json:"prompt_tokens"`
-				CompletionTokens int64 `json:"completion_tokens"`
-			} `json:"usage"`
-		}
-		if err := json.Unmarshal(body, &resp); err == nil && resp.Usage != nil {
-			return resp.Usage.PromptTokens, resp.Usage.CompletionTokens
-		}
-	} else {
-		var resp struct {
-			Usage *struct {
-				InputTokens  int64 `json:"input_tokens"`
-				OutputTokens int64 `json:"output_tokens"`
-			} `json:"usage"`
-		}
-		if err := json.Unmarshal(body, &resp); err == nil && resp.Usage != nil {
-			return resp.Usage.InputTokens, resp.Usage.OutputTokens
-		}
-	}
-	return 0, 0
-}
+

@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -51,10 +50,17 @@ func ForwardRequest(meta *model.RequestMetadata, key *model.Key, provider *model
 		return nil, err
 	}
 
-	// Set headers (discard incoming headers, use provider config)
+	// Set headers (discard incoming headers, use provider type)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+key.KeyValue)
 	req.Header.Set("Accept", "application/json")
+
+	// Set auth based on provider type
+	if targetFormat == "anthropic" {
+		req.Header.Set("x-api-key", key.KeyValue)
+		req.Header.Set("anthropic-version", "2023-06-01")
+	} else {
+		req.Header.Set("Authorization", "Bearer "+key.KeyValue)
+	}
 
 	// Apply extra headers from provider config
 	if provider.ExtraHeaders != "" {
@@ -64,12 +70,6 @@ func ForwardRequest(meta *model.RequestMetadata, key *model.Key, provider *model
 				req.Header.Set(k, v)
 			}
 		}
-	}
-
-	// Set Anthropic-specific headers if applicable
-	if targetFormat == "anthropic" {
-		req.Header.Set("x-api-key", key.KeyValue)
-		req.Header.Set("anthropic-version", "2023-06-01")
 	}
 
 	// Use a timeout client
@@ -90,35 +90,39 @@ func ForwardRequest(meta *model.RequestMetadata, key *model.Key, provider *model
 	return resp, nil
 }
 
-// StreamResponse streams an SSE response from upstream to the client response writer
-// Converts format if needed
-func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, targetFormat string) error {
+// StreamResponse streams an SSE response from upstream to the client response writer.
+// Returns captured token usage if available from the stream end events.
+func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, targetFormat string) (*model.TokenUsage, error) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		return fmt.Errorf("streaming not supported")
+		return nil, fmt.Errorf("streaming not supported")
 	}
 
+	usage := &model.TokenUsage{}
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 1024*64), 1024*1024) // 64KB initial, 1MB max line
 
 	for scanner.Scan() {
 		line := scanner.Text()
 
-		// Forward SSE data: "data: {...}"
+		// Forward SSE non-data lines
 		if !strings.HasPrefix(line, "data: ") {
-			// Forward non-data lines (event type, etc.)
 			_, err := fmt.Fprintf(w, "%s\n", line)
 			if err != nil {
 				resp.Body.Close()
-				return err
+				return usage, err
 			}
 			flusher.Flush()
 			continue
 		}
 
-		// Skip "[DONE]" message
+		// Handle "[DONE]" message
 		if strings.TrimSpace(line) == "data: [DONE]" {
-			fmt.Fprintf(w, "%s\n", line)
+			_, err := fmt.Fprintf(w, "%s\n", line)
+			if err != nil {
+				resp.Body.Close()
+				return usage, err
+			}
 			flusher.Flush()
 			continue
 		}
@@ -126,17 +130,17 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, tar
 		// Extract JSON data
 		jsonStr := strings.TrimPrefix(line, "data: ")
 
+		// Try to extract token usage from stream events
+		extractStreamUsage([]byte(jsonStr), inputFormat, targetFormat, usage)
+
 		// Convert format if needed
 		var converted []byte
 		var err error
 
 		if format.NeedConvert(targetFormat, inputFormat) {
-			// Response is in targetFormat, but client expects inputFormat
 			if inputFormat == "openai" && targetFormat == "anthropic" {
-				// Upstream is anthropic, client expects openai
 				converted, err = format.AnthropicStreamEventToOpenAI([]byte(jsonStr))
 			} else if inputFormat == "anthropic" && targetFormat == "openai" {
-				// Upstream is openai, client expects anthropic
 				converted, err = format.OpenAIStreamChunkToAnthropic([]byte(jsonStr))
 			} else {
 				converted = []byte(jsonStr)
@@ -149,79 +153,84 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, tar
 			if err == format.ErrSkipChunk {
 				continue
 			}
-			// Log conversion error but try to continue
 			continue
 		}
 
-		_, err = fmt.Fprintf(w, "data: %s\n\n", string(converted))
+		// Write converted chunk to client
+		out := append([]byte("data: "), converted...)
+		out = append(out, '\n', '\n')
+		_, err = w.Write(out)
 		if err != nil {
 			resp.Body.Close()
-			return err
+			return usage, err
 		}
 		flusher.Flush()
 	}
 
-	return scanner.Err()
+	return usage, scanner.Err()
 }
 
-// WriteStreamError sends an error message to the downstream client in stream format
+// extractStreamUsage tries to parse token usage from streaming events
+func extractStreamUsage(data []byte, inputFormat, targetFormat string, usage *model.TokenUsage) {
+	// OpenAI final chunk may include usage
+	if inputFormat == "openai" || targetFormat == "openai" {
+		var chunk struct {
+			Usage *struct {
+				PromptTokens     int64 `json:"prompt_tokens"`
+				CompletionTokens int64 `json:"completion_tokens"`
+				TotalTokens      int64 `json:"total_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal(data, &chunk); err == nil && chunk.Usage != nil {
+			usage.PromptTokens = chunk.Usage.PromptTokens
+			usage.CompletionTokens = chunk.Usage.CompletionTokens
+			usage.TotalTokens = chunk.Usage.TotalTokens
+		}
+	}
+
+	// Anthropic message_delta includes usage
+	if inputFormat == "anthropic" || targetFormat == "anthropic" {
+		var event struct {
+			Type  string `json:"type"`
+			Usage *struct {
+				InputTokens  int64 `json:"input_tokens"`
+				OutputTokens int64 `json:"output_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal(data, &event); err == nil && event.Type == "message_delta" && event.Usage != nil {
+			usage.PromptTokens = event.Usage.InputTokens
+			usage.CompletionTokens = event.Usage.OutputTokens
+			usage.TotalTokens = event.Usage.InputTokens + event.Usage.OutputTokens
+		}
+	}
+}
+
+// WriteStreamError sends an error message to the downstream client in stream format (JSON-safe)
 func WriteStreamError(w http.ResponseWriter, inputFormat string, errMsg string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		return
 	}
 
+	var errPayload []byte
 	if inputFormat == "openai" {
-		fmt.Fprintf(w, "data: {\"error\":{\"message\":\"%s\",\"type\":\"stream_error\"}}\n\n", errMsg)
+		errPayload, _ = json.Marshal(map[string]interface{}{
+			"error": map[string]string{
+				"message": errMsg,
+				"type":    "stream_error",
+			},
+		})
 	} else {
-		// Anthropic format - send as a content_block_delta with error
-		fmt.Fprintf(w, "data: {\"type\":\"error\",\"error\":{\"message\":\"%s\"}}\n\n", errMsg)
+		errPayload, _ = json.Marshal(map[string]interface{}{
+			"type": "error",
+			"error": map[string]string{
+				"message": errMsg,
+			},
+		})
 	}
+	// Best-effort write; client may already be disconnected
+	fmt.Fprintf(w, "data: %s\n\n", string(errPayload))
 	flusher.Flush()
-}
-
-// CopyResponse copies a non-streaming response from upstream to client
-func CopyResponse(w http.ResponseWriter, resp *http.Response, meta *model.RequestMetadata, provider *model.Provider) error {
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	// Copy status code and headers
-	for k, v := range resp.Header {
-		if k != "Content-Length" {
-			for _, hv := range v {
-				w.Header().Add(k, hv)
-			}
-		}
-	}
-	w.WriteHeader(resp.StatusCode)
-
-	// Convert format if needed
-	if format.NeedConvert(meta.Format, provider.Type) {
-		var converted []byte
-		var err error
-		if meta.Format == "openai" && provider.Type == "anthropic" {
-			// Anthropic response -> OpenAI response conversion (simplified)
-			converted, err = ConvertAnthropicResponseToOpenAI(body, meta.Model)
-		} else if meta.Format == "anthropic" && provider.Type == "openai" {
-			// OpenAI response -> Anthropic response conversion (simplified)
-			converted, err = ConvertOpenAIResponseToAnthropic(body)
-		} else {
-			converted = body
-		}
-		if err != nil {
-			// Fallback to original body on conversion error
-			w.Write(body)
-			return nil
-		}
-		w.Write(converted)
-		return nil
-	}
-
-	w.Write(body)
-	return nil
 }
 
 // replaceModelName replaces the "model" field in a JSON request body if targetModel is set
@@ -274,23 +283,31 @@ func ConvertOpenAIResponseToAnthropic(body []byte) ([]byte, error) {
 		return body, nil
 	}
 
-	usage, _ := oaiResp["usage"].(map[string]interface{})
+	usage, usageOk := oaiResp["usage"].(map[string]interface{})
+	if !usageOk {
+		usage = nil
+	}
 	anthResp := map[string]interface{}{
-		"id":         oaiResp["id"],
-		"type":       "message",
-		"role":       "assistant",
-		"content":    []interface{}{},
-		"model":      oaiResp["model"],
+		"id":          oaiResp["id"],
+		"type":        "message",
+		"role":        "assistant",
+		"content":     []interface{}{},
+		"model":       oaiResp["model"],
 		"stop_reason": "end_turn",
-		"usage": map[string]interface{}{
+	}
+	if usage != nil {
+		anthResp["usage"] = map[string]interface{}{
 			"input_tokens":  usage["prompt_tokens"],
 			"output_tokens": usage["completion_tokens"],
-		},
+		}
 	}
 
 	choices, ok := oaiResp["choices"].([]interface{})
 	if ok && len(choices) > 0 {
-		choice := choices[0].(map[string]interface{})
+		choice, ok := choices[0].(map[string]interface{})
+		if !ok {
+			return json.Marshal(anthResp)
+		}
 		msg, _ := choice["message"].(map[string]interface{})
 		if content, ok := msg["content"].(string); ok && content != "" {
 			anthResp["content"] = []interface{}{

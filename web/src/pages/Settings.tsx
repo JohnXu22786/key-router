@@ -56,7 +56,7 @@ const Settings: React.FC = () => {
             <InputNumber min={10} max={3600} style={{ width: '100%' }} />
           </Form.Item>
           <Button type="primary" onClick={handleSave}>Save Settings</Button>
-          <Button style={{ marginLeft: 12 }} onClick={async () => { await reloadConfig(); message.success('Config reloaded'); }}>
+          <Button style={{ marginLeft: 12 }} onClick={async () => { try { await reloadConfig(); message.success('Config reloaded'); } catch { message.error('Failed to reload config'); } }}>
             Reload Config
           </Button>
         </Form>
