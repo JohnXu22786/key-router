@@ -46,12 +46,16 @@ type Key struct {
 	RecoveryStrategy string   `gorm:"type:varchar(20);default:'lazy'" json:"recovery_strategy"`
 	RateLimitedUntil *time.Time `json:"rate_limited_until"`
 	DisabledReason  string     `gorm:"type:varchar(512)" json:"disabled_reason"`
-	RPMLimit        int64      `gorm:"default:0" json:"rpm_limit"`       // 0 = unlimited
-	TPMLimit        int64      `gorm:"default:0" json:"tpm_limit"`       // tokens per minute
-	RP5hLimit       int64      `gorm:"default:0" json:"rp5h_limit"`     // 5-hour limit
-	RPDLimit        int64      `gorm:"default:0" json:"rpd_limit"`      // daily limit
-	RPWLimit        int64      `gorm:"default:0" json:"rpw_limit"`      // weekly limit
-	RPMLimitMonth   int64      `gorm:"default:0" json:"rpm_month_limit"` // monthly limit
+	RPMLimit        int64      `gorm:"default:0" json:"rpm_limit"`          // requests per minute
+	TPMLimit        int64      `gorm:"default:0" json:"tpm_limit"`          // tokens per minute
+	RP5hLimit       int64      `gorm:"default:0" json:"rp5h_limit"`        // 5-hour limit
+	RP5hMetric      string     `gorm:"type:varchar(10);default:'requests'" json:"rp5h_metric"` // requests|tokens
+	RPDLimit        int64      `gorm:"default:0" json:"rpd_limit"`         // daily limit
+	RPDMetric       string     `gorm:"type:varchar(10);default:'requests'" json:"rpd_metric"`
+	RPWLimit        int64      `gorm:"default:0" json:"rpw_limit"`         // weekly limit
+	RPWMetric       string     `gorm:"type:varchar(10);default:'requests'" json:"rpw_metric"`
+	RPMLimitMonth   int64     `gorm:"default:0" json:"rpm_month_limit"`    // monthly limit
+	RPMMetric       string     `gorm:"type:varchar(10);default:'requests'" json:"rpm_metric"`
 	CreatedAt       time.Time  `json:"created_at"`
 	UpdatedAt       time.Time  `json:"updated_at"`
 

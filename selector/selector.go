@@ -174,9 +174,8 @@ func (e *Engine) SelectKey(route *RouteEntry) *model.Key {
 			continue
 		}
 
-		// Check limits
-		limits := e.getKeyLimits(k)
-		if e.WindowManager.IsAnyExceeded(k.ID, limits) {
+		// Check limits (uses metric type for 5h/daily/weekly/monthly windows)
+		if !e.isKeyWithinLimits(k) {
 			continue
 		}
 
@@ -198,6 +197,45 @@ func (e *Engine) SelectKey(route *RouteEntry) *model.Key {
 	return nil
 }
 
+// isKeyWithinLimits checks all rate limit windows against the key's metric type
+func (e *Engine) isKeyWithinLimits(k *model.Key) bool {
+	// RPM always checks request count
+	if k.RPMLimit > 0 && e.WindowManager.GetCount(k.ID, model.WindowRPM) >= k.RPMLimit {
+		return false
+	}
+	// TPM always checks token count
+	if k.TPMLimit > 0 && e.WindowManager.GetTokens(k.ID, model.WindowTPM) >= k.TPMLimit {
+		return false
+	}
+	// 5-hour: check based on configured metric
+	if k.RP5hLimit > 0 && e.getMetricCount(k.ID, model.WindowRP5h, k.RP5hMetric) >= k.RP5hLimit {
+		return false
+	}
+	// Daily
+	if k.RPDLimit > 0 && e.getMetricCount(k.ID, model.WindowRPD, k.RPDMetric) >= k.RPDLimit {
+		return false
+	}
+	// Weekly
+	if k.RPWLimit > 0 && e.getMetricCount(k.ID, model.WindowRPW, k.RPWMetric) >= k.RPWLimit {
+		return false
+	}
+	// Monthly
+	if k.RPMLimitMonth > 0 && e.getMetricCount(k.ID, model.WindowRPMo, k.RPMMetric) >= k.RPMLimitMonth {
+		return false
+	}
+	return true
+}
+
+// getMetricCount returns the count for a window using the appropriate metric (requests or tokens)
+func (e *Engine) getMetricCount(keyID int64, wt model.WindowType, metric string) int64 {
+	switch metric {
+	case "tokens":
+		return e.WindowManager.GetTokens(keyID, wt)
+	default:
+		return e.WindowManager.GetCount(keyID, wt)
+	}
+}
+
 // isKeyAvailable checks if a key can be used
 func (e *Engine) isKeyAvailable(k *model.Key) bool {
 	switch k.Status {
@@ -213,30 +251,6 @@ func (e *Engine) isKeyAvailable(k *model.Key) bool {
 	default:
 		return false
 	}
-}
-
-// getKeyLimits returns the limit map for a key
-func (e *Engine) getKeyLimits(k *model.Key) map[model.WindowType]int64 {
-	limits := make(map[model.WindowType]int64)
-	if k.RPMLimit > 0 {
-		limits[model.WindowRPM] = k.RPMLimit
-	}
-	if k.TPMLimit > 0 {
-		limits[model.WindowTPM] = k.TPMLimit
-	}
-	if k.RP5hLimit > 0 {
-		limits[model.WindowRP5h] = k.RP5hLimit
-	}
-	if k.RPDLimit > 0 {
-		limits[model.WindowRPD] = k.RPDLimit
-	}
-	if k.RPWLimit > 0 {
-		limits[model.WindowRPW] = k.RPWLimit
-	}
-	if k.RPMLimitMonth > 0 {
-		limits[model.WindowRPMo] = k.RPMLimitMonth
-	}
-	return limits
 }
 
 // RecordSuccess updates window counters and consumption after a successful relay

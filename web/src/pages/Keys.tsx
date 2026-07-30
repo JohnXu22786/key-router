@@ -139,26 +139,43 @@ const Keys: React.FC = () => {
               { value: 'lazy', label: 'Lazy — only use when no immediate keys available' },
             ]} />
           </Form.Item>
-          <Collapse ghost items={[{
-            key: 'limits',
-            label: 'Rate Limits (0 = unlimited)',
-            children: (
-              <div>
-                <Space size="large" style={{ marginBottom: 8 }}>
-                  <Form.Item name="rpm_limit" label="RPM"><InputNumber min={0} placeholder="500" /></Form.Item>
-                  <Form.Item name="tpm_limit" label="TPM"><InputNumber min={0} placeholder="200000" /></Form.Item>
-                </Space>
-                <Space size="large" style={{ marginBottom: 8 }}>
-                  <Form.Item name="rp5h_limit" label="5-Hour"><InputNumber min={0} placeholder="5000" /></Form.Item>
-                  <Form.Item name="rpd_limit" label="Daily"><InputNumber min={0} placeholder="10000" /></Form.Item>
-                </Space>
-                <Space size="large">
-                  <Form.Item name="rpw_limit" label="Weekly"><InputNumber min={0} placeholder="50000" /></Form.Item>
-                  <Form.Item name="rpm_month_limit" label="Monthly"><InputNumber min={0} placeholder="200000" /></Form.Item>
-                </Space>
-              </div>
-            ),
-          }]} />
+          <div style={{ marginTop: 8 }}>
+            <Typography.Text strong>Rate Limits</Typography.Text>
+            <Space size="large" style={{ marginTop: 8, marginBottom: 8, display: 'flex' }}>
+              <Form.Item name="rpm_limit" label="RPM (requests)"><InputNumber min={0} placeholder="500" /></Form.Item>
+              <Form.Item name="tpm_limit" label="TPM (tokens)"><InputNumber min={0} placeholder="200000" /></Form.Item>
+            </Space>
+            <Space size="large" style={{ display: 'flex', flexWrap: 'wrap' }}>
+              <Form.Item name="rp5h_limit" label="5-Hour Limit"><InputNumber min={0} placeholder="5000" style={{ width: 100 }} /></Form.Item>
+              <Form.Item name="rp5h_metric" label="Metric">
+                <Select style={{ width: 100 }} options={[
+                  { value: 'requests', label: 'Requests' },
+                  { value: 'tokens', label: 'Tokens' },
+                ]} />
+              </Form.Item>
+              <Form.Item name="rpd_limit" label="Daily Limit"><InputNumber min={0} placeholder="10000" style={{ width: 100 }} /></Form.Item>
+              <Form.Item name="rpd_metric" label="Metric">
+                <Select style={{ width: 100 }} options={[
+                  { value: 'requests', label: 'Requests' },
+                  { value: 'tokens', label: 'Tokens' },
+                ]} />
+              </Form.Item>
+              <Form.Item name="rpw_limit" label="Weekly Limit"><InputNumber min={0} placeholder="50000" style={{ width: 100 }} /></Form.Item>
+              <Form.Item name="rpw_metric" label="Metric">
+                <Select style={{ width: 100 }} options={[
+                  { value: 'requests', label: 'Requests' },
+                  { value: 'tokens', label: 'Tokens' },
+                ]} />
+              </Form.Item>
+              <Form.Item name="rpm_month_limit" label="Monthly Limit"><InputNumber min={0} placeholder="200000" style={{ width: 100 }} /></Form.Item>
+              <Form.Item name="rpm_metric" label="Metric">
+                <Select style={{ width: 100 }} options={[
+                  { value: 'requests', label: 'Requests' },
+                  { value: 'tokens', label: 'Tokens' },
+                ]} />
+              </Form.Item>
+            </Space>
+          </div>
         </Form>
       </Modal>
 

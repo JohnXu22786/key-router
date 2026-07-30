@@ -27,9 +27,13 @@ export interface Key {
   rpm_limit: number;
   tpm_limit: number;
   rp5h_limit: number;
+  rp5h_metric: string;
   rpd_limit: number;
+  rpd_metric: string;
   rpw_limit: number;
+  rpw_metric: string;
   rpm_month_limit: number;
+  rpm_metric: string;
   counts?: Record<string, { count: number; token_count: number }>;
   provider?: Provider;
   created_at: string;

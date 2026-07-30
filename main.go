@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	"local-router/db"
 	"local-router/health"
@@ -16,10 +17,17 @@ import (
 	"github.com/webview/webview_go"
 )
 
+// FreeConsole detaches the process from its console window (GUI mode only)
+var kernel32 = syscall.NewLazyDLL("kernel32.dll")
+var freeConsole = kernel32.NewProc("FreeConsole")
+
 //go:embed web/dist/*
 var staticFS embed.FS
 
 func main() {
+	// Detach from console window immediately (GUI mode)
+	freeConsole.Call()
+
 	// Determine data directory
 	dataDir := os.Getenv("LOCALROUTER_DATA")
 	if dataDir == "" {
