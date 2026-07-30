@@ -10,8 +10,9 @@ import {
   AppstoreOutlined,
   BranchesOutlined,
   DollarOutlined,
-  SettingOutlined,
   BarChartOutlined,
+  SettingOutlined,
+  QuestionCircleOutlined,
 } from '@ant-design/icons';
 
 import Dashboard from './pages/Dashboard';
@@ -20,8 +21,9 @@ import Keys from './pages/Keys';
 import ModelGroups from './pages/ModelGroups';
 import RoutesPage from './pages/RoutesPage';
 import Pricing from './pages/Pricing';
-import Settings from './pages/Settings';
 import Stats from './pages/Stats';
+import Settings from './pages/Settings';
+import Help from './pages/Help';
 
 const { Sider, Content } = Layout;
 const { Title } = Typography;
@@ -33,13 +35,16 @@ const LayoutWithRouter: React.FC = () => {
 
   const menuItems = [
     { key: '/', icon: <DashboardOutlined />, label: <Link to="/">Dashboard</Link> },
+    { type: 'divider' as const },
     { key: '/providers', icon: <CloudServerOutlined />, label: <Link to="/providers">Providers</Link> },
     { key: '/keys', icon: <KeyOutlined />, label: <Link to="/keys">Keys</Link> },
     { key: '/model-groups', icon: <AppstoreOutlined />, label: <Link to="/model-groups">Model Groups</Link> },
     { key: '/routes', icon: <BranchesOutlined />, label: <Link to="/routes">Routes</Link> },
     { key: '/pricing', icon: <DollarOutlined />, label: <Link to="/pricing">Pricing</Link> },
-    { key: '/settings', icon: <SettingOutlined />, label: <Link to="/settings">Settings</Link> },
+    { type: 'divider' as const },
     { key: '/stats', icon: <BarChartOutlined />, label: <Link to="/stats">Stats</Link> },
+    { key: '/settings', icon: <SettingOutlined />, label: <Link to="/settings">Settings</Link> },
+    { key: '/help', icon: <QuestionCircleOutlined />, label: <Link to="/help">Help</Link> },
   ];
 
   return (
@@ -68,6 +73,7 @@ const LayoutWithRouter: React.FC = () => {
             <Route path="/pricing" element={<Pricing />} />
             <Route path="/settings" element={<Settings />} />
             <Route path="/stats" element={<Stats />} />
+            <Route path="/help" element={<Help />} />
           </Routes>
         </Content>
       </Layout>

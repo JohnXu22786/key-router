@@ -82,16 +82,36 @@ func (h *AdminHandler) UpdateProvider(c *gin.Context) {
 	c.JSON(http.StatusOK, p)
 }
 
-// DeleteProvider deletes a provider and its keys/routes
+// DeleteProvider deletes a provider and its keys/routes (transactional)
 func (h *AdminHandler) DeleteProvider(c *gin.Context) {
 	id, _ := strconv.ParseInt(c.Param("id"), 10, 64)
-	if err := db.GetDB().Delete(&model.Provider{}, id).Error; err != nil {
+	tx := db.GetDB().Begin()
+
+	if err := tx.Delete(&model.Provider{}, id).Error; err != nil {
+		tx.Rollback()
 		log.Printf("[admin] DeleteProvider error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	db.GetDB().Where("provider_id = ?", id).Delete(&model.Key{})
-	db.GetDB().Where("provider_id = ?", id).Delete(&model.Route{})
+	if err := tx.Where("provider_id = ?", id).Delete(&model.Key{}).Error; err != nil {
+		tx.Rollback()
+		log.Printf("[admin] DeleteProvider cascade key delete error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if err := tx.Where("provider_id = ?", id).Delete(&model.Route{}).Error; err != nil {
+		tx.Rollback()
+		log.Printf("[admin] DeleteProvider cascade route delete error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		log.Printf("[admin] DeleteProvider commit error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
 	h.Engine.Refresh()
 	c.JSON(http.StatusNoContent, nil)
 }
@@ -222,23 +242,39 @@ func (h *AdminHandler) UpdateModelGroup(c *gin.Context) {
 	c.JSON(http.StatusOK, mg)
 }
 
-// DeleteModelGroup deletes a model group
+// DeleteModelGroup deletes a model group and its routes (transactional)
 func (h *AdminHandler) DeleteModelGroup(c *gin.Context) {
 	id, _ := strconv.ParseInt(c.Param("id"), 10, 64)
-	if err := db.GetDB().Delete(&model.ModelGroup{}, id).Error; err != nil {
+	tx := db.GetDB().Begin()
+
+	if err := tx.Delete(&model.ModelGroup{}, id).Error; err != nil {
+		tx.Rollback()
 		log.Printf("[admin] DeleteModelGroup error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	db.GetDB().Where("model_group_id = ?", id).Delete(&model.Route{})
+	if err := tx.Where("model_group_id = ?", id).Delete(&model.Route{}).Error; err != nil {
+		tx.Rollback()
+		log.Printf("[admin] DeleteModelGroup cascade route delete error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		tx.Rollback()
+		log.Printf("[admin] DeleteModelGroup commit error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
 	h.Engine.Refresh()
 	c.JSON(http.StatusNoContent, nil)
 }
 
-// GetRoutes returns all routes
+// GetRoutes returns all routes, ordered by priority (drag position)
 func (h *AdminHandler) GetRoutes(c *gin.Context) {
 	var routes []model.Route
-	query := db.GetDB().Preload("ModelGroup").Preload("Provider")
+	query := db.GetDB().Preload("ModelGroup").Preload("Provider").Order("priority ASC")
 	if groupID := c.Query("model_group_id"); groupID != "" {
 		query = query.Where("model_group_id = ?", groupID)
 	}
@@ -281,6 +317,38 @@ func (h *AdminHandler) UpdateRoute(c *gin.Context) {
 	}
 	h.Engine.Refresh()
 	c.JSON(http.StatusOK, r)
+}
+
+// ReorderRoutes batch-updates route priorities based on visual ordering
+func (h *AdminHandler) ReorderRoutes(c *gin.Context) {
+	var req struct {
+		Routes []struct {
+			ID       int64 `json:"id"`
+			Priority int   `json:"priority"`
+		} `json:"routes"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	tx := db.GetDB().Begin()
+	for _, r := range req.Routes {
+		if err := tx.Model(&model.Route{}).Where("id = ?", r.ID).Update("priority", r.Priority).Error; err != nil {
+			tx.Rollback()
+			log.Printf("[admin] ReorderRoutes error for route %d: %v", r.ID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "reorder failed"})
+			return
+		}
+	}
+	if err := tx.Commit().Error; err != nil {
+		log.Printf("[admin] ReorderRoutes commit error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "reorder commit failed"})
+		return
+	}
+
+	h.Engine.Refresh()
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
 // DeleteRoute deletes a route
@@ -370,7 +438,9 @@ func (h *AdminHandler) UpdateSettings(c *gin.Context) {
 		return
 	}
 	for k, v := range settings {
-		db.SetSetting(k, v)
+		if err := db.SetSetting(k, v); err != nil {
+			log.Printf("[admin] UpdateSettings error for %s: %v", k, err)
+		}
 	}
 	// Restart health checker if interval changed
 	if _, ok := settings[model.SettingHealthCheck]; ok {

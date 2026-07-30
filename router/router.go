@@ -77,6 +77,7 @@ func Setup(
 		api.POST("/routes", adminHandler.CreateRoute)
 		api.PUT("/routes/:id", adminHandler.UpdateRoute)
 		api.DELETE("/routes/:id", adminHandler.DeleteRoute)
+		api.POST("/routes/reorder", adminHandler.ReorderRoutes)
 
 		// Pricing
 		api.GET("/pricings", adminHandler.GetPricings)

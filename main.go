@@ -81,7 +81,7 @@ func main() {
 	w := webview.New(false) // false = no devtools
 	defer w.Destroy()
 	w.SetTitle(fmt.Sprintf("LocalRouter v0.1.0 — %s", url))
-	w.SetSize(1200, 800, webview.HintNone)
+	w.SetSize(900, 580, webview.HintNone)
 	w.Navigate(url)
 	w.Run()
 

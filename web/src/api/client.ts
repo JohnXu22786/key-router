@@ -122,6 +122,7 @@ export const getRoutes = () => api.get<Route[]>('/routes');
 export const createRoute = (data: Partial<Route>) => api.post<Route>('/routes', data);
 export const updateRoute = (id: number, data: Partial<Route>) => api.put<Route>(`/routes/${id}`, data);
 export const deleteRoute = (id: number) => api.delete(`/routes/${id}`);
+export const reorderRoutes = (routes: { id: number; priority: number }[]) => api.post('/routes/reorder', { routes });
 
 // Pricing
 export const getPricings = () => api.get<Pricing[]>('/pricings');
