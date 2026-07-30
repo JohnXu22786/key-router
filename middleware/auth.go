@@ -1,29 +1,33 @@
 package middleware
 
 import (
+	"log"
 	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 )
 
-// AuthMiddleware validates the local authentication token
-// It's a simple protection against unauthorized access on LAN
+// AuthMiddleware validates the local authentication token.
+// Only protects forwarding paths (/v1/*) when a token is configured.
+// Management API (/api/*) and UI always pass through regardless.
 func AuthMiddleware(expectedToken string) gin.HandlerFunc {
+	log.Printf("[auth] middleware initialized, token=%q (empty=disabled)", expectedToken)
 	return func(c *gin.Context) {
-		// Skip auth for the web UI
-		if isUIRequest(c.Request) {
+		// Management API and UI always pass through
+		if isUIRequest(c.Request) || strings.HasPrefix(c.Request.URL.Path, "/api/") {
 			c.Next()
 			return
 		}
 
-		// Skip auth for health check
-		if c.Request.URL.Path == "/api/health" {
-			c.Next()
-			return
-		}
-
+		// No token configured → allow everything
 		if expectedToken == "" {
+			c.Next()
+			return
+		}
+
+		// Only /v1/* (forwarding) paths require auth when token is set
+		if !isForwardingPath(c.Request.URL.Path) {
 			c.Next()
 			return
 		}
@@ -48,19 +52,8 @@ func AuthMiddleware(expectedToken string) gin.HandlerFunc {
 			return
 		}
 
-		// For API routes, check token
-		if strings.HasPrefix(c.Request.URL.Path, "/api/") {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid auth token"})
-			return
-		}
-
-		// For forwarding paths, reject
-		if isForwardingPath(c.Request.URL.Path) {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid auth token"})
-			return
-		}
-
-		c.Next()
+		log.Printf("[auth] 401: path=%s method=%s expected=%q got=%q", c.Request.URL.Path, c.Request.Method, expectedToken, token)
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid auth token"})
 	}
 }
 

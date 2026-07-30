@@ -20,9 +20,6 @@ import (
 var staticFS embed.FS
 
 func main() {
-	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
-	log.Println("[main] LocalRouter starting...")
-
 	// Determine data directory
 	dataDir := os.Getenv("LOCALROUTER_DATA")
 	if dataDir == "" {
@@ -36,6 +33,16 @@ func main() {
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		log.Fatalf("[main] cannot create data directory: %v", err)
 	}
+
+	// Set up log file (GUI mode has no console)
+	logPath := filepath.Join(dataDir, "local-router.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err == nil {
+		log.SetOutput(logFile)
+		defer logFile.Close()
+	}
+	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+	log.Printf("[main] LocalRouter starting... dataDir=%s", dataDir)
 
 	// Initialize database
 	if err := db.Init(dataDir); err != nil {

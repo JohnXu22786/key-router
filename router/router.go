@@ -31,6 +31,7 @@ func Setup(
 
 	// Auth middleware
 	authToken := db.GetSetting(model.SettingAuthToken)
+	log.Printf("[router] auth token from DB: %q (empty=disabled)", authToken)
 	r.Use(middleware.AuthMiddleware(authToken))
 
 	// Create handlers
