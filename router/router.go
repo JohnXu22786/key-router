@@ -125,19 +125,24 @@ func serveStaticFallback(prefix string, fsys fs.FS) gin.HandlerFunc {
 		path = strings.TrimPrefix(path, "/")
 
 		// SPA fallback: paths without file extensions serve index.html
+		// Asset paths with extensions (e.g. /assets/chunk.js) return 404 on miss
 		if path == "" || !strings.Contains(path, ".") {
 			path = "index.html"
 		}
 
 		f, err := fsys.Open(path)
 		if err != nil {
-			// Try index.html as last-resort fallback
+			// Only fall back to index.html for SPA routes (no extension)
+			if strings.Contains(path, ".") {
+				c.Status(http.StatusNotFound)
+				c.String(http.StatusNotFound, "404 not found")
+				return
+			}
 			f, err = fsys.Open("index.html")
 			if err != nil {
 				c.Status(http.StatusNotFound)
 				return
 			}
-			path = "index.html"
 		}
 		defer f.Close()
 

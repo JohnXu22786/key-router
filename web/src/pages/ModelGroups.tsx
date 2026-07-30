@@ -69,8 +69,8 @@ const ModelGroups: React.FC = () => {
           <Form.Item name="group_id" label="Group ID (matches incoming model name)" rules={[{ required: true }]}>
             <Input placeholder="gpt-4o" />
           </Form.Item>
-          <Form.Item name="name" label="Display Name"><Input /></Form.Item>
-          <Form.Item name="enabled" label="Enabled" valuePropName="checked"><Switch /></Form.Item>
+          <Form.Item name="name" label="Display Name"><Input placeholder="GPT-4o Pool" /></Form.Item>
+          <Form.Item name="enabled" label="Enabled" valuePropName="checked"><Switch defaultChecked /></Form.Item>
           <Form.Item name="retry_times" label="Retry Times"><InputNumber min={0} max={20} /></Form.Item>
         </Form>
       </Modal>

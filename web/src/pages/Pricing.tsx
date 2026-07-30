@@ -41,10 +41,10 @@ const Pricing: React.FC = () => {
   const columns = [
     { title: 'ID', dataIndex: 'id', key: 'id', width: 60 },
     { title: 'Model Name', dataIndex: 'model_name', key: 'model_name' },
-    { title: 'Prompt /1K', dataIndex: 'prompt_per_1k', key: 'prompt_per_1k', render: (v: number) => `$${v?.toFixed(6)}` },
-    { title: 'Completion /1K', dataIndex: 'completion_per_1k', key: 'completion_per_1k', render: (v: number) => `$${v?.toFixed(6)}` },
-    { title: 'Cache Read /1K', dataIndex: 'cache_read_per_1k', key: 'cache_read_per_1k', render: (v: number) => v ? `$${v.toFixed(6)}` : '-' },
-    { title: 'Cache Write /1K', dataIndex: 'cache_write_per_1k', key: 'cache_write_per_1k', render: (v: number) => v ? `$${v.toFixed(6)}` : '-' },
+    { title: 'Prompt $/1K', dataIndex: 'prompt_per_1k', key: 'prompt_per_1k', render: (v: number) => `$${v?.toFixed(6)}` },
+    { title: 'Completion $/1K', dataIndex: 'completion_per_1k', key: 'completion_per_1k', render: (v: number) => `$${v?.toFixed(6)}` },
+    { title: 'Cache Read $/1K', dataIndex: 'cache_read_per_1k', key: 'cache_read_per_1k', render: (v: number) => v ? `$${v.toFixed(6)}` : '-' },
+    { title: 'Cache Write $/1K', dataIndex: 'cache_write_per_1k', key: 'cache_write_per_1k', render: (v: number) => v ? `$${v.toFixed(6)}` : '-' },
     {
       title: 'Actions', key: 'actions',
       render: (_: unknown, r: PricingType) => (

@@ -1,10 +1,10 @@
 import React, { useEffect, useState } from 'react';
 import {
   Table, Button, Modal, Form, Input, Select, InputNumber, message, Space,
-  Typography, Popconfirm, Tag, Descriptions, Progress,
+  Typography, Popconfirm, Tag, Descriptions, Progress, Collapse,
 } from 'antd';
 import { PlusOutlined, EditOutlined, DeleteOutlined, EyeOutlined } from '@ant-design/icons';
-import { getKeys, createKey, updateKey, deleteKey, getKeyDetail, Key } from '../api/client';
+import { getKeys, createKey, updateKey, deleteKey, getKeyDetail, getProviders, Key, Provider } from '../api/client';
 
 const { Title, Text } = Typography;
 
@@ -17,6 +17,7 @@ const statusColors: Record<string, string> = {
 
 const Keys: React.FC = () => {
   const [keys, setKeys] = useState<Key[]>([]);
+  const [providers, setProviders] = useState<Provider[]>([]);
   const [loading, setLoading] = useState(false);
   const [modalOpen, setModalOpen] = useState(false);
   const [detailOpen, setDetailOpen] = useState(false);
@@ -27,8 +28,9 @@ const Keys: React.FC = () => {
   const fetch = async () => {
     setLoading(true);
     try {
-      const res = await getKeys();
-      setKeys(res.data);
+      const [keysRes, provRes] = await Promise.all([getKeys(), getProviders()]);
+      setKeys(keysRes.data);
+      setProviders(provRes.data);
     } catch { message.error('Failed to load keys'); }
     finally { setLoading(false); }
   };
@@ -120,31 +122,43 @@ const Keys: React.FC = () => {
       </Button>
       <Table dataSource={keys} columns={columns} rowKey="id" loading={loading} scroll={{ x: 900 }} />
 
-      <Modal title={editing ? 'Edit Key' : 'Add Key'} open={modalOpen} onOk={handleSave} onCancel={() => { setModalOpen(false); setEditing(null); }} width={600}>
+      <Modal title={editing ? 'Edit Key' : 'Add Key'} open={modalOpen} onOk={handleSave} onCancel={() => { setModalOpen(false); setEditing(null); }} width={680}>
         <Form form={form} layout="vertical">
-          <Form.Item name="provider_id" label="Provider ID" rules={[{ required: true }]}>
-            <InputNumber style={{ width: '100%' }} min={1} />
+          <Form.Item name="provider_id" label="Provider" rules={[{ required: true }]}>
+            <Select
+              placeholder="Select a provider"
+              showSearch
+              options={providers.map(p => ({ value: p.id, label: `${p.name} (${p.type})` }))}
+            />
           </Form.Item>
-          <Form.Item name="name" label="Name"><Input /></Form.Item>
-          <Form.Item name="key_value" label="API Key" rules={[{ required: true }]}><Input.Password /></Form.Item>
-          <Form.Item name="recovery_strategy" label="Recovery Strategy">
+          <Form.Item name="name" label="Display Name"><Input placeholder="My OpenAI Key 1" /></Form.Item>
+          <Form.Item name="key_value" label="API Key" rules={[{ required: true }]}><Input.Password placeholder="sk-..." /></Form.Item>
+          <Form.Item name="recovery_strategy" label="Recovery Strategy" initialValue="immediate">
             <Select options={[
-              { value: 'immediate', label: 'Immediate' },
-              { value: 'lazy', label: 'Lazy' },
+              { value: 'immediate', label: 'Immediate — use as soon as recovered' },
+              { value: 'lazy', label: 'Lazy — only use when no immediate keys available' },
             ]} />
           </Form.Item>
-          <Space size="large">
-            <Form.Item name="rpm_limit" label="RPM Limit"><InputNumber min={0} /></Form.Item>
-            <Form.Item name="tpm_limit" label="TPM Limit"><InputNumber min={0} /></Form.Item>
-          </Space>
-          <Space size="large">
-            <Form.Item name="rp5h_limit" label="5H Limit"><InputNumber min={0} /></Form.Item>
-            <Form.Item name="rpd_limit" label="Daily Limit"><InputNumber min={0} /></Form.Item>
-          </Space>
-          <Space size="large">
-            <Form.Item name="rpw_limit" label="Weekly Limit"><InputNumber min={0} /></Form.Item>
-            <Form.Item name="rpm_month_limit" label="Monthly Limit"><InputNumber min={0} /></Form.Item>
-          </Space>
+          <Collapse ghost items={[{
+            key: 'limits',
+            label: 'Rate Limits (0 = unlimited)',
+            children: (
+              <div>
+                <Space size="large" style={{ marginBottom: 8 }}>
+                  <Form.Item name="rpm_limit" label="RPM"><InputNumber min={0} placeholder="500" /></Form.Item>
+                  <Form.Item name="tpm_limit" label="TPM"><InputNumber min={0} placeholder="200000" /></Form.Item>
+                </Space>
+                <Space size="large" style={{ marginBottom: 8 }}>
+                  <Form.Item name="rp5h_limit" label="5-Hour"><InputNumber min={0} placeholder="5000" /></Form.Item>
+                  <Form.Item name="rpd_limit" label="Daily"><InputNumber min={0} placeholder="10000" /></Form.Item>
+                </Space>
+                <Space size="large">
+                  <Form.Item name="rpw_limit" label="Weekly"><InputNumber min={0} placeholder="50000" /></Form.Item>
+                  <Form.Item name="rpm_month_limit" label="Monthly"><InputNumber min={0} placeholder="200000" /></Form.Item>
+                </Space>
+              </div>
+            ),
+          }]} />
         </Form>
       </Modal>
 

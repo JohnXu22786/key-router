@@ -87,7 +87,7 @@ const RoutesPage: React.FC = () => {
           </Form.Item>
           <Space size="large">
             <Form.Item name="priority" label="Priority (lower=higher)"><InputNumber min={1} /></Form.Item>
-            <Form.Item name="weight" label="Weight"><InputNumber min={1} /></Form.Item>
+            <Form.Item name="weight" label="Weight" initialValue={10}><InputNumber min={1} /></Form.Item>
           </Space>
           <Form.Item name="enabled" label="Enabled" valuePropName="checked"><Switch defaultChecked /></Form.Item>
         </Form>

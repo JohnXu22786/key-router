@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Card, Col, Row, Statistic, Typography, Spin, message } from 'antd';
+import { Card, Col, Row, Statistic, Typography, Spin } from 'antd';
 import {
   ApiOutlined,
   KeyOutlined,
@@ -13,7 +13,7 @@ const { Title } = Typography;
 
 const Dashboard: React.FC = () => {
   const [stats, setStats] = useState<OverviewStats | null>(null);
-  const [health, setHealth] = useState<string>('checking...');
+  const [health, setHealth] = useState<string>('loading...');
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -26,13 +26,13 @@ const Dashboard: React.FC = () => {
         setStats(statsRes.data);
         setHealth(healthRes.data.status || 'ok');
       } catch (err) {
-        message.error('Failed to load dashboard data');
+        setHealth('error');
       } finally {
         setLoading(false);
       }
     };
     fetch();
-    const interval = setInterval(fetch, 10000);
+    const interval = setInterval(fetch, 30000);
     return () => clearInterval(interval);
   }, []);
 
@@ -44,12 +44,12 @@ const Dashboard: React.FC = () => {
       <Row gutter={[16, 16]}>
         <Col xs={24} sm={12} lg={6}>
           <Card>
-            <Statistic
-              title="Health Status"
-              value={health}
-              prefix={health === 'ok' ? <CheckCircleOutlined style={{ color: '#52c41a' }} /> : <CloseCircleOutlined style={{ color: '#ff4d4f' }} />}
-              valueStyle={{ color: health === 'ok' ? '#52c41a' : '#ff4d4f' }}
-            />
+              <Statistic
+                title="Health Status"
+                value={health === 'ok' ? 'Healthy' : health === 'error' ? 'Error' : health}
+                prefix={health === 'ok' ? <CheckCircleOutlined style={{ color: '#52c41a' }} /> : <CloseCircleOutlined style={{ color: '#ff4d4f' }} />}
+                valueStyle={{ color: health === 'ok' ? '#52c41a' : '#ff4d4f' }}
+              />
           </Card>
         </Col>
         <Col xs={24} sm={12} lg={6}>

@@ -34,9 +34,9 @@ func (a *App) GetPort() int {
 	return a.port
 }
 
-// StartBackground starts the HTTP server in a background goroutine
+// StartBackground starts the HTTP server in a background goroutine.
+// Returns an error if the port is invalid (but not if Listen fails — use StartupDone channel for that).
 func (a *App) StartBackground() error {
-	// Get port from settings
 	portStr := db.GetSetting(model.SettingPort)
 	port, err := strconv.Atoi(portStr)
 	if err != nil || port <= 0 {
@@ -59,7 +59,7 @@ func (a *App) StartBackground() error {
 		log.Printf("[server] forwarding API: http://localhost%s/v1/chat/completions", addr)
 
 		if err := a.Server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("[server] error: %v", err)
+			log.Printf("[server] failed to start: %v", err)
 		}
 	}()
 
@@ -68,6 +68,9 @@ func (a *App) StartBackground() error {
 
 // Shutdown gracefully stops the HTTP server
 func (a *App) Shutdown() error {
+	if a.Server == nil {
+		return nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return a.Server.Shutdown(ctx)

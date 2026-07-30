@@ -1,7 +1,8 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import {
-  Card, Table, Typography, Spin, message, Row, Col, Statistic,
+  Card, Table, Typography, Spin, message, Row, Col, Statistic, Button,
 } from 'antd';
+import { ReloadOutlined } from '@ant-design/icons';
 import { getConsumptions, getOverview, Consumption, OverviewStats } from '../api/client';
 import dayjs from 'dayjs';
 
@@ -11,21 +12,22 @@ const Stats: React.FC = () => {
   const [consumptions, setConsumptions] = useState<Consumption[]>([]);
   const [overview, setOverview] = useState<OverviewStats | null>(null);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
 
-  useEffect(() => {
-    const fetch = async () => {
-      try {
-        const [consRes, ovRes] = await Promise.all([
-          getConsumptions({ since: dayjs().subtract(7, 'day').toISOString() }),
-          getOverview(),
-        ]);
-        setConsumptions(consRes.data);
-        setOverview(ovRes.data);
-      } catch { message.error('Failed to load stats'); }
-      finally { setLoading(false); }
-    };
-    fetch();
+  const fetch = useCallback(async (isRefresh = false) => {
+    if (isRefresh) setRefreshing(true);
+    try {
+      const [consRes, ovRes] = await Promise.all([
+        getConsumptions({ since: dayjs().subtract(7, 'day').toISOString() }),
+        getOverview(),
+      ]);
+      setConsumptions(consRes.data);
+      setOverview(ovRes.data);
+    } catch { message.error('Failed to load stats'); }
+    finally { setLoading(false); setRefreshing(false); }
   }, []);
+
+  useEffect(() => { fetch(); }, [fetch]);
 
   if (loading) return <Spin size="large" style={{ display: 'block', margin: '100px auto' }} />;
 
@@ -33,7 +35,12 @@ const Stats: React.FC = () => {
 
   return (
     <div>
-      <Title level={3}>Statistics</Title>
+      <Title level={3}>
+        Statistics
+        <Button icon={<ReloadOutlined />} loading={refreshing} onClick={() => fetch(true)} style={{ marginLeft: 12 }}>
+          Refresh
+        </Button>
+      </Title>
       <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
         <Col span={8}><Card><Statistic title="Total Cost" value={overview?.total_cost || 0} precision={6} prefix="$" /></Card></Col>
         <Col span={8}><Card><Statistic title="Total Tokens" value={totalTokens} /></Card></Col>

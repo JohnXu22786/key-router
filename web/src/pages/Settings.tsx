@@ -7,6 +7,7 @@ const { Title } = Typography;
 const Settings: React.FC = () => {
   const [form] = Form.useForm();
   const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     const fetch = async () => {
@@ -25,6 +26,7 @@ const Settings: React.FC = () => {
   }, [form]);
 
   const handleSave = async () => {
+    setSaving(true);
     try {
       const values = await form.validateFields();
       const strValues: Record<string, string> = {};
@@ -33,7 +35,20 @@ const Settings: React.FC = () => {
       }
       await updateSettings(strValues);
       message.success('Settings saved');
-    } catch { /* validation error */ }
+    } catch (err) {
+      if (err && typeof err === 'object' && 'errorFields' in err) {
+        // validation error, form will show field errors
+      } else {
+        message.error('Failed to save settings');
+      }
+    } finally { setSaving(false); }
+  };
+
+  const handleReload = async () => {
+    try {
+      await reloadConfig();
+      message.success('Config reloaded');
+    } catch { message.error('Failed to reload config'); }
   };
 
   if (loading) return <Spin size="large" style={{ display: 'block', margin: '100px auto' }} />;
@@ -55,10 +70,8 @@ const Settings: React.FC = () => {
           <Form.Item name="server.health_check_interval" label="Health Check Interval (seconds)">
             <InputNumber min={10} max={3600} style={{ width: '100%' }} />
           </Form.Item>
-          <Button type="primary" onClick={handleSave}>Save Settings</Button>
-          <Button style={{ marginLeft: 12 }} onClick={async () => { try { await reloadConfig(); message.success('Config reloaded'); } catch { message.error('Failed to reload config'); } }}>
-            Reload Config
-          </Button>
+          <Button type="primary" loading={saving} onClick={handleSave}>Save Settings</Button>
+          <Button style={{ marginLeft: 12 }} onClick={handleReload}>Reload Config</Button>
         </Form>
       </Card>
     </div>

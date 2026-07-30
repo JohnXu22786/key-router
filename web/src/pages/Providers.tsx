@@ -64,7 +64,7 @@ const Providers: React.FC = () => {
   const columns = [
     { title: 'ID', dataIndex: 'id', key: 'id', width: 60 },
     { title: 'Name', dataIndex: 'name', key: 'name' },
-    { title: 'Type', dataIndex: 'type', key: 'type', render: (t: string) => t === 'openai' ? 'OpenAI' : 'Anthropic' },
+    { title: 'Type', dataIndex: 'type', key: 'type', render: (t: string) => ({ openai: 'OpenAI', anthropic: 'Anthropic' })[t] || t },
     { title: 'Base URL', dataIndex: 'base_url', key: 'base_url', ellipsis: true },
     {
       title: 'Actions', key: 'actions',
