@@ -11,12 +11,12 @@ import (
 
 // SlidingWindow implements a bucket-based sliding window counter
 type SlidingWindow struct {
-	mu          sync.Mutex
-	buckets     []int64
+	mu           sync.Mutex
+	buckets      []int64
 	tokenBuckets []int64
-	bucketSize  time.Duration
-	head        int
-	lastCleanup time.Time
+	bucketSize   time.Duration
+	head         int
+	lastCleanup  time.Time
 }
 
 // NewSlidingWindow creates a new sliding window counter
@@ -25,11 +25,11 @@ type SlidingWindow struct {
 func NewSlidingWindow(wt model.WindowType, numBuckets int, bucketSize time.Duration) *SlidingWindow {
 	now := time.Now()
 	return &SlidingWindow{
-		buckets:     make([]int64, numBuckets),
+		buckets:      make([]int64, numBuckets),
 		tokenBuckets: make([]int64, numBuckets),
-		bucketSize:  bucketSize,
-		head:        0,
-		lastCleanup: now,
+		bucketSize:   bucketSize,
+		head:         0,
+		lastCleanup:  now,
 	}
 }
 
@@ -195,9 +195,9 @@ func (sw *SlidingWindow) importState(s exportedState) {
 
 // WindowManager manages multiple sliding windows per key
 type WindowManager struct {
-	mu       sync.RWMutex
-	windows  map[int64]map[model.WindowType]*SlidingWindow
-	configs  map[model.WindowType]model.WindowConfig
+	mu      sync.RWMutex
+	windows map[int64]map[model.WindowType]*SlidingWindow
+	configs map[model.WindowType]model.WindowConfig
 }
 
 // NewWindowManager creates a new WindowManager

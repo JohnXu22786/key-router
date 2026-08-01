@@ -34,6 +34,7 @@ func New(router *gin.Engine) *App {
 func (a *App) GetPort() int {
 	return a.port
 }
+
 // StartBackground starts the HTTP server in a background goroutine.
 // Returns an error if the port is invalid or the listener cannot bind
 // (e.g. port already in use).

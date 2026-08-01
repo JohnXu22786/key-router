@@ -470,14 +470,14 @@ type AnthropicStreamConverter struct {
 	started      bool
 	finished     bool
 	textOpened   bool
-	textBlockIdx int // assigned when the text block first opens
-	nextBlockIdx int // next free content block index
+	textBlockIdx int         // assigned when the text block first opens
+	nextBlockIdx int         // next free content block index
 	toolBlocks   map[int]int // openai tool_call index -> anthropic content block index
 	// OpenAI sends usage in a chunk AFTER the finish chunk (with
 	// include_usage). message_delta/message_stop are therefore deferred until
 	// that chunk arrives (or the stream ends) so the synthesized
 	// message_delta can carry real output_tokens instead of 0.
-	finishPending   bool
+	finishPending    bool
 	finishStopReason string
 	pendingTokens    int64
 }
@@ -815,10 +815,10 @@ type OpenAIStreamConverter struct {
 	// input tokens and cache figures arrive in message_start (nested under
 	// message.usage); message_delta only carries output_tokens, so the final
 	// usage chunk merges all of them.
-	inputTokens  int64
-	cacheHit     int64
-	cacheWrite   int64
-	modelName    string
+	inputTokens int64
+	cacheHit    int64
+	cacheWrite  int64
+	modelName   string
 }
 
 // NewOpenAIStreamConverter creates a fresh converter

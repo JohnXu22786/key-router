@@ -33,11 +33,11 @@ func TestSlidingWindow_Count(t *testing.T) {
 	t.Run("returns sum of all buckets", func(t *testing.T) {
 		sw := NewSlidingWindow(model.WindowRPM, 5, time.Second)
 		// Add at different times
-		sw.AddRequest(1) // bucket 0
-		testAdvanceTime(sw, 2)    // move to bucket 2
+		sw.AddRequest(1)       // bucket 0
+		testAdvanceTime(sw, 2) // move to bucket 2
 		sw.AddRequest(1)
-		sw.AddRequest(1) // bucket 2 gets 2
-		testAdvanceTime(sw, 1)    // bucket 3
+		sw.AddRequest(1)       // bucket 2 gets 2
+		testAdvanceTime(sw, 1) // bucket 3
 		sw.AddRequest(1)
 
 		if got := sw.Count(); got != 4 {

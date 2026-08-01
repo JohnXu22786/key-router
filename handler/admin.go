@@ -27,14 +27,14 @@ var version = "0.1.0"
 
 // AdminHandler handles management API endpoints
 type AdminHandler struct {
-	Engine       *selector.Engine
+	Engine        *selector.Engine
 	HealthChecker *health.Checker
 }
 
 // NewAdminHandler creates a new admin handler
 func NewAdminHandler(engine *selector.Engine, checker *health.Checker) *AdminHandler {
 	return &AdminHandler{
-		Engine:       engine,
+		Engine:        engine,
 		HealthChecker: checker,
 	}
 }

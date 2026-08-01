@@ -1,8 +1,8 @@
 package db
 
 import (
-	"log"
 	"local-router/model"
+	"log"
 	"os"
 	"path/filepath"
 

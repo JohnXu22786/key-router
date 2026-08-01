@@ -128,7 +128,7 @@ jobs:
           body: |
             ## LocalRouter ${{ needs.version.outputs.tag }}
 
-            Automated release — built from `master`.
+            Automated release — built from `main`.
 
             ### Downloads
             - **Windows**: `LocalRouter-${{ needs.version.outputs.tag }}-windows-amd64.exe`

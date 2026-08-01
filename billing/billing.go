@@ -138,10 +138,10 @@ func RecordConsumption(keyID int64, modelName string, usage *model.TokenUsage) (
 	}
 
 	consumption := &model.Consumption{
-		KeyID:      keyID,
-		HourBucket: now,
+		KeyID:        keyID,
+		HourBucket:   now,
 		RequestCount: 1,
-		CostUSD:    cost,
+		CostUSD:      cost,
 	}
 	if usage != nil {
 		consumption.InputTokens = usage.PromptTokens
@@ -191,14 +191,14 @@ func GetTotalCost(keyID int64) (float64, error) {
 
 // OverviewStats holds aggregate statistics
 type OverviewStats struct {
-	TotalRequests   int64   `json:"total_requests"`
-	TotalCost       float64 `json:"total_cost"`
-	TotalInput      int64   `json:"total_input_tokens"`
-	TotalOutput     int64   `json:"total_output_tokens"`
-	ActiveKeys      int64   `json:"active_keys"`
-	DisabledKeys    int64   `json:"disabled_keys"`
-	TotalKeyCount   int64   `json:"total_keys"`
-	TotalProviders  int64   `json:"total_providers"`
+	TotalRequests  int64   `json:"total_requests"`
+	TotalCost      float64 `json:"total_cost"`
+	TotalInput     int64   `json:"total_input_tokens"`
+	TotalOutput    int64   `json:"total_output_tokens"`
+	ActiveKeys     int64   `json:"active_keys"`
+	DisabledKeys   int64   `json:"disabled_keys"`
+	TotalKeyCount  int64   `json:"total_keys"`
+	TotalProviders int64   `json:"total_providers"`
 }
 
 // GetOverview returns overall statistics

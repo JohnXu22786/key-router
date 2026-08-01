@@ -54,9 +54,9 @@ func (h *ChatHandler) HandleModels(c *gin.Context) {
 	data := make([]gin.H, 0, len(groups))
 	for _, g := range groups {
 		data = append(data, gin.H{
-			"id":      g.GroupID,
-			"object":  "model",
-			"created": 0,
+			"id":       g.GroupID,
+			"object":   "model",
+			"created":  0,
 			"owned_by": "local-router",
 		})
 	}

@@ -21,16 +21,16 @@ type Engine struct {
 	Calculator    *billing.Calculator
 
 	// Cached routing data (refreshed periodically)
-	routes     map[string][]*RouteEntry // model group ID -> routes
-	providers  map[int64]*model.Provider
-	keys       map[int64][]*model.Key
+	routes    map[string][]*RouteEntry // model group ID -> routes
+	providers map[int64]*model.Provider
+	keys      map[int64][]*model.Key
 }
 
 // RouteEntry is a cached route with resolved provider and keys
 type RouteEntry struct {
-	Route       *model.Route
-	Provider    *model.Provider
-	Keys        []*model.Key
+	Route    *model.Route
+	Provider *model.Provider
+	Keys     []*model.Key
 }
 
 // NewEngine creates a new routing engine

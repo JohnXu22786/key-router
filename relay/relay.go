@@ -616,9 +616,9 @@ func completionToStreamChunk(body []byte, modelName string) []byte {
 		Choices []struct {
 			FinishReason string `json:"finish_reason"`
 			Message      *struct {
-				Content    interface{}   `json:"content"`
-				Role       string        `json:"role"`
-				ToolCalls  []interface{} `json:"tool_calls"`
+				Content   interface{}   `json:"content"`
+				Role      string        `json:"role"`
+				ToolCalls []interface{} `json:"tool_calls"`
 			} `json:"message"`
 			Delta *struct {
 				Content   string        `json:"content"`
@@ -1014,8 +1014,8 @@ func extractAnthropicUsage(anthResp map[string]interface{}) map[string]interface
 	inputTokens := toFloat64(usage["input_tokens"])
 	outputTokens := toFloat64(usage["output_tokens"])
 	return map[string]interface{}{
-		"input_tokens":     inputTokens,
-		"output_tokens":    outputTokens,
+		"input_tokens":      inputTokens,
+		"output_tokens":     outputTokens,
 		"prompt_tokens":     inputTokens,
 		"completion_tokens": outputTokens,
 		"total_tokens":      inputTokens + outputTokens,

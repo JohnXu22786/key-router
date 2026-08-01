@@ -377,10 +377,10 @@ func truncateKey(key string) string {
 
 // CheckResult holds the result of a health check for a specific key
 type CheckResult struct {
-	KeyID    int64  `json:"key_id"`
-	Status   string `json:"status"`
-	Alive    bool   `json:"alive"`
-	Error    string `json:"error,omitempty"`
+	KeyID  int64  `json:"key_id"`
+	Status string `json:"status"`
+	Alive  bool   `json:"alive"`
+	Error  string `json:"error,omitempty"`
 }
 
 // GetKeyStatuses returns current status of all keys
@@ -401,5 +401,3 @@ func GetKeyStatuses() ([]CheckResult, error) {
 	}
 	return results, nil
 }
-
-
