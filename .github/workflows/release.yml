@@ -2,11 +2,11 @@ name: Release
 
 # Automatically bumps the patch version and publishes a GitHub Release with
 # native builds for Windows, macOS and Linux whenever code changes land on
-# master. Builds run on each platform's own runner because the WebView2 /
+# main. Builds run on each platform's own runner because the WebView2 /
 # WKWebView / WebKit2GTK bindings are cgo-based and cannot be cross-compiled.
 on:
   push:
-    branches: [master]
+    branches: [main]
     paths:
       - '**.go'
       - 'go.mod'
