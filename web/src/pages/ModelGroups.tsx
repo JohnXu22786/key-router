@@ -70,8 +70,10 @@ const ModelGroups: React.FC = () => {
             <Input placeholder="gpt-4o" />
           </Form.Item>
           <Form.Item name="name" label="Display Name"><Input placeholder="GPT-4o Pool" /></Form.Item>
-          <Form.Item name="enabled" label="Enabled" valuePropName="checked"><Switch defaultChecked /></Form.Item>
-          <Form.Item name="retry_times" label="Retry Times"><InputNumber min={0} max={20} /></Form.Item>
+          <Form.Item name="enabled" label="Enabled" valuePropName="checked" initialValue={true}><Switch /></Form.Item>
+          <Form.Item name="retry_times" label="Retry Times" tooltip="0 = use the global retry setting (Settings page). A positive value overrides it for this group.">
+            <InputNumber min={0} max={20} />
+          </Form.Item>
         </Form>
       </Modal>
     </div>

@@ -1,0 +1,51 @@
+name: Bug report
+description: Report a problem with LocalRouter
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Please fill in as much as you can — logs and
+        reproduction steps help a lot.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Version shown in the window title or /api/health
+      placeholder: "e.g. v0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: OS and architecture
+      placeholder: "e.g. Windows 11 x64"
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the bug and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Add a provider ...
+        2. Send a request ...
+        3. Observe ...
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Paste relevant lines from `data/local-router.log` (redact API keys!)
+      render: text
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration (optional)
+      description: Provider types, model groups, routes — redact any secret values.

@@ -149,6 +149,40 @@ func TestWindowManager_Snapshot(t *testing.T) {
 	})
 }
 
+func TestWindowManager_ExportRestore(t *testing.T) {
+	t.Run("export/restore round-trip preserves counts", func(t *testing.T) {
+		wm := NewWindowManager()
+		keyID := int64(1)
+
+		wm.IncrementRequest(keyID, model.WindowRPM)
+		wm.IncrementRequest(keyID, model.WindowRPM)
+		wm.IncrementRequest(keyID, model.WindowRPD)
+		wm.IncrementTokens(keyID, model.WindowTPM, 150)
+
+		state := wm.ExportAll()
+
+		// Fresh manager, restore from state
+		wm2 := NewWindowManager()
+		wm2.RestoreAll(state)
+
+		if got := wm2.GetCount(keyID, model.WindowRPM); got != 2 {
+			t.Errorf("restored RPM count = %d, want 2", got)
+		}
+		if got := wm2.GetCount(keyID, model.WindowRPD); got != 1 {
+			t.Errorf("restored RPD count = %d, want 1", got)
+		}
+		if got := wm2.GetTokens(keyID, model.WindowTPM); got != 150 {
+			t.Errorf("restored TPM tokens = %d, want 150", got)
+		}
+
+		// Nil state is a no-op
+		wm2.RestoreAll(nil)
+		if got := wm2.GetCount(keyID, model.WindowRPM); got != 2 {
+			t.Errorf("count changed after nil restore = %d, want 2", got)
+		}
+	})
+}
+
 func TestWindowManager_CheckLimit(t *testing.T) {
 	t.Run("respects RPM limit", func(t *testing.T) {
 		wm := NewWindowManager()

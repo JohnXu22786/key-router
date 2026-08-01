@@ -9,11 +9,9 @@ import (
 	"net/http"
 	"strings"
 
-	"local-router/db"
 	"local-router/handler"
 	"local-router/health"
 	"local-router/middleware"
-	"local-router/model"
 	"local-router/selector"
 
 	"github.com/gin-gonic/gin"
@@ -28,11 +26,10 @@ func Setup(
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
+	r.Use(middleware.LocalOnlyMiddleware())
 
-	// Auth middleware
-	authToken := db.GetSetting(model.SettingAuthToken)
-	log.Printf("[router] auth token from DB: %q (empty=disabled)", authToken)
-	r.Use(middleware.AuthMiddleware(authToken))
+	// Auth middleware (token read from DB per request)
+	r.Use(middleware.AuthMiddleware())
 
 	// Create handlers
 	chatHandler := handler.NewChatHandler(engine)
@@ -120,6 +117,17 @@ func Setup(
 // This avoids redirect loops by using http.ServeContent instead of http.FileServer
 func serveStaticFallback(prefix string, fsys fs.FS) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// Unknown /api* and /v1* paths must 404 as JSON, not be swallowed by
+		// the SPA fallback (which would mask API misconfiguration with
+		// index.html and mislead API clients). The prefix check without the
+		// trailing slash also covers typos like /v1foo or /apix; paths are
+		// compared case-insensitively.
+		p := strings.ToLower(c.Request.URL.Path)
+		if strings.HasPrefix(p, "/api") || strings.HasPrefix(p, "/v1") {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+			return
+		}
+
 		path := c.Request.URL.Path
 		if prefix != "/" {
 			path = strings.TrimPrefix(path, prefix)
@@ -134,17 +142,11 @@ func serveStaticFallback(prefix string, fsys fs.FS) gin.HandlerFunc {
 
 		f, err := fsys.Open(path)
 		if err != nil {
-			// Only fall back to index.html for SPA routes (no extension)
-			if strings.Contains(path, ".") {
-				c.Status(http.StatusNotFound)
-				c.String(http.StatusNotFound, "404 not found")
-				return
-			}
-			f, err = fsys.Open("index.html")
-			if err != nil {
-				c.Status(http.StatusNotFound)
-				return
-			}
+			// File (or index.html) missing → 404. Path already has an
+			// extension or is exactly "index.html" here.
+			c.Status(http.StatusNotFound)
+			c.String(http.StatusNotFound, "404 not found")
+			return
 		}
 		defer f.Close()
 

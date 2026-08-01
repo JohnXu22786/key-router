@@ -8,6 +8,7 @@ import (
 
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
 )
 
@@ -20,12 +21,23 @@ func Init(dataDir string) error {
 	}
 
 	dbPath := filepath.Join(dataDir, "local-router.db")
-	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{
+	// _busy_timeout: concurrent writers (parallel relays, health checker,
+	// admin transactions) retry instead of failing with SQLITE_BUSY.
+	// _journal_mode=WAL: readers don't block the writer.
+	db, err := gorm.Open(sqlite.Open(dbPath+"?_busy_timeout=5000&_journal_mode=WAL"), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Warn),
 	})
 	if err != nil {
 		return err
 	}
+
+	// One writer at a time for SQLite; serializes writes, avoids lock storms.
+	sqlDB, err := db.DB()
+	if err != nil {
+		return err
+	}
+	sqlDB.SetMaxOpenConns(1)
+	sqlDB.SetMaxIdleConns(1)
 
 	// Run migrations
 	if err := db.AutoMigrate(
@@ -33,7 +45,6 @@ func Init(dataDir string) error {
 		&model.Key{},
 		&model.ModelGroup{},
 		&model.Route{},
-		&model.WindowCounter{},
 		&model.Consumption{},
 		&model.Pricing{},
 		&model.Setting{},
@@ -56,11 +67,10 @@ func GetDB() *gorm.DB {
 // seedDefaults inserts default settings if they don't exist
 func seedDefaults(db *gorm.DB) {
 	defaults := map[string]string{
-		model.SettingPort:          model.DefaultPort,
-		model.SettingAuthToken:     model.DefaultAuthToken,
-		model.SettingRetryTimes:    model.DefaultRetryTimes,
-		model.SettingHealthCheck:   model.DefaultHealthCheck,
-		model.SettingWindowPersist: model.DefaultWindowPersist,
+		model.SettingPort:        model.DefaultPort,
+		model.SettingAuthToken:   model.DefaultAuthToken,
+		model.SettingRetryTimes:  model.DefaultRetryTimes,
+		model.SettingHealthCheck: model.DefaultHealthCheck,
 	}
 
 	for k, v := range defaults {
@@ -79,14 +89,26 @@ func seedDefaults(db *gorm.DB) {
 
 // GetSetting retrieves a setting value
 func GetSetting(key string) string {
+	s, _ := GetSettingChecked(key)
+	return s
+}
+
+// GetSettingChecked retrieves a setting value, distinguishing "unset" from a
+// DB read error (callers must fail closed on error)
+func GetSettingChecked(key string) (string, error) {
 	var s model.Setting
 	if err := DB.Where("key = ?", key).First(&s).Error; err != nil {
-		return ""
+		return "", err
 	}
-	return s.Value
+	return s.Value, nil
 }
 
 // SetSetting updates a setting value
 func SetSetting(key, value string) error {
-	return DB.Where("key = ?", key).Assign(model.Setting{Value: value}).FirstOrCreate(&model.Setting{Key: key}).Error
+	// Atomic upsert — avoids the FirstOrCreate SELECT+INSERT race where
+	// concurrent writes to a new key would collide on the primary key.
+	return DB.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "key"}},
+		DoUpdates: clause.Assignments(map[string]interface{}{"value": value}),
+	}).Create(&model.Setting{Key: key, Value: value}).Error
 }

@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
-import { Table, Button, Modal, Form, Input, Select, Switch, message, Space, Typography, Popconfirm, Tag } from 'antd';
+import { Table, Button, Modal, Form, Input, InputNumber, Select, Switch, message, Space, Typography, Popconfirm, Tag } from 'antd';
 import { PlusOutlined, EditOutlined, DeleteOutlined, HolderOutlined } from '@ant-design/icons';
 import { getRoutes, createRoute, updateRoute, deleteRoute, reorderRoutes, getProviders, getModelGroups, Route, Provider, ModelGroup } from '../api/client';
 
@@ -15,6 +15,10 @@ const RoutesPage: React.FC = () => {
   const [form] = Form.useForm();
   const dragItem = useRef<number | null>(null);
   const persistTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Always-current routes for drag handling — avoids stale-closure reorders
+  // when a second drop or a background fetch lands before a re-render
+  const routesRef = useRef<Route[]>([]);
+  routesRef.current = routes;
 
   const fetch = async () => {
     setLoading(true);
@@ -30,9 +34,10 @@ const RoutesPage: React.FC = () => {
   const handleSave = async () => {
     try {
       const values = await form.validateFields();
-      const data = { ...values, priority: 0, weight: 10 };
-      if (editing) { await updateRoute(editing.id, data); message.success('Updated'); }
-      else { await createRoute(data); message.success('Created'); }
+      // Only new routes get defaults; editing must keep the stored
+      // priority/weight (drag reorder would otherwise be reset)
+      if (editing) { await updateRoute(editing.id, values); message.success('Updated'); }
+      else { await createRoute({ ...values, priority: 0, weight: values.weight ?? 10 }); message.success('Created'); }
       setModalOpen(false); setEditing(null); form.resetFields(); fetch();
     } catch { message.error('Failed to save route'); }
   };
@@ -47,7 +52,15 @@ const RoutesPage: React.FC = () => {
     // Debounce: cancel previous pending save
     if (persistTimer.current) clearTimeout(persistTimer.current);
     persistTimer.current = setTimeout(async () => {
-      const payload = ordered.map((r, i) => ({ id: r.id, priority: i }));
+      // Priorities are PER-GROUP (0..n-1 within each model group): the
+      // table mixes groups, so a global index would silently renumber every
+      // other group's routes.
+      const groupCounts: Record<number, number> = {};
+      const payload = ordered.map(r => {
+        const idx = groupCounts[r.model_group_id] ?? 0;
+        groupCounts[r.model_group_id] = idx + 1;
+        return { id: r.id, priority: idx };
+      });
       try {
         await reorderRoutes(payload);
       } catch { message.error('Failed to save order'); }
@@ -71,7 +84,16 @@ const RoutesPage: React.FC = () => {
     const dragIndex = dragItem.current;
     if (dragIndex === null || dragIndex === dropIndex) return;
 
-    const newRoutes = [...routes];
+    // Priorities are per-group: crossing group boundaries can't be persisted,
+    // so reject it instead of showing an order that reverts on fetch.
+    const current = routesRef.current;
+    if (current[dragIndex].model_group_id !== current[dropIndex].model_group_id) {
+      message.warning('Routes can only be reordered within the same model group');
+      dragItem.current = null;
+      return;
+    }
+
+    const newRoutes = [...current];
     const [removed] = newRoutes.splice(dragIndex, 1);
     newRoutes.splice(dropIndex, 0, removed);
     setRoutes(newRoutes);
@@ -122,6 +144,9 @@ const RoutesPage: React.FC = () => {
         columns={columns}
         rowKey="id"
         loading={loading}
+        // No pagination: drag reorder persists page-relative indices as
+        // priorities, which would collide across pages
+        pagination={false}
         onRow={(_, index) => ({
           draggable: true,
           onDragStart: (e) => handleDragStart(e, index!),
@@ -141,7 +166,10 @@ const RoutesPage: React.FC = () => {
           <Form.Item name="target_model" label="Target Model (leave empty to use incoming model name)">
             <Input placeholder="gpt-4o-2024-08-06" />
           </Form.Item>
-          <Form.Item name="enabled" label="Enabled" valuePropName="checked"><Switch defaultChecked /></Form.Item>
+          <Form.Item name="weight" label="Weight" tooltip="Higher weight = more likely to be selected within its priority tier. Default 10.">
+            <InputNumber min={1} max={1000} style={{ width: 120 }} />
+          </Form.Item>
+          <Form.Item name="enabled" label="Enabled" valuePropName="checked" initialValue={true}><Switch /></Form.Item>
         </Form>
       </Modal>
     </div>

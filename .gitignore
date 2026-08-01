@@ -31,7 +31,6 @@ go.work.sum
 
 # Web
 /web/node_modules/
-/web/dist/
 /web/.vite/
 
 # OS

@@ -34,17 +34,19 @@ const Stats: React.FC = () => {
 
   useEffect(() => { fetch(); }, [fetch]);
 
-  // Aggregate consumption by day
-  const dailyData = consumptions.reduce<Record<string, { date: string; input: number; output: number; cost: number; requests: number }>>((acc, c) => {
+  // Aggregate consumption by day. Keep the full date for correct
+  // chronological sorting (MM-DD strings break across year boundaries).
+  const dailyData = consumptions.reduce<Record<string, { date: string; sortKey: string; input: number; output: number; cost: number; requests: number }>>((acc, c) => {
+    const sortKey = dayjs(c.hour_bucket).format('YYYY-MM-DD');
     const date = dayjs(c.hour_bucket).format('MM-DD');
-    if (!acc[date]) acc[date] = { date, input: 0, output: 0, cost: 0, requests: 0 };
-    acc[date].input += c.input_tokens;
-    acc[date].output += c.output_tokens;
-    acc[date].cost += c.cost_usd;
-    acc[date].requests += c.request_count;
+    if (!acc[sortKey]) acc[sortKey] = { date, sortKey, input: 0, output: 0, cost: 0, requests: 0 };
+    acc[sortKey].input += c.input_tokens;
+    acc[sortKey].output += c.output_tokens;
+    acc[sortKey].cost += c.cost_usd;
+    acc[sortKey].requests += c.request_count;
     return acc;
   }, {});
-  const dailyChart = Object.values(dailyData).sort((a, b) => a.date.localeCompare(b.date));
+  const dailyChart = Object.values(dailyData).sort((a, b) => a.sortKey.localeCompare(b.sortKey));
 
   // Aggregate by key
   const keyData = consumptions.reduce<Record<string, { name: string; tokens: number; cost: number }>>((acc, c) => {

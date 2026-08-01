@@ -6,10 +6,11 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"syscall"
+	"time"
 
 	"local-router/db"
 	"local-router/health"
+	"local-router/model"
 	"local-router/router"
 	"local-router/selector"
 	"local-router/server"
@@ -17,16 +18,17 @@ import (
 	"github.com/webview/webview_go"
 )
 
-// FreeConsole detaches the process from its console window (GUI mode only)
-var kernel32 = syscall.NewLazyDLL("kernel32.dll")
-var freeConsole = kernel32.NewProc("FreeConsole")
+// version is the app version, overridable at build time:
+//
+//	go build -ldflags "-X main.version=1.2.3"
+var version = "0.1.0"
 
 //go:embed web/dist/*
 var staticFS embed.FS
 
 func main() {
-	// Detach from console window immediately (GUI mode)
-	freeConsole.Call()
+	// Detach from console window (GUI mode; Windows-only, see platform files)
+	detachConsole()
 
 	// Determine data directory
 	dataDir := os.Getenv("LOCALROUTER_DATA")
@@ -39,7 +41,9 @@ func main() {
 		}
 	}
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
-		log.Fatalf("[main] cannot create data directory: %v", err)
+		log.Printf("[main] cannot create data directory: %v", err)
+		showFatalError(fmt.Sprintf("LocalRouter failed to start:\n\nCannot create data directory:\n%v", err))
+		os.Exit(1)
 	}
 
 	// Set up log file (GUI mode has no console)
@@ -54,12 +58,73 @@ func main() {
 
 	// Initialize database
 	if err := db.Init(dataDir); err != nil {
-		log.Fatalf("[main] database initialization failed: %v", err)
+		log.Printf("[main] database initialization failed: %v", err)
+		showFatalError(fmt.Sprintf("LocalRouter failed to start:\n\nDatabase initialization failed:\n%v", err))
+		os.Exit(1)
 	}
 	log.Println("[main] database initialized")
 
 	// Initialize routing engine
 	engine := selector.NewEngine()
+
+	// Restore persisted rate-limit windows so long-window budgets (daily,
+	// weekly, monthly) survive restarts
+	windowsPath := filepath.Join(dataDir, "windows.json")
+	if err := engine.WindowManager.LoadFromFile(windowsPath); err != nil {
+		log.Printf("[main] failed to restore window state (continuing fresh): %v", err)
+	}
+
+	// Prune window state of keys deleted while the app was closed (otherwise
+	// windows.json grows forever with key churn). Only when the key list
+	// loads — an empty list on a DB error must NOT wipe all windows.
+	var keyIDs []int64
+	if err := db.GetDB().Model(&model.Key{}).Pluck("id", &keyIDs).Error; err != nil {
+		log.Printf("[main] failed to load key IDs for window pruning: %v", err)
+	} else {
+		known := make(map[int64]bool, len(keyIDs))
+		for _, id := range keyIDs {
+			known[id] = true
+		}
+		engine.WindowManager.Prune(known)
+	}
+
+	// pruneWindows removes window state for keys that no longer exist (e.g.
+	// deleted mid-session while an in-flight relay re-created them)
+	pruneWindows := func() {
+		var ids []int64
+		if err := db.GetDB().Model(&model.Key{}).Pluck("id", &ids).Error; err != nil {
+			log.Printf("[main] window prune key-list error: %v", err)
+			return
+		}
+		known := make(map[int64]bool, len(ids))
+		for _, id := range ids {
+			known[id] = true
+		}
+		engine.WindowManager.Prune(known)
+	}
+
+	// Periodically persist rate-limit windows (also saved on shutdown).
+	// persistDone lets shutdown join the goroutine so the final save can't
+	// race an in-flight ticker save on the same temp file.
+	stopPersist := make(chan struct{})
+	persistDone := make(chan struct{})
+	go func() {
+		defer close(persistDone)
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				pruneWindows()
+				if err := engine.WindowManager.SaveToFile(windowsPath); err != nil {
+					log.Printf("[main] failed to persist window state: %v", err)
+				}
+			case <-stopPersist:
+				return
+			}
+		}
+	}()
+
 	log.Println("[main] routing engine initialized")
 
 	// Initialize and start health checker
@@ -76,7 +141,12 @@ func main() {
 	// Start HTTP server in background
 	app := server.New(r)
 	if err := app.StartBackground(); err != nil {
-		log.Fatalf("[main] server error: %v", err)
+		// The console was detached above (GUI mode) — log.Fatalf alone would
+		// be invisible. Show a message box so a double-click launch isn't a
+		// silent failure (e.g. port already in use by another instance).
+		log.Printf("[main] server error: %v", err)
+		showFatalError(fmt.Sprintf("LocalRouter failed to start:\n\n%v\n\nCheck the log file for details.", err))
+		os.Exit(1)
 	}
 
 	// Get port for webview URL
@@ -88,13 +158,24 @@ func main() {
 	// Create desktop window with WebView2
 	w := webview.New(false) // false = no devtools
 	defer w.Destroy()
-	w.SetTitle(fmt.Sprintf("LocalRouter v0.1.0 — %s", url))
+	w.SetTitle(fmt.Sprintf("LocalRouter v%s — %s", version, url))
 	w.SetSize(900, 580, webview.HintNone)
 	w.Navigate(url)
 	w.Run()
 
 	// When window closes, stop server
 	log.Println("[main] window closed, shutting down...")
+	close(stopPersist)
+	<-persistDone
+	// Disable (not just Stop) so an in-flight async Restart from
+	// UpdateSettings can't relaunch the loop after shutdown
+	checker.Disable()
+	// Stop serving FIRST so no in-flight relay can increment windows between
+	// the save and shutdown (those increments would be lost on restart)
 	app.Shutdown()
+	pruneWindows()
+	if err := engine.WindowManager.SaveToFile(windowsPath); err != nil {
+		log.Printf("[main] failed to persist window state on shutdown: %v", err)
+	}
 	log.Println("[main] LocalRouter stopped")
 }

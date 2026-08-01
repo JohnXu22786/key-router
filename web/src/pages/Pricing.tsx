@@ -75,11 +75,19 @@ const Pricing: React.FC = () => {
       <Table dataSource={pricings} columns={columns} rowKey="id" loading={loading} />
       <Modal title={editing ? 'Edit Pricing' : 'Add Pricing'} open={modalOpen} onOk={handleSave} onCancel={() => { setModalOpen(false); setEditing(null); }}>
         <Form form={form} layout="vertical">
-          <Form.Item name="model_name" label="Model (select a route's target model)" rules={[{ required: true }]}>
+          <Form.Item
+            name="model_name"
+            label="Model"
+            extra='Use "*" for a wildcard default covering any unlisted model'
+            rules={[{ required: true }]}
+          >
             <Select
               showSearch
-              placeholder="Select target model from routes"
-              options={modelOptions.map(m => ({ value: m, label: m }))}
+              placeholder="Select a target model, or choose * for a wildcard rule"
+              options={[
+                { value: '*', label: '* (wildcard — any unlisted model)' },
+                ...modelOptions.map(m => ({ value: m, label: m })),
+              ]}
             />
           </Form.Item>
           <Space size="large">

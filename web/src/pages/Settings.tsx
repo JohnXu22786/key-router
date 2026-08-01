@@ -16,9 +16,16 @@ const Settings: React.FC = () => {
     const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
     const array = new Uint8Array(48);
     crypto.getRandomValues(array);
+    // Rejection sampling: avoid the modulo bias (chars 0-3 would otherwise
+    // be drawn 8/256 times vs 7/256 for the rest)
     let token = 'sk-';
     for (let i = 0; i < 48; i++) {
-      token += chars.charAt(array[i] % chars.length);
+      let idx = 256;
+      while (idx >= chars.length * Math.floor(256 / chars.length)) {
+        crypto.getRandomValues(array);
+        idx = array[0];
+      }
+      token += chars.charAt(idx % chars.length);
     }
     return token;
   }, []);
@@ -84,7 +91,7 @@ const Settings: React.FC = () => {
       <Title level={3}>Settings</Title>
       <Card>
         <Form form={form} layout="vertical">
-          <Form.Item name="server.port" label="Server Port">
+          <Form.Item name="server.port" label="Server Port" tooltip="Takes effect after restarting the app.">
             <InputNumber min={1024} max={65535} style={{ width: '100%' }} />
           </Form.Item>
           <Form.Item name="server.auth_token" label="Auth Token (leave empty to disable)">
@@ -93,7 +100,7 @@ const Settings: React.FC = () => {
               addonAfter={<Button size="small" type="text" onClick={handleGenerateClick}><KeyOutlined /> Generate</Button>}
             />
           </Form.Item>
-          <Form.Item name="server.retry_times" label="Max Retry Times">
+          <Form.Item name="server.retry_times" label="Max Retry Times" tooltip="0 disables retries (single attempt). Groups with a per-group retry_times > 0 override this.">
             <InputNumber min={0} max={20} style={{ width: '100%' }} />
           </Form.Item>
           <Form.Item name="server.health_check_interval" label="Health Check Interval (seconds)">
@@ -117,7 +124,7 @@ const Settings: React.FC = () => {
           {pendingToken}
         </Typography.Text>
         <p style={{ marginTop: 12, color: '#ff4d4f' }}>
-          ⚠️ Changing the auth token will reject any clients currently using the old token.
+          ⚠️ The new token takes effect immediately and will reject any clients still using the old token.
         </p>
       </Modal>
     </div>

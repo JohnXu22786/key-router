@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"net/http"
 	"time"
 )
@@ -68,8 +69,8 @@ type ModelGroup struct {
 	ID         int64  `gorm:"primaryKey;autoIncrement" json:"id"`
 	GroupID    string `gorm:"type:varchar(255);not null;uniqueIndex" json:"group_id"` // The model name clients send
 	Name       string `gorm:"type:varchar(255);not null" json:"name"`
-	Enabled    bool   `gorm:"default:true" json:"enabled"`
-	RetryTimes int    `gorm:"default:3" json:"retry_times"`
+	Enabled    bool   `json:"enabled"` // defaulted to true by the create handler
+	RetryTimes int    `gorm:"default:0" json:"retry_times"` // 0 = inherit global server.retry_times
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
 }
@@ -82,7 +83,7 @@ type Route struct {
 	TargetModel   string    `gorm:"type:varchar(255)" json:"target_model"` // NULL = use incoming model name
 	Priority      int       `gorm:"default:1" json:"priority"`             // Lower = higher priority
 	Weight        int       `gorm:"default:10" json:"weight"`
-	Enabled       bool      `gorm:"default:true" json:"enabled"`
+	Enabled       bool      `json:"enabled"` // defaulted to true by the create handler
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
 
@@ -120,17 +121,6 @@ func GetWindowConfigs() []WindowConfig {
 		{WindowRPW, 7, 24 * time.Hour, 7 * 24 * time.Hour},
 		{WindowRPMo, 30, 24 * time.Hour, 30 * 24 * time.Hour},
 	}
-}
-
-// WindowCounter persists the sliding window buckets
-type WindowCounter struct {
-	ID           int64      `gorm:"primaryKey;autoIncrement" json:"id"`
-	KeyID        int64      `gorm:"not null;index:idx_key_window_time,unique" json:"key_id"`
-	WindowType   string     `gorm:"type:varchar(10);not null;index:idx_key_window_time,unique" json:"window_type"`
-	BucketTime   int64      `gorm:"not null;index:idx_key_window_time,unique" json:"bucket_time"` // unix timestamp
-	RequestCount int64      `gorm:"default:0" json:"request_count"`
-	TokenCount   int64      `gorm:"default:0" json:"token_count"`
-	Key          Key        `gorm:"foreignKey:KeyID" json:"key,omitempty"`
 }
 
 // Consumption records usage per key per hour
@@ -171,17 +161,14 @@ const (
 	SettingAuthToken     = "server.auth_token"
 	SettingRetryTimes    = "server.retry_times"
 	SettingHealthCheck   = "server.health_check_interval"
-	SettingWindowPersist = "server.window_persist_interval"
-	SettingDefaultFlush  = "server.default_flush_interval"
 )
 
 // Default settings
 const (
-	DefaultPort            = "9998"
-	DefaultAuthToken       = ""
-	DefaultRetryTimes      = "3"
-	DefaultHealthCheck     = "120"
-	DefaultWindowPersist   = "30"
+	DefaultPort          = "9998"
+	DefaultAuthToken     = ""
+	DefaultRetryTimes    = "3"
+	DefaultHealthCheck   = "120"
 )
 
 // RequestMetadata holds information about an incoming API request
@@ -193,6 +180,10 @@ type RequestMetadata struct {
 	RequestBody  []byte     // Raw request body
 	Headers      http.Header // Incoming request headers for forwarding
 	TargetModel  string     // Model name after route resolution
+	// Ctx is the client request's context: when the downstream client
+	// disconnects, the upstream fetch is cancelled instead of stalling for
+	// the full client timeout.
+	Ctx context.Context
 }
 
 // RelayResult holds the result of a relay operation
@@ -211,4 +202,8 @@ type TokenUsage struct {
 	CacheHitTokens   int64
 	CacheWriteTokens int64
 	TotalTokens      int64
+	// Format is the upstream format the usage was parsed from ("openai" or
+	// "anthropic"). OpenAI's prompt_tokens INCLUDES cached tokens (billing
+	// must subtract them); Anthropic's input_tokens EXCLUDES them.
+	Format string
 }

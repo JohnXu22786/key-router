@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import {
   Table, Button, Modal, Form, Input, Select, InputNumber, message, Space,
   Typography, Popconfirm, Tag, Descriptions, Progress, Collapse,
@@ -24,6 +24,12 @@ const Keys: React.FC = () => {
   const [detailData, setDetailData] = useState<any>(null);
   const [editing, setEditing] = useState<Key | null>(null);
   const [form] = Form.useForm();
+  // True once the user explicitly changed the status field — only then is
+  // "status" included in the save payload. Without this, every edit would
+  // echo the page-load snapshot's status and silently override what the
+  // relay/health checker did since (e.g. re-enabling a key the relay just
+  // disabled, or permanently disabling an auto-recovered one).
+  const statusTouched = useRef(false);
 
   const fetch = async () => {
     setLoading(true);
@@ -40,8 +46,12 @@ const Keys: React.FC = () => {
   const handleSave = async () => {
     try {
       const values = await form.validateFields();
+      if (!statusTouched.current) delete values.status;
       if (editing) { await updateKey(editing.id, values); message.success('Key updated'); }
       else { await createKey(values); message.success('Key created'); }
+      // Only clear the flag on success: a failed save keeps the modal open
+      // and the user's explicit status change must survive a retry.
+      statusTouched.current = false;
       setModalOpen(false); setEditing(null); form.resetFields(); fetch();
     } catch (err) { message.error('Failed to save key'); }
   };
@@ -62,6 +72,7 @@ const Keys: React.FC = () => {
 
   const openEdit = (k: Key) => {
     setEditing(k);
+    statusTouched.current = false;
     form.setFieldsValue({
       ...k,
       provider_id: k.provider_id,
@@ -123,7 +134,13 @@ const Keys: React.FC = () => {
       <Table dataSource={keys} columns={columns} rowKey="id" loading={loading} scroll={{ x: 900 }} />
 
       <Modal title={editing ? 'Edit Key' : 'Add Key'} open={modalOpen} onOk={handleSave} onCancel={() => { setModalOpen(false); setEditing(null); }} width={680}>
-        <Form form={form} layout="vertical">
+        <Form
+          form={form}
+          layout="vertical"
+          onValuesChange={(changed) => {
+            if ('status' in changed) statusTouched.current = true;
+          }}
+        >
           <Form.Item name="provider_id" label="Provider" rules={[{ required: true }]}>
             <Select
               placeholder="Select a provider"
@@ -133,6 +150,12 @@ const Keys: React.FC = () => {
           </Form.Item>
           <Form.Item name="name" label="Display Name"><Input placeholder="My OpenAI Key 1" /></Form.Item>
           <Form.Item name="key_value" label="API Key" rules={[{ required: true }]}><Input.Password placeholder="sk-..." /></Form.Item>
+          <Form.Item name="status" label="Status" tooltip="Set to Disabled to take the key out of rotation manually (keeps its history). The relay and health checker manage this field automatically otherwise.">
+            <Select options={[
+              { value: 'active', label: 'Active' },
+              { value: 'disabled', label: 'Disabled' },
+            ]} />
+          </Form.Item>
           <Form.Item name="recovery_strategy" label="Recovery Strategy" initialValue="lazy">
             <Select options={[
               { value: 'immediate', label: 'Immediate — use as soon as recovered' },
@@ -194,13 +217,25 @@ const Keys: React.FC = () => {
             <Space wrap size="large">
               {windowTypes.map(wt => {
                 const c = detailData.counts?.[wt.key];
-                return c ? (
+                if (!c) return null;
+                const limit = detailData.key?.[wt.limitField] || 0;
+                // Token-budget windows (TPM always; 5h/daily/weekly/monthly when
+                // metric is "tokens") must show token_count, not request count.
+                // NOTE: the monthly window reuses the backend "rpm_metric" field,
+                // so rpm must never consult it (rpm is always request-count).
+                let metricField: string | undefined;
+                if (wt.key === 'tpm') metricField = 'tokens';
+                else if (wt.key === 'rpmo') metricField = detailData.key?.rpm_metric;
+                else if (wt.key !== 'rpm') metricField = detailData.key?.[`${wt.key}_metric`];
+                const used = metricField === 'tokens' ? c.token_count : c.count;
+                const percent = limit > 0 ? Math.min(100, used / limit * 100) : 0;
+                return (
                   <div key={wt.key} style={{ textAlign: 'center' }}>
                     <Text strong>{wt.label}</Text>
-                    <Progress type="circle" size={60} percent={Math.min(100, c.count / (detailData.key?.[wt.limitField] || 1) * 100)} format={() => `${c.count}`} />
+                    <Progress type="circle" size={60} percent={percent} format={() => `${used}${limit > 0 ? ` / ${limit}` : ''}`} />
                     <div><Text type="secondary">{c.token_count > 0 ? `${c.token_count} t` : ''}</Text></div>
                   </div>
-                ) : null;
+                );
               })}
             </Space>
             {detailData.consumptions?.length > 0 && (

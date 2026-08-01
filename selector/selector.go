@@ -69,10 +69,14 @@ func (e *Engine) Refresh() {
 		}
 	}
 
-	// Reload all model groups (one query, no N+1)
+	// Reload all model groups (one query, no N+1). On failure, keep the
+	// existing routes cache (like providers/keys) instead of wiping it —
+	// a transient DB error must not 404 every model.
 	var allMGs []model.ModelGroup
-	if err := db.GetDB().Find(&allMGs).Error; err != nil {
-		log.Printf("[selector] failed to load model groups: %v", err)
+	mgErr := db.GetDB().Find(&allMGs).Error
+	if mgErr != nil {
+		log.Printf("[selector] failed to load model groups: %v", mgErr)
+		return
 	}
 	mgMap := make(map[int64]model.ModelGroup)
 	for i := range allMGs {
@@ -116,42 +120,6 @@ func (e *Engine) GetRoutes(modelGroupID string) []*RouteEntry {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.routes[modelGroupID]
-}
-
-// SelectRoute selects a route for the given model, considering retry attempts
-// retry: 0 = first attempt, 1 = first retry, etc.
-func (e *Engine) SelectRoute(modelGroupID string, retry int) *RouteEntry {
-	entries := e.GetRoutes(modelGroupID)
-	if len(entries) == 0 {
-		return nil
-	}
-
-	// Group by priority
-	priorityGroups := make(map[int][]*RouteEntry)
-	var priorities []int
-	for _, entry := range entries {
-		p := entry.Route.Priority
-		if _, ok := priorityGroups[p]; !ok {
-			priorities = append(priorities, p)
-		}
-		priorityGroups[p] = append(priorityGroups[p], entry)
-	}
-
-	sort.Ints(priorities)
-
-	// Select priority tier based on retry count
-	if retry >= len(priorities) {
-		retry = len(priorities) - 1
-	}
-	targetPriority := priorities[retry]
-
-	entries = priorityGroups[targetPriority]
-	if len(entries) == 0 {
-		return nil
-	}
-
-	// Weighted random selection within priority tier
-	return weightedSelect(entries)
 }
 
 // SelectKey selects an available (non-exceeded, non-disabled) key from a route.
@@ -258,44 +226,81 @@ func (e *Engine) RecordSuccess(keyID int64, tokens int64) {
 	e.WindowManager.IncrementAll(keyID, tokens)
 }
 
-// MarkKeyRateLimited marks a key as rate limited
+// MarkKeyRateLimited marks a key as rate limited.
+// A status guard prevents a stale in-flight relay response (the key was
+// picked earlier, then the admin disabled it) from clobbering newer state,
+// and the cooldown guard never SHRINKS an existing longer cooldown (a
+// sibling relay response must not re-admit a hot key early).
 func (e *Engine) MarkKeyRateLimited(keyID int64, retryAfter time.Duration) {
 	until := time.Now().Add(retryAfter)
-	if err := db.GetDB().Model(&model.Key{}).Where("id = ?", keyID).Updates(map[string]interface{}{
-		"status":              model.KeyStatusRateLimited,
-		"rate_limited_until":  until,
-	}).Error; err == nil {
-		// Update in-memory cache
-		e.updateKeyStatus(keyID, model.KeyStatusRateLimited, &until)
+	res := db.GetDB().Model(&model.Key{}).
+		Where("id = ? AND status <> ? AND (rate_limited_until IS NULL OR rate_limited_until <= ?)",
+			keyID, model.KeyStatusDisabled, until).
+		Updates(map[string]interface{}{
+			"status":             model.KeyStatusRateLimited,
+			"rate_limited_until": until,
+		})
+	if res.Error != nil {
+		log.Printf("[selector] MarkKeyRateLimited DB error for key %d: %v", keyID, res.Error)
 	}
+	if res.RowsAffected == 0 {
+		// Key is disabled (admin), already has a longer cooldown, or is in a
+		// worse state — don't downgrade it, and don't touch the memory cache
+		return
+	}
+	e.updateKeyStatus(keyID, model.KeyStatusRateLimited, &until)
 }
 
-// MarkKeyDisabled marks a key as disabled due to auth error
+// MarkKeyDisabled marks a key as disabled due to auth error.
+// The status guard keeps a deliberately-disabled key from being re-marked
+// by a stale in-flight relay response.
 func (e *Engine) MarkKeyDisabled(keyID int64, reason string) {
-	if err := db.GetDB().Model(&model.Key{}).Where("id = ?", keyID).Updates(map[string]interface{}{
-		"status":          model.KeyStatusDisabled,
-		"disabled_reason": reason,
-	}).Error; err == nil {
-		e.updateKeyStatus(keyID, model.KeyStatusDisabled, nil)
+	res := db.GetDB().Model(&model.Key{}).
+		Where("id = ? AND status <> ?", keyID, model.KeyStatusDisabled).
+		Updates(map[string]interface{}{
+			"status":          model.KeyStatusDisabled,
+			"disabled_reason": reason,
+		})
+	if res.Error != nil {
+		log.Printf("[selector] MarkKeyDisabled DB error for key %d: %v", keyID, res.Error)
 	}
+	if res.RowsAffected == 0 {
+		return // already disabled (admin) — don't clobber
+	}
+	e.updateKeyStatus(keyID, model.KeyStatusDisabled, nil)
+	e.updateKeyDisabledReason(keyID, reason)
 }
 
-// MarkKeyActive marks a key as active (e.g., after health check recovers)
+// MarkKeyActive marks a key as active (e.g., after health check recovers).
+// Guarded so a stale recovery can't clobber a fresh cooldown or a deliberate
+// admin disable; auth_failed-disabled keys (auto-recoverable) are allowed.
 func (e *Engine) MarkKeyActive(keyID int64) {
-	if err := db.GetDB().Model(&model.Key{}).Where("id = ?", keyID).Updates(map[string]interface{}{
-		"status":             model.KeyStatusActive,
-		"rate_limited_until": nil,
-		"disabled_reason":    "",
-	}).Error; err == nil {
-		e.updateKeyStatus(keyID, model.KeyStatusActive, nil)
+	res := db.GetDB().Model(&model.Key{}).
+		Where("id = ? AND (status <> ? OR disabled_reason = ?) AND (rate_limited_until IS NULL OR rate_limited_until <= ?)",
+			keyID, model.KeyStatusDisabled, "auth_failed", time.Now()).
+		Updates(map[string]interface{}{
+			"status":             model.KeyStatusActive,
+			"rate_limited_until": nil,
+			"disabled_reason":    "",
+		})
+	if res.Error != nil {
+		log.Printf("[selector] MarkKeyActive DB error for key %d: %v", keyID, res.Error)
 	}
+	if res.RowsAffected == 0 {
+		return // state changed — keep memory consistent with DB
+	}
+	e.updateKeyStatus(keyID, model.KeyStatusActive, nil)
 }
 
-// updateKeyStatus updates the in-memory key status
+// updateKeyStatus updates the in-memory key status.
+// It mutates BOTH the current keys map and any cached RouteEntry.Keys slices
+// that may still reference older key objects (a failed Refresh leaves routes
+// pointing at the previous generation of key objects).
 func (e *Engine) updateKeyStatus(keyID int64, status string, rateLimitedUntil *time.Time) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	// Update the current keys map
 	for providerID, keys := range e.keys {
 		for _, k := range keys {
 			if k.ID == keyID {
@@ -305,9 +310,48 @@ func (e *Engine) updateKeyStatus(keyID int64, status string, rateLimitedUntil *t
 					k.DisabledReason = ""
 					k.RateLimitedUntil = nil
 				}
-				// Refresh the provider's keys list
 				e.keys[providerID] = keys
-				return
+				break
+			}
+		}
+	}
+
+	// Update any cached route entries still referencing older key objects
+	for _, entries := range e.routes {
+		for _, entry := range entries {
+			for _, k := range entry.Keys {
+				if k.ID == keyID {
+					k.Status = status
+					k.RateLimitedUntil = rateLimitedUntil
+					if status == model.KeyStatusActive {
+						k.DisabledReason = ""
+						k.RateLimitedUntil = nil
+					}
+				}
+			}
+		}
+	}
+}
+
+// updateKeyDisabledReason syncs the in-memory disabled_reason with the DB
+// (both the keys map and any stale route-entry key objects)
+func (e *Engine) updateKeyDisabledReason(keyID int64, reason string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	for _, keys := range e.keys {
+		for _, k := range keys {
+			if k.ID == keyID {
+				k.DisabledReason = reason
+			}
+		}
+	}
+	for _, entries := range e.routes {
+		for _, entry := range entries {
+			for _, k := range entry.Keys {
+				if k.ID == keyID {
+					k.DisabledReason = reason
+				}
 			}
 		}
 	}
@@ -335,62 +379,118 @@ func (e *Engine) GetProvider(providerID int64) *model.Provider {
 	return e.providers[providerID]
 }
 
-// RetryResult holds the result of a retry cycle
-type RetryResult struct {
-	Route       *RouteEntry
-	Key         *model.Key
-	Err         error
-}
+// RetryLoop selects a route and key for a model group.
+// It walks ALL priority tiers in order — the retry budget lives in the caller
+// (handler/chat.go) — and within each tier tries every route (in
+// weighted-random order) until a key is found, so a route whose keys are
+// exhausted does not prevent healthy sibling routes in the same tier from
+// being used, and lower-priority fallback routes stay reachable regardless
+// of the configured retry count.
+//
+// excludedRouteIDs skips routes already proven unable to serve THIS request
+// (e.g. an embeddings request hitting an anthropic-only route), so selection
+// converges deterministically onto a serving route instead of re-rolling onto
+// the unsupported one on every attempt.
+func (e *Engine) RetryLoop(modelGroupID string, excludedRouteIDs map[int64]bool) (*RouteEntry, *model.Key, error) {
+	entries := e.GetRoutes(modelGroupID)
+	if len(entries) == 0 {
+		return nil, nil, fmt.Errorf("no available route or key for model %s", modelGroupID)
+	}
 
-// RetryLoop performs the full retry loop for a model group
-func (e *Engine) RetryLoop(modelGroupID string, maxRetries int) (*RouteEntry, *model.Key, error) {
-	for retry := 0; retry <= maxRetries; retry++ {
-		route := e.SelectRoute(modelGroupID, retry)
-		if route == nil {
+	// Group by priority
+	priorityGroups := make(map[int][]*RouteEntry)
+	var priorities []int
+	for _, entry := range entries {
+		if excludedRouteIDs != nil && excludedRouteIDs[entry.Route.ID] {
 			continue
 		}
-
-		key := e.SelectKey(route)
-		if key == nil {
-			// No available keys in this route, try next retry
-			continue
+		p := entry.Route.Priority
+		if _, ok := priorityGroups[p]; !ok {
+			priorities = append(priorities, p)
 		}
+		priorityGroups[p] = append(priorityGroups[p], entry)
+	}
 
-		return route, key, nil
+	if len(priorities) == 0 {
+		return nil, nil, fmt.Errorf("no available route or key for model %s", modelGroupID)
+	}
+
+	sort.Ints(priorities)
+
+	for _, prio := range priorities {
+		group := priorityGroups[prio]
+
+		// Try routes in weighted-random order until one yields an available key.
+		order := weightedOrder(group)
+
+		// Pass 1: routes that have an immediate-recovery key available — lazy
+		// keys are only used when no immediate keys exist anywhere in the tier.
+		for _, route := range order {
+			if !e.routeHasImmediateKey(route) {
+				continue
+			}
+			if key := e.SelectKey(route); key != nil {
+				return route, key, nil
+			}
+		}
+		// Pass 2: any remaining route (lazy keys or fully immediate-exhausted)
+		for _, route := range order {
+			if key := e.SelectKey(route); key != nil {
+				return route, key, nil
+			}
+		}
 	}
 
 	return nil, nil, fmt.Errorf("no available route or key for model %s", modelGroupID)
 }
 
-// weightedSelect picks a random entry from a list using weights
-func weightedSelect(entries []*RouteEntry) *RouteEntry {
-	if len(entries) == 0 {
-		return nil
-	}
-	if len(entries) == 1 {
-		return entries[0]
-	}
-
-	totalWeight := 0
-	for _, e := range entries {
-		if e.Route.Weight <= 0 {
-			totalWeight += 10 // default weight
-		} else {
-			totalWeight += e.Route.Weight
+// routeHasImmediateKey reports whether the route has at least one available
+// key whose recovery strategy is immediate.
+func (e *Engine) routeHasImmediateKey(route *RouteEntry) bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	for _, k := range route.Keys {
+		if k.RecoveryStrategy != model.RecoveryImmediate {
+			continue
+		}
+		if e.isKeyAvailable(k) && e.isKeyWithinLimits(k) {
+			return true
 		}
 	}
+	return false
+}
 
-	roll := rand.Intn(totalWeight)
-	for _, e := range entries {
-		w := e.Route.Weight
-		if w <= 0 {
-			w = 10
+// weightedOrder returns the entries in weighted-random order (each entry used
+// at most once), so routes with higher weight tend to be tried first.
+func weightedOrder(entries []*RouteEntry) []*RouteEntry {
+	remaining := make([]*RouteEntry, len(entries))
+	copy(remaining, entries)
+	order := make([]*RouteEntry, 0, len(entries))
+
+	for len(remaining) > 0 {
+		totalWeight := 0
+		for _, en := range remaining {
+			totalWeight += effectiveWeight(en)
 		}
-		roll -= w
-		if roll < 0 {
-			return e
+		roll := rand.Intn(totalWeight)
+		idx := 0
+		for i, en := range remaining {
+			roll -= effectiveWeight(en)
+			if roll < 0 {
+				idx = i
+				break
+			}
 		}
+		order = append(order, remaining[idx])
+		remaining = append(remaining[:idx], remaining[idx+1:]...)
 	}
+	return order
+}
 
-	return entries[len(entries)-1]
+// effectiveWeight returns a route's weight, defaulting to 10 when unset/invalid
+func effectiveWeight(en *RouteEntry) int {
+	if en.Route.Weight <= 0 {
+		return 10
+	}
+	return en.Route.Weight
 }

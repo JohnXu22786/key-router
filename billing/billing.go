@@ -9,6 +9,7 @@ import (
 	"local-router/model"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // Calculator handles token cost calculations
@@ -35,6 +36,8 @@ func (c *Calculator) loadPricing() {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// Rebuild from scratch so deleted rows don't linger in the map
+	c.pricing = make(map[string]*model.Pricing, len(pricings))
 	for _, p := range pricings {
 		cp := p
 		c.pricing[p.ModelName] = &cp
@@ -72,10 +75,21 @@ func (c *Calculator) CalculateCost(modelName string, usage *model.TokenUsage) fl
 		return 0
 	}
 
+	// OpenAI's prompt_tokens includes cached_tokens — bill cached tokens at
+	// the cache-read rate only, not also at the prompt rate. Anthropic's
+	// input_tokens excludes cache tokens (no subtraction).
+	uncachedPrompt := usage.PromptTokens
+	if usage.Format == "openai" {
+		uncachedPrompt = usage.PromptTokens - usage.CacheHitTokens
+		if uncachedPrompt < 0 {
+			uncachedPrompt = 0
+		}
+	}
+
 	cost := 0.0
 
 	// Input (prompt) tokens
-	cost += float64(usage.PromptTokens) * p.PromptPer1K / 1000.0
+	cost += float64(uncachedPrompt) * p.PromptPer1K / 1000.0
 
 	// Output (completion) tokens
 	cost += float64(usage.CompletionTokens) * p.CompletionPer1K / 1000.0
@@ -91,14 +105,32 @@ func (c *Calculator) CalculateCost(modelName string, usage *model.TokenUsage) fl
 
 // RecordConsumption writes a consumption record to the database
 func RecordConsumption(keyID int64, modelName string, usage *model.TokenUsage) (*model.Consumption, error) {
-	now := time.Now().Truncate(time.Hour)
+	// Truncate to the LOCAL hour: time.Truncate aligns to UTC hours, which
+	// misaligns buckets in non-whole-hour-offset zones (e.g. +05:30).
+	nowT := time.Now()
+	now := time.Date(nowT.Year(), nowT.Month(), nowT.Day(), nowT.Hour(), 0, 0, 0, nowT.Location())
 	cost := 0.0
 
 	if usage != nil {
-		// Try to find pricing
+		// Try to find pricing — exact model name first, then the "*" wildcard
 		var p model.Pricing
-		if err := db.GetDB().Where("model_name = ?", modelName).First(&p).Error; err == nil {
-			cost = float64(usage.PromptTokens)*p.PromptPer1K/1000.0 +
+		exact := db.GetDB().Where("model_name = ?", modelName).First(&p).Error
+		if exact != nil {
+			db.GetDB().Where("model_name = ?", "*").First(&p)
+		}
+		if exact == nil || p.ID > 0 {
+			// OpenAI's prompt_tokens INCLUDES prompt_tokens_details.cached_tokens,
+			// so cached tokens are billed at the cache-read rate only. Anthropic's
+			// input_tokens EXCLUDES cache tokens — subtracting there would
+			// under-bill real prompt tokens.
+			uncachedPrompt := usage.PromptTokens
+			if usage.Format == "openai" {
+				uncachedPrompt = usage.PromptTokens - usage.CacheHitTokens
+				if uncachedPrompt < 0 {
+					uncachedPrompt = 0
+				}
+			}
+			cost = float64(uncachedPrompt)*p.PromptPer1K/1000.0 +
 				float64(usage.CompletionTokens)*p.CompletionPer1K/1000.0 +
 				float64(usage.CacheHitTokens)*p.CacheReadPer1K/1000.0 +
 				float64(usage.CacheWriteTokens)*p.CacheWritePer1K/1000.0
@@ -118,16 +150,22 @@ func RecordConsumption(keyID int64, modelName string, usage *model.TokenUsage) (
 		consumption.CacheWriteTokens = usage.CacheWriteTokens
 	}
 
-	// Upsert: add to existing or create new
-	err := db.GetDB().Where("key_id = ? AND hour_bucket = ?", keyID, now).
-		Assign(map[string]interface{}{
-			"request_count":     gorm.Expr("request_count + 1"),
-			"input_tokens":      gorm.Expr("input_tokens + ?", consumption.InputTokens),
-			"output_tokens":     gorm.Expr("output_tokens + ?", consumption.OutputTokens),
-			"cache_hit_tokens":  gorm.Expr("cache_hit_tokens + ?", consumption.CacheHitTokens),
+	// Atomic upsert: INSERT or increment the hourly row.
+	// Using a real ON CONFLICT avoids the FirstOrCreate SELECT+INSERT race
+	// where concurrent requests for the same (key, hour) could both INSERT
+	// and one would hit the unique index error and be lost.
+	consumption.ID = 0
+	err := db.GetDB().Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "key_id"}, {Name: "hour_bucket"}},
+		DoUpdates: clause.Assignments(map[string]interface{}{
+			"request_count":      gorm.Expr("request_count + 1"),
+			"input_tokens":       gorm.Expr("input_tokens + ?", consumption.InputTokens),
+			"output_tokens":      gorm.Expr("output_tokens + ?", consumption.OutputTokens),
+			"cache_hit_tokens":   gorm.Expr("cache_hit_tokens + ?", consumption.CacheHitTokens),
 			"cache_write_tokens": gorm.Expr("cache_write_tokens + ?", consumption.CacheWriteTokens),
-			"cost_usd":          gorm.Expr("cost_usd + ?", consumption.CostUSD),
-		}).FirstOrCreate(consumption).Error
+			"cost_usd":           gorm.Expr("cost_usd + ?", consumption.CostUSD),
+		}),
+	}).Create(consumption).Error
 
 	return consumption, err
 }
@@ -136,7 +174,7 @@ func RecordConsumption(keyID int64, modelName string, usage *model.TokenUsage) (
 func GetConsumptionSummary(keyID int64, since, until time.Time) ([]model.Consumption, error) {
 	var consumptions []model.Consumption
 	err := db.GetDB().Where("key_id = ? AND hour_bucket >= ? AND hour_bucket <= ?",
-		keyID, since, until).Order("hour_bucket ASC").Find(&consumptions).Error
+		keyID, since, until).Order("hour_bucket DESC").Find(&consumptions).Error
 	return consumptions, err
 }
 

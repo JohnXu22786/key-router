@@ -103,8 +103,8 @@ const Providers: React.FC = () => {
               { value: 'anthropic', label: 'Anthropic' },
             ]} />
           </Form.Item>
-          <Form.Item name="base_url" label="Base URL" rules={[{ required: true }]}>
-            <Input placeholder="https://api.openai.com/v1" />
+          <Form.Item name="base_url" label="Base URL" rules={[{ required: true }]} extra="Do not include /v1 — it is appended automatically">
+            <Input placeholder="https://api.openai.com" />
           </Form.Item>
           <Form.Item name="extra_headers" label="Extra Headers (JSON)">
             <Input.TextArea rows={3} placeholder='{"Organization":"org-xxx"}' />
