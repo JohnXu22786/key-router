@@ -105,7 +105,7 @@ jobs:
           go build -trimpath -ldflags "-s -w -X main.version=${{ needs.version.outputs.tag }} -X local-router/handler.version=${{ needs.version.outputs.tag }}" -o ${{ matrix.asset }} .
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset }}
           path: ${{ matrix.asset }}
