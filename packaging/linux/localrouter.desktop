@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=LocalRouter
+Comment=Local AI API gateway
+Exec=localrouter
+Terminal=false
+Categories=Network;Utility;

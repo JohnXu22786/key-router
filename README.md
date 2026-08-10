@@ -29,16 +29,33 @@ LocalRouter runs on your machine and exposes **one OpenAI-compatible endpoint** 
 
 ### Windows
 
-Download the latest `LocalRouter-x.y.z-windows-amd64.exe` from the [Releases page](https://github.com/JohnXu22786/key-router/releases) and run it. The app starts a local web UI and an API server, then opens a desktop window.
+Download the latest **installer** `LocalRouter-x.y.z-windows-amd64-setup.exe` from the [Releases page](https://github.com/JohnXu22786/key-router/releases) and run it (installs to Program Files, adds Start-menu/desktop shortcuts and an uninstaller). A portable `LocalRouter-x.y.z-windows-amd64.exe` is also published — run it anywhere; it uses the same data location as the installed version.
 
-### macOS / Linux
+### macOS
 
-Download the matching release asset, make it executable, and run:
+Download the DMG for your architecture — `LocalRouter-x.y.z-darwin-arm64.dmg` (Apple Silicon) or `LocalRouter-x.y.z-darwin-amd64.dmg` (Intel) — open it and drag `LocalRouter.app` into Applications. The app is ad-hoc signed and **not notarized**: if Gatekeeper refuses to open it, right-click the app → Open, or remove the quarantine attribute (`xattr -dr com.apple.quarantine /Applications/LocalRouter.app`). Plain executables for both architectures are also published.
+
+### Linux
+
+Download the Debian/Ubuntu package and install it (built for **Ubuntu 22.04 / Debian 12**; needs WebKitGTK 4.0 / GTK 3):
 
 ```bash
-chmod +x LocalRouter-*-darwin-amd64  # or -linux-amd64
-./LocalRouter-*-darwin-amd64
+sudo apt install ./LocalRouter-x.y.z-linux-amd64.deb
 ```
+
+Alternatively, use `LocalRouter-x.y.z-linux-amd64.tar.gz` or the raw binary directly.
+
+### Data location
+
+All user data — the SQLite database, rate-limit windows, and logs — is stored in the **system application-data directory**, never next to the executable, so it survives updates and behaves identically for every build type and platform:
+
+| Platform | Location |
+|---|---|
+| Windows | `%LOCALAPPDATA%\LocalRouter` |
+| macOS | `~/Library/Application Support/LocalRouter` |
+| Linux | `$XDG_DATA_HOME/localrouter` (default: `~/.local/share/localrouter`) |
+
+Set the `LOCALROUTER_DATA` environment variable to override (e.g. for tests or portable isolated instances).
 
 ### Use it
 

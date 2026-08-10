@@ -30,17 +30,12 @@ func main() {
 	// Detach from console window (GUI mode; Windows-only, see platform files)
 	detachConsole()
 
-	// Determine data directory
-	dataDir := os.Getenv("LOCALROUTER_DATA")
-	if dataDir == "" {
-		execPath, err := os.Executable()
-		if err != nil {
-			dataDir = "./data"
-		} else {
-			dataDir = filepath.Join(filepath.Dir(execPath), "data")
-		}
-	}
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
+	// Determine data directory. User data always lives in the system
+	// application-data directory — never next to the executable — so it
+	// survives updates across every build type and platform. LOCALROUTER_DATA
+	// overrides it (used for testing / isolated instances).
+	dataDir := resolveDataDir(os.Getenv, defaultDataDir)
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
 		log.Printf("[main] cannot create data directory: %v", err)
 		showFatalError(fmt.Sprintf("LocalRouter failed to start:\n\nCannot create data directory:\n%v", err))
 		os.Exit(1)
@@ -55,6 +50,12 @@ func main() {
 	}
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 	log.Printf("[main] LocalRouter starting... dataDir=%s", dataDir)
+
+	// One-time migration from the legacy executable-adjacent ./data dir.
+	// Runs after the log is set up so migration messages are visible.
+	if execPath, err := os.Executable(); err == nil {
+		migrateLegacyData(dataDir, filepath.Join(filepath.Dir(execPath), "data"))
+	}
 
 	// Initialize database
 	if err := db.Init(dataDir); err != nil {
