@@ -89,21 +89,23 @@ func (c *Calculator) CalculateCost(modelName string, usage *model.TokenUsage) fl
 	cost := 0.0
 
 	// Input (prompt) tokens
-	cost += float64(uncachedPrompt) * p.PromptPer1K / 1000.0
+	cost += float64(uncachedPrompt) * p.PromptPer1M / 1e6
 
 	// Output (completion) tokens
-	cost += float64(usage.CompletionTokens) * p.CompletionPer1K / 1000.0
+	cost += float64(usage.CompletionTokens) * p.CompletionPer1M / 1e6
 
 	// Cache read (cache hit)
-	cost += float64(usage.CacheHitTokens) * p.CacheReadPer1K / 1000.0
+	cost += float64(usage.CacheHitTokens) * p.CacheReadPer1M / 1e6
 
 	// Cache write
-	cost += float64(usage.CacheWriteTokens) * p.CacheWritePer1K / 1000.0
+	cost += float64(usage.CacheWriteTokens) * p.CacheWritePer1M / 1e6
 
 	return cost
 }
 
-// RecordConsumption writes a consumption record to the database
+// RecordConsumption writes a consumption record to the database.
+// modelName is the model actually served (post route-target resolution); it
+// powers the Activity page's by-model aggregation.
 func RecordConsumption(keyID int64, modelName string, usage *model.TokenUsage) (*model.Consumption, error) {
 	// Truncate to the LOCAL hour: time.Truncate aligns to UTC hours, which
 	// misaligns buckets in non-whole-hour-offset zones (e.g. +05:30).
@@ -130,16 +132,17 @@ func RecordConsumption(keyID int64, modelName string, usage *model.TokenUsage) (
 					uncachedPrompt = 0
 				}
 			}
-			cost = float64(uncachedPrompt)*p.PromptPer1K/1000.0 +
-				float64(usage.CompletionTokens)*p.CompletionPer1K/1000.0 +
-				float64(usage.CacheHitTokens)*p.CacheReadPer1K/1000.0 +
-				float64(usage.CacheWriteTokens)*p.CacheWritePer1K/1000.0
+			cost = float64(uncachedPrompt)*p.PromptPer1M/1e6 +
+				float64(usage.CompletionTokens)*p.CompletionPer1M/1e6 +
+				float64(usage.CacheHitTokens)*p.CacheReadPer1M/1e6 +
+				float64(usage.CacheWriteTokens)*p.CacheWritePer1M/1e6
 		}
 	}
 
 	consumption := &model.Consumption{
 		KeyID:        keyID,
 		HourBucket:   now,
+		ModelName:    modelName,
 		RequestCount: 1,
 		CostUSD:      cost,
 	}

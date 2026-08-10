@@ -71,13 +71,17 @@ type Key struct {
 
 // ModelGroup represents a logical group of models that share routing rules
 type ModelGroup struct {
-	ID         int64     `gorm:"primaryKey;autoIncrement" json:"id"`
-	GroupID    string    `gorm:"type:varchar(255);not null;uniqueIndex" json:"group_id"` // The model name clients send
-	Name       string    `gorm:"type:varchar(255);not null" json:"name"`
-	Enabled    bool      `json:"enabled"`                      // defaulted to true by the create handler
-	RetryTimes int       `gorm:"default:0" json:"retry_times"` // 0 = inherit global server.retry_times
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	ID         int64  `gorm:"primaryKey;autoIncrement" json:"id"`
+	GroupID    string `gorm:"type:varchar(255);not null;uniqueIndex" json:"group_id"` // The model name clients send
+	Name       string `gorm:"type:varchar(255);not null" json:"name"`
+	Enabled    bool   `json:"enabled"`                      // defaulted to true by the create handler
+	RetryTimes int    `gorm:"default:0" json:"retry_times"` // 0 = inherit global server.retry_times
+	// ExtraParams is a JSON object merged into every forwarded request body
+	// for this group. Client-sent keys are OVERWRITTEN (extra params win),
+	// so e.g. {"temperature": 0.2} pins the sampling temperature.
+	ExtraParams string    `gorm:"type:text" json:"extra_params"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 // Route maps a ModelGroup to a Provider
@@ -133,6 +137,7 @@ type Consumption struct {
 	ID               int64     `gorm:"primaryKey;autoIncrement" json:"id"`
 	KeyID            int64     `gorm:"not null;index:idx_key_hour,unique" json:"key_id"`
 	HourBucket       time.Time `gorm:"not null;index:idx_key_hour,unique" json:"hour_bucket"` // truncated to hour
+	ModelName        string    `gorm:"type:varchar(255);default:'';index" json:"model_name"`  // model actually served (after route target resolution)
 	RequestCount     int64     `gorm:"default:0" json:"request_count"`
 	InputTokens      int64     `gorm:"default:0" json:"input_tokens"`
 	OutputTokens     int64     `gorm:"default:0" json:"output_tokens"`
@@ -142,14 +147,15 @@ type Consumption struct {
 	Key              Key       `gorm:"foreignKey:KeyID" json:"key,omitempty"`
 }
 
-// Pricing defines per-model token pricing
+// Pricing defines per-model token pricing. Rates are per 1,000,000 tokens
+// (industry convention), stored directly in USD.
 type Pricing struct {
 	ID              int64     `gorm:"primaryKey;autoIncrement" json:"id"`
 	ModelName       string    `gorm:"type:varchar(255);not null;uniqueIndex" json:"model_name"`
-	PromptPer1K     float64   `gorm:"default:0" json:"prompt_per_1k"`
-	CompletionPer1K float64   `gorm:"default:0" json:"completion_per_1k"`
-	CacheReadPer1K  float64   `gorm:"default:0" json:"cache_read_per_1k"`
-	CacheWritePer1K float64   `gorm:"default:0" json:"cache_write_per_1k"`
+	PromptPer1M     float64   `gorm:"default:0" json:"prompt_per_1m"`
+	CompletionPer1M float64   `gorm:"default:0" json:"completion_per_1m"`
+	CacheReadPer1M  float64   `gorm:"default:0" json:"cache_read_per_1m"`
+	CacheWritePer1M float64   `gorm:"default:0" json:"cache_write_per_1m"`
 	CreatedAt       time.Time `json:"created_at"`
 	UpdatedAt       time.Time `json:"updated_at"`
 }
@@ -185,6 +191,9 @@ type RequestMetadata struct {
 	RequestBody []byte      // Raw request body
 	Headers     http.Header // Incoming request headers for forwarding
 	TargetModel string      // Model name after route resolution
+	// ExtraParams is the model group's configured JSON object to merge into
+	// the request body (client keys overwritten).
+	ExtraParams string
 	// Ctx is the client request's context: when the downstream client
 	// disconnects, the upstream fetch is cancelled instead of stalling for
 	// the full client timeout.

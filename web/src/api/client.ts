@@ -47,6 +47,7 @@ export interface ModelGroup {
   name: string;
   enabled: boolean;
   retry_times: number;
+  extra_params: string;
   created_at: string;
   updated_at: string;
 }
@@ -139,12 +140,29 @@ export const deletePricing = (id: number) => api.delete(`/pricings/${id}`);
 // Settings
 export const getSettings = () => api.get<Settings>('/settings');
 export const updateSettings = (data: Settings) => api.put('/settings', data);
+export const getAutostart = () => api.get<{ enabled: boolean; supported: boolean }>('/autostart');
+export const setAutostart = (enabled: boolean) => api.put('/autostart', { enabled });
 
 // Stats
 export const getOverview = () => api.get<OverviewStats>('/stats/overview');
 export const getConsumptions = (params?: { key_id?: number; since?: string; until?: string }) =>
   api.get<Consumption[]>('/stats/consumptions', { params });
 export const getKeyDetail = (id: number) => api.get(`/stats/keys/${id}`);
+
+// Activity (OpenRouter-style: overview / trends / explore)
+export interface ActivitySeriesPoint { bucket: string; group: string; value: number; is_zero: boolean; }
+export interface ActivityGroupSummary { group: string; min: number; max: number; avg: number; sum: number; value: number; percent: number; }
+export interface ActivityResponse {
+  metric: string;
+  group_by: string;
+  rollup: string;
+  series: ActivitySeriesPoint[];
+  summary: ActivityGroupSummary[];
+  buckets: string[];
+  totals: { spend: number; tokens: number; requests: number; cache: number };
+}
+export const getActivity = (params: { metric?: string; group_by?: string; rollup?: string; since?: string; until?: string }) =>
+  api.get<ActivityResponse>('/stats/activity', { params });
 
 // Actions
 export const reloadConfig = () => api.post('/reload');

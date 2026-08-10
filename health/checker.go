@@ -3,6 +3,7 @@ package health
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -21,7 +22,11 @@ type OnKeyRecovered func(keyID int64)
 // take it out of rotation in memory as well as in the DB.
 type OnKeyFailed func(keyID int64, reason string)
 
-// Checker periodically tests disabled/rate-limited keys for availability
+// Checker periodically tests keys for availability. Disabled/rate-limited
+// keys are probed every interval (recovery happens only on a successful
+// probe); ACTIVE keys are probed on a slower cadence so an expired/over-quota
+// key with no traffic is still detected and auto-disabled instead of sitting
+// in rotation forever.
 type Checker struct {
 	mu          sync.Mutex
 	interval    time.Duration
@@ -35,13 +40,22 @@ type Checker struct {
 	// failing key (e.g. a billable Anthropic inference probe) is not probed
 	// every interval forever.
 	failCount map[int64]int
+	// lastActiveProbe throttles probes of ACTIVE keys: checking every key
+	// every interval would burn billable Anthropic probes and hammer the
+	// upstreams. Active keys are probed at most once per activeProbeInterval.
+	lastActiveProbe map[int64]time.Time
 }
+
+// activeProbeInterval is how often ACTIVE keys are health-probed. Expired
+// keys are therefore detected within this window even with zero traffic.
+const activeProbeInterval = 1 * time.Hour
 
 // NewChecker creates a new health checker
 func NewChecker() *Checker {
 	return &Checker{
-		interval:  120 * time.Second, // default
-		failCount: make(map[int64]int),
+		interval:        120 * time.Second, // default
+		failCount:       make(map[int64]int),
+		lastActiveProbe: make(map[int64]time.Time),
 	}
 }
 
@@ -142,11 +156,11 @@ func (c *Checker) loop(stop chan struct{}, interval time.Duration) {
 }
 
 func (c *Checker) checkAll() {
+	// Include ACTIVE keys: an expired/over-quota key with no traffic must
+	// still be detected and auto-disabled. The throttle in shouldProbeKey
+	// keeps active-key probing at one check per activeProbeInterval.
 	var keys []model.Key
-	if err := db.GetDB().Where("status IN ?", []string{
-		model.KeyStatusDisabled,
-		model.KeyStatusRateLimited,
-	}).Find(&keys).Error; err != nil {
+	if err := db.GetDB().Find(&keys).Error; err != nil {
 		log.Printf("[health] failed to query keys: %v", err)
 		return
 	}
@@ -158,6 +172,9 @@ func (c *Checker) checkAll() {
 	var wg sync.WaitGroup
 	for i := range keys {
 		key := &keys[i]
+		if !c.shouldProbeKey(key) {
+			continue
+		}
 		wg.Add(1)
 		sem <- struct{}{}
 		go func() {
@@ -167,6 +184,26 @@ func (c *Checker) checkAll() {
 		}()
 	}
 	wg.Wait()
+}
+
+// shouldProbeKey decides whether a key is due for a probe this pass.
+//   - Disabled keys with an empty reason are admin-disabled — never probed.
+//   - Disabled (system) / rate-limited keys: every pass.
+//   - Active keys: at most once per activeProbeInterval (throttled).
+func (c *Checker) shouldProbeKey(key *model.Key) bool {
+	if key.Status == model.KeyStatusDisabled && key.DisabledReason == "" {
+		return false // deliberately disabled by an admin
+	}
+	if key.Status != model.KeyStatusActive {
+		return true
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	last, ok := c.lastActiveProbe[key.ID]
+	if !ok || time.Since(last) >= activeProbeInterval {
+		return true
+	}
+	return false
 }
 
 // ResetFailCount clears the consecutive-failure latch for a key (e.g. after
@@ -187,7 +224,11 @@ type ProbeResult struct {
 	// "auth_failed", "insufficient_quota", "rate_limited", "upstream_error"
 }
 
-// checkKey probes a single disabled/rate-limited key
+// checkKey probes a single key.
+//   - Active key: probe validates it is still usable (quota/auth); on
+//     auth_failed/insufficient_quota the key is auto-disabled. A success
+//     leaves it active.
+//   - Disabled/rate-limited key: recovery happens ONLY on a successful probe.
 func (c *Checker) checkKey(key *model.Key) {
 	// Disabled keys are only auto-recovered when the disabled_reason was set
 	// by the system (auth_failed / insufficient_quota / ...). A key disabled
@@ -206,6 +247,9 @@ func (c *Checker) checkKey(key *model.Key) {
 		c.mu.Unlock()
 		return
 	}
+	// Mark this probe as the key's active-probe time (covers the active-key
+	// throttle; harmless for non-active keys).
+	c.lastActiveProbe[key.ID] = time.Now()
 	c.mu.Unlock()
 
 	// Get provider
@@ -228,6 +272,11 @@ func (c *Checker) checkKey(key *model.Key) {
 	c.mu.Lock()
 	delete(c.failCount, key.ID)
 	c.mu.Unlock()
+
+	// Active keys that probe fine stay active — nothing to do.
+	if key.Status == model.KeyStatusActive {
+		return
+	}
 
 	// Re-check the status from the DB before marking active: the relay may
 	// have marked this key rate-limited again (fresh cooldown) or an admin
@@ -385,7 +434,9 @@ func (c *Checker) testAnthropic(keyValue string, provider *model.Provider) Probe
 // classifyOpenAIProbe classifies an OpenAI-format probe response.
 // A 400 ("model not found") or 404 (no /models endpoint) still proves the key
 // authenticated and is usable; only auth/quota/rate-limit failures and
-// upstream 5xx mean the key is not usable.
+// upstream 5xx mean the key is not usable. A 429 whose body carries a quota
+// error code is classified as insufficient_quota (disabled), not a transient
+// rate limit — an over-quota key never recovers on its own.
 func classifyOpenAIProbe(resp *http.Response) ProbeResult {
 	switch {
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
@@ -393,12 +444,45 @@ func classifyOpenAIProbe(resp *http.Response) ProbeResult {
 	case resp.StatusCode == http.StatusPaymentRequired:
 		return ProbeResult{Alive: false, Reason: "insufficient_quota"}
 	case resp.StatusCode == http.StatusTooManyRequests:
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		resp.Body.Close()
+		if quotaErrorInBody(body) {
+			return ProbeResult{Alive: false, Reason: "insufficient_quota"}
+		}
 		return ProbeResult{Alive: false, Reason: "rate_limited"}
 	case resp.StatusCode >= 500:
 		return ProbeResult{Alive: false, Reason: "upstream_error"}
 	default:
 		return ProbeResult{Alive: true}
 	}
+}
+
+// quotaErrorInBody reports whether an error body carries a quota-exhaustion
+// code (OpenAI 429 + insufficient_quota / billing_hard_limit_reached, or a
+// gateway using error.type).
+func quotaErrorInBody(body []byte) bool {
+	var payload struct {
+		Error json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(body, &payload) != nil || len(payload.Error) == 0 {
+		return false
+	}
+	var inner struct {
+		Code string `json:"code"`
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(payload.Error, &inner) != nil {
+		return false
+	}
+	switch inner.Code {
+	case "insufficient_quota", "billing_hard_limit_reached", "billing_not_active", "card_declined", "quota_exceeded":
+		return true
+	}
+	switch inner.Type {
+	case "insufficient_quota", "billing_error", "billing_not_active":
+		return true
+	}
+	return false
 }
 
 // classifyAnthropicProbe classifies an Anthropic probe response.
