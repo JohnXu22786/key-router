@@ -57,8 +57,13 @@ type Key struct {
 	RPWMetric        string     `gorm:"type:varchar(10);default:'requests'" json:"rpw_metric"`
 	RPMLimitMonth    int64      `gorm:"default:0" json:"rpm_month_limit"` // monthly limit
 	RPMMetric        string     `gorm:"type:varchar(10);default:'requests'" json:"rpm_metric"`
-	CreatedAt        time.Time  `json:"created_at"`
-	UpdatedAt        time.Time  `json:"updated_at"`
+	// SortOrder is the caller-priority within the provider group (0 = called
+	// first). It coexists with the recovery strategy: immediate keys are
+	// always preferred over lazy keys, and within each strategy keys are
+	// tried in sort_order.
+	SortOrder int64     `gorm:"default:0" json:"sort_order"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 
 	// Relations
 	Provider Provider `gorm:"foreignKey:ProviderID" json:"provider,omitempty"`

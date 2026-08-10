@@ -14,6 +14,7 @@ type SlidingWindow struct {
 	mu           sync.Mutex
 	buckets      []int64
 	tokenBuckets []int64
+	costBuckets  []int64 // micro-USD (1e6 per $1) to avoid float drift
 	bucketSize   time.Duration
 	head         int
 	lastCleanup  time.Time
@@ -27,6 +28,7 @@ func NewSlidingWindow(wt model.WindowType, numBuckets int, bucketSize time.Durat
 	return &SlidingWindow{
 		buckets:      make([]int64, numBuckets),
 		tokenBuckets: make([]int64, numBuckets),
+		costBuckets:  make([]int64, numBuckets),
 		bucketSize:   bucketSize,
 		head:         0,
 		lastCleanup:  now,
@@ -96,6 +98,14 @@ func (sw *SlidingWindow) AddTokens(count int64) {
 	sw.tokenBuckets[sw.head] += count
 }
 
+// AddCost increments the cost (micro-USD) in the current bucket
+func (sw *SlidingWindow) AddCost(costMicroUSD int64) {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	sw.advance()
+	sw.costBuckets[sw.head] += costMicroUSD
+}
+
 // Count returns the total request count across all buckets
 func (sw *SlidingWindow) Count() int64 {
 	sw.mu.Lock()
@@ -120,6 +130,18 @@ func (sw *SlidingWindow) TokenCount() int64 {
 	return sum
 }
 
+// CostCount returns the total cost (micro-USD) across all buckets
+func (sw *SlidingWindow) CostCount() int64 {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	sw.advance()
+	var sum int64
+	for _, v := range sw.costBuckets {
+		sum += v
+	}
+	return sum
+}
+
 // Reset clears all data in the window
 func (sw *SlidingWindow) Reset() {
 	sw.mu.Lock()
@@ -127,6 +149,7 @@ func (sw *SlidingWindow) Reset() {
 	for i := range sw.buckets {
 		sw.buckets[i] = 0
 		sw.tokenBuckets[i] = 0
+		sw.costBuckets[i] = 0
 	}
 	sw.head = 0
 	sw.lastCleanup = time.Now()
@@ -147,6 +170,7 @@ func (sw *SlidingWindow) Snapshot() ([]int64, []int64) {
 type exportedState struct {
 	ReqBuckets  []int64 `json:"req_buckets"`
 	TokBuckets  []int64 `json:"tok_buckets"`
+	CostBuckets []int64 `json:"cost_buckets"`
 	Head        int     `json:"head"`
 	LastCleanup int64   `json:"last_cleanup"` // unix nanos
 }
@@ -158,11 +182,14 @@ func (sw *SlidingWindow) exportState() exportedState {
 	defer sw.mu.Unlock()
 	reqCopy := make([]int64, len(sw.buckets))
 	tokCopy := make([]int64, len(sw.tokenBuckets))
+	costCopy := make([]int64, len(sw.costBuckets))
 	copy(reqCopy, sw.buckets)
 	copy(tokCopy, sw.tokenBuckets)
+	copy(costCopy, sw.costBuckets)
 	return exportedState{
 		ReqBuckets:  reqCopy,
 		TokBuckets:  tokCopy,
+		CostBuckets: costCopy,
 		Head:        sw.head,
 		LastCleanup: sw.lastCleanup.UnixNano(),
 	}
@@ -178,6 +205,11 @@ func (sw *SlidingWindow) importState(s exportedState) {
 	if len(s.ReqBuckets) == len(sw.buckets) && len(s.TokBuckets) == len(sw.tokenBuckets) {
 		copy(sw.buckets, s.ReqBuckets)
 		copy(sw.tokenBuckets, s.TokBuckets)
+	}
+	// Cost buckets may be absent in state written by older versions — treat
+	// as zero rather than failing the whole restore.
+	if len(s.CostBuckets) == len(sw.costBuckets) {
+		copy(sw.costBuckets, s.CostBuckets)
 	}
 	sw.head = s.Head % len(sw.buckets)
 	if sw.head < 0 {
@@ -256,6 +288,22 @@ func (wm *WindowManager) IncrementAll(keyID int64, tokens int64) {
 	}
 }
 
+// IncrementAllWithCost increments request count, tokens and cost (micro-USD)
+// across all windows
+func (wm *WindowManager) IncrementAllWithCost(keyID int64, tokens int64, costMicroUSD int64) {
+	wm.mu.Lock()
+	defer wm.mu.Unlock()
+	for _, wt := range []model.WindowType{
+		model.WindowRPM, model.WindowTPM, model.WindowRP5h,
+		model.WindowRPD, model.WindowRPW, model.WindowRPMo,
+	} {
+		sw := wm.getOrCreateWindow(keyID, wt)
+		sw.AddRequest(1)
+		sw.AddTokens(tokens)
+		sw.AddCost(costMicroUSD)
+	}
+}
+
 // GetCount returns the current count for a key+window
 func (wm *WindowManager) GetCount(keyID int64, wt model.WindowType) int64 {
 	wm.mu.RLock()
@@ -275,6 +323,18 @@ func (wm *WindowManager) GetTokens(keyID int64, wt model.WindowType) int64 {
 	if km, ok := wm.windows[keyID]; ok {
 		if sw, ok := km[wt]; ok {
 			return sw.TokenCount()
+		}
+	}
+	return 0
+}
+
+// GetCost returns the current cost (micro-USD) for a key+window
+func (wm *WindowManager) GetCost(keyID int64, wt model.WindowType) int64 {
+	wm.mu.RLock()
+	defer wm.mu.RUnlock()
+	if km, ok := wm.windows[keyID]; ok {
+		if sw, ok := km[wt]; ok {
+			return sw.CostCount()
 		}
 	}
 	return 0
