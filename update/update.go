@@ -32,14 +32,14 @@ type Asset struct {
 
 // UpdateInfo is what the UI shows after a check.
 type UpdateInfo struct {
-	CurrentVersion string     `json:"current_version"`
-	LatestVersion  string     `json:"latest_version"`
+	CurrentVersion  string    `json:"current_version"`
+	LatestVersion   string    `json:"latest_version"`
 	UpdateAvailable bool      `json:"update_available"`
-	InstallMode    string     `json:"install_mode"` // "portable" or "installed"
-	AssetName      string     `json:"asset_name,omitempty"`
-	AssetURL       string     `json:"asset_url,omitempty"`
-	AssetSize      int64      `json:"asset_size,omitempty"`
-	CheckedAt      time.Time  `json:"checked_at"`
+	InstallMode     string    `json:"install_mode"` // "portable" or "installed"
+	AssetName       string    `json:"asset_name,omitempty"`
+	AssetURL        string    `json:"asset_url,omitempty"`
+	AssetSize       int64     `json:"asset_size,omitempty"`
+	CheckedAt       time.Time `json:"checked_at"`
 }
 
 // repo and owner of the GitHub releases to check (product repo).
@@ -100,11 +100,11 @@ func (c *Client) Check() (*UpdateInfo, error) {
 	if resp.StatusCode == http.StatusNotFound {
 		// No releases yet — nothing to update to.
 		return &UpdateInfo{
-			CurrentVersion: c.CurrentVersion,
-			LatestVersion:  c.CurrentVersion,
+			CurrentVersion:  c.CurrentVersion,
+			LatestVersion:   c.CurrentVersion,
 			UpdateAvailable: false,
-			InstallMode:    c.installMode(),
-			CheckedAt:      time.Now(),
+			InstallMode:     c.installMode(),
+			CheckedAt:       time.Now(),
 		}, nil
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -117,11 +117,11 @@ func (c *Client) Check() (*UpdateInfo, error) {
 	}
 
 	info := &UpdateInfo{
-		CurrentVersion: c.CurrentVersion,
-		LatestVersion:  release.TagName,
+		CurrentVersion:  c.CurrentVersion,
+		LatestVersion:   release.TagName,
 		UpdateAvailable: compareVersions(release.TagName, c.CurrentVersion) > 0,
-		InstallMode:    c.installMode(),
-		CheckedAt:      time.Now(),
+		InstallMode:     c.installMode(),
+		CheckedAt:       time.Now(),
 	}
 
 	// Resolve the asset for this OS/arch/mode.
