@@ -124,7 +124,9 @@ func (e *Engine) GetRoutes(modelGroupID string) []*RouteEntry {
 
 // SelectKey selects an available (non-exceeded, non-disabled) key from a route.
 // Keys with recovery_strategy=immediate are preferred over lazy keys.
-// Lazy keys are only used when no immediate keys are available.
+// Lazy keys are only used when no immediate keys are available. Within each
+// strategy, keys are tried in ascending sort_order — the order the user
+// arranged them in the UI (sort order = call order).
 func (e *Engine) SelectKey(route *RouteEntry) *model.Key {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
@@ -155,14 +157,28 @@ func (e *Engine) SelectKey(route *RouteEntry) *model.Key {
 		}
 	}
 
-	// Prefer immediate keys; only use lazy keys when no immediate ones are available
+	// Prefer immediate keys; only use lazy keys when no immediate ones are
+	// available. Within each bucket, keys are tried in sort_order (UI order).
 	if len(immediateKeys) > 0 {
-		return immediateKeys[rand.Intn(len(immediateKeys))]
+		return firstBySortOrder(immediateKeys)
 	}
 	if len(lazyKeys) > 0 {
-		return lazyKeys[rand.Intn(len(lazyKeys))]
+		return firstBySortOrder(lazyKeys)
 	}
 	return nil
+}
+
+// firstBySortOrder returns the key with the smallest sort_order. Ties fall
+// back to the smallest ID for deterministic behavior.
+func firstBySortOrder(keys []*model.Key) *model.Key {
+	best := keys[0]
+	for _, k := range keys[1:] {
+		if k.SortOrder < best.SortOrder ||
+			(k.SortOrder == best.SortOrder && k.ID < best.ID) {
+			best = k
+		}
+	}
+	return best
 }
 
 // isKeyWithinLimits checks all rate limit windows against the key's metric type
@@ -194,11 +210,14 @@ func (e *Engine) isKeyWithinLimits(k *model.Key) bool {
 	return true
 }
 
-// getMetricCount returns the count for a window using the appropriate metric (requests or tokens)
+// getMetricCount returns the count for a window using the appropriate metric
+// (requests, tokens, or cost — cost is stored in micro-USD)
 func (e *Engine) getMetricCount(keyID int64, wt model.WindowType, metric string) int64 {
 	switch metric {
 	case "tokens":
 		return e.WindowManager.GetTokens(keyID, wt)
+	case "cost":
+		return e.WindowManager.GetCost(keyID, wt)
 	default:
 		return e.WindowManager.GetCount(keyID, wt)
 	}
@@ -221,9 +240,11 @@ func (e *Engine) isKeyAvailable(k *model.Key) bool {
 	}
 }
 
-// RecordSuccess updates window counters and consumption after a successful relay
-func (e *Engine) RecordSuccess(keyID int64, tokens int64) {
-	e.WindowManager.IncrementAll(keyID, tokens)
+// RecordSuccess updates window counters and consumption after a successful relay.
+// costMicroUSD: cost of this request in micro-USD (1e6 per $1), for cost-metric
+// rate limits.
+func (e *Engine) RecordSuccess(keyID int64, tokens int64, costMicroUSD int64) {
+	e.WindowManager.IncrementAllWithCost(keyID, tokens, costMicroUSD)
 }
 
 // MarkKeyRateLimited marks a key as rate limited.

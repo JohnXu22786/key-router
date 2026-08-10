@@ -375,13 +375,15 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			// (read/conversion failure) must not inflate costs or burn
 			// rate-limit quotas — the client received an error, not work.
 			if streamErr == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				if _, err := billing.RecordConsumption(key.ID, targetModel, usage); err != nil {
+				consumption, err := billing.RecordConsumption(key.ID, targetModel, usage)
+				if err != nil {
 					log.Printf("[relay] failed to record consumption for key %d: %v", key.ID, err)
 				}
+				costMicro := int64(consumption.CostUSD * 1e6)
 				if usage.TotalTokens > 0 {
-					h.Engine.RecordSuccess(key.ID, usage.TotalTokens)
+					h.Engine.RecordSuccess(key.ID, usage.TotalTokens, costMicro)
 				} else {
-					h.Engine.WindowManager.IncrementAll(key.ID, 0)
+					h.Engine.WindowManager.IncrementAllWithCost(key.ID, 0, costMicro)
 				}
 			}
 		} else {
@@ -455,10 +457,12 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			// performed and must not burn the key's request budgets.
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				usage := relay.ParseTokenUsage(responseBody, route.Provider.Type)
-				if _, err := billing.RecordConsumption(key.ID, targetModel, usage); err != nil {
+				consumption, err := billing.RecordConsumption(key.ID, targetModel, usage)
+				if err != nil {
 					log.Printf("[relay] failed to record consumption for key %d: %v", key.ID, err)
 				}
-				h.Engine.RecordSuccess(key.ID, usage.TotalTokens)
+				costMicro := int64(consumption.CostUSD * 1e6)
+				h.Engine.RecordSuccess(key.ID, usage.TotalTokens, costMicro)
 			}
 
 			// 3xx without Location is useless to the client (and a redirect

@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
-import { Table, Button, Modal, Form, Input, InputNumber, Select, Switch, message, Space, Typography, Popconfirm, Tag } from 'antd';
+import { Table, Button, Modal, Form, Input, Select, Switch, message, Space, Typography, Popconfirm, Tag } from 'antd';
 import { PlusOutlined, EditOutlined, DeleteOutlined, HolderOutlined } from '@ant-design/icons';
 import { getRoutes, createRoute, updateRoute, deleteRoute, reorderRoutes, getProviders, getModelGroups, Route, Provider, ModelGroup } from '../api/client';
 
@@ -35,9 +35,9 @@ const RoutesPage: React.FC = () => {
     try {
       const values = await form.validateFields();
       // Only new routes get defaults; editing must keep the stored
-      // priority/weight (drag reorder would otherwise be reset)
+      // priority (drag reorder would otherwise be reset)
       if (editing) { await updateRoute(editing.id, values); message.success('Updated'); }
-      else { await createRoute({ ...values, priority: 0, weight: values.weight ?? 10 }); message.success('Created'); }
+      else { await createRoute({ ...values, priority: 0 }); message.success('Created'); }
       setModalOpen(false); setEditing(null); form.resetFields(); fetch();
     } catch { message.error('Failed to save route'); }
   };
@@ -134,7 +134,8 @@ const RoutesPage: React.FC = () => {
     <div>
       <Title level={3}>Routes</Title>
       <Typography.Paragraph type="secondary">
-        Drag rows to reorder. Routes at the top are tried first when a request comes in.
+        Drag rows to reorder — the drag order IS the call order. Routes at the top are tried
+        first when a request comes in. There is no weighting: position decides everything.
       </Typography.Paragraph>
       <Button type="primary" icon={<PlusOutlined />} onClick={() => { setEditing(null); form.resetFields(); setModalOpen(true); }} style={{ marginBottom: 16 }}>
         Add Route
@@ -166,9 +167,7 @@ const RoutesPage: React.FC = () => {
           <Form.Item name="target_model" label="Target Model (leave empty to use incoming model name)">
             <Input placeholder="gpt-4o-2024-08-06" />
           </Form.Item>
-          <Form.Item name="weight" label="Weight" tooltip="Higher weight = more likely to be selected within its priority tier. Default 10.">
-            <InputNumber min={1} max={1000} style={{ width: 120 }} />
-          </Form.Item>
+
           <Form.Item name="enabled" label="Enabled" valuePropName="checked" initialValue={true}><Switch /></Form.Item>
         </Form>
       </Modal>

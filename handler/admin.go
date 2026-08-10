@@ -676,6 +676,41 @@ func (h *AdminHandler) DeleteRoute(c *gin.Context) {
 	c.JSON(http.StatusNoContent, nil)
 }
 
+// ReorderKeys batch-updates key sort_order based on visual ordering (the
+// order the user arranged keys within a provider — sort order = call order).
+// sort_order is per-provider: the payload carries the full ordered key list
+// for one provider.
+func (h *AdminHandler) ReorderKeys(c *gin.Context) {
+	var req struct {
+		Keys []struct {
+			ID        int64 `json:"id"`
+			SortOrder int64 `json:"sort_order"`
+		} `json:"keys"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	tx := db.GetDB().Begin()
+	for _, r := range req.Keys {
+		if err := tx.Model(&model.Key{}).Where("id = ?", r.ID).Update("sort_order", r.SortOrder).Error; err != nil {
+			tx.Rollback()
+			log.Printf("[admin] ReorderKeys error for key %d: %v", r.ID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "reorder failed"})
+			return
+		}
+	}
+	if err := tx.Commit().Error; err != nil {
+		log.Printf("[admin] ReorderKeys commit error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "reorder commit failed"})
+		return
+	}
+
+	h.Engine.Refresh()
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
 // GetPricings returns all pricing rules
 func (h *AdminHandler) GetPricings(c *gin.Context) {
 	var pricings []model.Pricing
@@ -854,6 +889,7 @@ func (h *AdminHandler) GetKeyDetail(c *gin.Context) {
 		counts[string(wt)] = gin.H{
 			"count":       h.Engine.WindowManager.GetCount(id, wt),
 			"token_count": h.Engine.WindowManager.GetTokens(id, wt),
+			"cost":        h.Engine.WindowManager.GetCost(id, wt), // micro-USD
 		}
 	}
 
