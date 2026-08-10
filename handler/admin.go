@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -31,6 +33,10 @@ type AdminHandler struct {
 	Engine        *selector.Engine
 	HealthChecker *health.Checker
 	Updater       *update.Client
+	// AutostartEnabled reports whether launch-at-login is on (nil = unsupported).
+	AutostartEnabled func() bool
+	// AutostartSet enables/disables launch-at-login (nil = unsupported).
+	AutostartSet func(enabled bool) error
 }
 
 // NewAdminHandler creates a new admin handler
@@ -263,6 +269,22 @@ func (h *AdminHandler) CreateKey(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "provider_id is required"})
 		return
 	}
+	// Display names are unique per provider: the UI identifies keys by name
+	// (no numeric IDs), so a duplicate would make them indistinguishable.
+	if k.Name != "" {
+		var dup int64
+		if err := db.GetDB().Model(&model.Key{}).
+			Where("provider_id = ? AND name = ?", k.ProviderID, k.Name).
+			Count(&dup).Error; err != nil {
+			log.Printf("[admin] CreateKey name check error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to validate key name"})
+			return
+		}
+		if dup > 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "a key with this name already exists for the provider"})
+			return
+		}
+	}
 	var count int64
 	if err := db.GetDB().Model(&model.Provider{}).Where("id = ?", k.ProviderID).Count(&count).Error; err != nil {
 		log.Printf("[admin] CreateKey provider check error: %v", err)
@@ -346,6 +368,21 @@ func (h *AdminHandler) UpdateKey(c *gin.Context) {
 	if providerCount == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "provider not found"})
 		return
+	}
+	// Display-name uniqueness per provider (excluding the key being edited).
+	if k.Name != "" && k.Name != orig.Name {
+		var dup int64
+		if err := db.GetDB().Model(&model.Key{}).
+			Where("provider_id = ? AND name = ? AND id <> ?", k.ProviderID, k.Name, id).
+			Count(&dup).Error; err != nil {
+			log.Printf("[admin] UpdateKey name check error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to validate key name"})
+			return
+		}
+		if dup > 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "a key with this name already exists for the provider"})
+			return
+		}
 	}
 
 	// Status/cooldown/reason/strategy are owned by the relay and health
@@ -435,6 +472,10 @@ func (h *AdminHandler) CreateModelGroup(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
+	if err := validateExtraParams(mg.ExtraParams); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	// Default new groups to enabled unless the payload explicitly said false
 	if !enabledProvided {
 		mg.Enabled = true
@@ -460,6 +501,10 @@ func (h *AdminHandler) UpdateModelGroup(c *gin.Context) {
 		return
 	}
 	mg.ID = id
+	if err := validateExtraParams(mg.ExtraParams); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	if err := db.GetDB().Save(&mg).Error; err != nil {
 		log.Printf("[admin] UpdateModelGroup save error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -533,6 +578,20 @@ func bodyHasKey(c *gin.Context, key string) bool {
 	return true
 }
 
+// validateExtraParams ensures the model group's extra params is either empty
+// or a valid JSON object (a top-level array/scalar would break the relay
+// merge).
+func validateExtraParams(extra string) error {
+	if extra == "" {
+		return nil
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(extra), &m); err != nil {
+		return fmt.Errorf("extra_params must be a valid JSON object: %v", err)
+	}
+	return nil
+}
+
 // CreateRoute creates a new route
 func (h *AdminHandler) CreateRoute(c *gin.Context) {
 	// Inspect the payload BEFORE binding (binding consumes the body)
@@ -584,6 +643,22 @@ func (h *AdminHandler) CreateRoute(c *gin.Context) {
 			r.Priority = *maxPrio + 1
 		}
 	}
+	// A route is identified by (model group, provider, target model): the UI
+	// shows these names instead of the numeric ID, so duplicates would make
+	// routes indistinguishable.
+	var dup int64
+	if err := db.GetDB().Model(&model.Route{}).
+		Where("model_group_id = ? AND provider_id = ? AND target_model = ?",
+			r.ModelGroupID, r.ProviderID, r.TargetModel).
+		Count(&dup).Error; err != nil {
+		log.Printf("[admin] CreateRoute uniqueness check error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to validate route"})
+		return
+	}
+	if dup > 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "a route for this model group / provider / target model already exists"})
+		return
+	}
 	if err := db.GetDB().Create(&r).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -625,6 +700,20 @@ func (h *AdminHandler) UpdateRoute(c *gin.Context) {
 	// Bound weight so weightedOrder's int sum can't overflow and panic
 	if r.Weight < 1 || r.Weight > 1000000 {
 		r.Weight = 10
+	}
+	// Route identity uniqueness (excluding this route itself)
+	var dup int64
+	if err := db.GetDB().Model(&model.Route{}).
+		Where("model_group_id = ? AND provider_id = ? AND target_model = ? AND id <> ?",
+			r.ModelGroupID, r.ProviderID, r.TargetModel, id).
+		Count(&dup).Error; err != nil {
+		log.Printf("[admin] UpdateRoute uniqueness check error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to validate route"})
+		return
+	}
+	if dup > 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "a route for this model group / provider / target model already exists"})
+		return
 	}
 	if err := db.GetDB().Save(&r).Error; err != nil {
 		log.Printf("[admin] UpdateRoute save error: %v", err)
@@ -974,6 +1063,36 @@ func (h *AdminHandler) ReloadConfig(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "message": "configuration reloaded"})
 }
 
+// GetAutostart returns the current launch-at-login state.
+func (h *AdminHandler) GetAutostart(c *gin.Context) {
+	enabled := false
+	supported := h.AutostartEnabled != nil
+	if supported {
+		enabled = h.AutostartEnabled()
+	}
+	c.JSON(http.StatusOK, gin.H{"enabled": enabled, "supported": supported})
+}
+
+// SetAutostart enables or disables launch-at-login.
+func (h *AdminHandler) SetAutostart(c *gin.Context) {
+	if h.AutostartSet == nil {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": "autostart is only supported on Windows"})
+		return
+	}
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := h.AutostartSet(req.Enabled); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"enabled": req.Enabled})
+}
+
 // CheckUpdate queries GitHub Releases for a newer version. Errors are
 // reported as a 200 with update_available=false + error message so the UI can
 // show them inline (a GitHub outage must not look like "no update").
@@ -1010,4 +1129,282 @@ func (h *AdminHandler) ApplyUpdate(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "applied", "install_mode": info.InstallMode})
+}
+
+// ActivitySeriesPoint is one (time bucket, group) value for the stacked chart.
+type ActivitySeriesPoint struct {
+	Bucket string  `json:"bucket"` // "MM-DD" or "MM-DD HH:00"
+	Group  string  `json:"group"`  // model name / key name / app name
+	Value  float64 `json:"value"`
+	IsZero bool    `json:"is_zero"` // explicit zero for chart stacking
+}
+
+// activityAcc accumulates one (bucket, group) cell.
+type activityAcc struct{ sum float64 }
+
+// ActivityGroupSummary is one row of the Explore-style summary table.
+type ActivityGroupSummary struct {
+	Group   string  `json:"group"`
+	Min     float64 `json:"min"`
+	Max     float64 `json:"max"`
+	Avg     float64 `json:"avg"`
+	Sum     float64 `json:"sum"`
+	Value   float64 `json:"value"`   // the last bucket's value (OpenRouter shows Value column)
+	Percent float64 `json:"percent"` // % of total (0-100)
+}
+
+// ActivityResponse is the payload for the Activity page (Overview/Trends/Explore).
+type ActivityResponse struct {
+	Metric  string                 `json:"metric"`
+	GroupBy string                 `json:"group_by"`
+	Rollup  string                 `json:"rollup"`
+	Series  []ActivitySeriesPoint  `json:"series"`
+	Summary []ActivityGroupSummary `json:"summary"`
+	Buckets []string               `json:"buckets"` // ordered bucket labels
+	Totals  map[string]float64     `json:"totals"`  // metric totals: spend/tokens/requests/cache
+}
+
+// GetActivity aggregates consumption for the Activity page.
+// Query params:
+//
+//	metric:  spend | tokens | requests | cache   (default spend)
+//	group_by: model | key | app                    (default model)
+//	rollup:  hour | day                            (default day)
+//	since / until: RFC3339, inclusive range
+func (h *AdminHandler) GetActivity(c *gin.Context) {
+	metric := c.DefaultQuery("metric", "spend")
+	groupBy := c.DefaultQuery("group_by", "model")
+	rollup := c.DefaultQuery("rollup", "day")
+	if metric != "spend" && metric != "tokens" && metric != "requests" && metric != "cache" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "metric must be spend|tokens|requests|cache"})
+		return
+	}
+	if groupBy != "model" && groupBy != "key" && groupBy != "app" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "group_by must be model|key|app"})
+		return
+	}
+	if rollup != "hour" && rollup != "day" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "rollup must be hour|day"})
+		return
+	}
+
+	since := time.Now().Add(-7 * 24 * time.Hour)
+	if s := c.Query("since"); s != "" {
+		if t, err := time.Parse(time.RFC3339, s); err == nil {
+			since = t.Local()
+		} else {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid since parameter"})
+			return
+		}
+	}
+	until := time.Now()
+	if u := c.Query("until"); u != "" {
+		if t, err := time.Parse(time.RFC3339, u); err == nil {
+			until = t.Local()
+		} else {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid until parameter"})
+			return
+		}
+	}
+
+	// Load consumption in range.
+	var rows []model.Consumption
+	if err := db.GetDB().
+		Where("hour_bucket >= ? AND hour_bucket <= ?", since, until).
+		Order("hour_bucket ASC").
+		Find(&rows).Error; err != nil {
+		log.Printf("[admin] GetActivity load error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load consumption"})
+		return
+	}
+
+	// Load key names (for group_by=key/app display).
+	keyNames := make(map[int64]string)
+	var keys []model.Key
+	if groupBy == "key" || groupBy == "app" {
+		if err := db.GetDB().Find(&keys).Error; err == nil {
+			for i := range keys {
+				keyNames[keys[i].ID] = keys[i].Name
+			}
+		}
+	}
+
+	// groupOf maps a consumption row to its display group.
+	groupOf := func(r *model.Consumption) string {
+		switch groupBy {
+		case "model":
+			if r.ModelName == "" {
+				return "Unknown"
+			}
+			return r.ModelName
+		case "key":
+			if n, ok := keyNames[r.KeyID]; ok && n != "" {
+				return n
+			}
+			return fmt.Sprintf("Key #%d", r.KeyID)
+		default: // app = key name, falling back to id
+			if n, ok := keyNames[r.KeyID]; ok && n != "" {
+				return n
+			}
+			return fmt.Sprintf("Key #%d", r.KeyID)
+		}
+	}
+
+	// valueOf extracts the metric value from a row.
+	valueOf := func(r *model.Consumption) float64 {
+		switch metric {
+		case "spend":
+			return r.CostUSD
+		case "tokens":
+			return float64(r.InputTokens + r.OutputTokens)
+		case "requests":
+			return float64(r.RequestCount)
+		default: // cache
+			return float64(r.CacheHitTokens)
+		}
+	}
+
+	// Bucket label.
+	bucketOf := func(t time.Time) string {
+		if rollup == "hour" {
+			return t.Format("01-02 15:00")
+		}
+		return t.Format("01-02")
+	}
+
+	// Aggregate: bucket -> group -> sum.
+	type acc struct{ sum float64 }
+	agg := make(map[string]map[string]*activityAcc)
+	bucketOrder := make([]string, 0)
+	groupOrder := make([]string, 0)
+	seenGroup := make(map[string]bool)
+	for i := range rows {
+		b := bucketOf(rows[i].HourBucket)
+		g := groupOf(&rows[i])
+		if _, ok := agg[b]; !ok {
+			agg[b] = make(map[string]*activityAcc)
+			bucketOrder = append(bucketOrder, b)
+		}
+		if _, ok := agg[b][g]; !ok {
+			agg[b][g] = &activityAcc{}
+		}
+		agg[b][g].sum += valueOf(&rows[i])
+		if !seenGroup[g] {
+			seenGroup[g] = true
+			groupOrder = append(groupOrder, g)
+		}
+	}
+
+	// Sort bucket order chronologically (appended in row order, so it's
+	// already chronological after dedupe).
+
+	// Build the response.
+	resp := ActivityResponse{
+		Metric:  metric,
+		GroupBy: groupBy,
+		Rollup:  rollup,
+		Series:  make([]ActivitySeriesPoint, 0),
+		Summary: make([]ActivityGroupSummary, 0),
+		Buckets: bucketOrder,
+		Totals:  map[string]float64{"spend": 0, "tokens": 0, "requests": 0, "cache": 0},
+	}
+	for i := range rows {
+		resp.Totals["spend"] += rows[i].CostUSD
+		resp.Totals["tokens"] += float64(rows[i].InputTokens + rows[i].OutputTokens)
+		resp.Totals["requests"] += float64(rows[i].RequestCount)
+		resp.Totals["cache"] += float64(rows[i].CacheHitTokens)
+	}
+
+	// Series: for each bucket, for each group.
+	for _, b := range bucketOrder {
+		for _, g := range groupOrder {
+			v := float64(0)
+			if m, ok := agg[b][g]; ok {
+				v = m.sum
+			}
+			resp.Series = append(resp.Series, ActivitySeriesPoint{
+				Bucket: b,
+				Group:  g,
+				Value:  v,
+				IsZero: v == 0,
+			})
+		}
+	}
+
+	// Summary: per group Min/Max/Avg/Sum/Value/Percent. Value = sum in the
+	// LAST bucket (OpenRouter's "Value" column).
+	groupTotals := make(map[string]float64)
+	for _, g := range groupOrder {
+		var sum float64
+		for _, b := range bucketOrder {
+			v := float64(0)
+			if m, ok := agg[b][g]; ok {
+				v = m.sum
+			}
+			sum += v
+		}
+		groupTotals[g] = sum
+	}
+	totalSum := float64(0)
+	for _, v := range groupTotals {
+		totalSum += v
+	}
+	for _, g := range groupOrder {
+		avg := float64(0)
+		if len(bucketOrder) > 0 {
+			avg = groupTotals[g] / float64(len(bucketOrder))
+		}
+		percent := float64(0)
+		if totalSum > 0 {
+			percent = groupTotals[g] / totalSum * 100
+		}
+		var min, max float64
+		first := true
+		for _, b := range bucketOrder {
+			v := float64(0)
+			if m, ok := agg[b][g]; ok {
+				v = m.sum
+			}
+			if first {
+				min, max = v, v
+				first = false
+			} else {
+				if v < min {
+					min = v
+				}
+				if v > max {
+					max = v
+				}
+			}
+		}
+		resp.Summary = append(resp.Summary, ActivityGroupSummary{
+			Group:   g,
+			Min:     min,
+			Max:     max,
+			Avg:     avg,
+			Sum:     groupTotals[g],
+			Value:   lastBucketValue(agg, bucketOrder, g),
+			Percent: percent,
+		})
+	}
+	// Sort summary by Sum descending (OpenRouter's default rank = current metric).
+	sort.Slice(resp.Summary, func(i, j int) bool {
+		return resp.Summary[i].Sum > resp.Summary[j].Sum
+	})
+
+	c.JSON(http.StatusOK, resp)
+}
+
+// lastBucketValue returns the group's value in the final bucket (or 0).
+func lastBucketValue(agg map[string]map[string]*activityAcc, bucketOrder []string, g string) float64 {
+	if len(bucketOrder) == 0 {
+		return 0
+	}
+	last := bucketOrder[len(bucketOrder)-1]
+	if m, ok := agg[last]; ok {
+		if a, ok := m[g]; ok {
+			return a.sum
+		}
+	}
+	return 0
 }

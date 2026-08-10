@@ -1,9 +1,9 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
-import { Table, Button, Modal, Form, Input, Select, Switch, message, Space, Typography, Popconfirm, Tag } from 'antd';
+import { Button, Modal, Form, Input, Select, Switch, message, Space, Typography, Popconfirm, Tag, Collapse, Table } from 'antd';
 import { PlusOutlined, EditOutlined, DeleteOutlined, HolderOutlined } from '@ant-design/icons';
 import { getRoutes, createRoute, updateRoute, deleteRoute, reorderRoutes, getProviders, getModelGroups, Route, Provider, ModelGroup } from '../api/client';
 
-const { Title } = Typography;
+const { Title, Text } = Typography;
 
 const RoutesPage: React.FC = () => {
   const [routes, setRoutes] = useState<Route[]>([]);
@@ -12,6 +12,7 @@ const RoutesPage: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState<Route | null>(null);
+  const [activeGroups, setActiveGroups] = useState<string[]>([]);
   const [form] = Form.useForm();
   const dragItem = useRef<number | null>(null);
   const persistTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -106,11 +107,6 @@ const RoutesPage: React.FC = () => {
       title: '', key: 'drag', width: 40,
       render: () => <HolderOutlined style={{ cursor: 'grab', color: '#999' }} />,
     },
-    { title: 'ID', dataIndex: 'id', key: 'id', width: 60 },
-    {
-      title: 'Model Group', key: 'group',
-      render: (_: unknown, r: Route) => r.model_group?.group_id || `#${r.model_group_id}`,
-    },
     {
       title: 'Provider', key: 'provider',
       render: (_: unknown, r: Route) => r.provider?.name || `#${r.provider_id}`,
@@ -130,32 +126,62 @@ const RoutesPage: React.FC = () => {
     },
   ];
 
+  // Group routes by model group (the UI identifies routes by names, not IDs)
+  const groupsWithRoutes = groups
+    .map(g => ({ group: g, routes: routes.filter(r => r.model_group_id === g.id) }))
+    .filter(x => x.routes.length > 0);
+
   return (
     <div>
       <Title level={3}>Routes</Title>
       <Typography.Paragraph type="secondary">
-        Drag rows to reorder — the drag order IS the call order. Routes at the top are tried
-        first when a request comes in. There is no weighting: position decides everything.
+        Routes are grouped by model. Drag rows to reorder — the drag order IS the call order.
+        Routes at the top are tried first when a request comes in. There is no weighting:
+        position decides everything.
       </Typography.Paragraph>
       <Button type="primary" icon={<PlusOutlined />} onClick={() => { setEditing(null); form.resetFields(); setModalOpen(true); }} style={{ marginBottom: 16 }}>
         Add Route
       </Button>
-      <Table
-        dataSource={routes}
-        columns={columns}
-        rowKey="id"
-        loading={loading}
-        // No pagination: drag reorder persists page-relative indices as
-        // priorities, which would collide across pages
-        pagination={false}
-        onRow={(_, index) => ({
-          draggable: true,
-          onDragStart: (e) => handleDragStart(e, index!),
-          onDragOver: handleDragOver,
-          onDrop: (e) => handleDrop(e, index!),
-          style: { cursor: 'default' },
-        })}
-      />
+
+      {groupsWithRoutes.length === 0 && !loading && (
+        <Typography.Text type="secondary">No routes yet. Add a route to get started.</Typography.Text>
+      )}
+
+      {groupsWithRoutes.map(x => (
+        <Collapse
+          key={x.group.id}
+          style={{ marginBottom: 12 }}
+          activeKey={activeGroups}
+          onChange={(keys: any) => setActiveGroups(Array.isArray(keys) ? keys : [keys])}
+          items={[{
+            key: String(x.group.id),
+            label: (
+              <Space>
+                <Text strong>{x.group.group_id}</Text>
+                <Text type="secondary">{x.group.name}</Text>
+                <Tag>{x.routes.length} route{x.routes.length > 1 ? 's' : ''}</Tag>
+              </Space>
+            ),
+            children: (
+              <Table
+                dataSource={x.routes}
+                columns={columns}
+                rowKey="id"
+                size="small"
+                pagination={false}
+                onRow={(_, index) => ({
+                  draggable: true,
+                  onDragStart: (e) => handleDragStart(e, routes.indexOf(x.routes[index!])),
+                  onDragOver: handleDragOver,
+                  onDrop: (e) => handleDrop(e, routes.indexOf(x.routes[index!])),
+                  style: { cursor: 'default' },
+                })}
+              />
+            ),
+          }]}
+        />
+      ))}
+
       <Modal title={editing ? 'Edit Route' : 'Add Route'} open={modalOpen} onOk={handleSave} onCancel={() => { setModalOpen(false); setEditing(null); }}>
         <Form form={form} layout="vertical">
           <Form.Item name="model_group_id" label="Model Group" rules={[{ required: true }]}>
@@ -167,7 +193,6 @@ const RoutesPage: React.FC = () => {
           <Form.Item name="target_model" label="Target Model (leave empty to use incoming model name)">
             <Input placeholder="gpt-4o-2024-08-06" />
           </Form.Item>
-
           <Form.Item name="enabled" label="Enabled" valuePropName="checked" initialValue={true}><Switch /></Form.Item>
         </Form>
       </Modal>

@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 
 	"key-router/handler"
 	"key-router/health"
@@ -16,6 +17,24 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
+
+// SetAutostartHooks wires the platform autostart functions into the shared
+// admin handler (they live in package main; the router builds the handler).
+func SetAutostartHooks(enabledFn func() bool, setFn func(bool) error) {
+	sharedAdminHandler.mu.Lock()
+	defer sharedAdminHandler.mu.Unlock()
+	if sharedAdminHandler.h != nil {
+		sharedAdminHandler.h.AutostartEnabled = enabledFn
+		sharedAdminHandler.h.AutostartSet = setFn
+	}
+}
+
+// sharedAdminHandler is a package-level reference so main can inject hooks
+// after the handler is constructed inside Setup.
+var sharedAdminHandler = struct {
+	mu sync.Mutex
+	h  *handler.AdminHandler
+}{}
 
 // Setup configures all routes and returns the gin engine
 func Setup(
@@ -34,6 +53,9 @@ func Setup(
 	// Create handlers
 	chatHandler := handler.NewChatHandler(engine)
 	adminHandler := handler.NewAdminHandler(engine, checker)
+	sharedAdminHandler.mu.Lock()
+	sharedAdminHandler.h = adminHandler
+	sharedAdminHandler.mu.Unlock()
 
 	// ===== Forwarding API routes =====
 
@@ -86,10 +108,13 @@ func Setup(
 		// Settings
 		api.GET("/settings", adminHandler.GetSettings)
 		api.PUT("/settings", adminHandler.UpdateSettings)
+		api.GET("/autostart", adminHandler.GetAutostart)
+		api.PUT("/autostart", adminHandler.SetAutostart)
 
 		// Stats & monitoring
 		api.GET("/stats/overview", adminHandler.GetOverview)
 		api.GET("/stats/keys/:id", adminHandler.GetKeyDetail)
+		api.GET("/stats/activity", adminHandler.GetActivity)
 		api.POST("/updates/check", adminHandler.CheckUpdate)
 		api.POST("/updates/apply", adminHandler.ApplyUpdate)
 		api.GET("/stats/consumptions", adminHandler.GetStatsConsumptions)

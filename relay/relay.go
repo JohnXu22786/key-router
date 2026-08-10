@@ -76,6 +76,15 @@ func ForwardRequest(meta *model.RequestMetadata, key *model.Key, provider *model
 		}
 	}
 
+	// Merge the model group's extra params (client keys are OVERWRITTEN by
+	// the group config — e.g. {"temperature": 0.2} pins sampling).
+	if meta.ExtraParams != "" {
+		bodyToSend, err = mergeExtraParams(bodyToSend, meta.ExtraParams)
+		if err != nil {
+			return nil, fmt.Errorf("extra params merge error: %w", err)
+		}
+	}
+
 	// Create upstream request. Derive from the client's context so a
 	// disconnected downstream client cancels the upstream fetch instead of
 	// stalling the goroutine for the full client timeout.
@@ -791,6 +800,32 @@ func WriteStreamError(w http.ResponseWriter, inputFormat string, errMsg string) 
 	// Best-effort write; client may already be disconnected
 	fmt.Fprintf(w, "data: %s\n\n", string(errPayload))
 	flusher.Flush()
+}
+
+// mergeExtraParams merges a JSON object of extra params into a request body.
+// The extra params win on key conflicts (deliberate override, e.g. pinning
+// temperature). Both must be JSON objects; on any parse failure the original
+// body is returned unchanged so a misconfigured group can't break every
+// request it serves.
+func mergeExtraParams(body []byte, extraParams string) ([]byte, error) {
+	var req map[string]interface{}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	if err := dec.Decode(&req); err != nil {
+		return body, nil // not clean JSON — leave as-is
+	}
+	if dec.More() {
+		return body, nil // trailing data
+	}
+
+	var extra map[string]interface{}
+	if err := json.Unmarshal([]byte(extraParams), &extra); err != nil {
+		return body, nil // invalid extra params — leave as-is
+	}
+	for k, v := range extra {
+		req[k] = v
+	}
+	return json.Marshal(req)
 }
 
 // replaceModelName replaces the "model" field in a JSON request body if targetModel is set

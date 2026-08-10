@@ -190,6 +190,7 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			RequestBody: body,
 			Headers:     c.Request.Header.Clone(),
 			TargetModel: targetModel,
+			ExtraParams: group.ExtraParams,
 			Ctx:         c.Request.Context(),
 		}
 
@@ -232,6 +233,21 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 		// a rate-limit signal.
 		lastUpstreamStatus = resp.StatusCode
 		if resp.StatusCode == http.StatusTooManyRequests {
+			// 429 is ambiguous: OpenAI returns 429 + error.code
+			// "insufficient_quota" / "billing_hard_limit_reached" when the
+			// account has no balance left, and a plain 429 (no such code) for
+			// genuine rate limiting. Quota exhaustion must DISABLE the key
+			// (it would never recover on its own); a real rate limit only
+			// cools it down. Read a bounded chunk of the body to classify.
+			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+			resp.Body.Close()
+			if isQuotaExhaustedError(errBody) {
+				h.Engine.MarkKeyDisabled(key.ID, "insufficient_quota")
+				log.Printf("[relay] key %d quota exhausted (429 + quota error, attempt %d/%d)", key.ID, attempt+1, maxRetries+1)
+				attempt++
+				continue
+			}
+
 			retryAfter := 60 * time.Second
 			if ra := resp.Header.Get("Retry-After"); ra != "" {
 				if sec, err := strconv.Atoi(ra); err == nil {
@@ -249,7 +265,6 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			}
 			h.Engine.MarkKeyRateLimited(key.ID, retryAfter)
 			log.Printf("[relay] key %d rate limited, cooling %v (attempt %d/%d)", key.ID, retryAfter, attempt+1, maxRetries+1)
-			drainClose(resp)
 			attempt++
 			continue
 		}
@@ -567,4 +582,35 @@ func extractUpstreamError(body []byte, statusCode int) string {
 		msg = http.StatusText(statusCode)
 	}
 	return msg
+}
+
+// isQuotaExhaustedError reports whether an upstream error body means the
+// account/key has no balance left (as opposed to a transient rate limit).
+// OpenAI-compatible APIs return 429 with error.code "insufficient_quota" or
+// "billing_hard_limit_reached"; Anthropic uses 402 Payment Required (handled
+// separately by status code) and some gateways return the code as a string
+// or in "error.type".
+func isQuotaExhaustedError(body []byte) bool {
+	var payload struct {
+		Error json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(body, &payload) != nil || len(payload.Error) == 0 {
+		return false
+	}
+	var inner struct {
+		Code string `json:"code"`
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(payload.Error, &inner) != nil {
+		return false
+	}
+	switch inner.Code {
+	case "insufficient_quota", "billing_hard_limit_reached", "billing_not_active", "card_declined", "quota_exceeded":
+		return true
+	}
+	switch inner.Type {
+	case "insufficient_quota", "billing_error", "billing_not_active":
+		return true
+	}
+	return false
 }
