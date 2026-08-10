@@ -263,6 +263,22 @@ func (h *AdminHandler) CreateKey(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "provider_id is required"})
 		return
 	}
+	// Display names are unique per provider: the UI identifies keys by name
+	// (no numeric IDs), so a duplicate would make them indistinguishable.
+	if k.Name != "" {
+		var dup int64
+		if err := db.GetDB().Model(&model.Key{}).
+			Where("provider_id = ? AND name = ?", k.ProviderID, k.Name).
+			Count(&dup).Error; err != nil {
+			log.Printf("[admin] CreateKey name check error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to validate key name"})
+			return
+		}
+		if dup > 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "a key with this name already exists for the provider"})
+			return
+		}
+	}
 	var count int64
 	if err := db.GetDB().Model(&model.Provider{}).Where("id = ?", k.ProviderID).Count(&count).Error; err != nil {
 		log.Printf("[admin] CreateKey provider check error: %v", err)
@@ -346,6 +362,21 @@ func (h *AdminHandler) UpdateKey(c *gin.Context) {
 	if providerCount == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "provider not found"})
 		return
+	}
+	// Display-name uniqueness per provider (excluding the key being edited).
+	if k.Name != "" && k.Name != orig.Name {
+		var dup int64
+		if err := db.GetDB().Model(&model.Key{}).
+			Where("provider_id = ? AND name = ? AND id <> ?", k.ProviderID, k.Name, id).
+			Count(&dup).Error; err != nil {
+			log.Printf("[admin] UpdateKey name check error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to validate key name"})
+			return
+		}
+		if dup > 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "a key with this name already exists for the provider"})
+			return
+		}
 	}
 
 	// Status/cooldown/reason/strategy are owned by the relay and health
@@ -584,6 +615,22 @@ func (h *AdminHandler) CreateRoute(c *gin.Context) {
 			r.Priority = *maxPrio + 1
 		}
 	}
+	// A route is identified by (model group, provider, target model): the UI
+	// shows these names instead of the numeric ID, so duplicates would make
+	// routes indistinguishable.
+	var dup int64
+	if err := db.GetDB().Model(&model.Route{}).
+		Where("model_group_id = ? AND provider_id = ? AND target_model = ?",
+			r.ModelGroupID, r.ProviderID, r.TargetModel).
+		Count(&dup).Error; err != nil {
+		log.Printf("[admin] CreateRoute uniqueness check error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to validate route"})
+		return
+	}
+	if dup > 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "a route for this model group / provider / target model already exists"})
+		return
+	}
 	if err := db.GetDB().Create(&r).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -625,6 +672,20 @@ func (h *AdminHandler) UpdateRoute(c *gin.Context) {
 	// Bound weight so weightedOrder's int sum can't overflow and panic
 	if r.Weight < 1 || r.Weight > 1000000 {
 		r.Weight = 10
+	}
+	// Route identity uniqueness (excluding this route itself)
+	var dup int64
+	if err := db.GetDB().Model(&model.Route{}).
+		Where("model_group_id = ? AND provider_id = ? AND target_model = ? AND id <> ?",
+			r.ModelGroupID, r.ProviderID, r.TargetModel, id).
+		Count(&dup).Error; err != nil {
+		log.Printf("[admin] UpdateRoute uniqueness check error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to validate route"})
+		return
+	}
+	if dup > 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "a route for this model group / provider / target model already exists"})
+		return
 	}
 	if err := db.GetDB().Save(&r).Error; err != nil {
 		log.Printf("[admin] UpdateRoute save error: %v", err)

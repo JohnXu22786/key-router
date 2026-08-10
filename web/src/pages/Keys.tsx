@@ -188,10 +188,14 @@ const Keys: React.FC = () => {
       title: '', key: 'drag', width: 40,
       render: () => <HolderOutlined style={{ cursor: 'grab', color: '#999' }} />,
     },
-    { title: 'ID', dataIndex: 'id', key: 'id', width: 60 },
     {
       title: 'Name', dataIndex: 'name', key: 'name',
-      render: (n: string, r: Key) => n || r.key_value?.substring(0, 12) + '...',
+      render: (n: string, r: Key) => (
+        <Space size={6}>
+          <Text strong>{n || '(unnamed)'}</Text>
+          <Text type="secondary" style={{ fontSize: 12 }}>{r.key_value?.substring(0, 12)}...</Text>
+        </Space>
+      ),
     },
     {
       title: 'Status', dataIndex: 'status', key: 'status',
@@ -355,7 +359,10 @@ const Keys: React.FC = () => {
               <Descriptions.Item label="Total Cost">${detailData.total_cost?.toFixed(6)}</Descriptions.Item>
             </Descriptions>
             <Title level={5} style={{ marginTop: 16 }}>Window Counters</Title>
-            <Space wrap size="large">
+            {/* 2×3 grid: 6 windows, 3 per row. The circle shows only the
+                percentage; the used/limit values sit underneath so the ring
+                never gets cramped. */}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16, maxWidth: 480 }}>
               {windowTypes.map(wt => {
                 const c = detailData.counts?.[wt.key];
                 if (!c) return null;
@@ -374,13 +381,20 @@ const Keys: React.FC = () => {
                 const fmt = (v: number) => isCost ? `$${v.toFixed(2)}` : String(v);
                 return (
                   <div key={wt.key} style={{ textAlign: 'center' }}>
-                    <Text strong>{wt.label}</Text>
-                    <Progress type="circle" size={60} percent={percent} format={() => `${fmt(used)}${limit > 0 ? ` / ${fmt(limitShown)}` : ''}`} />
-                    {!isCost && <div><Text type="secondary">{c.token_count > 0 ? `${c.token_count} t` : ''}</Text></div>}
+                    <Progress type="circle" size={72} percent={percent} strokeWidth={8} format={(p) => <span style={{ fontSize: 16, fontWeight: 600 }}>{limit > 0 ? `${p}%` : '—'}</span>} />
+                    <div style={{ marginTop: 4 }}>
+                      <Text strong>{wt.label}</Text>
+                    </div>
+                    <Text type="secondary" style={{ fontSize: 12 }}>
+                      {limit > 0 ? `${fmt(used)} / ${fmt(limitShown)}` : `${fmt(used)} (unlimited)`}
+                    </Text>
+                    {!isCost && c.token_count > 0 && (
+                      <div><Text type="secondary" style={{ fontSize: 11 }}>{c.token_count} t</Text></div>
+                    )}
                   </div>
                 );
               })}
-            </Space>
+            </div>
             {detailData.consumptions?.length > 0 && (
               <>
                 <Title level={5} style={{ marginTop: 16 }}>Recent Consumption</Title>

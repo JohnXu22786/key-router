@@ -52,10 +52,88 @@ func Init(dataDir string) error {
 		return err
 	}
 
+	// Migrate pricing from per-1K to per-1M rates. Older builds stored
+	// prompt_per_1k etc. (USD per 1,000 tokens); the new schema uses
+	// prompt_per_1m (USD per 1,000,000 tokens). AutoMigrate adds the new
+	// columns but leaves the old ones in place, so copy the values ×1000 and
+	// drop the old columns. Idempotent: once the old columns are gone this
+	// does nothing.
+	if err := migratePricingPer1KToPer1M(db); err != nil {
+		return err
+	}
+
 	// Seed default settings if not exist
 	seedDefaults(db)
 
 	DB = db
+	return nil
+}
+
+// migratePricingPer1KToPer1M converts legacy per-1K pricing rows to the
+// per-1M schema. SQLite cannot alter a column in place, so the migration is:
+// detect old column -> copy each value ×1000 into the new column -> drop the
+// old column. Runs inside one transaction; idempotent (old columns gone
+// => no-op on subsequent launches).
+func migratePricingPer1KToPer1M(db *gorm.DB) error {
+	hasColumn := func(col string) bool {
+		var n int
+		db.Raw("SELECT COUNT(*) FROM pragma_table_info('pricings') WHERE name = ?", col).Scan(&n)
+		return n > 0
+	}
+
+	// Newer schema already in place (or table brand new): nothing to do.
+	if !hasColumn("prompt_per_1k") {
+		return nil
+	}
+	if !hasColumn("prompt_per_1m") {
+		// Shouldn't happen after AutoMigrate, but be safe.
+		return db.Exec("ALTER TABLE pricings ADD COLUMN prompt_per_1m REAL DEFAULT 0").Error
+	}
+
+	log.Println("[db] migrating pricing rates from per-1K to per-1M tokens")
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+			panic(r)
+		}
+	}()
+
+	// Copy ×1000 into the new columns (per 1K → per 1M is ×1000).
+	for _, pair := range [][2]string{
+		{"prompt_per_1k", "prompt_per_1m"},
+		{"completion_per_1k", "completion_per_1m"},
+		{"cache_read_per_1k", "cache_read_per_1m"},
+		{"cache_write_per_1k", "cache_write_per_1m"},
+	} {
+		oldCol, newCol := pair[0], pair[1]
+		if !hasColumn(newCol) {
+			if err := tx.Exec("ALTER TABLE pricings ADD COLUMN "+newCol+" REAL DEFAULT 0").Error; err != nil {
+				tx.Rollback()
+				return err
+			}
+		}
+		if err := tx.Exec("UPDATE pricings SET "+newCol+" = "+oldCol+" * 1000").Error; err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+
+	// Drop the old columns (SQLite supports DROP COLUMN since 3.35).
+	for _, oldCol := range []string{"prompt_per_1k", "completion_per_1k", "cache_read_per_1k", "cache_write_per_1k"} {
+		if err := tx.Exec("ALTER TABLE pricings DROP COLUMN " + oldCol).Error; err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		return err
+	}
+	log.Println("[db] pricing migration complete (per-1K → per-1M)")
 	return nil
 }
 

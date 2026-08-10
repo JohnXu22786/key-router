@@ -49,10 +49,10 @@ const Pricing: React.FC = () => {
   const columns = [
     { title: 'ID', dataIndex: 'id', key: 'id', width: 60 },
     { title: 'Model', dataIndex: 'model_name', key: 'model_name', render: (v: string) => <Tag color="blue">{v}</Tag> },
-    { title: 'Prompt $/1K', dataIndex: 'prompt_per_1k', key: 'prompt_per_1k', render: (v: number) => `$${v?.toFixed(6)}` },
-    { title: 'Completion $/1K', dataIndex: 'completion_per_1k', key: 'completion_per_1k', render: (v: number) => `$${v?.toFixed(6)}` },
-    { title: 'Cache Read $/1K', dataIndex: 'cache_read_per_1k', key: 'cache_read_per_1k', render: (v: number) => v ? `$${v.toFixed(6)}` : '-' },
-    { title: 'Cache Write $/1K', dataIndex: 'cache_write_per_1k', key: 'cache_write_per_1k', render: (v: number) => v ? `$${v.toFixed(6)}` : '-' },
+    { title: 'Prompt $/1M', dataIndex: 'prompt_per_1m', key: 'prompt_per_1m', render: (v: number) => `$${v?.toFixed(6)}` },
+    { title: 'Completion $/1M', dataIndex: 'completion_per_1m', key: 'completion_per_1m', render: (v: number) => `$${v?.toFixed(6)}` },
+    { title: 'Cache Read $/1M', dataIndex: 'cache_read_per_1m', key: 'cache_read_per_1m', render: (v: number) => v ? `$${v.toFixed(6)}` : '-' },
+    { title: 'Cache Write $/1M', dataIndex: 'cache_write_per_1m', key: 'cache_write_per_1m', render: (v: number) => v ? `$${v.toFixed(6)}` : '-' },
     {
       title: 'Actions', key: 'actions', width: 80,
       render: (_: unknown, r: PricingType) => (
@@ -91,12 +91,12 @@ const Pricing: React.FC = () => {
             />
           </Form.Item>
           <Space size="large">
-            <Form.Item name="prompt_per_1k" label="Prompt $/1K"><InputNumber min={0} step={0.0001} style={{ width: 150 }} /></Form.Item>
-            <Form.Item name="completion_per_1k" label="Completion $/1K"><InputNumber min={0} step={0.0001} style={{ width: 150 }} /></Form.Item>
+            <Form.Item name="prompt_per_1m" label="Prompt $/1M"><InputNumber min={0} step={0.0001} style={{ width: 150 }} /></Form.Item>
+            <Form.Item name="completion_per_1m" label="Completion $/1M"><InputNumber min={0} step={0.0001} style={{ width: 150 }} /></Form.Item>
           </Space>
           <Space size="large">
-            <Form.Item name="cache_read_per_1k" label="Cache Read $/1K"><InputNumber min={0} step={0.0001} style={{ width: 150 }} /></Form.Item>
-            <Form.Item name="cache_write_per_1k" label="Cache Write $/1K"><InputNumber min={0} step={0.0001} style={{ width: 150 }} /></Form.Item>
+            <Form.Item name="cache_read_per_1m" label="Cache Read $/1M"><InputNumber min={0} step={0.0001} style={{ width: 150 }} /></Form.Item>
+            <Form.Item name="cache_write_per_1m" label="Cache Write $/1M"><InputNumber min={0} step={0.0001} style={{ width: 150 }} /></Form.Item>
           </Space>
         </Form>
       </Modal>
