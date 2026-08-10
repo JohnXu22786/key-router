@@ -12,10 +12,6 @@ OutFile "..\..\dist\LocalRouter-${VERSION}-windows-amd64-setup.exe"
 InstallDir "$PROGRAMFILES64\LocalRouter"
 RequestExecutionLevel admin
 
-; Per-machine install (HKLM, Program Files): shortcuts and uninstall keys go
-; to the all-users context so every account sees them.
-SetShellVarContext all
-
 !define MUI_ABORTWARNING
 !define MUI_ICON "${NSISDIR}\Contrib\Graphics\Icons\modern-install.ico"
 !define MUI_UNICON "${NSISDIR}\Contrib\Graphics\Icons\modern-uninstall.ico"
@@ -32,6 +28,9 @@ SetShellVarContext all
 !insertmacro MUI_LANGUAGE "English"
 
 Section "Install"
+  ; Per-machine install (HKLM, Program Files): shortcuts and uninstall keys
+  ; go to the all-users context so every account sees them.
+  SetShellVarContext all
   SetOutPath "$INSTDIR"
   File "/oname=LocalRouter.exe" "${APP_EXE}"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
@@ -53,6 +52,7 @@ Section "Install"
 SectionEnd
 
 Section "Uninstall"
+  SetShellVarContext all
   Delete "$INSTDIR\LocalRouter.exe"
   Delete "$INSTDIR\Uninstall.exe"
   Delete "$SMPROGRAMS\LocalRouter.lnk"
