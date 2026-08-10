@@ -78,6 +78,7 @@ jobs:
       # Historical tags used the local-router module path; the version is
       # injected numeric so the window title formats it once (no "vv").
       - name: Build binary
+        shell: bash
         run: |
           ver="${{ inputs.tag }}"
           ver="${ver#v}"
