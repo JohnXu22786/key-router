@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useRef, useCallback } from 'react';
 import {
-  Table, Button, Modal, Form, Input, Select, InputNumber, message, Space,
+  Table, Button, Modal, Form, Input, Select, InputNumber, message, Space, Alert,
   Typography, Popconfirm, Tag, Descriptions, Progress, Collapse,
 } from 'antd';
 import { PlusOutlined, EditOutlined, DeleteOutlined, EyeOutlined, HolderOutlined } from '@ant-design/icons';
@@ -318,6 +318,13 @@ const Keys: React.FC = () => {
             <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
               Leave a field empty to remove the limit (0 = unlimited). For 5-hour/daily/weekly/monthly windows, the metric can be requests, tokens, or cost — cost limits are in USD.
             </Typography.Paragraph>
+            <Alert
+              type="info"
+              showIcon
+              style={{ marginBottom: 8 }}
+              message="Limits apply to traffic through KeyRouter only"
+              description="Rate limits are enforced on requests that flow through KeyRouter. Usage that bypasses KeyRouter — calling the upstream provider directly with the raw API key — is invisible to the gateway and does not count toward these limits."
+            />
             <Space size="large" style={{ marginTop: 8, marginBottom: 8, display: 'flex' }}>
               <Form.Item name="rpm_limit" label="RPM (requests)"><InputNumber min={0} placeholder="500" /></Form.Item>
               <Form.Item name="tpm_limit" label="TPM (tokens)"><InputNumber min={0} placeholder="200000" /></Form.Item>

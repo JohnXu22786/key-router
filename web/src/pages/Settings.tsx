@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useCallback } from 'react';
-import { Card, Form, Input, InputNumber, Button, message, Typography, Spin, Modal, Space, Tag, Alert } from 'antd';
-import { KeyOutlined, ReloadOutlined, DownloadOutlined, CheckCircleOutlined } from '@ant-design/icons';
-import { getSettings, updateSettings, reloadConfig, checkUpdate, applyUpdate, getHealth, UpdateInfo } from '../api/client';
+import { Card, Form, Input, InputNumber, Button, message, Typography, Spin, Modal, Space, Tag, Alert, Switch } from 'antd';
+import { KeyOutlined, ReloadOutlined, DownloadOutlined, CheckCircleOutlined, RocketOutlined } from '@ant-design/icons';
+import { getSettings, updateSettings, reloadConfig, checkUpdate, applyUpdate, getHealth, getAutostart, setAutostart, UpdateInfo } from '../api/client';
 
 const { Title } = Typography;
 
@@ -17,6 +17,9 @@ const Settings: React.FC = () => {
   const [applying, setApplying] = useState(false);
   // Running app version from /api/health (injected at build time via ldflags)
   const [appVersion, setAppVersion] = useState<string>('');
+  // Launch-at-login state
+  const [autostart, setAutostartState] = useState<{ enabled: boolean; supported: boolean } | null>(null);
+  const [autostartSaving, setAutostartSaving] = useState(false);
 
   const generateToken = useCallback(() => {
     const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
@@ -63,6 +66,11 @@ const Settings: React.FC = () => {
           const health = await getHealth();
           setAppVersion(health.data.version || '');
         } catch { /* version is optional; the update card still works */ }
+        // Launch-at-login state (Windows)
+        try {
+          const as = await getAutostart();
+          setAutostartState(as.data);
+        } catch { /* unsupported platform — hide the switch */ }
       } catch { message.error('Failed to load settings'); }
       finally { setLoading(false); }
     };
@@ -93,6 +101,16 @@ const Settings: React.FC = () => {
       await reloadConfig();
       message.success('Config reloaded');
     } catch { message.error('Failed to reload config'); }
+  };
+
+  const handleAutostartChange = async (checked: boolean) => {
+    setAutostartSaving(true);
+    try {
+      await setAutostart(checked);
+      setAutostartState({ ...autostart!, enabled: checked });
+      message.success(checked ? 'KeyRouter will launch when you sign in' : 'Launch at login disabled');
+    } catch { message.error('Failed to update autostart setting'); }
+    finally { setAutostartSaving(false); }
   };
 
   const handleCheckUpdate = async () => {
@@ -143,6 +161,19 @@ const Settings: React.FC = () => {
           <Form.Item name="server.health_check_interval" label="Health Check Interval (seconds)">
             <InputNumber min={10} max={3600} style={{ width: '100%' }} />
           </Form.Item>
+          {autostart && autostart.supported && (
+            <Form.Item
+              label={
+                <Space>
+                  <RocketOutlined />
+                  Launch at Login
+                </Space>
+              }
+              tooltip="Starts KeyRouter (hidden to the tray) when you sign in to Windows. Uses the per-user registry Run key — no admin rights needed."
+            >
+              <Switch checked={autostart.enabled} loading={autostartSaving} onChange={handleAutostartChange} />
+            </Form.Item>
+          )}
           <Button type="primary" loading={saving} onClick={handleSave}>Save Settings</Button>
           <Button style={{ marginLeft: 12 }} onClick={handleReload}>Reload Config</Button>
         </Form>

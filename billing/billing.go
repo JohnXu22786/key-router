@@ -103,7 +103,9 @@ func (c *Calculator) CalculateCost(modelName string, usage *model.TokenUsage) fl
 	return cost
 }
 
-// RecordConsumption writes a consumption record to the database
+// RecordConsumption writes a consumption record to the database.
+// modelName is the model actually served (post route-target resolution); it
+// powers the Activity page's by-model aggregation.
 func RecordConsumption(keyID int64, modelName string, usage *model.TokenUsage) (*model.Consumption, error) {
 	// Truncate to the LOCAL hour: time.Truncate aligns to UTC hours, which
 	// misaligns buckets in non-whole-hour-offset zones (e.g. +05:30).
@@ -140,6 +142,7 @@ func RecordConsumption(keyID int64, modelName string, usage *model.TokenUsage) (
 	consumption := &model.Consumption{
 		KeyID:        keyID,
 		HourBucket:   now,
+		ModelName:    modelName,
 		RequestCount: 1,
 		CostUSD:      cost,
 	}

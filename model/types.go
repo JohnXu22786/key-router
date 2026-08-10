@@ -137,6 +137,7 @@ type Consumption struct {
 	ID               int64     `gorm:"primaryKey;autoIncrement" json:"id"`
 	KeyID            int64     `gorm:"not null;index:idx_key_hour,unique" json:"key_id"`
 	HourBucket       time.Time `gorm:"not null;index:idx_key_hour,unique" json:"hour_bucket"` // truncated to hour
+	ModelName        string    `gorm:"type:varchar(255);default:'';index" json:"model_name"`  // model actually served (after route target resolution)
 	RequestCount     int64     `gorm:"default:0" json:"request_count"`
 	InputTokens      int64     `gorm:"default:0" json:"input_tokens"`
 	OutputTokens     int64     `gorm:"default:0" json:"output_tokens"`

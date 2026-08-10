@@ -21,7 +21,7 @@ import Keys from './pages/Keys';
 import ModelGroups from './pages/ModelGroups';
 import RoutesPage from './pages/RoutesPage';
 import Pricing from './pages/Pricing';
-import Stats from './pages/Stats';
+import Activity from './pages/Activity';
 import Settings from './pages/Settings';
 import Help from './pages/Help';
 
@@ -42,7 +42,7 @@ const LayoutWithRouter: React.FC = () => {
     { key: '/routes', icon: <BranchesOutlined />, label: <Link to="/routes">Routes</Link> },
     { key: '/pricing', icon: <DollarOutlined />, label: <Link to="/pricing">Pricing</Link> },
     { type: 'divider' as const },
-    { key: '/stats', icon: <BarChartOutlined />, label: <Link to="/stats">Stats</Link> },
+    { key: '/stats', icon: <BarChartOutlined />, label: <Link to="/stats">Activity</Link> },
     { key: '/settings', icon: <SettingOutlined />, label: <Link to="/settings">Settings</Link> },
     { key: '/help', icon: <QuestionCircleOutlined />, label: <Link to="/help">Help</Link> },
   ];
@@ -72,7 +72,7 @@ const LayoutWithRouter: React.FC = () => {
             <Route path="/routes" element={<RoutesPage />} />
             <Route path="/pricing" element={<Pricing />} />
             <Route path="/settings" element={<Settings />} />
-            <Route path="/stats" element={<Stats />} />
+            <Route path="/stats" element={<Activity />} />
             <Route path="/help" element={<Help />} />
           </Routes>
         </Content>

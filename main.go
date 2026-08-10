@@ -141,6 +141,9 @@ func main() {
 
 	// Setup HTTP router
 	r := router.Setup(staticFS, engine, checker)
+	// Launch-at-login (Windows only; injected after the handler is built so
+	// the router's internal handler sees the functions).
+	router.SetAutostartHooks(autostartEnabled, setAutostartEnabled)
 
 	// Start HTTP server in background
 	app := server.New(r)
@@ -165,7 +168,17 @@ func main() {
 	w.SetTitle(fmt.Sprintf("KeyRouter v%s — %s", version, url))
 	w.SetSize(900, 580, webview.HintNone)
 	w.Navigate(url)
+
+	// System tray (Windows): clicking the window X hides to the tray instead
+	// of quitting; the tray menu restores the window or exits for real. On
+	// other platforms StartTray is a no-op and closing quits as before.
+	trayQuit := StartTray(uintptr(w.Window()))
+
+	// Run the message loop. With the tray active, Run() returns only when
+	// the user picks "Exit" from the tray menu (WM_CLOSE is intercepted and
+	// the window is hidden instead of destroyed).
 	w.Run()
+	_ = trayQuit
 
 	// When window closes, stop server
 	log.Println("[main] window closed, shutting down...")
