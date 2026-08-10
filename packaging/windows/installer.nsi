@@ -35,6 +35,16 @@ Section "Install"
   File "/oname=KeyRouter.exe" "${APP_EXE}"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 
+  ; Installed-build marker + version file: the auto-updater uses
+  ; KeyRouter.installed to tell an installed copy (update via the setup
+  ; installer) from a portable copy (replace the exe in place), and
+  ; version.txt for the UI. This also keeps the install dir multi-file.
+  FileOpen $0 "$INSTDIR\KeyRouter.installed" w
+  FileClose $0
+  FileOpen $0 "$INSTDIR\version.txt" w
+  FileWrite $0 "${VERSION}"
+  FileClose $0
+
   ; Start menu + desktop shortcuts
   CreateShortcut "$SMPROGRAMS\KeyRouter.lnk" "$INSTDIR\KeyRouter.exe"
   CreateShortcut "$DESKTOP\KeyRouter.lnk" "$INSTDIR\KeyRouter.exe"
@@ -55,6 +65,8 @@ Section "Uninstall"
   SetShellVarContext all
   Delete "$INSTDIR\KeyRouter.exe"
   Delete "$INSTDIR\Uninstall.exe"
+  Delete "$INSTDIR\KeyRouter.installed"
+  Delete "$INSTDIR\version.txt"
   Delete "$SMPROGRAMS\KeyRouter.lnk"
   Delete "$DESKTOP\KeyRouter.lnk"
   DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\KeyRouter"

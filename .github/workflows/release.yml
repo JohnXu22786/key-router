@@ -1,72 +1,69 @@
 name: Release
 
-# Automatically bumps the patch version and publishes a GitHub Release with
-# installers (Windows NSIS .exe, macOS .dmg, Linux .deb/.tar.gz) plus the raw
-# native binaries for all three platforms whenever code changes land on main.
+# Manual-only release workflow. Pushing code to main does NOT publish a
+# release — run this workflow from the Actions tab (workflow_dispatch) when a
+# release is wanted. The version is bumped automatically (patch) unless an
+# explicit version like "v1.2.3" is typed in the dialog.
 # Builds run on each platform's own runner because the WebView2 / WKWebView /
 # WebKit2GTK bindings are cgo-based and cannot be cross-compiled.
 on:
-  push:
-    branches: [main]
-    paths:
-      - '**.go'
-      - 'go.mod'
-      - 'go.sum'
-      - 'web/src/**'
-      - 'web/package.json'
-      - 'web/package-lock.json'
-      - '.github/workflows/release.yml'
-      - 'packaging/**'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Optional explicit version (e.g. v1.2.3). Leave empty to auto-bump the patch version.'
+        required: false
+        type: string
 
 permissions:
   contents: write
 
-# Serialize release runs: two rapid pushes to main would otherwise compute the
-# same next tag and one of the tag pushes would fail. queue: max ensures every
-# landed commit still gets its own release (the default queue: single would
-# silently cancel the middle run of three rapid pushes).
+# Serialize release runs: two manual triggers at once would otherwise compute
+# the same next tag and one of the tag pushes would fail.
 concurrency:
   group: release
   cancel-in-progress: false
-  queue: max
 
 jobs:
   version:
-    name: Bump version
+    name: Resolve version
     runs-on: ubuntu-latest
     outputs:
-      tag: ${{ steps.bump.outputs.tag }}
-      ver: ${{ steps.bump.outputs.ver }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      ver: ${{ steps.resolve.outputs.ver }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - name: Bump patch version
-        id: bump
+      - name: Resolve version (explicit or auto-bump)
+        id: resolve
         run: |
-          latest=$(git tag --list 'v*' --sort=-v:refname | head -n1 || true)
-          if [ -z "$latest" ]; then
-            tag="v0.1.0"
+          if [ -n "${{ inputs.version }}" ]; then
+            tag="${{ inputs.version }}"
           else
-            base=${latest#v}
-            IFS='.' read -r maj min pat <<< "$base"
-            pat="${pat%%-*}"   # tolerate prerelease tags like v1.2.3-beta
-            tag="v${maj}.${min}.$((pat + 1))"
+            latest=$(git tag --list 'v*' --sort=-v:refname | head -n1 || true)
+            if [ -z "$latest" ]; then
+              tag="v0.1.0"
+            else
+              base=${latest#v}
+              IFS='.' read -r maj min pat <<< "$base"
+              pat="${pat%%-*}"   # tolerate prerelease tags like v1.2.3-beta
+              tag="v${maj}.${min}.$((pat + 1))"
+            fi
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           # Numeric version (no 'v') for -X ldflags, NSIS, Info.plist, deb:
           # the window title formats it as "KeyRouter v$ver", so passing the
           # tag verbatim would produce "vv0.1.4".
           echo "ver=${tag#v}" >> "$GITHUB_OUTPUT"
-          echo "Latest tag: ${latest:-<none>} -> new tag: $tag"
+          echo "Resolved tag: $tag"
 
       - name: Create and push tag
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag "${{ steps.bump.outputs.tag }}"
-          git push origin "${{ steps.bump.outputs.tag }}"
+          git tag "${{ steps.resolve.outputs.tag }}"
+          git push origin "${{ steps.resolve.outputs.tag }}"
 
   build:
     name: Build ${{ matrix.name }}

@@ -149,6 +149,21 @@ export const getKeyDetail = (id: number) => api.get(`/stats/keys/${id}`);
 // Actions
 export const reloadConfig = () => api.post('/reload');
 
+// Updates
+export interface UpdateInfo {
+  current_version: string;
+  latest_version: string;
+  update_available: boolean;
+  install_mode: 'portable' | 'installed';
+  asset_name?: string;
+  asset_url?: string;
+  asset_size?: number;
+  checked_at: string;
+  error?: string;
+}
+export const checkUpdate = () => api.post<UpdateInfo>('/updates/check');
+export const applyUpdate = () => api.post('/updates/apply');
+
 // Health
 export const getHealth = () => api.get('/health');
 export const getKeyStatuses = () => api.get('/status/keys');
