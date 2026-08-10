@@ -1,5 +1,5 @@
 name: Feature request
-description: Suggest an idea for LocalRouter
+description: Suggest an idea for KeyRouter
 labels: [enhancement]
 body:
   - type: textarea
@@ -13,7 +13,7 @@ body:
     id: proposal
     attributes:
       label: Proposed solution
-      description: Describe what you'd like LocalRouter to do.
+      description: Describe what you'd like KeyRouter to do.
     validations:
       required: true
   - type: textarea

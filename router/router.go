@@ -9,10 +9,10 @@ import (
 	"net/http"
 	"strings"
 
-	"local-router/handler"
-	"local-router/health"
-	"local-router/middleware"
-	"local-router/selector"
+	"key-router/handler"
+	"key-router/health"
+	"key-router/middleware"
+	"key-router/selector"
 
 	"github.com/gin-gonic/gin"
 )
@@ -104,7 +104,7 @@ func Setup(
 		log.Printf("[router] no embedded web UI found: %v", err)
 		// Fallback: serve a simple index.html
 		r.NoRoute(func(c *gin.Context) {
-			c.String(http.StatusOK, "<html><body><h1>LocalRouter</h1><p>Web UI not built. Run: cd web && npm install && npm run build</p></body></html>")
+			c.String(http.StatusOK, "<html><body><h1>KeyRouter</h1><p>Web UI not built. Run: cd web && npm install && npm run build</p></body></html>")
 		})
 	} else {
 		r.NoRoute(serveStaticFallback("/", staticSubFS))

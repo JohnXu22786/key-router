@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🔀 LocalRouter
+# 🔀 KeyRouter
 
 **A local OpenAI/Anthropic API gateway with multi-key management, automatic failover, format conversion, rate limiting, and billing — all in one desktop app.**
 
@@ -14,9 +14,9 @@
 
 ---
 
-## What is LocalRouter?
+## What is KeyRouter?
 
-LocalRouter runs on your machine and exposes **one OpenAI-compatible endpoint** that fronts **many upstream providers and API keys**. It handles the messy parts of working with multiple LLM providers:
+KeyRouter runs on your machine and exposes **one OpenAI-compatible endpoint** that fronts **many upstream providers and API keys**. It handles the messy parts of working with multiple LLM providers:
 
 - **Multi-key pooling** — spread traffic across many API keys from many providers, with weighted routing and automatic failover when a key is rate-limited, banned, or out of quota.
 - **Format conversion** — send **OpenAI-format** requests to Anthropic providers (and vice versa). Requests, responses, streaming SSE, tools, and images are converted transparently.
@@ -29,21 +29,21 @@ LocalRouter runs on your machine and exposes **one OpenAI-compatible endpoint** 
 
 ### Windows
 
-Download the latest **installer** `LocalRouter-x.y.z-windows-amd64-setup.exe` from the [Releases page](https://github.com/JohnXu22786/key-router/releases) and run it (installs to Program Files, adds Start-menu/desktop shortcuts and an uninstaller). A portable `LocalRouter-x.y.z-windows-amd64.exe` is also published — run it anywhere; it uses the same data location as the installed version.
+Download the latest **installer** `KeyRouter-x.y.z-windows-amd64-setup.exe` from the [Releases page](https://github.com/JohnXu22786/key-router/releases) and run it (installs to Program Files, adds Start-menu/desktop shortcuts and an uninstaller). A portable `KeyRouter-x.y.z-windows-amd64.exe` is also published — run it anywhere; it uses the same data location as the installed version.
 
 ### macOS
 
-Download the DMG for your architecture — `LocalRouter-x.y.z-darwin-arm64.dmg` (Apple Silicon) or `LocalRouter-x.y.z-darwin-amd64.dmg` (Intel) — open it and drag `LocalRouter.app` into Applications. The app is ad-hoc signed and **not notarized**: if Gatekeeper refuses to open it, right-click the app → Open, or remove the quarantine attribute (`xattr -dr com.apple.quarantine /Applications/LocalRouter.app`). Plain executables for both architectures are also published.
+Download the DMG for your architecture — `KeyRouter-x.y.z-darwin-arm64.dmg` (Apple Silicon) or `KeyRouter-x.y.z-darwin-amd64.dmg` (Intel) — open it and drag `KeyRouter.app` into Applications. The app is ad-hoc signed and **not notarized**: if Gatekeeper refuses to open it, right-click the app → Open, or remove the quarantine attribute (`xattr -dr com.apple.quarantine /Applications/KeyRouter.app`). Plain executables for both architectures are also published.
 
 ### Linux
 
 Download the Debian/Ubuntu package and install it (built for **Ubuntu 22.04 / Debian 12**; needs WebKitGTK 4.0 / GTK 3):
 
 ```bash
-sudo apt install ./LocalRouter-x.y.z-linux-amd64.deb
+sudo apt install ./KeyRouter-x.y.z-linux-amd64.deb
 ```
 
-Alternatively, use `LocalRouter-x.y.z-linux-amd64.tar.gz` or the raw binary directly.
+Alternatively, use `KeyRouter-x.y.z-linux-amd64.tar.gz` or the raw binary directly.
 
 ### Data location
 
@@ -51,11 +51,11 @@ All user data — the SQLite database, rate-limit windows, and logs — is store
 
 | Platform | Location |
 |---|---|
-| Windows | `%LOCALAPPDATA%\LocalRouter` |
-| macOS | `~/Library/Application Support/LocalRouter` |
-| Linux | `$XDG_DATA_HOME/localrouter` (default: `~/.local/share/localrouter`) |
+| Windows | `%LOCALAPPDATA%\KeyRouter` |
+| macOS | `~/Library/Application Support/KeyRouter` |
+| Linux | `$XDG_DATA_HOME/keyrouter` (default: `~/.local/share/keyrouter`) |
 
-Set the `LOCALROUTER_DATA` environment variable to override (e.g. for tests or portable isolated instances).
+Set the `KEYROUTER_DATA` environment variable to override (e.g. for tests or portable isolated instances).
 
 ### Use it
 
@@ -99,11 +99,11 @@ Windows are persisted to `windows.json` every 60s and on shutdown, so budgets su
 
 ```bash
 # Backend + embedded UI (the built web/dist is committed, so this works from a fresh clone)
-go build -o local-router .
+go build -o keyrouter .
 
 # If you changed the web UI:
 cd web && npm install && npm run build && cd ..
-go build -o local-router .
+go build -o keyrouter .
 ```
 
 The UI is a React + Ant Design SPA served by the Go binary (no external server needed).
@@ -130,7 +130,7 @@ web/                     # React + Ant Design management UI
 
 ## License
 
-**LocalRouter is licensed under the [GNU Affero General Public License v3.0 (AGPL-3.0)](LICENSE).**
+**KeyRouter is licensed under the [GNU Affero General Public License v3.0 (AGPL-3.0)](LICENSE).**
 
 If you use a modified version to provide a service over a network, you must make your modified source code available to users of that service under the same license.
 

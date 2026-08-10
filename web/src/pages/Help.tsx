@@ -9,9 +9,9 @@ const Help: React.FC = () => {
     <div style={{ maxWidth: 800 }}>
       <Title level={3}>Help</Title>
 
-      <Card title="About LocalRouter" style={{ marginBottom: 16 }}>
+      <Card title="About KeyRouter" style={{ marginBottom: 16 }}>
         <Paragraph>
-          LocalRouter is a local API aggregation gateway that sits between your AI client apps
+          KeyRouter is a local API aggregation gateway that sits between your AI client apps
           (Chatbox, LobeChat, Cherry Studio, etc.) and upstream AI providers (OpenAI, Anthropic, DeepSeek, etc.).
         </Paragraph>
         <Paragraph>
@@ -69,7 +69,7 @@ const Help: React.FC = () => {
 
       <Card title="Format Conversion" style={{ marginBottom: 16 }}>
         <Paragraph>
-          LocalRouter supports both OpenAI and Anthropic API formats. Your client can use either format,
+          KeyRouter supports both OpenAI and Anthropic API formats. Your client can use either format,
           and the router will convert to the provider's format automatically.
         </Paragraph>
         <Descriptions column={2} size="small" bordered>

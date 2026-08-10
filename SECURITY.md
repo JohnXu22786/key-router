@@ -2,7 +2,7 @@
 
 ## Reporting a Vulnerability
 
-This project stores API keys for LLM providers (OpenAI, Anthropic, etc.) locally in SQLite. A vulnerability in LocalRouter could expose those keys, so please treat security issues seriously.
+This project stores API keys for LLM providers (OpenAI, Anthropic, etc.) locally in SQLite. A vulnerability in KeyRouter could expose those keys, so please treat security issues seriously.
 
 **Do not open a public issue for a security vulnerability.** Instead, report it privately by emailing the maintainers (see the repository's About / profile for contact details), or open a [private security advisory](https://github.com/JohnXu22786/key-router/security/advisories/new) if available.
 

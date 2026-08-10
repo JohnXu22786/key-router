@@ -23,7 +23,7 @@ func detachConsole() {
 
 // showFatalError displays a modal error dialog (GUI mode)
 func showFatalError(msg string) {
-	title, _ := syscall.UTF16PtrFromString("LocalRouter")
+	title, _ := syscall.UTF16PtrFromString("KeyRouter")
 	text, _ := syscall.UTF16PtrFromString(msg)
 	messageBoxW.Call(0, uintptr(unsafe.Pointer(text)), uintptr(unsafe.Pointer(title)), 0x10 /* MB_ICONERROR */)
 }

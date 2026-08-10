@@ -1,7 +1,7 @@
 package db
 
 import (
-	"local-router/model"
+	"key-router/model"
 	"log"
 	"os"
 	"path/filepath"
@@ -20,7 +20,7 @@ func Init(dataDir string) error {
 		return err
 	}
 
-	dbPath := filepath.Join(dataDir, "local-router.db")
+	dbPath := filepath.Join(dataDir, "key-router.db")
 	// _busy_timeout: concurrent writers (parallel relays, health checker,
 	// admin transactions) retry instead of failing with SQLITE_BUSY.
 	// _journal_mode=WAL: readers don't block the writer.

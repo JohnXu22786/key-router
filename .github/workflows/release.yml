@@ -36,6 +36,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.bump.outputs.tag }}
+      ver: ${{ steps.bump.outputs.ver }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -54,6 +55,10 @@ jobs:
             tag="v${maj}.${min}.$((pat + 1))"
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          # Numeric version (no 'v') for -X ldflags, NSIS, Info.plist, deb:
+          # the window title formats it as "KeyRouter v$ver", so passing the
+          # tag verbatim would produce "vv0.1.4".
+          echo "ver=${tag#v}" >> "$GITHUB_OUTPUT"
           echo "Latest tag: ${latest:-<none>} -> new tag: $tag"
 
       - name: Create and push tag
@@ -72,18 +77,18 @@ jobs:
         include:
           - name: Windows amd64
             os: windows-latest
-            asset: LocalRouter-${{ needs.version.outputs.tag }}-windows-amd64.exe
+            asset: KeyRouter-${{ needs.version.outputs.tag }}-windows-amd64.exe
           - name: macOS arm64
             os: macos-latest
             arch: arm64
-            asset: LocalRouter-${{ needs.version.outputs.tag }}-darwin-arm64
+            asset: KeyRouter-${{ needs.version.outputs.tag }}-darwin-arm64
           - name: macOS amd64 (Intel)
             os: macos-15-intel
             arch: amd64
-            asset: LocalRouter-${{ needs.version.outputs.tag }}-darwin-amd64
+            asset: KeyRouter-${{ needs.version.outputs.tag }}-darwin-amd64
           - name: Linux amd64
             os: ubuntu-22.04
-            asset: LocalRouter-${{ needs.version.outputs.tag }}-linux-amd64
+            asset: KeyRouter-${{ needs.version.outputs.tag }}-linux-amd64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -119,7 +124,7 @@ jobs:
 
       - name: Build binary
         run: |
-          go build -trimpath -ldflags "-s -w -X main.version=${{ needs.version.outputs.tag }} -X local-router/handler.version=${{ needs.version.outputs.tag }}" -o ${{ matrix.asset }} .
+          go build -trimpath -ldflags "-s -w -X main.version=${{ needs.version.outputs.ver }} -X key-router/handler.version=${{ needs.version.outputs.ver }}" -o ${{ matrix.asset }} .
 
       # ---- Windows: NSIS installer ----
       - name: Build Windows installer
@@ -131,7 +136,7 @@ jobs:
           choco install nsis -y --no-progress
           # choco's nsis package creates no shim; NSIS installs here:
           $env:PATH += ";C:\Program Files (x86)\NSIS"
-          makensis /DVERSION="${{ needs.version.outputs.tag }}" "/DAPP_EXE=${{ github.workspace }}\${{ matrix.asset }}" packaging/windows/installer.nsi
+          makensis /DVERSION="${{ needs.version.outputs.ver }}" "/DAPP_EXE=${{ github.workspace }}\${{ matrix.asset }}" packaging/windows/installer.nsi
           Copy-Item "${{ matrix.asset }}" "dist\${{ matrix.asset }}"
 
       # ---- macOS: .app bundle + DMG ----
@@ -139,14 +144,12 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           set -euo pipefail
-          mkdir -p dist "LocalRouter.app/Contents/MacOS"
-          cp "${{ matrix.asset }}" "LocalRouter.app/Contents/MacOS/LocalRouter"
-          chmod +x "LocalRouter.app/Contents/MacOS/LocalRouter"
-          ver="${{ needs.version.outputs.tag }}"
-          ver="${ver#v}"   # CFBundleVersion must be numeric
-          sed "s/@VERSION@/${ver}/" packaging/macos/Info.plist > "LocalRouter.app/Contents/Info.plist"
-          codesign --force --deep -s - "LocalRouter.app"
-          hdiutil create -volname "LocalRouter" -srcfolder "LocalRouter.app" -ov -format UDZO "dist/LocalRouter-${{ needs.version.outputs.tag }}-darwin-${{ matrix.arch }}.dmg"
+          mkdir -p dist "KeyRouter.app/Contents/MacOS"
+          cp "${{ matrix.asset }}" "KeyRouter.app/Contents/MacOS/KeyRouter"
+          chmod +x "KeyRouter.app/Contents/MacOS/KeyRouter"
+          sed "s/@VERSION@/${{ needs.version.outputs.ver }}/" packaging/macos/Info.plist > "KeyRouter.app/Contents/Info.plist"
+          codesign --force --deep -s - "KeyRouter.app"
+          hdiutil create -volname "KeyRouter" -srcfolder "KeyRouter.app" -ov -format UDZO "dist/KeyRouter-${{ needs.version.outputs.tag }}-darwin-${{ matrix.arch }}.dmg"
           cp "${{ matrix.asset }}" "dist/${{ matrix.asset }}"
 
       # ---- Linux: .deb + .tar.gz ----
@@ -155,13 +158,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist pkg/DEBIAN pkg/usr/bin pkg/usr/share/applications
-          ver="${{ needs.version.outputs.tag }}"
-          ver="${ver#v}"   # dpkg versions must not have a 'v' prefix
-          install -m 0755 "${{ matrix.asset }}" pkg/usr/bin/localrouter
-          sed "s/@VERSION@/${ver}/" packaging/linux/control > pkg/DEBIAN/control
-          install -m 0644 packaging/linux/localrouter.desktop pkg/usr/share/applications/
-          dpkg-deb --build --root-owner-group pkg "dist/LocalRouter-${{ needs.version.outputs.tag }}-linux-amd64.deb"
-          tar -czf "dist/LocalRouter-${{ needs.version.outputs.tag }}-linux-amd64.tar.gz" "${{ matrix.asset }}"
+          install -m 0755 "${{ matrix.asset }}" pkg/usr/bin/keyrouter
+          sed "s/@VERSION@/${{ needs.version.outputs.ver }}/" packaging/linux/control > pkg/DEBIAN/control
+          install -m 0644 packaging/linux/keyrouter.desktop pkg/usr/share/applications/
+          dpkg-deb --build --root-owner-group pkg "dist/KeyRouter-${{ needs.version.outputs.tag }}-linux-amd64.deb"
+          tar -czf "dist/KeyRouter-${{ needs.version.outputs.tag }}-linux-amd64.tar.gz" "${{ matrix.asset }}"
           cp "${{ matrix.asset }}" "dist/${{ matrix.asset }}"
 
       - name: Upload artifacts
@@ -184,31 +185,31 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.version.outputs.tag }}
-          name: LocalRouter ${{ needs.version.outputs.tag }}
+          name: KeyRouter ${{ needs.version.outputs.tag }}
           body: |
-            ## LocalRouter ${{ needs.version.outputs.tag }}
+            ## KeyRouter ${{ needs.version.outputs.tag }}
 
             Automated release — built from `main`.
 
             ### Windows
-            - **Installer**: `LocalRouter-${{ needs.version.outputs.tag }}-windows-amd64-setup.exe`
-            - Portable: `LocalRouter-${{ needs.version.outputs.tag }}-windows-amd64.exe`
+            - **Installer**: `KeyRouter-${{ needs.version.outputs.tag }}-windows-amd64-setup.exe`
+            - Portable: `KeyRouter-${{ needs.version.outputs.tag }}-windows-amd64.exe`
 
             ### macOS
-            - **DMG (Apple Silicon)**: `LocalRouter-${{ needs.version.outputs.tag }}-darwin-arm64.dmg`
-            - **DMG (Intel)**: `LocalRouter-${{ needs.version.outputs.tag }}-darwin-amd64.dmg`
+            - **DMG (Apple Silicon)**: `KeyRouter-${{ needs.version.outputs.tag }}-darwin-arm64.dmg`
+            - **DMG (Intel)**: `KeyRouter-${{ needs.version.outputs.tag }}-darwin-amd64.dmg`
             - Portable binaries for both architectures are also published.
 
             ### Linux
-            - **Debian/Ubuntu package**: `LocalRouter-${{ needs.version.outputs.tag }}-linux-amd64.deb` (built for Ubuntu 22.04 / Debian 12; needs WebKitGTK 4.0 / GTK 3)
-            - **tar.gz**: `LocalRouter-${{ needs.version.outputs.tag }}-linux-amd64.tar.gz`
-            - Portable: `LocalRouter-${{ needs.version.outputs.tag }}-linux-amd64`
+            - **Debian/Ubuntu package**: `KeyRouter-${{ needs.version.outputs.tag }}-linux-amd64.deb` (built for Ubuntu 22.04 / Debian 12; needs WebKitGTK 4.0 / GTK 3)
+            - **tar.gz**: `KeyRouter-${{ needs.version.outputs.tag }}-linux-amd64.tar.gz`
+            - Portable: `KeyRouter-${{ needs.version.outputs.tag }}-linux-amd64`
 
             > All build types store their data in the system application-data
-            > directory (e.g. `%LOCALAPPDATA%\LocalRouter` on Windows) — never
+            > directory (e.g. `%LOCALAPPDATA%\KeyRouter` on Windows) — never
             > next to the executable — so upgrades never lose your keys,
             > routes, or billing history.
 
-            LocalRouter is licensed under the [GNU Affero General Public License v3.0](https://www.gnu.org/licenses/agpl-3.0.html).
+            KeyRouter is licensed under the [GNU Affero General Public License v3.0](https://www.gnu.org/licenses/agpl-3.0.html).
           files: artifacts/**
           generate_release_notes: true

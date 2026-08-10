@@ -1,6 +1,6 @@
-# Contributing to LocalRouter
+# Contributing to KeyRouter
 
-Thanks for your interest in contributing! LocalRouter is a small, focused project — here's how to help.
+Thanks for your interest in contributing! KeyRouter is a small, focused project — here's how to help.
 
 ## Development setup
 
@@ -17,7 +17,7 @@ npm run dev             # vite dev server with HMR
 npm run build           # production build → web/dist (commit the result)
 ```
 
-Run the app: `go run .` (opens the desktop window; `LOCALROUTER_DATA=/tmp/lr go run .` for an isolated data dir).
+Run the app: `go run .` (opens the desktop window; `KEYROUTER_DATA=/tmp/lr go run .` for an isolated data dir).
 
 ## Before you open a PR
 

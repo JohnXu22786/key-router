@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"local-router/format"
-	"local-router/model"
+	"key-router/format"
+	"key-router/model"
 )
 
 // ErrUnsupportedRoute is returned when a request cannot be routed to the

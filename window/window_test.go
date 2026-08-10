@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"local-router/model"
+	"key-router/model"
 )
 
 func TestSlidingWindow_AddRequest(t *testing.T) {

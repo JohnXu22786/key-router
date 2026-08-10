@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"strings"
 
-	"local-router/db"
-	"local-router/model"
+	"key-router/db"
+	"key-router/model"
 
 	"github.com/gin-gonic/gin"
 )

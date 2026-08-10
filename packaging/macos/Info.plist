@@ -3,17 +3,17 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleName</key>
-	<string>LocalRouter</string>
+	<string>KeyRouter</string>
 	<key>CFBundleDisplayName</key>
-	<string>LocalRouter</string>
+	<string>KeyRouter</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.localrouter.app</string>
+	<string>com.keyrouter.app</string>
 	<key>CFBundleVersion</key>
 	<string>@VERSION@</string>
 	<key>CFBundleShortVersionString</key>
 	<string>@VERSION@</string>
 	<key>CFBundleExecutable</key>
-	<string>LocalRouter</string>
+	<string>KeyRouter</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleInfoDictionaryVersion</key>

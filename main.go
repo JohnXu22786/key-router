@@ -6,14 +6,15 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 
-	"local-router/db"
-	"local-router/health"
-	"local-router/model"
-	"local-router/router"
-	"local-router/selector"
-	"local-router/server"
+	"key-router/db"
+	"key-router/health"
+	"key-router/model"
+	"key-router/router"
+	"key-router/selector"
+	"key-router/server"
 
 	"github.com/webview/webview_go"
 )
@@ -32,35 +33,34 @@ func main() {
 
 	// Determine data directory. User data always lives in the system
 	// application-data directory — never next to the executable — so it
-	// survives updates across every build type and platform. LOCALROUTER_DATA
+	// survives updates across every build type and platform. KEYROUTER_DATA
 	// overrides it (used for testing / isolated instances).
 	dataDir := resolveDataDir(os.Getenv, defaultDataDir)
 	if err := os.MkdirAll(dataDir, 0700); err != nil {
 		log.Printf("[main] cannot create data directory: %v", err)
-		showFatalError(fmt.Sprintf("LocalRouter failed to start:\n\nCannot create data directory:\n%v", err))
+		showFatalError(fmt.Sprintf("KeyRouter failed to start:\n\nCannot create data directory:\n%v", err))
 		os.Exit(1)
 	}
 
 	// Set up log file (GUI mode has no console)
-	logPath := filepath.Join(dataDir, "local-router.log")
+	logPath := filepath.Join(dataDir, "key-router.log")
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err == nil {
 		log.SetOutput(logFile)
 		defer logFile.Close()
 	}
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
-	log.Printf("[main] LocalRouter starting... dataDir=%s", dataDir)
+	log.Printf("[main] KeyRouter starting... dataDir=%s", dataDir)
 
-	// One-time migration from the legacy executable-adjacent ./data dir.
-	// Runs after the log is set up so migration messages are visible.
-	if execPath, err := os.Executable(); err == nil {
-		migrateLegacyData(dataDir, filepath.Join(filepath.Dir(execPath), "data"))
-	}
+	// One-time migration from legacy data locations (exe-adjacent ./data and
+	// the v0.1.x LocalRouter app-data dir). Runs after the log is set up so
+	// migration messages are visible.
+	migrateLegacyData(dataDir, legacyDataDirs(runtime.GOOS, os.Getenv, os.UserHomeDir))
 
 	// Initialize database
 	if err := db.Init(dataDir); err != nil {
 		log.Printf("[main] database initialization failed: %v", err)
-		showFatalError(fmt.Sprintf("LocalRouter failed to start:\n\nDatabase initialization failed:\n%v", err))
+		showFatalError(fmt.Sprintf("KeyRouter failed to start:\n\nDatabase initialization failed:\n%v", err))
 		os.Exit(1)
 	}
 	log.Println("[main] database initialized")
@@ -146,7 +146,7 @@ func main() {
 		// be invisible. Show a message box so a double-click launch isn't a
 		// silent failure (e.g. port already in use by another instance).
 		log.Printf("[main] server error: %v", err)
-		showFatalError(fmt.Sprintf("LocalRouter failed to start:\n\n%v\n\nCheck the log file for details.", err))
+		showFatalError(fmt.Sprintf("KeyRouter failed to start:\n\n%v\n\nCheck the log file for details.", err))
 		os.Exit(1)
 	}
 
@@ -159,7 +159,7 @@ func main() {
 	// Create desktop window with WebView2
 	w := webview.New(false) // false = no devtools
 	defer w.Destroy()
-	w.SetTitle(fmt.Sprintf("LocalRouter v%s — %s", version, url))
+	w.SetTitle(fmt.Sprintf("KeyRouter v%s — %s", version, url))
 	w.SetSize(900, 580, webview.HintNone)
 	w.Navigate(url)
 	w.Run()
@@ -178,5 +178,5 @@ func main() {
 	if err := engine.WindowManager.SaveToFile(windowsPath); err != nil {
 		log.Printf("[main] failed to persist window state on shutdown: %v", err)
 	}
-	log.Println("[main] LocalRouter stopped")
+	log.Println("[main] KeyRouter stopped")
 }
