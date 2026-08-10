@@ -191,6 +191,9 @@ type RequestMetadata struct {
 	RequestBody []byte      // Raw request body
 	Headers     http.Header // Incoming request headers for forwarding
 	TargetModel string      // Model name after route resolution
+	// ExtraParams is the model group's configured JSON object to merge into
+	// the request body (client keys overwritten).
+	ExtraParams string
 	// Ctx is the client request's context: when the downstream client
 	// disconnects, the upstream fetch is cancelled instead of stalling for
 	// the full client timeout.

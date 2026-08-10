@@ -472,6 +472,10 @@ func (h *AdminHandler) CreateModelGroup(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
+	if err := validateExtraParams(mg.ExtraParams); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	// Default new groups to enabled unless the payload explicitly said false
 	if !enabledProvided {
 		mg.Enabled = true
@@ -497,6 +501,10 @@ func (h *AdminHandler) UpdateModelGroup(c *gin.Context) {
 		return
 	}
 	mg.ID = id
+	if err := validateExtraParams(mg.ExtraParams); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	if err := db.GetDB().Save(&mg).Error; err != nil {
 		log.Printf("[admin] UpdateModelGroup save error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -568,6 +576,20 @@ func bodyHasKey(c *gin.Context, key string) bool {
 		return false
 	}
 	return true
+}
+
+// validateExtraParams ensures the model group's extra params is either empty
+// or a valid JSON object (a top-level array/scalar would break the relay
+// merge).
+func validateExtraParams(extra string) error {
+	if extra == "" {
+		return nil
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(extra), &m); err != nil {
+		return fmt.Errorf("extra_params must be a valid JSON object: %v", err)
+	}
+	return nil
 }
 
 // CreateRoute creates a new route

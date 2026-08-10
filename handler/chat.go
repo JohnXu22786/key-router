@@ -190,6 +190,7 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			RequestBody: body,
 			Headers:     c.Request.Header.Clone(),
 			TargetModel: targetModel,
+			ExtraParams: group.ExtraParams,
 			Ctx:         c.Request.Context(),
 		}
 
