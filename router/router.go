@@ -62,6 +62,7 @@ func Setup(
 		api.POST("/keys", adminHandler.CreateKey)
 		api.PUT("/keys/:id", adminHandler.UpdateKey)
 		api.DELETE("/keys/:id", adminHandler.DeleteKey)
+		api.POST("/keys/reorder", adminHandler.ReorderKeys)
 
 		// Model Groups
 		api.GET("/model-groups", adminHandler.GetModelGroups)

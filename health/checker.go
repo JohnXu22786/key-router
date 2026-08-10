@@ -16,6 +16,11 @@ import (
 // OnKeyRecovered is a callback invoked when a key recovers from disabled/rate-limited status
 type OnKeyRecovered func(keyID int64)
 
+// OnKeyFailed is a callback invoked when a probe classifies a key as
+// permanently failing (auth_failed / insufficient_quota), so the engine can
+// take it out of rotation in memory as well as in the DB.
+type OnKeyFailed func(keyID int64, reason string)
+
 // Checker periodically tests disabled/rate-limited keys for availability
 type Checker struct {
 	mu          sync.Mutex
@@ -25,6 +30,7 @@ type Checker struct {
 	running     bool
 	disabled    bool // set by Disable(): the checker must never restart
 	onRecovered OnKeyRecovered
+	onFailed    OnKeyFailed
 	// failCount tracks consecutive probe failures per key so a persistently
 	// failing key (e.g. a billable Anthropic inference probe) is not probed
 	// every interval forever.
@@ -44,6 +50,14 @@ func (c *Checker) SetOnKeyRecovered(cb OnKeyRecovered) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.onRecovered = cb
+}
+
+// SetOnKeyFailed sets a callback for when a key is classified as permanently
+// failing (auth_failed / insufficient_quota)
+func (c *Checker) SetOnKeyFailed(cb OnKeyFailed) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onFailed = cb
 }
 
 // Start begins the periodic health check loop
@@ -163,19 +177,23 @@ func (c *Checker) ResetFailCount(keyID int64) {
 	delete(c.failCount, keyID)
 }
 
+// ProbeResult classifies the outcome of a health probe. The classification
+// drives both the key's disabled_reason (user-visible feedback: 欠费, auth
+// failure, ...) and the recovery decision — recovery happens ONLY on a
+// successful probe, never on a timer.
+type ProbeResult struct {
+	Alive  bool
+	Reason string // "" when alive; otherwise one of:
+	// "auth_failed", "insufficient_quota", "rate_limited", "upstream_error"
+}
+
 // checkKey probes a single disabled/rate-limited key
 func (c *Checker) checkKey(key *model.Key) {
-	// Rate-limited keys: only check if cooldown has expired
-	if key.Status == model.KeyStatusRateLimited {
-		if key.RateLimitedUntil != nil && time.Now().Before(*key.RateLimitedUntil) {
-			return // Still in cooldown
-		}
-	}
-
-	// Disabled keys are only auto-recovered when the failure was an upstream
-	// auth error; keys disabled for any other reason (e.g. deliberately by an
-	// admin via the API) stay out of rotation.
-	if key.Status == model.KeyStatusDisabled && key.DisabledReason != "auth_failed" {
+	// Disabled keys are only auto-recovered when the disabled_reason was set
+	// by the system (auth_failed / insufficient_quota / ...). A key disabled
+	// deliberately by an admin has an empty reason (UpdateKey clears it) and
+	// stays out of rotation.
+	if key.Status == model.KeyStatusDisabled && key.DisabledReason == "" {
 		return
 	}
 
@@ -191,99 +209,137 @@ func (c *Checker) checkKey(key *model.Key) {
 	c.mu.Unlock()
 
 	// Get provider
-
-	// Get provider
 	var provider model.Provider
 	if err := db.GetDB().First(&provider, key.ProviderID).Error; err != nil {
 		return
 	}
 
-	// Test by listing models (a lightweight request)
-	alive := c.testKey(key.KeyValue, &provider)
+	// Probe with the smallest real request that proves the key works (a
+	// max_tokens=1 chat completion / minimal message). Rate-limit cooldowns
+	// are NOT waited out: the probe decides, not the timer.
+	result := c.testKey(key.KeyValue, &provider)
 
-	if !alive {
-		// Count the consecutive failure so persistently broken keys back off
-		c.mu.Lock()
-		c.failCount[key.ID]++
-		if c.failCount[key.ID] > 6 {
-			c.failCount[key.ID] = 6
-		}
-		c.mu.Unlock()
+	if !result.Alive {
+		c.recordFailure(key, result.Reason)
 		return
 	}
 
-	if alive {
-		// Reset the failure counter on success
-		c.mu.Lock()
-		delete(c.failCount, key.ID)
-		c.mu.Unlock()
+	// Reset the failure counter on success
+	c.mu.Lock()
+	delete(c.failCount, key.ID)
+	c.mu.Unlock()
 
-		// Re-check the cooldown/status from the DB before marking active: the
-		// relay may have marked this key rate-limited again (fresh cooldown)
-		// or an admin may have disabled it while our probe was in flight —
-		// wiping that state would immediately re-admit a hot/disabled key.
-		var current model.Key
-		if err := db.GetDB().First(&current, key.ID).Error; err != nil {
-			return
-		}
-		if current.Status == model.KeyStatusRateLimited &&
-			current.RateLimitedUntil != nil && time.Now().Before(*current.RateLimitedUntil) {
-			return // a fresher cooldown exists
-		}
-		if current.Status == model.KeyStatusDisabled && current.DisabledReason != "auth_failed" {
-			return // deliberately disabled while probing
-		}
+	// Re-check the status from the DB before marking active: the relay may
+	// have marked this key rate-limited again (fresh cooldown) or an admin
+	// may have disabled it while our probe was in flight — wiping that state
+	// would immediately re-admit a hot/disabled key.
+	var current model.Key
+	if err := db.GetDB().First(&current, key.ID).Error; err != nil {
+		return
+	}
+	if current.Status == model.KeyStatusDisabled && current.DisabledReason == "" {
+		return // deliberately disabled while probing
+	}
 
-		log.Printf("[health] key %d (%s...) recovered, marking active",
-			key.ID, truncateKey(key.KeyValue))
+	log.Printf("[health] key %d (%s...) recovered, marking active",
+		key.ID, truncateKey(key.KeyValue))
 
-		// Guarded update: don't clobber a fresher state written while our
-		// probe was in flight (a new cooldown or a deliberate admin disable).
-		// Deliberately-disabled keys (reason != auth_failed) are excluded;
-		// auth_failed-disabled keys are the ones we're recovering.
-		res := db.GetDB().Model(&model.Key{}).
-			Where("id = ? AND (status <> ? OR disabled_reason = ?) AND (rate_limited_until IS NULL OR rate_limited_until <= ?)",
-				key.ID, model.KeyStatusDisabled, "auth_failed", time.Now()).
-			Updates(map[string]interface{}{
-				"status":             model.KeyStatusActive,
-				"rate_limited_until": nil,
-				"disabled_reason":    "",
-			})
-		if res.Error != nil {
-			log.Printf("[health] failed to update key %d in DB: %v", key.ID, res.Error)
-			return
-		}
-		if res.RowsAffected == 0 {
-			return // state changed while probing — don't touch memory
-		}
+	// Guarded update: don't clobber a fresher state written while our
+	// probe was in flight. Deliberately-disabled keys (empty reason) are
+	// excluded; system-disabled and rate-limited keys are the ones we recover.
+	res := db.GetDB().Model(&model.Key{}).
+		Where("id = ? AND (status <> ? OR disabled_reason <> ?)",
+			key.ID, model.KeyStatusDisabled, "").
+		Updates(map[string]interface{}{
+			"status":             model.KeyStatusActive,
+			"rate_limited_until": nil,
+			"disabled_reason":    "",
+		})
+	if res.Error != nil {
+		log.Printf("[health] failed to update key %d in DB: %v", key.ID, res.Error)
+		return
+	}
+	if res.RowsAffected == 0 {
+		return // state changed while probing — don't touch memory
+	}
 
-		// Notify engine to update in-memory cache
-		if c.onRecovered != nil {
-			c.onRecovered(key.ID)
-		}
+	// Notify engine to update in-memory cache
+	if c.onRecovered != nil {
+		c.onRecovered(key.ID)
 	}
 }
 
-func (c *Checker) testKey(keyValue string, provider *model.Provider) bool {
+// recordFailure classifies a failed probe into a user-visible reason and
+// persists it as the key's disabled_reason (the UI shows 欠费/鉴权失败/...).
+// Auth/quota failures take the key out of rotation entirely (via the
+// onFailed callback so the engine's in-memory cache stays consistent);
+// rate limits and upstream errors leave the status to the relay, which
+// already handles failover.
+func (c *Checker) recordFailure(key *model.Key, reason string) {
+	if reason == "" {
+		reason = "upstream_error"
+	}
+	// Persist the reason so the UI can show WHY the key is down. Skip the
+	// write when the reason is unchanged (avoids pointless DB churn on every
+	// interval for a key that stays broken).
+	if key.DisabledReason != reason {
+		res := db.GetDB().Model(&model.Key{}).
+			Where("id = ?", key.ID).
+			Updates(map[string]interface{}{"disabled_reason": reason})
+		if res.Error != nil {
+			log.Printf("[health] failed to record failure reason for key %d: %v", key.ID, res.Error)
+		} else {
+			key.DisabledReason = reason // keep the in-memory copy in sync
+		}
+	}
+	// Auth/quota failures permanently take the key out of rotation (no point
+	// routing traffic to it); rate limits and upstream errors stay as-is so
+	// the relay's own retry/failover handles them and this probe keeps
+	// checking.
+	if (reason == "auth_failed" || reason == "insufficient_quota") && key.Status != model.KeyStatusDisabled {
+		if c.onFailed != nil {
+			c.onFailed(key.ID, reason)
+		} else {
+			// No callback wired (e.g. tests): fall back to a direct DB update.
+			res := db.GetDB().Model(&model.Key{}).
+				Where("id = ? AND status <> ?", key.ID, model.KeyStatusDisabled).
+				Updates(map[string]interface{}{
+					"status":          model.KeyStatusDisabled,
+					"disabled_reason": reason,
+				})
+			if res.Error != nil {
+				log.Printf("[health] failed to disable key %d: %v", key.ID, res.Error)
+			}
+		}
+	}
+	// Count the consecutive failure so persistently broken keys back off
+	c.mu.Lock()
+	c.failCount[key.ID]++
+	if c.failCount[key.ID] > 6 {
+		c.failCount[key.ID] = 6
+	}
+	c.mu.Unlock()
+}
+
+func (c *Checker) testKey(keyValue string, provider *model.Provider) ProbeResult {
 	baseURL := strings.TrimRight(provider.BaseURL, "/")
+
+	if provider.Type == "anthropic" {
+		return c.testAnthropic(keyValue, provider)
+	}
+
+	// OpenAI-format providers: test by listing models (a lightweight request).
 	// Relay builds upstream URLs as baseURL + "/v1/...", so the health probe
 	// must use the same convention (BaseURL without the /v1 suffix).
 	testURL := baseURL + "/v1/models"
 
 	req, err := http.NewRequest("GET", testURL, nil)
 	if err != nil {
-		return false
+		return ProbeResult{Alive: false, Reason: "upstream_error"}
 	}
 
 	req.Header.Set("Authorization", "Bearer "+keyValue)
 	req.Header.Set("Content-Type", "application/json")
-
-	if provider.Type == "anthropic" {
-		req.Header.Set("x-api-key", keyValue)
-		req.Header.Set("anthropic-version", "2023-06-01")
-		// Anthropic doesn't have /models, use a minimal message instead
-		return c.testAnthropic(keyValue, provider)
-	}
 
 	// Apply the same extra headers the relay uses, so gateways requiring
 	// them (e.g. Organization) answer the probe like real traffic
@@ -292,17 +348,14 @@ func (c *Checker) testKey(keyValue string, provider *model.Provider) bool {
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return false
+		return ProbeResult{Alive: false, Reason: "upstream_error"}
 	}
 	defer resp.Body.Close()
 
-	// Auth-based acceptance (OpenAI probe): gateways that don't implement
-	// GET /v1/models return 404 for ANY key — treating only auth/rate-limit
-	// failures and upstream 5xx as "not alive" lets valid keys recover there.
-	return testOpenAIProbe(resp)
+	return classifyOpenAIProbe(resp)
 }
 
-func (c *Checker) testAnthropic(keyValue string, provider *model.Provider) bool {
+func (c *Checker) testAnthropic(keyValue string, provider *model.Provider) ProbeResult {
 	baseURL := strings.TrimRight(provider.BaseURL, "/")
 	testURL := baseURL + "/v1/messages"
 
@@ -310,7 +363,7 @@ func (c *Checker) testAnthropic(keyValue string, provider *model.Provider) bool 
 
 	req, err := http.NewRequest("POST", testURL, strings.NewReader(body))
 	if err != nil {
-		return false
+		return ProbeResult{Alive: false, Reason: "upstream_error"}
 	}
 
 	req.Header.Set("x-api-key", keyValue)
@@ -322,31 +375,50 @@ func (c *Checker) testAnthropic(keyValue string, provider *model.Provider) bool 
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return false
+		return ProbeResult{Alive: false, Reason: "upstream_error"}
 	}
 	defer resp.Body.Close()
 
-	// Auth-based acceptance (Anthropic probe): a 400 ("model not found") or
-	// 403 (permission_error for model access — the KEY itself authenticated)
-	// still proves the key is usable; only 401 (bad key), 402 (quota
-	// exhausted), 429 (rate limit) and upstream 5xx (provider down) mean the
-	// key is not usable.
-	return resp.StatusCode < 500 &&
-		resp.StatusCode != http.StatusUnauthorized &&
-		resp.StatusCode != http.StatusPaymentRequired &&
-		resp.StatusCode != http.StatusTooManyRequests
+	return classifyAnthropicProbe(resp)
 }
 
-// testOpenAIProbe is the probe acceptance predicate for OpenAI-format
-// providers: unlike Anthropic (where 403 = model access), an OpenAI 403
-// means the key is forbidden and should stay disabled. 402 (quota
-// exhausted) is likewise not alive.
-func testOpenAIProbe(resp *http.Response) bool {
-	return resp.StatusCode < 500 &&
-		resp.StatusCode != http.StatusUnauthorized &&
-		resp.StatusCode != http.StatusForbidden &&
-		resp.StatusCode != http.StatusPaymentRequired &&
-		resp.StatusCode != http.StatusTooManyRequests
+// classifyOpenAIProbe classifies an OpenAI-format probe response.
+// A 400 ("model not found") or 404 (no /models endpoint) still proves the key
+// authenticated and is usable; only auth/quota/rate-limit failures and
+// upstream 5xx mean the key is not usable.
+func classifyOpenAIProbe(resp *http.Response) ProbeResult {
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		return ProbeResult{Alive: false, Reason: "auth_failed"}
+	case resp.StatusCode == http.StatusPaymentRequired:
+		return ProbeResult{Alive: false, Reason: "insufficient_quota"}
+	case resp.StatusCode == http.StatusTooManyRequests:
+		return ProbeResult{Alive: false, Reason: "rate_limited"}
+	case resp.StatusCode >= 500:
+		return ProbeResult{Alive: false, Reason: "upstream_error"}
+	default:
+		return ProbeResult{Alive: true}
+	}
+}
+
+// classifyAnthropicProbe classifies an Anthropic probe response.
+// A 400 ("model not found") or 403 (permission_error for model access — the
+// KEY itself authenticated) still proves the key is usable; only 401 (bad
+// key), 402 (quota exhausted), 429 (rate limit) and upstream 5xx mean the
+// key is not usable.
+func classifyAnthropicProbe(resp *http.Response) ProbeResult {
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized:
+		return ProbeResult{Alive: false, Reason: "auth_failed"}
+	case resp.StatusCode == http.StatusPaymentRequired:
+		return ProbeResult{Alive: false, Reason: "insufficient_quota"}
+	case resp.StatusCode == http.StatusTooManyRequests:
+		return ProbeResult{Alive: false, Reason: "rate_limited"}
+	case resp.StatusCode >= 500:
+		return ProbeResult{Alive: false, Reason: "upstream_error"}
+	default:
+		return ProbeResult{Alive: true}
+	}
 }
 
 // applyExtraHeaders sets the provider's configured extra headers on a request

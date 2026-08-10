@@ -133,6 +133,9 @@ func main() {
 	checker.SetOnKeyRecovered(func(keyID int64) {
 		engine.MarkKeyActive(keyID)
 	})
+	checker.SetOnKeyFailed(func(keyID int64, reason string) {
+		engine.MarkKeyDisabled(keyID, reason)
+	})
 	checker.Start()
 	log.Println("[main] health checker started")
 
