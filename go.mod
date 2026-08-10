@@ -1,4 +1,4 @@
-module local-router
+module key-router
 
 go 1.26.5
 

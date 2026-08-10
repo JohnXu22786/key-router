@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"local-router/db"
-	"local-router/model"
+	"key-router/db"
+	"key-router/model"
 )
 
 // OnKeyRecovered is a callback invoked when a key recovers from disabled/rate-limited status

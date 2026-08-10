@@ -52,7 +52,7 @@ const LayoutWithRouter: React.FC = () => {
       <Sider collapsible collapsed={collapsed} onCollapse={setCollapsed}>
         <div style={{ height: 64, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
           <Title level={4} style={{ color: '#fff', margin: 0 }}>
-            {collapsed ? 'LR' : 'LocalRouter'}
+            {collapsed ? 'KR' : 'KeyRouter'}
           </Title>
         </div>
         <Menu

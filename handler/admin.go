@@ -12,11 +12,11 @@ import (
 	"strings"
 	"time"
 
-	"local-router/billing"
-	"local-router/db"
-	"local-router/health"
-	"local-router/model"
-	"local-router/selector"
+	"key-router/billing"
+	"key-router/db"
+	"key-router/health"
+	"key-router/model"
+	"key-router/selector"
 
 	"github.com/gin-gonic/gin"
 )

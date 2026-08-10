@@ -5,8 +5,8 @@ import (
 	"sync"
 	"time"
 
-	"local-router/db"
-	"local-router/model"
+	"key-router/db"
+	"key-router/model"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"

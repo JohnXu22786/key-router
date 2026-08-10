@@ -1,15 +1,15 @@
-; LocalRouter Windows installer (NSIS)
+; KeyRouter Windows installer (NSIS)
 ; Built by .github/workflows/release.yml:
 ;   makensis /DVERSION=<tag> /DAPP_EXE=<path-to-binary> installer.nsi
-; The binary is installed as LocalRouter.exe; user data is stored in
-; %LOCALAPPDATA%\LocalRouter (never next to the executable).
+; The binary is installed as KeyRouter.exe; user data is stored in
+; %LOCALAPPDATA%\KeyRouter (never next to the executable).
 
 Unicode true
 !include "MUI2.nsh"
 
-Name "LocalRouter"
-OutFile "..\..\dist\LocalRouter-${VERSION}-windows-amd64-setup.exe"
-InstallDir "$PROGRAMFILES64\LocalRouter"
+Name "KeyRouter"
+OutFile "..\..\dist\KeyRouter-${VERSION}-windows-amd64-setup.exe"
+InstallDir "$PROGRAMFILES64\KeyRouter"
 RequestExecutionLevel admin
 
 !define MUI_ABORTWARNING
@@ -19,7 +19,7 @@ RequestExecutionLevel admin
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
-!define MUI_FINISHPAGE_RUN "$INSTDIR\LocalRouter.exe"
+!define MUI_FINISHPAGE_RUN "$INSTDIR\KeyRouter.exe"
 !insertmacro MUI_PAGE_FINISH
 
 !insertmacro MUI_UNPAGE_CONFIRM
@@ -32,32 +32,32 @@ Section "Install"
   ; go to the all-users context so every account sees them.
   SetShellVarContext all
   SetOutPath "$INSTDIR"
-  File "/oname=LocalRouter.exe" "${APP_EXE}"
+  File "/oname=KeyRouter.exe" "${APP_EXE}"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 
   ; Start menu + desktop shortcuts
-  CreateShortcut "$SMPROGRAMS\LocalRouter.lnk" "$INSTDIR\LocalRouter.exe"
-  CreateShortcut "$DESKTOP\LocalRouter.lnk" "$INSTDIR\LocalRouter.exe"
+  CreateShortcut "$SMPROGRAMS\KeyRouter.lnk" "$INSTDIR\KeyRouter.exe"
+  CreateShortcut "$DESKTOP\KeyRouter.lnk" "$INSTDIR\KeyRouter.exe"
 
   ; Add/Remove Programs entry
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\LocalRouter" "DisplayName" "LocalRouter"
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\LocalRouter" "DisplayVersion" "${VERSION}"
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\LocalRouter" "Publisher" "LocalRouter"
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\LocalRouter" "InstallLocation" "$INSTDIR"
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\LocalRouter" "UninstallString" '"$INSTDIR\Uninstall.exe"'
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\LocalRouter" "QuietUninstallString" '"$INSTDIR\Uninstall.exe" /S'
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\LocalRouter" "DisplayIcon" "$INSTDIR\LocalRouter.exe"
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\LocalRouter" "NoModify" "1"
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\LocalRouter" "NoRepair" "1"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\KeyRouter" "DisplayName" "KeyRouter"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\KeyRouter" "DisplayVersion" "${VERSION}"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\KeyRouter" "Publisher" "KeyRouter"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\KeyRouter" "InstallLocation" "$INSTDIR"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\KeyRouter" "UninstallString" '"$INSTDIR\Uninstall.exe"'
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\KeyRouter" "QuietUninstallString" '"$INSTDIR\Uninstall.exe" /S'
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\KeyRouter" "DisplayIcon" "$INSTDIR\KeyRouter.exe"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\KeyRouter" "NoModify" "1"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\KeyRouter" "NoRepair" "1"
 SectionEnd
 
 Section "Uninstall"
   SetShellVarContext all
-  Delete "$INSTDIR\LocalRouter.exe"
+  Delete "$INSTDIR\KeyRouter.exe"
   Delete "$INSTDIR\Uninstall.exe"
-  Delete "$SMPROGRAMS\LocalRouter.lnk"
-  Delete "$DESKTOP\LocalRouter.lnk"
-  DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\LocalRouter"
+  Delete "$SMPROGRAMS\KeyRouter.lnk"
+  Delete "$DESKTOP\KeyRouter.lnk"
+  DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\KeyRouter"
   RMDir "$INSTDIR"
-  ; User data in %LOCALAPPDATA%\LocalRouter is intentionally left intact.
+  ; User data in %LOCALAPPDATA%\KeyRouter is intentionally left intact.
 SectionEnd

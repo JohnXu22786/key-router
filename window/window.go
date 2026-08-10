@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"local-router/model"
+	"key-router/model"
 )
 
 // SlidingWindow implements a bucket-based sliding window counter

@@ -12,12 +12,12 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"local-router/billing"
-	"local-router/db"
-	"local-router/format"
-	"local-router/model"
-	"local-router/relay"
-	"local-router/selector"
+	"key-router/billing"
+	"key-router/db"
+	"key-router/format"
+	"key-router/model"
+	"key-router/relay"
+	"key-router/selector"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -57,7 +57,7 @@ func (h *ChatHandler) HandleModels(c *gin.Context) {
 			"id":       g.GroupID,
 			"object":   "model",
 			"created":  0,
-			"owned_by": "local-router",
+			"owned_by": "key-router",
 		})
 	}
 
