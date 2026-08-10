@@ -1133,8 +1133,8 @@ func (h *AdminHandler) ApplyUpdate(c *gin.Context) {
 
 // ActivitySeriesPoint is one (time bucket, group) value for the stacked chart.
 type ActivitySeriesPoint struct {
-	Bucket string  `json:"bucket"`  // "MM-DD" or "MM-DD HH:00"
-	Group  string  `json:"group"`   // model name / key name / app name
+	Bucket string  `json:"bucket"` // "MM-DD" or "MM-DD HH:00"
+	Group  string  `json:"group"`  // model name / key name / app name
 	Value  float64 `json:"value"`
 	IsZero bool    `json:"is_zero"` // explicit zero for chart stacking
 }
@@ -1149,19 +1149,19 @@ type ActivityGroupSummary struct {
 	Max     float64 `json:"max"`
 	Avg     float64 `json:"avg"`
 	Sum     float64 `json:"sum"`
-	Value   float64 `json:"value"`  // the last bucket's value (OpenRouter shows Value column)
+	Value   float64 `json:"value"`   // the last bucket's value (OpenRouter shows Value column)
 	Percent float64 `json:"percent"` // % of total (0-100)
 }
 
 // ActivityResponse is the payload for the Activity page (Overview/Trends/Explore).
 type ActivityResponse struct {
-	Metric   string                 `json:"metric"`
-	GroupBy  string                 `json:"group_by"`
-	Rollup   string                 `json:"rollup"`
-	Series   []ActivitySeriesPoint  `json:"series"`
-	Summary  []ActivityGroupSummary `json:"summary"`
-	Buckets  []string               `json:"buckets"` // ordered bucket labels
-	Totals   map[string]float64     `json:"totals"`  // metric totals: spend/tokens/requests/cache
+	Metric  string                 `json:"metric"`
+	GroupBy string                 `json:"group_by"`
+	Rollup  string                 `json:"rollup"`
+	Series  []ActivitySeriesPoint  `json:"series"`
+	Summary []ActivityGroupSummary `json:"summary"`
+	Buckets []string               `json:"buckets"` // ordered bucket labels
+	Totals  map[string]float64     `json:"totals"`  // metric totals: spend/tokens/requests/cache
 }
 
 // GetActivity aggregates consumption for the Activity page.

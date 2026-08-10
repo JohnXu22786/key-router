@@ -111,12 +111,12 @@ func migratePricingPer1KToPer1M(db *gorm.DB) error {
 	} {
 		oldCol, newCol := pair[0], pair[1]
 		if !hasColumn(newCol) {
-			if err := tx.Exec("ALTER TABLE pricings ADD COLUMN "+newCol+" REAL DEFAULT 0").Error; err != nil {
+			if err := tx.Exec("ALTER TABLE pricings ADD COLUMN " + newCol + " REAL DEFAULT 0").Error; err != nil {
 				tx.Rollback()
 				return err
 			}
 		}
-		if err := tx.Exec("UPDATE pricings SET "+newCol+" = "+oldCol+" * 1000").Error; err != nil {
+		if err := tx.Exec("UPDATE pricings SET " + newCol + " = " + oldCol + " * 1000").Error; err != nil {
 			tx.Rollback()
 			return err
 		}
