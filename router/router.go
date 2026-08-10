@@ -90,6 +90,8 @@ func Setup(
 		// Stats & monitoring
 		api.GET("/stats/overview", adminHandler.GetOverview)
 		api.GET("/stats/keys/:id", adminHandler.GetKeyDetail)
+		api.POST("/updates/check", adminHandler.CheckUpdate)
+		api.POST("/updates/apply", adminHandler.ApplyUpdate)
 		api.GET("/stats/consumptions", adminHandler.GetStatsConsumptions)
 		api.GET("/status/keys", adminHandler.GetKeyStatuses)
 

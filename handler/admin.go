@@ -17,6 +17,7 @@ import (
 	"key-router/health"
 	"key-router/model"
 	"key-router/selector"
+	"key-router/update"
 
 	"github.com/gin-gonic/gin"
 )
@@ -29,6 +30,7 @@ var version = "0.1.0"
 type AdminHandler struct {
 	Engine        *selector.Engine
 	HealthChecker *health.Checker
+	Updater       *update.Client
 }
 
 // NewAdminHandler creates a new admin handler
@@ -36,6 +38,7 @@ func NewAdminHandler(engine *selector.Engine, checker *health.Checker) *AdminHan
 	return &AdminHandler{
 		Engine:        engine,
 		HealthChecker: checker,
+		Updater:       update.NewClient(version),
 	}
 }
 
@@ -969,4 +972,42 @@ func (h *AdminHandler) ReloadConfig(c *gin.Context) {
 	h.Engine.Refresh()
 	h.Engine.Calculator.RefreshPricing()
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "message": "configuration reloaded"})
+}
+
+// CheckUpdate queries GitHub Releases for a newer version. Errors are
+// reported as a 200 with update_available=false + error message so the UI can
+// show them inline (a GitHub outage must not look like "no update").
+func (h *AdminHandler) CheckUpdate(c *gin.Context) {
+	info, err := h.Updater.Check()
+	if err != nil {
+		log.Printf("[admin] update check failed: %v", err)
+		c.JSON(http.StatusOK, gin.H{
+			"current_version":  h.Updater.CurrentVersion,
+			"latest_version":   h.Updater.CurrentVersion,
+			"update_available": false,
+			"error":            err.Error(),
+		})
+		return
+	}
+	c.JSON(http.StatusOK, info)
+}
+
+// ApplyUpdate downloads and applies the latest release (portable: replace
+// exe; installed: launch the installer). The app should exit shortly after.
+func (h *AdminHandler) ApplyUpdate(c *gin.Context) {
+	info, err := h.Updater.Check()
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "update check failed: " + err.Error()})
+		return
+	}
+	if !info.UpdateAvailable {
+		c.JSON(http.StatusConflict, gin.H{"error": "no update available"})
+		return
+	}
+	if err := h.Updater.Apply(info); err != nil {
+		log.Printf("[admin] update apply failed: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "applied", "install_mode": info.InstallMode})
 }

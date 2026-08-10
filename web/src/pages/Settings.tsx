@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useCallback } from 'react';
-import { Card, Form, Input, InputNumber, Button, message, Typography, Spin, Modal, Space } from 'antd';
-import { KeyOutlined, ReloadOutlined } from '@ant-design/icons';
-import { getSettings, updateSettings, reloadConfig } from '../api/client';
+import { Card, Form, Input, InputNumber, Button, message, Typography, Spin, Modal, Space, Tag, Alert } from 'antd';
+import { KeyOutlined, ReloadOutlined, DownloadOutlined, CheckCircleOutlined } from '@ant-design/icons';
+import { getSettings, updateSettings, reloadConfig, checkUpdate, applyUpdate, UpdateInfo } from '../api/client';
 
 const { Title } = Typography;
 
@@ -11,6 +11,10 @@ const Settings: React.FC = () => {
   const [saving, setSaving] = useState(false);
   const [genOpen, setGenOpen] = useState(false);
   const [pendingToken, setPendingToken] = useState('');
+  // Auto-update state
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [applying, setApplying] = useState(false);
 
   const generateToken = useCallback(() => {
     const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
@@ -84,6 +88,32 @@ const Settings: React.FC = () => {
     } catch { message.error('Failed to reload config'); }
   };
 
+  const handleCheckUpdate = async () => {
+    setChecking(true);
+    try {
+      const res = await checkUpdate();
+      setUpdateInfo(res.data);
+      if (!res.data.update_available && !res.data.error) {
+        message.success(`Already on the latest version (${res.data.latest_version})`);
+      }
+    } catch { message.error('Failed to check for updates'); }
+    finally { setChecking(false); }
+  };
+
+  const handleApplyUpdate = async () => {
+    setApplying(true);
+    try {
+      const res = await applyUpdate();
+      message.success(res.data.install_mode === 'installed'
+        ? 'Installer launched. Complete the install, then restart KeyRouter.'
+        : 'Update applied — KeyRouter will restart automatically.');
+      setUpdateInfo(null);
+    } catch (err: any) {
+      message.error(err?.response?.data?.error || 'Failed to apply update');
+    }
+    finally { setApplying(false); }
+  };
+
   if (loading) return <Spin size="large" style={{ display: 'block', margin: '100px auto' }} />;
 
   return (
@@ -109,6 +139,51 @@ const Settings: React.FC = () => {
           <Button type="primary" loading={saving} onClick={handleSave}>Save Settings</Button>
           <Button style={{ marginLeft: 12 }} onClick={handleReload}>Reload Config</Button>
         </Form>
+      </Card>
+
+      <Card
+        title="Software Update"
+        style={{ marginTop: 16 }}
+        extra={
+          <Space>
+            <Tag color={updateInfo?.update_available ? 'gold' : 'default'}>
+              {updateInfo ? `v${updateInfo.current_version}${updateInfo.update_available ? ` → v${updateInfo.latest_version}` : ' (latest)'}` : '—'}
+            </Tag>
+            <Tag>{updateInfo?.install_mode === 'installed' ? 'Installed' : 'Portable'}</Tag>
+          </Space>
+        }
+      >
+        <Space direction="vertical" style={{ width: '100%' }}>
+          <Typography.Paragraph type="secondary" style={{ marginBottom: 8 }}>
+            {updateInfo?.install_mode === 'installed'
+              ? 'This is an installed copy: updates download and launch the setup installer.'
+              : 'This is a portable copy: updates download and replace the executable directly.'}
+          </Typography.Paragraph>
+          {updateInfo?.error && (
+            <Alert type="warning" showIcon message={`Update check failed: ${updateInfo.error}`} />
+          )}
+          {updateInfo?.update_available && (
+            <Alert
+              type="info"
+              showIcon
+              message={`Version ${updateInfo.latest_version} is available`}
+              description={updateInfo.asset_name ? `Asset: ${updateInfo.asset_name}${updateInfo.asset_size ? ` (${(updateInfo.asset_size / 1024 / 1024).toFixed(1)} MB)` : ''}` : undefined}
+            />
+          )}
+          <Space>
+            <Button icon={<ReloadOutlined />} loading={checking} onClick={handleCheckUpdate}>
+              Check for Updates
+            </Button>
+            {updateInfo?.update_available && (
+              <Button type="primary" icon={<DownloadOutlined />} loading={applying} onClick={handleApplyUpdate}>
+                {updateInfo.install_mode === 'installed' ? 'Download & Launch Installer' : 'Download & Update Now'}
+              </Button>
+            )}
+            {updateInfo && !updateInfo.update_available && !updateInfo.error && (
+              <Typography.Text type="secondary"><CheckCircleOutlined /> Up to date</Typography.Text>
+            )}
+          </Space>
+        </Space>
       </Card>
 
       <Modal
