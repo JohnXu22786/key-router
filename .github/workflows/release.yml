@@ -136,7 +136,7 @@ jobs:
           choco install nsis -y --no-progress
           # choco's nsis package creates no shim; NSIS installs here:
           $env:PATH += ";C:\Program Files (x86)\NSIS"
-          makensis /DVERSION="${{ needs.version.outputs.ver }}" "/DAPP_EXE=${{ github.workspace }}\${{ matrix.asset }}" packaging/windows/installer.nsi
+          makensis /DTAG="${{ needs.version.outputs.tag }}" /DVERSION="${{ needs.version.outputs.ver }}" "/DAPP_EXE=${{ github.workspace }}\${{ matrix.asset }}" packaging/windows/installer.nsi
           Copy-Item "${{ matrix.asset }}" "dist\${{ matrix.asset }}"
 
       # ---- macOS: .app bundle + DMG ----

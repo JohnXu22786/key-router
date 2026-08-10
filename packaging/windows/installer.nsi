@@ -1,6 +1,6 @@
-; KeyRouter Windows installer (NSIS)
+; LocalRouter is the old product name — KeyRouter Windows installer (NSIS)
 ; Built by .github/workflows/release.yml:
-;   makensis /DVERSION=<tag> /DAPP_EXE=<path-to-binary> installer.nsi
+;   makensis /DTAG=<tag> /DVERSION=<numeric-version> /DAPP_EXE=<path-to-binary> installer.nsi
 ; The binary is installed as KeyRouter.exe; user data is stored in
 ; %LOCALAPPDATA%\KeyRouter (never next to the executable).
 
@@ -8,7 +8,7 @@ Unicode true
 !include "MUI2.nsh"
 
 Name "KeyRouter"
-OutFile "..\..\dist\KeyRouter-${VERSION}-windows-amd64-setup.exe"
+OutFile "..\..\dist\KeyRouter-${TAG}-windows-amd64-setup.exe"
 InstallDir "$PROGRAMFILES64\KeyRouter"
 RequestExecutionLevel admin
 
