@@ -71,15 +71,15 @@ type Key struct {
 
 // ModelGroup represents a logical group of models that share routing rules
 type ModelGroup struct {
-	ID         int64     `gorm:"primaryKey;autoIncrement" json:"id"`
-	GroupID    string    `gorm:"type:varchar(255);not null;uniqueIndex" json:"group_id"` // The model name clients send
-	Name       string    `gorm:"type:varchar(255);not null" json:"name"`
-	Enabled    bool      `json:"enabled"`                      // defaulted to true by the create handler
-	RetryTimes int       `gorm:"default:0" json:"retry_times"` // 0 = inherit global server.retry_times
+	ID         int64  `gorm:"primaryKey;autoIncrement" json:"id"`
+	GroupID    string `gorm:"type:varchar(255);not null;uniqueIndex" json:"group_id"` // The model name clients send
+	Name       string `gorm:"type:varchar(255);not null" json:"name"`
+	Enabled    bool   `json:"enabled"`                      // defaulted to true by the create handler
+	RetryTimes int    `gorm:"default:0" json:"retry_times"` // 0 = inherit global server.retry_times
 	// ExtraParams is a JSON object merged into every forwarded request body
 	// for this group. Client-sent keys are OVERWRITTEN (extra params win),
 	// so e.g. {"temperature": 0.2} pins the sampling temperature.
-	ExtraParams string `gorm:"type:text" json:"extra_params"`
+	ExtraParams string    `gorm:"type:text" json:"extra_params"`
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
 }
@@ -150,14 +150,14 @@ type Consumption struct {
 // Pricing defines per-model token pricing. Rates are per 1,000,000 tokens
 // (industry convention), stored directly in USD.
 type Pricing struct {
-	ID               int64     `gorm:"primaryKey;autoIncrement" json:"id"`
-	ModelName        string    `gorm:"type:varchar(255);not null;uniqueIndex" json:"model_name"`
-	PromptPer1M      float64   `gorm:"default:0" json:"prompt_per_1m"`
-	CompletionPer1M  float64   `gorm:"default:0" json:"completion_per_1m"`
-	CacheReadPer1M   float64   `gorm:"default:0" json:"cache_read_per_1m"`
-	CacheWritePer1M  float64   `gorm:"default:0" json:"cache_write_per_1m"`
-	CreatedAt        time.Time `json:"created_at"`
-	UpdatedAt        time.Time `json:"updated_at"`
+	ID              int64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	ModelName       string    `gorm:"type:varchar(255);not null;uniqueIndex" json:"model_name"`
+	PromptPer1M     float64   `gorm:"default:0" json:"prompt_per_1m"`
+	CompletionPer1M float64   `gorm:"default:0" json:"completion_per_1m"`
+	CacheReadPer1M  float64   `gorm:"default:0" json:"cache_read_per_1m"`
+	CacheWritePer1M float64   `gorm:"default:0" json:"cache_write_per_1m"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 // Setting stores key-value configuration
