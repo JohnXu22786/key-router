@@ -1,27 +1,36 @@
-# Dependabot is limited to security updates only.
+# Dependabot keeps Go, npm and GitHub Actions dependencies up to date.
 #
-# Version-update PRs are disabled (open-pull-requests-limit: 0): they spammed
-# this repo with major-version bumps (antd 5->6, vite 6->8, react-router-dom
-# 6->7, typescript 5->7, ...) that failed CI and drowned out real work.
-# Security fixes are still delivered by GitHub's native Dependabot
-# security-updates feature, which is enabled in the repository settings and
-# is independent of this file.
+# Version updates are grouped so the weekly schedule produces at most one PR
+# per ecosystem (minor+patch together); breaking major bumps arrive as
+# individual PRs for manual review. The CI workflow rebuilds and commits
+# web/dist on dependabot PRs, so their checks stay green.
 version: 2
 updates:
   - package-ecosystem: gomod
     directory: "/"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 0
+    open-pull-requests-limit: 5
+    groups:
+      go-deps:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   - package-ecosystem: npm
     directory: "/web"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 0
+    open-pull-requests-limit: 5
+    groups:
+      npm-deps:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 0
+    open-pull-requests-limit: 5
+    groups:
+      actions-deps:
+        patterns: ["*"]
