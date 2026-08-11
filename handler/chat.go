@@ -182,22 +182,22 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 		}
 
 		// Build request metadata with forwarded headers
-			// Route-level extra params override the model group's.
-			extraParams := route.Route.ExtraParams
-			if extraParams == "" {
-				extraParams = group.ExtraParams
-			}
-			meta := &model.RequestMetadata{
-				Format:      inputFormat,
-				Model:       reqMeta.Model,
-				Stream:      reqMeta.Stream,
-				RequestPath: c.Request.URL.Path,
-				RequestBody: body,
-				Headers:     c.Request.Header.Clone(),
-				TargetModel: targetModel,
-				ExtraParams: extraParams,
-				Ctx:         c.Request.Context(),
-			}
+		// Route-level extra params override the model group's.
+		extraParams := route.Route.ExtraParams
+		if extraParams == "" {
+			extraParams = group.ExtraParams
+		}
+		meta := &model.RequestMetadata{
+			Format:      inputFormat,
+			Model:       reqMeta.Model,
+			Stream:      reqMeta.Stream,
+			RequestPath: c.Request.URL.Path,
+			RequestBody: body,
+			Headers:     c.Request.Header.Clone(),
+			TargetModel: targetModel,
+			ExtraParams: extraParams,
+			Ctx:         c.Request.Context(),
+		}
 
 		// Forward request to upstream
 		resp, err := relay.ForwardRequest(meta, key, route.Provider)
