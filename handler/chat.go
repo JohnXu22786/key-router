@@ -406,7 +406,7 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			// (read/conversion failure) must not inflate costs or burn
 			// rate-limit quotas — the client received an error, not work.
 			if streamErr == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				consumption, err := billing.RecordConsumption(key.ID, targetModel, c.Request.Header.Get("X-App"), usage, route.Route)
+				consumption, err := billing.RecordConsumption(key.ID, targetModel, extractAppName(c.Request.Header), usage, route.Route)
 				if err != nil {
 					log.Printf("[relay] failed to record consumption for key %d: %v", key.ID, err)
 				}
@@ -488,7 +488,7 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			// performed and must not burn the key's request budgets.
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				usage := relay.ParseTokenUsage(responseBody, route.Provider.Type)
-				consumption, err := billing.RecordConsumption(key.ID, targetModel, c.Request.Header.Get("X-App"), usage, route.Route)
+				consumption, err := billing.RecordConsumption(key.ID, targetModel, extractAppName(c.Request.Header), usage, route.Route)
 				if err != nil {
 					log.Printf("[relay] failed to record consumption for key %d: %v", key.ID, err)
 				}
@@ -568,6 +568,62 @@ func writeRelayError(c *gin.Context, inputFormat string, status int, code, errTy
 			"code":    code,
 		},
 	})
+}
+
+// extractAppName derives the client app name from the request headers,
+// following the OpenRouter attribution convention with a User-Agent fallback
+// (OpenAI has no official app header; the ecosystem uses these):
+//
+//  1. X-OpenRouter-Title / X-Title  — explicit display name (highest trust)
+//  2. HTTP-Referer                 — the app's URL (hostname as app identity)
+//  3. User-Agent product token     — e.g. "claude-code", "curl", "OpenAI/Python"
+//  4. ""                           — shown as "Unknown" in the Activity page
+func extractAppName(h http.Header) string {
+	if t := strings.TrimSpace(h.Get("X-OpenRouter-Title")); t != "" {
+		return t
+	}
+	if t := strings.TrimSpace(h.Get("X-Title")); t != "" {
+		return t
+	}
+	if ref := strings.TrimSpace(h.Get("HTTP-Referer")); ref != "" {
+		// Keep the hostname (or path slug for github-style URLs).
+		ref = strings.TrimPrefix(ref, "https://")
+		ref = strings.TrimPrefix(ref, "http://")
+		ref = strings.TrimPrefix(ref, "www.")
+		if i := strings.IndexAny(ref, "/"); i > 0 {
+			ref = ref[:i]
+		}
+		if ref != "" {
+			return ref
+		}
+	}
+	if ua := h.Get("User-Agent"); ua != "" {
+		// Browser UAs start with "Mozilla/5.0 (...) ..."; skip the prefix,
+		// the platform comment, and rendering-engine tokens (AppleWebKit,
+		// KHTML, Gecko, Version) to land on the real browser (Chrome, Firefox).
+		if strings.HasPrefix(ua, "Mozilla/") {
+			if i := strings.IndexByte(ua, ')'); i >= 0 {
+				ua = ua[i+1:]
+			}
+		}
+		fields := strings.Fields(ua)
+		for _, f := range fields {
+			tok := strings.TrimSpace(f)
+			if tok == "" {
+				continue
+			}
+			name := tok
+			if i := strings.IndexAny(name, " /"); i > 0 {
+				name = name[:i]
+			}
+			switch name {
+			case "AppleWebKit", "KHTML", "Gecko", "Version", "Safari", "like":
+				continue
+			}
+			return name
+		}
+	}
+	return ""
 }
 
 // extractUpstreamError pulls a readable error message from an upstream error

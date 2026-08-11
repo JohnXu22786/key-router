@@ -24,7 +24,7 @@ export const fmtCompact = (v: number): string => {
   if (abs >= 1e12) return (v / 1e12).toFixed(2).replace(/\.?0+$/, '') + 'T';
   if (abs >= 1e9) return (v / 1e9).toFixed(2).replace(/\.?0+$/, '') + 'B';
   if (abs >= 1e6) return (v / 1e6).toFixed(2).replace(/\.?0+$/, '') + 'M';
-  if (abs >= 1e3) return (v / 1e3).toFixed(1).replace(/\.?0$/, '') + 'k';
+  if (abs >= 1e3) return (v / 1e3).toFixed(1).replace(/\.?0$/, '') + 'K';
   return String(Math.round(v));
 };
 
@@ -35,6 +35,23 @@ export const fmtUSD = (v: number): string => {
   if (abs >= 1e3) return `$${(v / 1e3).toFixed(1)}k`;
   return `$${v.toFixed(2)}`;
 };
+
+// fmtUSDInt renders integer-dollar axis ticks like OpenRouter ($0, $2, $4).
+export const fmtUSDInt = (v: number): string => {
+  if (v >= 1000) return `$${Math.round(v / 1000)}k`;
+  return `$${Math.round(v)}`;
+};
+
+// fmtDayLabel renders "MMM D" (Jul 11) for a "MM-DD" bucket string.
+export const fmtDayLabel = (mmdd: string): string => {
+  const [m, d] = mmdd.split('-').map(Number);
+  if (!m || !d) return mmdd;
+  const names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  return `${names[m - 1] || m} ${d}`;
+};
+
+// fmtTokensNoSuffix renders bare compact tokens (362M) for KPI values.
+export const fmtTokensBare = (v: number): string => fmtCompact(v);
 
 export const fmtTokens = (v: number): string => fmtCompact(v) + ' tok';
 

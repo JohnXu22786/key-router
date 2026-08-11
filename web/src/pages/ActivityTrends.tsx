@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Card, Row, Col, Typography, Spin, message, Tag, Segmented, Select, Space } from 'antd';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, LineChart, Line } from 'recharts';
 import { getActivity, ActivityResponse } from '../api/client';
-import { DateRange, fmtUSD, CHART_COLORS, OTHER_COLOR, GRID, AXIS } from './activityShared';
+import { DateRange, fmtUSD, fmtDayLabel, fmtUSDInt, CHART_COLORS, OTHER_COLOR, GRID, AXIS } from './activityShared';
 
 const { Text } = Typography;
 
@@ -80,20 +80,25 @@ const ActivityTrends: React.FC<TrendsProps> = ({ range }) => {
   const groups = Array.from(new Set(cur.series.map(s => s.group)));
   const fmt = METRICS.find(m => m.key === metric)!.fmt;
 
-  // Trending: relative change vs prev period per group.
+  // Trending: relative change vs prev period per group. "Other" is an
+  // aggregation bucket, never a real entity — exclude it (OR never shows it).
   const prevSum = new Map(prev.summary.map(s => [s.group, s.sum]));
   const allNames = new Set([...groups, ...Array.from(prevSum.keys())]);
-  const trending = Array.from(allNames).map(g => {
-    const c = cur.summary.find(s => s.group === g)?.sum ?? 0;
-    const p = prevSum.get(g) ?? 0;
-    const pct = p > 0 ? ((c - p) / p) * 100 : (c > 0 ? 100 : 0);
-    const isNew = p === 0 && c > 0;
-    // Sparkline from the current series.
-    const spark = cur.series.filter(s => s.group === g).map(s => s.value);
-    return { group: g, pct, isNew, spark };
-  }).sort((a, b) => b.pct - a.pct).slice(0, 6);
+  const trending = Array.from(allNames)
+    .filter(g => g !== 'Other')
+    .map(g => {
+      const c = cur.summary.find(s => s.group === g)?.sum ?? 0;
+      const p = prevSum.get(g) ?? 0;
+      const pct = p > 0 ? ((c - p) / p) * 100 : (c > 0 ? 100 : 0);
+      const isNew = p === 0 && c > 0;
+      // Sparkline shows the PREVIOUS period (OR renders a flat zero line for
+      // "New" rows: they had no usage in the previous period).
+      const spark = prev.series.filter(s => s.group === g).map(s => s.value);
+      return { group: g, pct, isNew, spark };
+    }).sort((a, b) => b.pct - a.pct).slice(0, 6);
 
-  const title = mode === 'model' ? 'Models' : mode === 'key' ? 'API Keys' : 'Apps';
+  const metricLabel = METRICS.find(m => m.key === metric)!.label;
+  const sectionLabel = mode === 'model' ? 'Models' : mode === 'key' ? 'API Keys' : 'Apps';
 
   return (
     <div>
@@ -113,13 +118,13 @@ const ActivityTrends: React.FC<TrendsProps> = ({ range }) => {
 
       <Row gutter={[16, 16]}>
         <Col xs={24} lg={16}>
-          <Card style={{ borderRadius: 12 }} title={`Spend over time — ${title}`}>
+          <Card style={{ borderRadius: 12 }} title={`${metricLabel} over time — ${sectionLabel}`}>
             <ResponsiveContainer width="100%" height={300}>
               <BarChart data={chartData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke={GRID} vertical={false} />
-                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={24} />
-                <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => fmt(Number(v))} />
-                <Tooltip formatter={(v: any, name: any) => [fmt(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID }} />
+                <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
+                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={24} tickFormatter={fmtDayLabel} />
+                <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => metric === 'spend' ? fmtUSDInt(Number(v)) : fmt(Number(v))} />
+                <Tooltip formatter={(v: any, name: any) => [fmt(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID }} labelFormatter={(l) => fmtDayLabel(String(l))} />
                 <Legend wrapperStyle={{ fontSize: 12 }} />
                 {groups.slice(0, 9).map((g, i) => (
                   <Bar
@@ -127,7 +132,7 @@ const ActivityTrends: React.FC<TrendsProps> = ({ range }) => {
                     dataKey={g}
                     stackId="1"
                     fill={g === 'Other' ? OTHER_COLOR : CHART_COLORS[i % CHART_COLORS.length]}
-                    maxBarSize={16}
+                    maxBarSize={12}
                     radius={i === Math.min(groups.length, 9) - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]}
                   />
                 ))}
@@ -147,13 +152,13 @@ const ActivityTrends: React.FC<TrendsProps> = ({ range }) => {
                 <div style={{ width: 44, height: 18 }}>
                   <ResponsiveContainer width="100%" height="100%">
                     <LineChart data={t.spark.map((v, i) => ({ i, v }))} margin={{ top: 1, right: 0, bottom: 0, left: 0 }}>
-                      <Line type="monotone" dataKey="v" stroke={t.isNew || t.pct >= 0 ? '#34dfaa' : '#e51d48'} strokeWidth={1.5} dot={false} isAnimationActive={false} />
+                      <Line type="monotone" dataKey="v" stroke={t.isNew || t.pct >= 0 ? '#34dfaa' : '#e1481d'} strokeWidth={1.5} dot={false} isAnimationActive={false} />
                     </LineChart>
                   </ResponsiveContainer>
                 </div>
                 {t.isNew
                   ? <Tag color="green" style={{ marginRight: 0 }}>New</Tag>
-                  : <Text style={{ color: t.pct >= 0 ? '#34dfaa' : '#e51d48', fontSize: 13, width: 52, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
+                  : <Text style={{ color: t.pct >= 0 ? '#34dfaa' : '#e1481d', fontSize: 13, width: 52, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
                       {t.pct >= 0 ? '▲' : '▼'}{Math.abs(t.pct).toFixed(0)}%
                     </Text>}
               </div>
