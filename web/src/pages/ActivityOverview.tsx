@@ -1,22 +1,35 @@
 import React, { useEffect, useState } from 'react';
-import { Card, Row, Col, Typography, Spin, message, Progress, Space } from 'antd';
+import { Card, Row, Col, Typography, Spin, message, Space } from 'antd';
 import {
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   BarChart, Bar, Legend, LineChart, Line,
 } from 'recharts';
 import { getConsumptions, getKeys, Consumption, Key } from '../api/client';
-import { DateRange, fmtUSD, fmtTokens, fmtCompact, CHART_COLORS, GRID, AXIS, fmtPercent } from './activityShared';
+import { DateRange, fmtUSD, fmtTokens, fmtCompact, fmtTokensBare, fmtDayLabel, fmtUSDInt, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtPercent } from './activityShared';
 import dayjs from 'dayjs';
 
 const { Text } = Typography;
 
 interface OverviewProps { range: DateRange; }
 
+// maskKey renders a masked key like "sk-or-v1-063...f48" (first ~12 + last 3).
+const maskKey = (raw: string): string => {
+  if (!raw) return '';
+  if (raw.length <= 16) return raw;
+  return `${raw.slice(0, 12)}...${raw.slice(-3)}`;
+};
+
+// keyValueFor is bound inside the component to the loaded keys.
+function keyValueFor(name: string): string {
+  return keysRefForOverview.get(name) || '';
+}
+let keysRefForOverview = new Map<string, string>();
+
 const deltaPct = (cur: number, prev: number) =>
   prev > 0 ? ((cur - prev) / prev) * 100 : (cur > 0 ? 100 : 0);
 
 // OR palette (from the saved page): chart-N tokens + semantic colors.
-const OTHER = '#94a3b8';
+
 
 // Build a per-day series from raw consumption records.
 function dailySeries(list: Consumption[], keyFn: (c: Consumption) => number, label = 'MM-DD') {
@@ -81,6 +94,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
         setCurList(curRes.data);
         setPrevList(prevRes.data);
         setKeys(keyRes.data);
+        keysRefForOverview = new Map(keyRes.data.map(k => [k.name || `Key #${k.id}`, k.key_value || '']));
       } catch { if (!cancelled) { setError(true); message.error('Failed to load activity'); } }
       finally { if (!cancelled) setLoading(false); }
     };
@@ -103,34 +117,69 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
 
   const cur = sum(curList);
   const prev = sum(prevList);
-  const cacheRate = (s: typeof cur) => s.tokens > 0 ? (s.cache / s.tokens) * 100 : 0;
+  // Cache hit rate = cached / total input tokens (incl. cached) — one
+  // consistent formula for both the KPI value and the sparkline.
+  const rateFor = (l: Consumption[]) => {
+    const s = sum(l);
+    const tot = s.input + s.cache;
+    return tot > 0 ? (s.cache / tot) * 100 : 0;
+  };
+  const curRate = rateFor(curList);
+  const prevRate = rateFor(prevList);
   const blended = cur.tokens > 0 ? (cur.spend / cur.tokens) * 1e6 : 0;
   const blendedPrev = prev.tokens > 0 ? (prev.spend / prev.tokens) * 1e6 : 0;
+  // Daily blended $/1M series for the sparkline.
+  const blendedSeries = dailySeries(curList, c => c.cost_usd).map((d, i) => {
+    const t = dailySeries(curList, c => c.input_tokens + c.output_tokens);
+    return { label: d.label, value: (t[i]?.value || 0) > 0 ? (d.value / (t[i]?.value || 0)) * 1e6 : 0 };
+  });
+  const rateSeries = dailySeries(curList, c => (c.cache_hit_tokens / Math.max(1, c.input_tokens + c.cache_hit_tokens)) * 100);
 
+  // deltaFor: for the Blended $/1M KPI a RISE is negative (cost per token up
+  // = bad), so the "bad" flag inverts the color.
   const kpis = [
-    { label: 'Total spend', value: fmtUSD(cur.spend), delta: deltaPct(cur.spend, prev.spend), series: dailySeries(curList, c => c.cost_usd) },
-    { label: 'Requests', value: fmtCompact(cur.requests), delta: deltaPct(cur.requests, prev.requests), series: dailySeries(curList, c => c.request_count) },
-    { label: 'Token volume', value: fmtTokens(cur.tokens), delta: deltaPct(cur.tokens, prev.tokens), series: dailySeries(curList, c => c.input_tokens + c.output_tokens) },
-    { label: 'Cache hit rate', value: fmtPercent(cacheRate(cur)), delta: deltaPct(cur.cache, prev.cache), series: dailySeries(curList, c => (c.cache_hit_tokens / Math.max(1, c.input_tokens + c.cache_hit_tokens)) * 100) },
-    { label: 'Blended $/1M', value: `$${blended.toFixed(2)}`, delta: deltaPct(blended, blendedPrev), series: dailySeries(curList, c => c.cost_usd) },
+    { label: 'Total spend', value: fmtUSD(cur.spend), delta: deltaPct(cur.spend, prev.spend), badUp: false, series: dailySeries(curList, c => c.cost_usd) },
+    { label: 'Requests', value: fmtCompact(cur.requests), delta: deltaPct(cur.requests, prev.requests), badUp: false, series: dailySeries(curList, c => c.request_count) },
+    { label: 'Token volume', value: fmtTokensBare(cur.tokens), delta: deltaPct(cur.tokens, prev.tokens), badUp: false, series: dailySeries(curList, c => c.input_tokens + c.output_tokens) },
+    { label: 'Cache hit rate', value: fmtPercent(curRate), delta: prevRate > 0 ? ((curRate - prevRate) / prevRate) * 100 : (curRate > 0 ? 100 : 0), badUp: false, series: rateSeries },
+    { label: 'Blended $/1M', value: `$${blended.toFixed(2)}`, delta: deltaPct(blended, blendedPrev), badUp: true, series: blendedSeries },
   ];
 
   // --- Charts ---
-  // Usage by model (spend, stacked bars)
+  // Usage by model (spend, stacked bars, top-5 + Other like OR)
   const modelSpend = groupTotals(curList, c => c.model_name || 'Unknown', c => c.cost_usd);
-  const topModels = modelSpend.slice(0, 6).map(([m]) => m);
-  const usageByModel = stackedData(curList, topModels, c => c.model_name || 'Unknown', c => c.cost_usd);
+  const topModels = modelSpend.slice(0, 5).map(([m]) => m);
+  const usageByModel = stackedData(curList, [...topModels, 'Other'], c => c.model_name || 'Unknown', c => c.cost_usd);
+  // Fold everything below top-5 into "Other" per bucket.
+  const otherModelSet = new Set(modelSpend.slice(5).map(([m]) => m));
+  usageByModel.forEach(row => {
+    const other = otherModelSet;
+    let sum = 0;
+    for (const [g, v] of Object.entries(row)) {
+      if (g !== 'label' && g !== 'Other' && other.has(g)) { sum += (v as number); delete (row as any)[g]; }
+    }
+    (row as any).Other = sum;
+  });
 
-  // Request volume by model (stacked bars)
+  // Request volume by model (stacked bars, top-5 + Other)
   const modelReqs = groupTotals(curList, c => c.model_name || 'Unknown', c => c.request_count);
-  const topReqModels = modelReqs.slice(0, 6).map(([m]) => m);
-  const reqByModel = stackedData(curList, topReqModels, c => c.model_name || 'Unknown', c => c.request_count);
+  const topReqModels = modelReqs.slice(0, 5).map(([m]) => m);
+  const reqByModel = stackedData(curList, [...topReqModels, 'Other'], c => c.model_name || 'Unknown', c => c.request_count);
+  const otherReqSet = new Set(modelReqs.slice(5).map(([m]) => m));
+  reqByModel.forEach(row => {
+    let sum = 0;
+    for (const [g, v] of Object.entries(row)) {
+      if (g !== 'label' && g !== 'Other' && otherReqSet.has(g)) { sum += (v as number); delete (row as any)[g]; }
+    }
+    (row as any).Other = sum;
+  });
 
   // Usage type: BYOK vs spend — we split cost into "OpenRouter Credits"
   // (the gateway's own keys) vs everything else. Simpler: total spend only.
   const usageType = dailySeries(curList, c => c.cost_usd).map(d => ({ ...d, Spend: d.value }));
 
-  // Token breakdown: Prompt / Completion / Cached (per day)
+  // Token breakdown: Prompt / Completion (no reasoning field in the model;
+  // cached tokens stay in Prompt so nothing is double-counted).
   const promptSeries = dailySeries(curList, c => c.input_tokens);
   const compSeries = dailySeries(curList, c => c.output_tokens);
   const cacheSeries = dailySeries(curList, c => c.cache_hit_tokens);
@@ -138,7 +187,6 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
     label: d.label,
     Prompt: d.value,
     Completion: compSeries[i]?.value || 0,
-    Cached: cacheSeries[i]?.value || 0,
   }));
 
   // Prompt caching: Cached vs Uncached (per day)
@@ -161,33 +209,42 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
   const topApps = appTokens.slice(0, 5);
   const maxAppTokens = topApps.length ? Math.max(...topApps.map(([, v]) => v)) : 1;
 
-  const kpiColors = ['#FF2D55', '#22c1a3', '#6d5cff', '#ffb020', '#8b5cf6'];
+  const kpiColors = ['#FF2D55', '#FF2D55', '#FF2D55', '#FF2D55', '#FF2D55'];
 
   return (
     <div>
-      {/* KPI cards with vs-prev chips + sparkline */}
+      {/* KPI cards with vs-prev chips + sparkline (OR: all sparklines #FF2D55) */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 12, marginBottom: 16 }}>
-        {kpis.map((k, i) => (
-          <Card key={k.label} size="small" style={{ borderRadius: 12 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 }}>
-              <div>
-                <Text type="secondary" style={{ fontSize: 12 }}>{k.label}</Text>
-                <div style={{ fontSize: 20, fontWeight: 700, margin: '2px 0', fontVariantNumeric: 'tabular-nums' }}>{k.value}</div>
-                <Text style={{ fontSize: 12, color: k.delta >= 0 ? '#22c1a3' : '#ff2d55' }}>
-                  {k.delta >= 0 ? '▲' : '▼'} {Math.abs(k.delta).toFixed(1)}%
-                  <Text type="secondary" style={{ fontSize: 12 }}> vs prev period</Text>
-                </Text>
+        {kpis.map((k, i) => {
+          // Blended $/1M: a rise is bad (cost per token up), so positive
+          // delta renders red; all other KPIs follow the normal polarity.
+          const rising = k.delta >= 0;
+          const negative = k.badUp ? rising : !rising;
+          return (
+            <Card key={k.label} size="small" style={{ borderRadius: 12 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 }}>
+                <div>
+                  <Text type="secondary" style={{ fontSize: 12 }}>{k.label}</Text>
+                  <div style={{ fontSize: 20, fontWeight: 700, margin: '2px 0', fontVariantNumeric: 'tabular-nums' }}>{k.value}</div>
+                  <span style={{ fontSize: 12, color: negative ? '#bf0024' : '#007544', display: 'inline-flex', alignItems: 'center', gap: 2 }}>
+                    {rising
+                      ? <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M7 17L17 7M17 7H7M17 7V17" /></svg>
+                      : <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M7 7l10 10M17 17H7M17 7v10" /></svg>}
+                    <span className="tabular-nums">{Math.abs(k.delta).toFixed(1)}%</span>
+                    <span style={{ color: '#6b7280', marginLeft: 2 }}>vs prev period</span>
+                  </span>
+                </div>
+                <div style={{ width: 84, height: 40 }}>
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={k.series} margin={{ top: 3, right: 0, bottom: 0, left: 0 }}>
+                      <Line type="monotone" dataKey="value" stroke={kpiColors[i]} strokeWidth={1.5} dot={false} isAnimationActive={false} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
               </div>
-              <div style={{ width: 84, height: 40 }}>
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={k.series} margin={{ top: 3, right: 0, bottom: 0, left: 0 }}>
-                    <Line type="monotone" dataKey="value" stroke={kpiColors[i]} strokeWidth={1.5} dot={false} isAnimationActive={false} />
-                  </LineChart>
-                </ResponsiveContainer>
-              </div>
-            </div>
-          </Card>
-        ))}
+            </Card>
+          );
+        })}
       </div>
 
       {/* Top API Keys + Top Apps */}
@@ -198,10 +255,10 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
             {topKeys.map(([name, val], idx) => (
               <div key={name} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '6px 0' }}>
                 <Text type="secondary" style={{ width: 20, textAlign: 'right' }}>{idx + 1}</Text>
-                <span style={{ width: 10, height: 10, borderRadius: '50%', background: CHART_COLORS[idx % CHART_COLORS.length] }} />
-                <div style={{ flex: 1 }}>
-                  <Text strong>{name}</Text>
-                  <Progress percent={Math.min(100, (val / maxKeyTokens) * 100)} showInfo={false} strokeColor={CHART_COLORS[idx % CHART_COLORS.length]} trailColor={GRID} size={{ height: 5 }} />
+                <span style={{ width: 10, height: 10, borderRadius: '50%', background: CHART_COLORS[idx % CHART_COLORS.length], flexShrink: 0 }} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <Text strong style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</Text>
+                  <Text type="secondary" style={{ fontSize: 12 }}>{maskKey(keyValueFor(name))}</Text>
                 </div>
                 <Text strong style={{ width: 90, textAlign: 'right' }}>{fmtTokens(val)}</Text>
               </div>
@@ -209,15 +266,15 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
           </Card>
         </Col>
         <Col xs={24} lg={12}>
-          <Card style={{ borderRadius: 12 }} title="Top Apps" extra={<Text type="secondary" style={{ fontSize: 12 }}>by tokens · X-App header</Text>}>
+          <Card style={{ borderRadius: 12 }} title="Top Apps" extra={<Text type="secondary" style={{ fontSize: 12 }}>by tokens · X-OpenRouter-Title / Referer / UA</Text>}>
             {topApps.length === 0 && <Text type="secondary">No usage in this period.</Text>}
             {topApps.map(([name, val], idx) => (
               <div key={name} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '6px 0' }}>
                 <Text type="secondary" style={{ width: 20, textAlign: 'right' }}>{idx + 1}</Text>
-                <span style={{ width: 10, height: 10, borderRadius: '50%', background: CHART_COLORS[(idx + 3) % CHART_COLORS.length] }} />
-                <div style={{ flex: 1 }}>
-                  <Text strong>{name}</Text>
-                  <Progress percent={Math.min(100, (val / maxAppTokens) * 100)} showInfo={false} strokeColor={CHART_COLORS[(idx + 3) % CHART_COLORS.length]} trailColor={GRID} size={{ height: 5 }} />
+                <span style={{ width: 10, height: 10, borderRadius: '50%', background: CHART_COLORS[(idx + 3) % CHART_COLORS.length], flexShrink: 0 }} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <Text strong style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</Text>
+                  <Text type="secondary" style={{ fontSize: 12 }}>{maskKey(keyValueFor(name))}</Text>
                 </div>
                 <Text strong style={{ width: 90, textAlign: 'right' }}>{fmtTokens(val)}</Text>
               </div>
@@ -230,13 +287,13 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
       <Card style={{ borderRadius: 12, marginBottom: 16 }} title="Usage by model">
         <ResponsiveContainer width="100%" height={260}>
           <BarChart data={usageByModel} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke={GRID} vertical={false} />
-            <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} />
-            <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => fmtUSD(Number(v))} />
-            <Tooltip formatter={(v: any, name: any) => [fmtUSD(Number(v)), String(name)]} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID }} />
+            <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
+            <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={fmtDayLabel} />
+            <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => fmtUSDInt(Number(v))} />
+            <Tooltip formatter={(v: any, name: any) => [fmtUSD(Number(v)), String(name)]} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID }} labelFormatter={(l) => fmtDayLabel(String(l))} />
             <Legend wrapperStyle={{ fontSize: 12 }} />
             {topModels.map((m, i) => (
-              <Bar key={m} dataKey={m} stackId="a" fill={m === 'Other' ? OTHER : CHART_COLORS[i % CHART_COLORS.length]} maxBarSize={22} radius={i === topModels.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]} />
+              <Bar key={m} dataKey={m} stackId="a" fill={m === 'Other' ? OTHER_COLOR : CHART_COLORS[i % CHART_COLORS.length]} maxBarSize={22} radius={i === topModels.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]} />
             ))}
           </BarChart>
         </ResponsiveContainer>
@@ -246,19 +303,13 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
         {/* Usage type — stacked area */}
         <Col xs={24} lg={12}>
           <Card style={{ borderRadius: 12 }} title="Usage type">
-            <ResponsiveContainer width="100%" height={220}>
+            <ResponsiveContainer width="100%" height={260}>
               <AreaChart data={usageType} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-                <defs>
-                  <linearGradient id="spendFill" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#8b5cf6" stopOpacity={0.4} />
-                    <stop offset="100%" stopColor="#8b5cf6" stopOpacity={0.02} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke={GRID} vertical={false} />
-                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} />
-                <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => fmtUSD(Number(v))} />
-                <Tooltip formatter={(v: any) => [fmtUSD(Number(v)), 'Spend']} contentStyle={{ borderRadius: 8 }} />
-                <Area type="monotone" dataKey="Spend" stroke="#8b5cf6" strokeWidth={2} fill="url(#spendFill)" dot={false} />
+                <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
+                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={fmtDayLabel} />
+                <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => fmtUSDInt(Number(v))} />
+                <Tooltip formatter={(v: any) => [fmtUSD(Number(v)), 'Spend']} contentStyle={{ borderRadius: 8 }} labelFormatter={(l) => fmtDayLabel(String(l))} />
+                <Area type="monotone" dataKey="Spend" stroke="#8b5cf6" strokeWidth={2} fill="#8b5cf6" fillOpacity={0.4} dot={false} />
               </AreaChart>
             </ResponsiveContainer>
           </Card>
@@ -266,15 +317,15 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
         {/* Request volume by model — stacked bars */}
         <Col xs={24} lg={12}>
           <Card style={{ borderRadius: 12 }} title="Request volume by model">
-            <ResponsiveContainer width="100%" height={220}>
+            <ResponsiveContainer width="100%" height={260}>
               <BarChart data={reqByModel} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke={GRID} vertical={false} />
-                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} />
+                <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
+                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={fmtDayLabel} />
                 <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={50} tickFormatter={(v) => fmtCompact(Number(v))} />
-                <Tooltip formatter={(v: any, name: any) => [fmtCompact(Number(v)), String(name)]} contentStyle={{ borderRadius: 8 }} />
+                <Tooltip formatter={(v: any, name: any) => [fmtCompact(Number(v)), String(name)]} contentStyle={{ borderRadius: 8 }} labelFormatter={(l) => fmtDayLabel(String(l))} />
                 <Legend wrapperStyle={{ fontSize: 12 }} />
                 {topReqModels.map((m, i) => (
-                  <Bar key={m} dataKey={m} stackId="a" fill={m === 'Other' ? OTHER : CHART_COLORS[i % CHART_COLORS.length]} maxBarSize={14} radius={i === topReqModels.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]} />
+                  <Bar key={m} dataKey={m} stackId="a" fill={m === 'Other' ? OTHER_COLOR : CHART_COLORS[i % CHART_COLORS.length]} maxBarSize={14} radius={i === topReqModels.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]} />
                 ))}
               </BarChart>
             </ResponsiveContainer>
@@ -283,19 +334,20 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
       </Row>
 
       <Row gutter={[16, 16]}>
-        {/* Token breakdown — stacked bars */}
+        {/* Token breakdown — stacked bars (Prompt + Completion; no
+            reasoning field in the data model, and no Cached here to avoid
+            double-counting cached tokens into the prompt bucket) */}
         <Col xs={24} lg={12}>
           <Card style={{ borderRadius: 12 }} title="Token breakdown">
-            <ResponsiveContainer width="100%" height={220}>
+            <ResponsiveContainer width="100%" height={260}>
               <BarChart data={tokenBreakdown} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke={GRID} vertical={false} />
-                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} />
+                <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
+                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={fmtDayLabel} />
                 <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => fmtCompact(Number(v))} />
-                <Tooltip formatter={(v: any, name: any) => [fmtTokens(Number(v)), String(name)]} contentStyle={{ borderRadius: 8 }} />
+                <Tooltip formatter={(v: any, name: any) => [fmtTokens(Number(v)), String(name)]} contentStyle={{ borderRadius: 8 }} labelFormatter={(l) => fmtDayLabel(String(l))} />
                 <Legend wrapperStyle={{ fontSize: 12 }} />
                 <Bar dataKey="Completion" stackId="a" fill="#a855f7" maxBarSize={14} />
-                <Bar dataKey="Prompt" stackId="a" fill="#3b82f6" maxBarSize={14} />
-                <Bar dataKey="Cached" stackId="a" fill="#f59e0b" maxBarSize={14} radius={[2, 2, 0, 0]} />
+                <Bar dataKey="Prompt" stackId="a" fill="#3b82f6" maxBarSize={14} radius={[2, 2, 0, 0]} />
               </BarChart>
             </ResponsiveContainer>
           </Card>
@@ -303,12 +355,12 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
         {/* Prompt token caching — stacked bars */}
         <Col xs={24} lg={12}>
           <Card style={{ borderRadius: 12 }} title="Prompt token caching">
-            <ResponsiveContainer width="100%" height={220}>
+            <ResponsiveContainer width="100%" height={260}>
               <BarChart data={caching} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke={GRID} vertical={false} />
-                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} />
+                <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
+                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={fmtDayLabel} />
                 <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => fmtCompact(Number(v))} />
-                <Tooltip formatter={(v: any, name: any) => [fmtTokens(Number(v)), String(name)]} contentStyle={{ borderRadius: 8 }} />
+                <Tooltip formatter={(v: any, name: any) => [fmtTokens(Number(v)), String(name)]} contentStyle={{ borderRadius: 8 }} labelFormatter={(l) => fmtDayLabel(String(l))} />
                 <Legend wrapperStyle={{ fontSize: 12 }} />
                 <Bar dataKey="Uncached" stackId="a" fill="#94a3b8" maxBarSize={14} />
                 <Bar dataKey="Cached" stackId="a" fill="#f59e0b" maxBarSize={14} radius={[2, 2, 0, 0]} />
