@@ -406,7 +406,7 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			// (read/conversion failure) must not inflate costs or burn
 			// rate-limit quotas — the client received an error, not work.
 			if streamErr == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				consumption, err := billing.RecordConsumption(key.ID, targetModel, extractAppName(c.Request.Header), usage, route.Route)
+				consumption, err := billing.RecordConsumption(key.ID, targetModel, extractAppName(c.Request.Header, meta.RequestBody), usage, route.Route)
 				if err != nil {
 					log.Printf("[relay] failed to record consumption for key %d: %v", key.ID, err)
 				}
@@ -488,7 +488,7 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			// performed and must not burn the key's request budgets.
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				usage := relay.ParseTokenUsage(responseBody, route.Provider.Type)
-				consumption, err := billing.RecordConsumption(key.ID, targetModel, extractAppName(c.Request.Header), usage, route.Route)
+				consumption, err := billing.RecordConsumption(key.ID, targetModel, extractAppName(c.Request.Header, meta.RequestBody), usage, route.Route)
 				if err != nil {
 					log.Printf("[relay] failed to record consumption for key %d: %v", key.ID, err)
 				}
@@ -578,13 +578,63 @@ func writeRelayError(c *gin.Context, inputFormat string, status int, code, errTy
 //  2. HTTP-Referer                 — the app's URL (hostname as app identity)
 //  3. User-Agent product token     — e.g. "claude-code", "curl", "OpenAI/Python"
 //  4. ""                           — shown as "Unknown" in the Activity page
-func extractAppName(h http.Header) string {
-	if t := strings.TrimSpace(h.Get("X-OpenRouter-Title")); t != "" {
-		return t
+func extractAppName(h http.Header, body []byte) string {
+	// 1. Explicit app-name headers (highest trust).
+	//    - OpenRouter convention: X-OpenRouter-Title / X-Title
+	//    - Anthropic ecosystem clients (Claude Code sends "x-app: cli")
+	//    - Cursor's X-Cursor-Mode marks its requests ("ask"/"agent"/"plan")
+	for _, key := range []string{"X-OpenRouter-Title", "X-Title", "x-app"} {
+		if t := strings.TrimSpace(h.Get(key)); t != "" && t != "cli" {
+			return t
+		}
 	}
-	if t := strings.TrimSpace(h.Get("X-Title")); t != "" {
-		return t
+	// x-app: cli from Claude Code is generic; the UA identifies it better.
+	if strings.TrimSpace(h.Get("x-app")) == "cli" && strings.HasPrefix(h.Get("User-Agent"), "claude-cli/") {
+		return "Claude Code"
 	}
+	if h.Get("X-Cursor-Mode") != "" {
+		return "Cursor"
+	}
+
+	// 2. Known client User-Agent prefixes (verified values from the wild):
+	//    claude-cli/2.1.96, opencode/1.14.28, Continue, codex, lobe-chat,
+	//    cursor (UA axios + X-Cursor-Mode already caught above), node-fetch.
+	if ua := h.Get("User-Agent"); ua != "" {
+		lua := strings.ToLower(ua)
+		known := []struct{ prefix, name string }{
+			{"claude-cli/", "Claude Code"},
+			{"opencode/", "OpenCode"},
+			{"codex", "Codex"},
+			{"lobe-chat", "LobeChat"},
+			{"lobehub", "LobeChat"},
+			{"cursor", "Cursor"},
+			{"continue", "Continue"},
+			{"cline", "Cline"},
+			{"cherry-studio", "Cherry Studio"},
+			{"chatbox", "Chatbox"},
+		}
+		for _, k := range known {
+			if strings.Contains(lua, k.prefix) {
+				return k.name
+			}
+		}
+	}
+
+	// 3. Codex sends app identity in the request body's client_metadata
+	//    (client_metadata.app_name). Only parse when the body looks like a
+	//    chat request — don't choke on arbitrary bodies.
+	if len(body) > 0 {
+		var meta struct {
+			ClientMetadata map[string]interface{} `json:"client_metadata"`
+		}
+		if json.Unmarshal(body, &meta) == nil && meta.ClientMetadata != nil {
+			if app, ok := meta.ClientMetadata["app_name"].(string); ok && strings.TrimSpace(app) != "" {
+				return strings.TrimSpace(app)
+			}
+		}
+	}
+
+	// 4. HTTP-Referer hostname (OpenRouter attribution).
 	if ref := strings.TrimSpace(h.Get("HTTP-Referer")); ref != "" {
 		// Keep the hostname (or path slug for github-style URLs).
 		ref = strings.TrimPrefix(ref, "https://")
@@ -597,6 +647,8 @@ func extractAppName(h http.Header) string {
 			return ref
 		}
 	}
+
+	// 5. Generic User-Agent product token fallback.
 	if ua := h.Get("User-Agent"); ua != "" {
 		// Browser UAs start with "Mozilla/5.0 (...) ..."; skip the prefix,
 		// the platform comment, and rendering-engine tokens (AppleWebKit,
