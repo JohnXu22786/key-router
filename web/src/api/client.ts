@@ -60,6 +60,11 @@ export interface Route {
   priority: number;
   weight: number;
   enabled: boolean;
+  prompt_per_1m: number;
+  completion_per_1m: number;
+  cache_read_per_1m: number;
+  cache_write_per_1m: number;
+  extra_params: string;
   model_group?: ModelGroup;
   provider?: Provider;
   created_at: string;

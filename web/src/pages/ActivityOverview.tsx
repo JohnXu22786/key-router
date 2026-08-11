@@ -18,6 +18,16 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
   const [keys, setKeys] = useState<Key[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
+  // Top API Keys: from a dedicated key-grouped fetch (declared BEFORE any
+  // conditional return — hooks order must be stable across renders).
+  const [keyGroups, setKeyGroups] = useState<ActivityResponse | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    getActivity({ metric: 'tokens', group_by: 'key', rollup: 'day', since: range.since.toISOString(), until: range.until.toISOString() })
+      .then(res => { if (!cancelled) setKeyGroups(res.data); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [range]);
 
   useEffect(() => {
     let cancelled = false;
@@ -65,14 +75,6 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
   ];
 
   // Top API Keys: from a dedicated key-grouped fetch.
-  const [keyGroups, setKeyGroups] = useState<ActivityResponse | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    getActivity({ metric: 'tokens', group_by: 'key', rollup: 'day', since: range.since.toISOString(), until: range.until.toISOString() })
-      .then(res => { if (!cancelled) setKeyGroups(res.data); })
-      .catch(() => {});
-    return () => { cancelled = true; };
-  }, [range]);
   const topKeys = (keyGroups?.summary ?? []).slice(0, 5);
   const maxKeyTokens = topKeys.length ? Math.max(...topKeys.map(k => k.sum)) : 1;
 
