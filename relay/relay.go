@@ -625,14 +625,16 @@ func completionToStreamChunk(body []byte, modelName string) []byte {
 		Choices []struct {
 			FinishReason string `json:"finish_reason"`
 			Message      *struct {
-				Content   interface{}   `json:"content"`
-				Role      string        `json:"role"`
-				ToolCalls []interface{} `json:"tool_calls"`
+				Content          interface{}   `json:"content"`
+				Role             string        `json:"role"`
+				ToolCalls        []interface{} `json:"tool_calls"`
+				ReasoningContent interface{}   `json:"reasoning_content"`
 			} `json:"message"`
 			Delta *struct {
-				Content   string        `json:"content"`
-				Role      string        `json:"role"`
-				ToolCalls []interface{} `json:"tool_calls"`
+				Content          string        `json:"content"`
+				Role             string        `json:"role"`
+				ToolCalls        []interface{} `json:"tool_calls"`
+				ReasoningContent interface{}   `json:"reasoning_content"`
 			} `json:"delta"`
 		} `json:"choices"`
 	}
@@ -643,6 +645,7 @@ func completionToStreamChunk(body []byte, modelName string) []byte {
 	content := ""
 	role := "assistant"
 	var toolCalls []interface{}
+	var reasoningContent interface{}
 	c := comp.Choices[0]
 	if c.Message != nil {
 		if s, ok := c.Message.Content.(string); ok {
@@ -662,6 +665,9 @@ func completionToStreamChunk(body []byte, modelName string) []byte {
 			role = c.Message.Role
 		}
 		toolCalls = c.Message.ToolCalls
+		// DeepSeek-style reasoning: keep it so streaming clients still see
+		// the model's thinking (e.g. opencode's reasoning_content interleave).
+		reasoningContent = c.Message.ReasoningContent
 	} else if c.Delta != nil {
 		// Body was already a single chunk object (choices[0].delta)
 		content = c.Delta.Content
@@ -669,6 +675,7 @@ func completionToStreamChunk(body []byte, modelName string) []byte {
 			role = c.Delta.Role
 		}
 		toolCalls = c.Delta.ToolCalls
+		reasoningContent = c.Delta.ReasoningContent
 	}
 
 	delta := map[string]interface{}{
@@ -677,6 +684,9 @@ func completionToStreamChunk(body []byte, modelName string) []byte {
 	}
 	if len(toolCalls) > 0 {
 		delta["tool_calls"] = toolCalls
+	}
+	if reasoningContent != nil {
+		delta["reasoning_content"] = reasoningContent
 	}
 	chunk := map[string]interface{}{
 		"id":      "chatcmpl-local",
