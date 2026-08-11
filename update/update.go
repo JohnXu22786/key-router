@@ -241,8 +241,14 @@ func (c *Client) Apply(info *UpdateInfo) error {
 		return fmt.Errorf("no update asset resolved — run a check first")
 	}
 
-	// Download to a temp file.
-	tmp, err := os.CreateTemp("", "keyrouter-update-*")
+	// Download to a temp file. Use an .exe suffix on Windows so the
+	// installer (CreateProcess requires the extension) and the portable swap
+	// script can execute it directly.
+	pattern := "keyrouter-update-*"
+	if runtime.GOOS == "windows" {
+		pattern = "keyrouter-update-*.exe"
+	}
+	tmp, err := os.CreateTemp("", pattern)
 	if err != nil {
 		return fmt.Errorf("failed to create temp file: %w", err)
 	}
