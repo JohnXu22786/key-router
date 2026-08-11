@@ -44,6 +44,15 @@ export const fmtUSD = (v: number): string => {
 
 export const fmtTokens = (v: number): string => fmtCompact(v) + ' tok';
 
+// fmtPercent renders a percentage with few digits: >=100 → integer,
+// >=1 → 1 decimal, else 2 decimals. Storage keeps full precision; only the
+// display is shortened (nobody reads 0.03149166666666666%).
+export const fmtPercent = (v: number): string => {
+  if (v >= 100) return `${Math.round(v)}%`;
+  if (v >= 1) return `${v.toFixed(1)}%`;
+  return `${v.toFixed(2)}%`;
+};
+
 export const GRID = 'rgba(120,120,140,0.14)';
 export const AXIS = 'rgba(120,120,140,0.75)';
 // OpenRouter brand palette (bright accents + deep neutral)

@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Card, Typography, Spin, message, Segmented, Select, Space, Table, Tag } from 'antd';
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
 import { getActivity, ActivityResponse, ActivityGroupSummary } from '../api/client';
-import { DateRange, fmtUSD, fmtTokens, fmtCompact, CHART_COLORS, GRID, AXIS } from './Activity';
+import { DateRange, fmtUSD, fmtTokens, fmtCompact, CHART_COLORS, GRID, AXIS, fmtPercent } from './Activity';
 
 const { Text } = Typography;
 
@@ -50,7 +50,6 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range }) => {
   const [groupBy, setGroupBy] = useState('model');
   const [rollup, setRollup] = useState('day');
   const [topN, setTopN] = useState(10);
-  const [expanded, setExpanded] = useState(false);
   const [data, setData] = useState<ActivityResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
@@ -85,11 +84,11 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range }) => {
   const fmt = fmtFor(metric);
   const chartData = toChartData(data);
   const groups = Array.from(new Set(data.series.map(s => s.group))).slice(0, topN);
-  const summary: ActivityGroupSummary[] = expanded ? data.summary : data.summary.slice(0, topN);
+  const summary: ActivityGroupSummary[] = data.summary.slice(0, topN);
 
   return (
     <div>
-      {/* Control row: metric | group by | rollup | top N | rank | expand */}
+      {/* Control row: metric | group by | rollup | top N | rank */}
       <Space wrap style={{ marginBottom: 16 }}>
         <Select value={metric} onChange={setMetric} style={{ width: 180 }}
           options={METRICS.map(m => ({ value: m.key, label: m.label }))} />
@@ -97,14 +96,9 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range }) => {
           options={GROUP_BY} />
         <Select value={rollup} onChange={setRollup} style={{ width: 120 }}
           options={ROLLUP} />
-        <Text type="secondary">Rollup: <Select value={rollup} onChange={setRollup} style={{ width: 110 }}
-          options={ROLLUP} /></Text>
         <Text type="secondary">Top <Select value={topN} onChange={setTopN} style={{ width: 80 }}
           options={[5, 10, 15, 20].map(n => ({ value: n, label: String(n) }))} /></Text>
         <Text type="secondary">Rank by: <Tag color="default">Current metric</Tag></Text>
-        <Text type="secondary" style={{ cursor: 'pointer' }} onClick={() => setExpanded(!expanded)}>
-          {expanded ? 'Collapse ▲' : 'Expand ▼'}
-        </Text>
       </Space>
 
       {/* Stacked area chart of the top groups */}

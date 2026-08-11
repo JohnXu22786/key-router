@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Table, Button, Modal, Form, Input, Switch, InputNumber, message, Space, Typography, Popconfirm, Tag, Alert } from 'antd';
+import { Table, Button, Modal, Form, Input, Switch, InputNumber, message, Space, Typography, Popconfirm, Tag } from 'antd';
 import { PlusOutlined, EditOutlined, DeleteOutlined } from '@ant-design/icons';
 import { getModelGroups, createModelGroup, updateModelGroup, deleteModelGroup, ModelGroup } from '../api/client';
 
@@ -10,7 +10,6 @@ const ModelGroups: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState<ModelGroup | null>(null);
-  const [extraError, setExtraError] = useState('');
   const [form] = Form.useForm();
 
   const fetch = async () => {
@@ -24,34 +23,12 @@ const ModelGroups: React.FC = () => {
 
   useEffect(() => { fetch(); }, []);
 
-  // JSON editor: validate as the user types, show inline feedback.
-  const onExtraChange = (v: string) => {
-    const s = (v || '').trim();
-    if (s === '') { setExtraError(''); return; }
-    try {
-      const parsed = JSON.parse(s);
-      if (Array.isArray(parsed) || typeof parsed !== 'object' || parsed === null) {
-        setExtraError('Must be a JSON object, e.g. {"temperature": 0.2}');
-      } else {
-        setExtraError('');
-      }
-    } catch (e: any) {
-      setExtraError(e.message || 'Invalid JSON');
-    }
-  };
-
   const handleSave = async () => {
     try {
       const values = await form.validateFields();
-      // Strip trailing whitespace; empty string = no extra params.
-      if (values.extra_params != null) values.extra_params = values.extra_params.trim();
-      if (values.extra_params && extraError) {
-        message.error('Fix the JSON in Extra Params first');
-        return;
-      }
       if (editing) { await updateModelGroup(editing.id, values); message.success('Updated'); }
       else { await createModelGroup(values); message.success('Created'); }
-      setModalOpen(false); setEditing(null); form.resetFields(); setExtraError(''); fetch();
+      setModalOpen(false); setEditing(null); form.resetFields(); fetch();
     } catch { message.error('Failed to save model group'); }
   };
 
@@ -66,12 +43,11 @@ const ModelGroups: React.FC = () => {
     { title: 'Name', dataIndex: 'name', key: 'name' },
     { title: 'Enabled', dataIndex: 'enabled', key: 'enabled', render: (e: boolean) => e ? <Tag color="green">Yes</Tag> : <Tag color="red">No</Tag> },
     { title: 'Retry Times', dataIndex: 'retry_times', key: 'retry_times' },
-    { title: 'Extra Params', dataIndex: 'extra_params', key: 'extra_params', ellipsis: true, render: (v: string) => v ? <Typography.Text code style={{ fontSize: 12 }}>{v}</Typography.Text> : <Typography.Text type="secondary">—</Typography.Text> },
     {
       title: 'Actions', key: 'actions', width: 80,
       render: (_: unknown, r: ModelGroup) => (
         <Space>
-          <Button icon={<EditOutlined />} size="small" onClick={() => { setEditing(r); setExtraError(''); form.setFieldsValue(r); setModalOpen(true); }} title="Edit" />
+          <Button icon={<EditOutlined />} size="small" onClick={() => { setEditing(r); form.setFieldsValue(r); setModalOpen(true); }} title="Edit" />
           <Popconfirm title="Delete?" onConfirm={() => handleDelete(r.id)}>
             <Button icon={<DeleteOutlined />} size="small" danger title="Delete" />
           </Popconfirm>
@@ -83,7 +59,7 @@ const ModelGroups: React.FC = () => {
   return (
     <div>
       <Title level={3}>Model Groups</Title>
-      <Button type="primary" icon={<PlusOutlined />} onClick={() => { setEditing(null); form.resetFields(); setExtraError(''); setModalOpen(true); }} style={{ marginBottom: 16 }}>
+      <Button type="primary" icon={<PlusOutlined />} onClick={() => { setEditing(null); form.resetFields(); setModalOpen(true); }} style={{ marginBottom: 16 }}>
         Add Model Group
       </Button>
       <Table dataSource={groups} columns={columns} rowKey="id" loading={loading} />
@@ -105,19 +81,6 @@ const ModelGroups: React.FC = () => {
               <InputNumber min={0} step={1000} style={{ width: 180 }} placeholder="16384" />
             </Form.Item>
           </Space>
-          <Form.Item
-            name="extra_params"
-            label="Extra Params (JSON object)"
-            extra='Merged into every forwarded request body. Keys you set here OVERRIDE the client-sent values — e.g. {"temperature": 0.2} pins sampling temperature.'
-          >
-            <Input.TextArea
-              rows={5}
-              placeholder={'{\n  "temperature": 0.2\n}'}
-              style={{ fontFamily: 'monospace', fontSize: 12 }}
-              onChange={(e) => onExtraChange(e.target.value)}
-            />
-          </Form.Item>
-          {extraError && <Alert type="error" showIcon message={extraError} style={{ marginBottom: 8 }} />}
         </Form>
       </Modal>
     </div>
