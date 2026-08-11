@@ -60,6 +60,8 @@ func Setup(
 
 	// Auth middleware (token read from DB per request)
 	r.Use(middleware.AuthMiddleware())
+	// Reject new requests once shutdown begins so in-flight streams finish.
+	r.Use(middleware.ShutdownMiddleware())
 
 	// Create handlers
 	chatHandler := handler.NewChatHandler(engine)

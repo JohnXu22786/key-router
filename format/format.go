@@ -848,27 +848,38 @@ func (c *OpenAIStreamConverter) Convert(event []byte) ([][]byte, error) {
 
 	switch eventType {
 	case "content_block_start":
-		// Only tool_use blocks matter; text blocks are skipped
 		cb, ok := safeMap(anth["content_block"])
-		if !ok || safeStringOrDefault(cb, "type", "") != "tool_use" {
+		if !ok {
 			return nil, ErrSkipChunk
 		}
-		blockIdx, _ := anth["index"].(float64)
-		toolIdx := c.nextToolIdx
-		c.nextToolIdx++
-		c.toolIndexes[int(blockIdx)] = toolIdx
+		switch safeStringOrDefault(cb, "type", "") {
+		case "tool_use":
+			blockIdx, _ := anth["index"].(float64)
+			toolIdx := c.nextToolIdx
+			c.nextToolIdx++
+			c.toolIndexes[int(blockIdx)] = toolIdx
 
-		tc := map[string]interface{}{
-			"index": toolIdx,
-			"id":    cb["id"],
-			"type":  "function",
-			"function": map[string]interface{}{
-				"name":      cb["name"],
-				"arguments": "",
-			},
+			tc := map[string]interface{}{
+				"index": toolIdx,
+				"id":    cb["id"],
+				"type":  "function",
+				"function": map[string]interface{}{
+					"name":      cb["name"],
+					"arguments": "",
+				},
+			}
+			b, _ := json.Marshal(c.openAIToolStreamChunk([]interface{}{tc}, ""))
+			chunks = append(chunks, b)
+		case "thinking":
+			// Anthropic thinking block: emit an assistant-role chunk; the
+			// actual thinking text arrives via thinking_delta below and is
+			// carried as delta.reasoning_content (DeepSeek/opencode style).
+			b, _ := json.Marshal(c.openAIStreamChunk("", ""))
+			chunks = append(chunks, b)
+		default:
+			// text blocks are skipped
+			return nil, ErrSkipChunk
 		}
-		b, _ := json.Marshal(c.openAIToolStreamChunk([]interface{}{tc}, ""))
-		chunks = append(chunks, b)
 
 	case "content_block_delta":
 		delta, ok := safeMap(anth["delta"])
@@ -880,6 +891,16 @@ func (c *OpenAIStreamConverter) Convert(event []byte) ([][]byte, error) {
 		case "text_delta":
 			if text, ok := safeString(delta, "text"); ok {
 				b, _ := json.Marshal(c.openAIStreamChunk(text, ""))
+				chunks = append(chunks, b)
+			}
+		case "thinking_delta":
+			// Map Anthropic's thinking stream to OpenAI reasoning_content so
+			// OpenAI-format clients (opencode, etc.) can render the chain.
+			if text, ok := safeString(delta, "thinking"); ok {
+				chunk := c.openAIStreamChunk("", "")
+				deltaMap := chunk["choices"].([]interface{})[0].(map[string]interface{})["delta"].(map[string]interface{})
+				deltaMap["reasoning_content"] = text
+				b, _ := json.Marshal(chunk)
 				chunks = append(chunks, b)
 			}
 		case "input_json_delta":

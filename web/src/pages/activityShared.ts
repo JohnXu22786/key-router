@@ -11,13 +11,20 @@ export interface DateRange {
   until: dayjs.Dayjs;
 }
 
-export const RANGES: DateRange[] = [
-  { key: 'today', label: 'Today', since: dayjs().startOf('day'), until: dayjs() },
-  { key: '24h', label: '24h', since: dayjs().subtract(24, 'hour'), until: dayjs() },
-  { key: '3d', label: '3 days', since: dayjs().subtract(3, 'day'), until: dayjs() },
-  { key: '7d', label: '7 days', since: dayjs().subtract(7, 'day'), until: dayjs() },
-  { key: '1mo', label: '1 month', since: dayjs().subtract(1, 'month'), until: dayjs() },
-];
+// makeRanges builds the date presets relative to a reference time (now).
+// The Activity page re-runs this on Refresh so the window slides to the
+// current moment instead of staying frozen at page-load time.
+export function makeRanges(now: dayjs.Dayjs): DateRange[] {
+  return [
+    { key: 'today', label: 'Today', since: now.startOf('day'), until: now },
+    { key: '24h', label: '24h', since: now.subtract(24, 'hour'), until: now },
+    { key: '3d', label: '3 days', since: now.subtract(3, 'day'), until: now },
+    { key: '7d', label: '7 days', since: now.subtract(7, 'day'), until: now },
+    { key: '1mo', label: '1 month', since: now.subtract(1, 'month'), until: now },
+  ];
+}
+
+export const RANGES = makeRanges(dayjs());
 
 export const fmtCompact = (v: number): string => {
   const abs = Math.abs(v);

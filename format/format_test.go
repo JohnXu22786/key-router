@@ -1011,3 +1011,40 @@ func TestAnthropicStreamConverter_RoleOnlyFirstChunk(t *testing.T) {
 		}
 	})
 }
+
+// TestOpenAIStreamConverterThinking verifies Anthropic thinking_delta events
+// are mapped to OpenAI reasoning_content so OpenAI-format clients (opencode)
+// can render the reasoning chain through a cross-format route.
+func TestOpenAIStreamConverterThinking(t *testing.T) {
+	conv := NewOpenAIStreamConverter()
+	conv.SetModel("deepseek-v4-flash")
+
+	// content_block_start with a thinking block ? assistant-role chunk
+	start := []byte(`{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"step 1"}}`)
+	chunks, err := conv.Convert(start)
+	if err != nil && err != ErrSkipChunk {
+		t.Fatalf("start convert: %v", err)
+	}
+	// thinking_delta ? reasoning_content chunk
+	delta := []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"because X"}}`)
+	chunks, err = conv.Convert(delta)
+	if err != nil {
+		t.Fatalf("delta convert: %v", err)
+	}
+	if len(chunks) == 0 {
+		t.Fatal("no chunks produced for thinking_delta")
+	}
+	var chunk struct {
+		Choices []struct {
+			Delta struct {
+				ReasoningContent string `json:"reasoning_content"`
+			} `json:"delta"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(chunks[0], &chunk); err != nil {
+		t.Fatalf("bad chunk json: %v", err)
+	}
+	if len(chunk.Choices) == 0 || chunk.Choices[0].Delta.ReasoningContent != "because X" {
+		t.Fatalf("reasoning_content not mapped: %s", chunks[0])
+	}
+}

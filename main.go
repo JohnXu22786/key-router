@@ -12,6 +12,7 @@ import (
 	"key-router/db"
 	"key-router/handler"
 	"key-router/health"
+	"key-router/middleware"
 	"key-router/model"
 	"key-router/router"
 	"key-router/selector"
@@ -193,6 +194,10 @@ func main() {
 
 	// When window closes, stop server
 	log.Println("[main] window closed, shutting down...")
+	// Reject NEW requests first (in-flight SSE streams are allowed to finish
+	// in the background — the agent keeps receiving its response until it
+	// completes, then the process exits).
+	middleware.BeginShutdown()
 	close(stopPersist)
 	<-persistDone
 	// Disable (not just Stop) so an in-flight async Restart from
