@@ -21,10 +21,18 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
   // Top API Keys: from a dedicated key-grouped fetch (declared BEFORE any
   // conditional return — hooks order must be stable across renders).
   const [keyGroups, setKeyGroups] = useState<ActivityResponse | null>(null);
+  const [appGroups, setAppGroups] = useState<ActivityResponse | null>(null);
   useEffect(() => {
     let cancelled = false;
     getActivity({ metric: 'tokens', group_by: 'key', rollup: 'day', since: range.since.toISOString(), until: range.until.toISOString() })
       .then(res => { if (!cancelled) setKeyGroups(res.data); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [range]);
+  useEffect(() => {
+    let cancelled = false;
+    getActivity({ metric: 'tokens', group_by: 'app', rollup: 'day', since: range.since.toISOString(), until: range.until.toISOString() })
+      .then(res => { if (!cancelled) setAppGroups(res.data); })
       .catch(() => {});
     return () => { cancelled = true; };
   }, [range]);
@@ -78,8 +86,9 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
   const topKeys = (keyGroups?.summary ?? []).slice(0, 5);
   const maxKeyTokens = topKeys.length ? Math.max(...topKeys.map(k => k.sum)) : 1;
 
-  // Top Apps: same as keys but labelled "app" — we use key name as the app.
-  const topApps = topKeys;
+  // Top Apps: grouped by the X-App request header ("" = Unknown).
+  const topApps = (appGroups?.summary ?? []).slice(0, 5);
+  const maxAppTokens = topApps.length ? Math.max(...topApps.map(k => k.sum)) : 1;
 
   const keyPrefixFor = (name: string) => {
     const k = keys.find(x => x.name === name);
@@ -151,7 +160,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
                     <Text strong>{k.group}</Text>
                   </div>
                   <Progress
-                    percent={Math.min(100, (k.sum / maxKeyTokens) * 100)}
+                    percent={Math.min(100, (k.sum / maxAppTokens) * 100)}
                     showInfo={false}
                     strokeColor={CHART_COLORS[(idx + 3) % CHART_COLORS.length]}
                     trailColor={GRID}

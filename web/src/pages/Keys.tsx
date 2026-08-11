@@ -30,6 +30,15 @@ const metricOptions = [
   { value: 'cost', label: 'Cost (USD)' },
 ];
 
+// fmtPercent renders a percentage with few digits: >=100 → integer,
+// >=1 → 1 decimal, else 2 decimals. Storage keeps full precision; only the
+// display is shortened (nobody reads 0.03149166666666666%).
+const fmtPercent = (v: number): string => {
+  if (v >= 100) return `${Math.round(v)}%`;
+  if (v >= 1) return `${v.toFixed(1)}%`;
+  return `${v.toFixed(2)}%`;
+};
+
 // Metric fields for the 5h/daily/weekly/monthly windows. The limit field
 // stores micro-USD when the metric is cost, so the UI converts on display.
 const windowTypes = [
@@ -388,7 +397,7 @@ const Keys: React.FC = () => {
                 const fmt = (v: number) => isCost ? `$${v.toFixed(2)}` : String(v);
                 return (
                   <div key={wt.key} style={{ textAlign: 'center' }}>
-                    <Progress type="circle" size={72} percent={percent} strokeWidth={8} format={(p) => <span style={{ fontSize: 16, fontWeight: 600 }}>{limit > 0 ? `${p}%` : '—'}</span>} />
+                    <Progress type="circle" size={72} percent={percent} strokeWidth={8} format={(p) => <span style={{ fontSize: 16, fontWeight: 600 }}>{limit > 0 ? fmtPercent(p ?? 0) : '—'}</span>} />
                     <div style={{ marginTop: 4 }}>
                       <Text strong>{wt.label}</Text>
                     </div>

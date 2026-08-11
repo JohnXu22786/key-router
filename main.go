@@ -10,11 +10,13 @@ import (
 	"time"
 
 	"key-router/db"
+	"key-router/handler"
 	"key-router/health"
 	"key-router/model"
 	"key-router/router"
 	"key-router/selector"
 	"key-router/server"
+	"key-router/update"
 
 	"github.com/webview/webview_go"
 )
@@ -144,6 +146,15 @@ func main() {
 	// Launch-at-login (Windows only; injected after the handler is built so
 	// the router's internal handler sees the functions).
 	router.SetAutostartHooks(autostartEnabled, setAutostartEnabled)
+
+	// Auto-update check: on startup and then daily. Detects the install mode
+	// (portable by default; installed only when the NSIS marker file exists)
+	// and stores the result for the UI notification — never applies
+	// automatically.
+	router.SetAutoCheckCallback(func(h *handler.AdminHandler) {
+		updater := update.NewClient(version)
+		updater.AutoCheck(h.SetAutoCheckInfo)
+	})
 
 	// Start HTTP server in background
 	app := server.New(r)
