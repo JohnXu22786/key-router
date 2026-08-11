@@ -5,13 +5,20 @@ import { getPricings, createPricing, updatePricing, deletePricing, getRoutes, ge
 
 const { Title } = Typography;
 
-// fmtPrice shows at least 2 decimals; if the stored value has more digits
-// (user entered them), preserve the full precision.
+// fmtPrice shows at least 2 decimals; if the value carries more digits
+// (user entered them), preserve the full precision. Uses a decimal-string
+// inspection so tiny values like 0.00025 render as $0.00025, never $0.00.
 const fmtPrice = (v: number): string => {
   if (v == null || Number.isNaN(v)) return '-';
-  const s = String(v);
-  const dot = s.indexOf('.');
-  const decimals = dot >= 0 ? s.length - dot - 1 : 0;
+  if (v === 0) return '$0.00';
+  // Convert via exponent form to avoid float tails (e.g. 0.0002500000001).
+  const s = v.toExponential();
+  const [mant, expStr] = s.split('e');
+  const exp = parseInt(expStr, 10);
+  // Decimals in exponential form = (decimals of mantissa) - exp.
+  const dot = mant.indexOf('.');
+  const mantDecimals = dot >= 0 ? mant.length - dot - 1 : 0;
+  const decimals = Math.max(0, mantDecimals - exp);
   const digits = Math.max(2, decimals);
   return `$${v.toFixed(digits)}`;
 };
