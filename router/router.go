@@ -29,6 +29,17 @@ func SetAutostartHooks(enabledFn func() bool, setFn func(bool) error) {
 	}
 }
 
+// SetAutoCheckCallback wires the auto-check result receiver into the shared
+// admin handler so the /api/updates/state endpoint can serve it.
+func SetAutoCheckCallback(fn func(*handler.AdminHandler)) {
+	sharedAdminHandler.mu.Lock()
+	h := sharedAdminHandler.h
+	sharedAdminHandler.mu.Unlock()
+	if h != nil && fn != nil {
+		fn(h)
+	}
+}
+
 // sharedAdminHandler is a package-level reference so main can inject hooks
 // after the handler is constructed inside Setup.
 var sharedAdminHandler = struct {
@@ -110,6 +121,7 @@ func Setup(
 		api.PUT("/settings", adminHandler.UpdateSettings)
 		api.GET("/autostart", adminHandler.GetAutostart)
 		api.PUT("/autostart", adminHandler.SetAutostart)
+		api.GET("/updates/state", adminHandler.GetAutoCheckState)
 
 		// Stats & monitoring
 		api.GET("/stats/overview", adminHandler.GetOverview)

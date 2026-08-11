@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"key-router/billing"
@@ -37,6 +38,29 @@ type AdminHandler struct {
 	AutostartEnabled func() bool
 	// AutostartSet enables/disables launch-at-login (nil = unsupported).
 	AutostartSet func(enabled bool) error
+	// autoCheckInfo holds the most recent auto-check result (set by
+	// AutoCheck's callback; read by GetAutoCheckState).
+	autoCheckMu   sync.Mutex
+	autoCheckInfo *update.UpdateInfo
+}
+
+// SetAutoCheckInfo stores the latest auto-check result.
+func (h *AdminHandler) SetAutoCheckInfo(info *update.UpdateInfo) {
+	h.autoCheckMu.Lock()
+	h.autoCheckInfo = info
+	h.autoCheckMu.Unlock()
+}
+
+// GetAutoCheckState returns the last auto-check result ("" when none yet).
+func (h *AdminHandler) GetAutoCheckState(c *gin.Context) {
+	h.autoCheckMu.Lock()
+	info := h.autoCheckInfo
+	h.autoCheckMu.Unlock()
+	if info == nil {
+		c.JSON(http.StatusOK, gin.H{"checked": false})
+		return
+	}
+	c.JSON(http.StatusOK, info)
 }
 
 // NewAdminHandler creates a new admin handler
@@ -472,10 +496,6 @@ func (h *AdminHandler) CreateModelGroup(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
-	if err := validateExtraParams(mg.ExtraParams); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
 	// Default new groups to enabled unless the payload explicitly said false
 	if !enabledProvided {
 		mg.Enabled = true
@@ -501,10 +521,6 @@ func (h *AdminHandler) UpdateModelGroup(c *gin.Context) {
 		return
 	}
 	mg.ID = id
-	if err := validateExtraParams(mg.ExtraParams); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
 	if err := db.GetDB().Save(&mg).Error; err != nil {
 		log.Printf("[admin] UpdateModelGroup save error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -1250,11 +1266,11 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 				return n
 			}
 			return fmt.Sprintf("Key #%d", r.KeyID)
-		default: // app = key name, falling back to id
-			if n, ok := keyNames[r.KeyID]; ok && n != "" {
-				return n
+		default: // app = the X-App request header ("" = "Unknown")
+			if r.AppName != "" {
+				return r.AppName
 			}
-			return fmt.Sprintf("Key #%d", r.KeyID)
+			return "Unknown"
 		}
 	}
 

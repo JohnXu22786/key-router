@@ -202,6 +202,34 @@ func (c *Client) SetInstallMode(mode string) {
 	c.mode = mode
 }
 
+// AutoCheck runs a check on startup and then daily. On finding a newer
+// version it calls onUpdate (the app shows a notification banner — it never
+// applies automatically). The check is best-effort: network failures are
+// logged and skipped silently.
+func (c *Client) AutoCheck(onUpdate func(info *UpdateInfo)) {
+	check := func() {
+		info, err := c.Check()
+		if err != nil {
+			log.Printf("[update] auto-check failed (will retry tomorrow): %v", err)
+			return
+		}
+		if info.UpdateAvailable {
+			log.Printf("[update] version %s available (current %s)", info.LatestVersion, info.CurrentVersion)
+			if onUpdate != nil {
+				onUpdate(info)
+			}
+		}
+	}
+	go func() {
+		check()
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			check()
+		}
+	}()
+}
+
 // Apply downloads the release asset and applies the update:
 //   - portable: replaces the running executable (via an .old rename + a
 //     small helper script that swaps and relaunches, since Windows cannot
