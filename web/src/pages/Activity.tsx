@@ -55,8 +55,26 @@ export const fmtPercent = (v: number): string => {
 
 export const GRID = 'rgba(120,120,140,0.14)';
 export const AXIS = 'rgba(120,120,140,0.75)';
-// OpenRouter brand palette (bright accents + deep neutral)
-export const CHART_COLORS = ['#6d5cff', '#22c1a3', '#ffb020', '#ff5f6d', '#3b82f6', '#a855f7', '#14b8a6', '#f59e0b', '#64748b'];
+// OpenRouter chart palette (from the saved page CSS, chart-1..chart-20)
+export const CHART_COLORS = [
+  '#0088fe', '#00c49f', '#ffbb28', '#ff8042', 'tomato', '#4682b4',
+  '#9acd32', 'orchid', '#40e0d0', '#ff69b4', '#daa520', '#7b68ee',
+  '#f08080', '#6b8e23', '#db7093', '#3cb371', '#bdb76b', 'purple',
+  '#ff4500', '#2e8b57',
+];
+export const OTHER_COLOR = '#94a3b8';
+
+// fmt3sig formats money to 3 significant figures like OpenRouter
+// ($0.00325, $0.0502, $0.478, $1.15, $3.11, $41.2k, $1.5M).
+export const fmt3sig = (v: number): string => {
+  if (v === 0) return '$0';
+  const abs = Math.abs(v);
+  if (abs >= 1e9) return `$${(v / 1e9).toPrecision(3)}B`;
+  if (abs >= 1e6) return `$${(v / 1e6).toPrecision(3)}M`;
+  if (abs >= 1e3) return `$${(v / 1e3).toPrecision(3)}k`;
+  const s = v.toPrecision(3);
+  return `$${parseFloat(s)}`;
+};
 
 export type TabKey = 'overview' | 'trends' | 'explore';
 
