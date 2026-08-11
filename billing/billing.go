@@ -106,7 +106,10 @@ func (c *Calculator) CalculateCost(modelName string, usage *model.TokenUsage) fl
 // RecordConsumption writes a consumption record to the database.
 // modelName is the model actually served (post route-target resolution); it
 // powers the Activity page's by-model aggregation.
-func RecordConsumption(keyID int64, modelName string, usage *model.TokenUsage) (*model.Consumption, error) {
+// routePrice, when non-nil and non-zero, overrides the Pricing table (each
+// route can carry its own per-1M rates — e.g. a cheap and a premium key for
+// the same model).
+func RecordConsumption(keyID int64, modelName string, usage *model.TokenUsage, routePrice *model.Route) (*model.Consumption, error) {
 	// Truncate to the LOCAL hour: time.Truncate aligns to UTC hours, which
 	// misaligns buckets in non-whole-hour-offset zones (e.g. +05:30).
 	nowT := time.Now()
@@ -114,13 +117,28 @@ func RecordConsumption(keyID int64, modelName string, usage *model.TokenUsage) (
 	cost := 0.0
 
 	if usage != nil {
-		// Try to find pricing — exact model name first, then the "*" wildcard
-		var p model.Pricing
-		exact := db.GetDB().Where("model_name = ?", modelName).First(&p).Error
-		if exact != nil {
-			db.GetDB().Where("model_name = ?", "*").First(&p)
+		// Route-level pricing wins when any of its rates is set; otherwise
+		// fall back to the Pricing table (exact model, then "*" wildcard).
+		var prompt, completion, cacheRead, cacheWrite float64
+		useRoutePrice := routePrice != nil &&
+			(routePrice.PromptPer1M != 0 || routePrice.CompletionPer1M != 0 ||
+				routePrice.CacheReadPer1M != 0 || routePrice.CacheWritePer1M != 0)
+		if useRoutePrice {
+			prompt, completion = routePrice.PromptPer1M, routePrice.CompletionPer1M
+			cacheRead, cacheWrite = routePrice.CacheReadPer1M, routePrice.CacheWritePer1M
+		} else {
+			// Try to find pricing — exact model name first, then the "*" wildcard
+			var p model.Pricing
+			exact := db.GetDB().Where("model_name = ?", modelName).First(&p).Error
+			if exact != nil {
+				db.GetDB().Where("model_name = ?", "*").First(&p)
+			}
+			if exact == nil || p.ID > 0 {
+				prompt, completion = p.PromptPer1M, p.CompletionPer1M
+				cacheRead, cacheWrite = p.CacheReadPer1M, p.CacheWritePer1M
+			}
 		}
-		if exact == nil || p.ID > 0 {
+		if prompt != 0 || completion != 0 || cacheRead != 0 || cacheWrite != 0 {
 			// OpenAI's prompt_tokens INCLUDES prompt_tokens_details.cached_tokens,
 			// so cached tokens are billed at the cache-read rate only. Anthropic's
 			// input_tokens EXCLUDES cache tokens — subtracting there would
@@ -132,10 +150,10 @@ func RecordConsumption(keyID int64, modelName string, usage *model.TokenUsage) (
 					uncachedPrompt = 0
 				}
 			}
-			cost = float64(uncachedPrompt)*p.PromptPer1M/1e6 +
-				float64(usage.CompletionTokens)*p.CompletionPer1M/1e6 +
-				float64(usage.CacheHitTokens)*p.CacheReadPer1M/1e6 +
-				float64(usage.CacheWriteTokens)*p.CacheWritePer1M/1e6
+			cost = float64(uncachedPrompt)*prompt/1e6 +
+				float64(usage.CompletionTokens)*completion/1e6 +
+				float64(usage.CacheHitTokens)*cacheRead/1e6 +
+				float64(usage.CacheWriteTokens)*cacheWrite/1e6
 		}
 	}
 

@@ -659,6 +659,10 @@ func (h *AdminHandler) CreateRoute(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "a route for this model group / provider / target model already exists"})
 		return
 	}
+	if err := validateExtraParams(r.ExtraParams); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	if err := db.GetDB().Create(&r).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -713,6 +717,10 @@ func (h *AdminHandler) UpdateRoute(c *gin.Context) {
 	}
 	if dup > 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "a route for this model group / provider / target model already exists"})
+		return
+	}
+	if err := validateExtraParams(r.ExtraParams); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 	if err := db.GetDB().Save(&r).Error; err != nil {
