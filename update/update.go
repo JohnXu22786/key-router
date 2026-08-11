@@ -252,7 +252,14 @@ func (c *Client) Apply(info *UpdateInfo) error {
 	if err != nil {
 		return fmt.Errorf("failed to create temp file: %w", err)
 	}
-	defer os.Remove(tmp.Name())
+	// Installed-mode hands the file to an installer that runs asynchronously,
+	// so the temp file must NOT be removed here; portable-mode removes it
+	// after staging. Use a deferred cleanup only for the portable path.
+	defer func() {
+		if c.installMode() != "installed" {
+			os.Remove(tmp.Name())
+		}
+	}()
 
 	req, err := http.NewRequest("GET", info.AssetURL, nil)
 	if err != nil {
@@ -292,12 +299,14 @@ func (c *Client) Apply(info *UpdateInfo) error {
 // applyInstalled launches the downloaded installer. For NSIS the /S flag
 // performs a silent install; the app itself exits when the installer starts
 // (the marker file is next to the exe, replaced by the installer).
+// The installer must run ELEVATED (Program Files is not writable otherwise),
+// so it is launched via ShellExecute with "runas" instead of exec.Command —
+// Windows will show the UAC prompt.
 func (c *Client) applyInstalled(downloadPath string, info *UpdateInfo) error {
 	if runtime.GOOS != "windows" {
 		return fmt.Errorf("installed-mode auto-update is only supported on Windows; run the %s installer manually", info.AssetName)
 	}
-	cmd := exec.Command(downloadPath, "/S")
-	if err := cmd.Start(); err != nil {
+	if err := runAsElevated(downloadPath, "/S"); err != nil {
 		return fmt.Errorf("failed to launch installer: %w", err)
 	}
 	log.Printf("[update] launched installer %s (%s)", info.AssetName, downloadPath)
