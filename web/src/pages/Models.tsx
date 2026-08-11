@@ -119,7 +119,7 @@ const Models: React.FC = () => {
   const routeColumns = [
     {
       title: '', key: 'drag', width: 40,
-      render: () => <HolderOutlined style={{ cursor: 'grab', color: '#999' }} />,
+      render: () => <span data-drag-handle style={{ cursor: 'grab', display: 'inline-block' }}><HolderOutlined style={{ color: '#999' }} /></span>,
     },
     {
       title: 'Provider', key: 'provider',
@@ -221,12 +221,11 @@ const Models: React.FC = () => {
                   const all = routes.filter(r => r.model_group_id === g.id);
                   const globalIndex = routes.indexOf(all[index!]);
                   return {
-                    draggable: true,
-                    onDragStart: (e) => drag.onDragStart(e, globalIndex),
-                    onDragOver: (e) => drag.onDragOver(e, globalIndex),
-                    onDrop: drag.onDrop,
-                    onDragEnd: drag.onDragEnd,
+                    'data-row-index': globalIndex,
                     style: { cursor: 'default', ...drag.rowStyle(globalIndex) },
+                    onPointerDown: (e: React.PointerEvent) => drag.onPointerDown(e, globalIndex),
+                    onPointerMove: drag.onPointerMove,
+                    onPointerUp: drag.onPointerUp,
                   };
                 }}
               />

@@ -1,16 +1,19 @@
 import { useRef, useState, useCallback } from 'react';
 
-// useDragSort provides HTML5 drag-and-drop reordering with a live preview:
-// while dragging, the rows slide (transform + transition) to show where the
-// dragged item will land, then the order is committed on drop.
+// useDragSort implements pointer-based drag-and-drop reordering with a live
+// preview: while dragging, the rows slide (transform + transition) to show
+// where the dragged item will land, then the order is committed on release.
+// Pointer events are used instead of HTML5 DnD because the native drag on
+// antd table rows is unreliable across browsers (drop/dragover often don't
+// fire), which made sorting appear to "not save".
 export interface DragHandlers {
-  onDragStart: (e: React.DragEvent, index: number) => void;
-  onDragOver: (e: React.DragEvent, index: number) => void;
-  onDrop: (e: React.DragEvent) => void;
-  onDragEnd: () => void;
+  onPointerDown: (e: React.PointerEvent, index: number) => void;
+  onPointerMove: (e: React.PointerEvent) => void;
+  onPointerUp: () => void;
   dragIndex: number | null;
   overIndex: number | null;
   rowStyle: (index: number) => React.CSSProperties;
+  dragging: boolean;
 }
 
 export function useDragSort<T>(
@@ -20,31 +23,51 @@ export function useDragSort<T>(
 ): DragHandlers {
   const dragIndex = useRef<number | null>(null);
   const overIndexRef = useRef<number | null>(null);
-  const committedRef = useRef(false);
   const [overIndex, setOverIndex] = useState<number | null>(null);
   const [dragging, setDragging] = useState(false);
   const itemsRef = useRef<T[]>(items);
   itemsRef.current = items;
+  const canReorderRef = useRef(canReorder);
+  canReorderRef.current = canReorder;
+  const onCommitRef = useRef(onCommit);
+  onCommitRef.current = onCommit;
 
-  const onDragStart = useCallback((e: React.DragEvent, index: number) => {
+  // Distance from the pointer to the dragged row's top, to compute the hover
+  // row from the pointer Y position.
+  const pointerY = useRef(0);
+
+  const onPointerDown = useCallback((e: React.PointerEvent, index: number) => {
+    // Only start from the drag handle (prevents hijacking row clicks and
+    // button interactions). The handle renders with data-drag-handle.
+    const target = e.target as HTMLElement;
+    if (!target.closest('[data-drag-handle]')) return;
+    e.preventDefault();
     dragIndex.current = index;
     overIndexRef.current = index;
-    committedRef.current = false;
+    setOverIndex(index);
     setDragging(true);
-    e.dataTransfer.effectAllowed = 'move';
-    e.dataTransfer.setData('text/plain', String(index));
-    requestAnimationFrame(() => setOverIndex(index));
+    pointerY.current = e.clientY;
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch { /* not critical */ }
   }, []);
 
-  const onDragOver = useCallback((e: React.DragEvent, index: number) => {
+  const onPointerMove = useCallback((e: React.PointerEvent) => {
+    if (dragIndex.current === null) return;
     e.preventDefault();
-    e.dataTransfer.dropEffect = 'move';
     const from = dragIndex.current;
-    if (from === null || from === index) return;
-    if (!canReorder(from, index)) return;
-    overIndexRef.current = index;
-    setOverIndex(index);
-  }, [canReorder]);
+    // Hit-test the row under the pointer via data-row-index attributes.
+    const el = document.elementFromPoint(e.clientX, e.clientY);
+    const tr = el?.closest?.('tr[data-row-index]') as HTMLElement | null;
+    if (!tr) return;
+    const idx = Number(tr.getAttribute('data-row-index'));
+    if (Number.isNaN(idx)) return;
+    if (idx !== from && !canReorderRef.current(from, idx)) return;
+    if (overIndexRef.current !== idx) {
+      overIndexRef.current = idx;
+      setOverIndex(idx);
+    }
+  }, []);
 
   const commit = useCallback(() => {
     const from = dragIndex.current;
@@ -53,23 +76,14 @@ export function useDragSort<T>(
     overIndexRef.current = null;
     setDragging(false);
     setOverIndex(null);
-    if (committedRef.current) return;
-    committedRef.current = true;
-    if (from === null || to === null || from === to || !canReorder(from, to)) return;
+    if (from === null || to === null || from === to || !canReorderRef.current(from, to)) return;
     const next = [...itemsRef.current];
     const [moved] = next.splice(from, 1);
     next.splice(to, 0, moved);
-    onCommit(next);
-  }, [canReorder, onCommit]);
+    onCommitRef.current(next);
+  }, []);
 
-  const onDrop = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    commit();
-  }, [commit]);
-
-  // Browsers don't always fire onDrop (esp. in antd table rows); onDragEnd
-  // always fires, so commit here too (guarded by committedRef).
-  const onDragEnd = useCallback(() => {
+  const onPointerUp = useCallback(() => {
     commit();
   }, [commit]);
 
@@ -80,7 +94,7 @@ export function useDragSort<T>(
     const from = dragIndex.current;
     const to = overIndex;
     if (index === from) {
-      return { opacity: 0.3, transition: 'transform 0.15s ease' };
+      return { opacity: 0.4, transition: 'transform 0.15s ease' };
     }
     let dy = 0;
     if (from < to && index > from && index <= to) dy = -1;
@@ -92,12 +106,12 @@ export function useDragSort<T>(
   }, [dragging, overIndex]);
 
   return {
-    onDragStart,
-    onDragOver,
-    onDrop,
-    onDragEnd,
+    onPointerDown,
+    onPointerMove,
+    onPointerUp,
     dragIndex: dragging ? dragIndex.current : null,
     overIndex,
     rowStyle,
+    dragging,
   };
 }
