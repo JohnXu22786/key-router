@@ -97,6 +97,14 @@ const ModelGroups: React.FC = () => {
           <Form.Item name="retry_times" label="Retry Times" tooltip="0 = use the global retry setting (Settings page). A positive value overrides it for this group.">
             <InputNumber min={0} max={20} />
           </Form.Item>
+          <Space size="large" wrap>
+            <Form.Item name="context_length" label="Context Length (tokens)" tooltip="Exposed via GET /v1/models so tools like opencode can auto-configure limits. 0 = unknown.">
+              <InputNumber min={0} step={1000} style={{ width: 180 }} placeholder="128000" />
+            </Form.Item>
+            <Form.Item name="max_output_tokens" label="Max Output (tokens)" tooltip="Exposed via GET /v1/models. 0 = unknown.">
+              <InputNumber min={0} step={1000} style={{ width: 180 }} placeholder="16384" />
+            </Form.Item>
+          </Space>
           <Form.Item
             name="extra_params"
             label="Extra Params (JSON object)"
