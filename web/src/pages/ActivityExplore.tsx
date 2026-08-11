@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Card, Typography, Spin, message, Segmented, Select, Space, Table, Tag, Progress } from 'antd';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
 import { getActivity, ActivityResponse, ActivityGroupSummary } from '../api/client';
-import { DateRange, fmtUSD, fmtTokens, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtPercent, fmt3sig } from './Activity';
+import { DateRange, fmtUSD, fmtTokens, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtPercent, fmt3sig } from './activityShared';
 
 const { Text } = Typography;
 

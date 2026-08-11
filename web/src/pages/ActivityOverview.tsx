@@ -5,7 +5,7 @@ import {
   BarChart, Bar, Legend, LineChart, Line,
 } from 'recharts';
 import { getConsumptions, getKeys, Consumption, Key } from '../api/client';
-import { DateRange, fmtUSD, fmtTokens, fmtCompact, CHART_COLORS, GRID, AXIS, fmtPercent } from './Activity';
+import { DateRange, fmtUSD, fmtTokens, fmtCompact, CHART_COLORS, GRID, AXIS, fmtPercent } from './activityShared';
 import dayjs from 'dayjs';
 
 const { Text } = Typography;

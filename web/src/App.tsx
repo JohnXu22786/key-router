@@ -21,6 +21,7 @@ import Pricing from './pages/Pricing';
 import Activity from './pages/Activity';
 import Settings from './pages/Settings';
 import Help from './pages/Help';
+import ErrorBoundary from './components/ErrorBoundary';
 import { getAutoCheckState } from './api/client';
 
 const { Sider, Content } = Layout;
@@ -86,13 +87,13 @@ const LayoutWithRouter: React.FC = () => {
             />
           )}
           <Routes>
-            <Route path="/" element={<Dashboard />} />
-            <Route path="/providers" element={<Providers />} />
-            <Route path="/models" element={<Models />} />
-            <Route path="/pricing" element={<Pricing />} />
-            <Route path="/settings" element={<Settings />} />
-            <Route path="/stats" element={<Activity />} />
-            <Route path="/help" element={<Help />} />
+            <Route path="/" element={<ErrorBoundary><Dashboard /></ErrorBoundary>} />
+            <Route path="/providers" element={<ErrorBoundary><Providers /></ErrorBoundary>} />
+            <Route path="/models" element={<ErrorBoundary><Models /></ErrorBoundary>} />
+            <Route path="/pricing" element={<ErrorBoundary><Pricing /></ErrorBoundary>} />
+            <Route path="/settings" element={<ErrorBoundary><Settings /></ErrorBoundary>} />
+            <Route path="/stats" element={<ErrorBoundary><Activity /></ErrorBoundary>} />
+            <Route path="/help" element={<ErrorBoundary><Help /></ErrorBoundary>} />
           </Routes>
         </Content>
       </Layout>
