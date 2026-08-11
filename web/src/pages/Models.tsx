@@ -17,8 +17,8 @@ const { Title, Text } = Typography;
 
 // Models page: Model Groups are the top-level rows; each expands to manage
 // that group's Routes (drag order = call order, per-route pricing and extra
-// params). This is the OR-style resource tree: ModelGroup 1—N Route, and a
-// Route references one Provider (many-to-many via routes).
+// params). Both "Add Model Group" and "Add Route" live at the top of the
+// page (blue buttons), matching the original per-page layout.
 const Models: React.FC = () => {
   const [groups, setGroups] = useState<ModelGroup[]>([]);
   const [routes, setRoutes] = useState<Route[]>([]);
@@ -155,27 +155,23 @@ const Models: React.FC = () => {
     },
   ];
 
-  const groupColumns = [
-    { title: 'Group ID', dataIndex: 'group_id', key: 'group_id', render: (g: string) => <Tag color="blue">{g}</Tag> },
-    { title: 'Name', dataIndex: 'name', key: 'name' },
-    { title: 'Context', key: 'ctx', render: (_: unknown, g: ModelGroup) => g.context_length ? <Tag>{g.context_length.toLocaleString()}</Tag> : <Tag>?</Tag> },
-    { title: 'Enabled', dataIndex: 'enabled', key: 'enabled', render: (e: boolean) => e ? <Tag color="green">Yes</Tag> : <Tag color="red">No</Tag> },
-    {
-      title: 'Routes', key: 'routeCount',
-      render: (_: unknown, g: ModelGroup) => <Tag>{routes.filter(r => r.model_group_id === g.id).length}</Tag>,
-    },
-    {
-      title: 'Actions', key: 'actions', width: 80,
-      render: (_: unknown, g: ModelGroup) => (
-        <Space>
-          <Button icon={<EditOutlined />} size="small" onClick={() => { setEditingGroup(g); groupForm.setFieldsValue(g); setGroupModal(true); }} title="Edit" />
-          <Popconfirm title="Delete (removes its routes)?" onConfirm={() => deleteGroup(g.id)}>
-            <Button icon={<DeleteOutlined />} size="small" danger title="Delete" />
-          </Popconfirm>
-        </Space>
-      ),
-    },
-  ];
+  // ---- Top-level toolbar: BOTH add buttons live here (per-page style) ----
+  const openAddRoute = () => {
+    setEditingRoute(null);
+    routeForm.resetFields();
+    // Pre-select the first expanded group when there is one, else the first group.
+    const firstId = activeGroups.length
+      ? parseInt(activeGroups[0], 10)
+      : (groups[0]?.id || undefined);
+    routeForm.setFieldsValue({ model_group_id: firstId, enabled: true });
+    setRouteModal(true);
+  };
+
+  const openAddGroup = () => {
+    setEditingGroup(null);
+    groupForm.resetFields();
+    setGroupModal(true);
+  };
 
   return (
     <div>
@@ -185,35 +181,48 @@ const Models: React.FC = () => {
         routes — drag to reorder (drag order IS the call order), set per-route pricing and
         extra params.
       </Typography.Paragraph>
-      <Button type="primary" icon={<PlusOutlined />} onClick={() => { setEditingGroup(null); groupForm.resetFields(); setGroupModal(true); }} style={{ marginBottom: 16 }}>
-        Add Model Group
-      </Button>
+      <Space style={{ marginBottom: 16 }}>
+        <Button type="primary" icon={<PlusOutlined />} onClick={openAddGroup}>Add Model Group</Button>
+        <Button type="primary" icon={<PlusOutlined />} onClick={openAddRoute}>Add Route</Button>
+      </Space>
 
-      <Table
-        dataSource={groups}
-        columns={groupColumns}
-        rowKey="id"
-        loading={loading}
-        expandable={{
-          expandedRowKeys: activeGroups,
-          onExpandedRowsChange: (keys: any) => setActiveGroups(keys.map(String)),
-          expandedRowRender: (g) => (
-            <div style={{ padding: '0 8px' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-                <Text strong>Routes for {g.group_id}</Text>
-                <Button
-                  size="small" type="primary" icon={<PlusOutlined />}
-                  onClick={() => { setEditingRoute(null); routeForm.resetFields(); routeForm.setFieldsValue({ model_group_id: g.id, enabled: true }); setRouteModal(true); }}
-                >
-                  Add Route
-                </Button>
-              </div>
+      {groups.length === 0 && !loading && (
+        <Typography.Text type="secondary">No model groups yet. Add a model group to get started.</Typography.Text>
+      )}
+
+      {groups.map(g => (
+        <Collapse
+          key={g.id}
+          style={{ marginBottom: 12 }}
+          activeKey={activeGroups}
+          onChange={(keys: any) => setActiveGroups(Array.isArray(keys) ? keys.map(String) : [keys].map(String))}
+          items={[{
+            key: String(g.id),
+            label: (
+              <Space>
+                <Tag color="blue">{g.group_id}</Tag>
+                <Text strong>{g.name}</Text>
+                {g.context_length > 0 && <Text type="secondary" style={{ fontSize: 12 }}>{g.context_length.toLocaleString()} ctx</Text>}
+                <Tag>{g.enabled ? 'enabled' : 'disabled'}</Tag>
+                <Text type="secondary" style={{ fontSize: 12 }}>{routes.filter(r => r.model_group_id === g.id).length} route{routes.filter(r => r.model_group_id === g.id).length === 1 ? '' : 's'}</Text>
+              </Space>
+            ),
+            extra: (
+              <Space>
+                <Button size="small" icon={<EditOutlined />} onClick={(e) => { e.stopPropagation(); setEditingGroup(g); groupForm.setFieldsValue(g); setGroupModal(true); }} title="Edit group" />
+                <Popconfirm title="Delete (removes its routes)?" onConfirm={() => deleteGroup(g.id)}>
+                  <Button size="small" danger icon={<DeleteOutlined />} onClick={(e) => e.stopPropagation()} title="Delete group" />
+                </Popconfirm>
+              </Space>
+            ),
+            children: (
               <Table
                 dataSource={routes.filter(r => r.model_group_id === g.id)}
                 columns={routeColumns}
                 rowKey="id"
                 size="small"
                 pagination={false}
+                locale={{ emptyText: 'No routes yet — use the Add Route button above.' }}
                 onRow={(_, index) => {
                   const all = routes.filter(r => r.model_group_id === g.id);
                   return {
@@ -225,10 +234,10 @@ const Models: React.FC = () => {
                   };
                 }}
               />
-            </div>
-          ),
-        }}
-      />
+            ),
+          }]}
+        />
+      ))}
 
       {/* Model Group modal */}
       <Modal title={editingGroup ? 'Edit Model Group' : 'Add Model Group'} open={groupModal} onOk={saveGroup} onCancel={() => { setGroupModal(false); setEditingGroup(null); }} width={560}>
@@ -242,7 +251,7 @@ const Models: React.FC = () => {
             <InputNumber min={0} max={20} />
           </Form.Item>
           <Space size="large" wrap>
-            <Form.Item name="context_length" label="Context Length (tokens)" tooltip="Exposed via GET /v1/models so tools like opencode can auto-configure limits. 0 = unknown.">
+            <Form.Item name="context_length" label="Context Length (tokens)" tooltip="Exposed via GET /v1/models. 0 = unknown.">
               <InputNumber min={0} step={1000} style={{ width: 180 }} placeholder="128000" />
             </Form.Item>
             <Form.Item name="max_output_tokens" label="Max Output (tokens)" tooltip="Exposed via GET /v1/models. 0 = unknown.">

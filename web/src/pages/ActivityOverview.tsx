@@ -1,41 +1,68 @@
 import React, { useEffect, useState } from 'react';
-import { Card, Row, Col, Typography, Spin, message, Progress, Space, Button } from 'antd';
-import { getActivity, getKeys, Key, ActivityResponse } from '../api/client';
-import { DateRange, fmtUSD, fmtTokens, fmtCompact, CHART_COLORS, GRID, AXIS } from './Activity';
+import { Card, Row, Col, Typography, Spin, message, Progress, Space } from 'antd';
+import {
+  AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
+  BarChart, Bar, Legend, LineChart, Line,
+} from 'recharts';
+import { getConsumptions, getKeys, Consumption, Key } from '../api/client';
+import { DateRange, fmtUSD, fmtTokens, fmtCompact, CHART_COLORS, GRID, AXIS, fmtPercent } from './Activity';
 import dayjs from 'dayjs';
 
 const { Text } = Typography;
 
 interface OverviewProps { range: DateRange; }
 
-// KPI delta: current period vs the previous equal-length period.
 const deltaPct = (cur: number, prev: number) =>
   prev > 0 ? ((cur - prev) / prev) * 100 : (cur > 0 ? 100 : 0);
 
+// OR palette (from the saved page): chart-N tokens + semantic colors.
+const OTHER = '#94a3b8';
+
+// Build a per-day series from raw consumption records.
+function dailySeries(list: Consumption[], keyFn: (c: Consumption) => number, label = 'MM-DD') {
+  const acc = new Map<string, { label: string; sort: string; value: number }>();
+  for (const c of list) {
+    const d = dayjs(c.hour_bucket).format('YYYY-MM-DD');
+    const row = acc.get(d) || { label: dayjs(c.hour_bucket).format(label), sort: d, value: 0 };
+    row.value += keyFn(c);
+    acc.set(d, row);
+  }
+  return [...acc.values()].sort((a, b) => a.sort.localeCompare(b.sort));
+}
+
+// Group total by a key, returning sorted desc.
+function groupTotals(list: Consumption[], keyFn: (c: Consumption) => string, valFn: (c: Consumption) => number) {
+  const acc = new Map<string, number>();
+  for (const c of list) {
+    acc.set(keyFn(c), (acc.get(keyFn(c)) || 0) + valFn(c));
+  }
+  return [...acc.entries()].sort((a, b) => b[1] - a[1]);
+}
+
+// Stacked chart data: bucket -> { label, [group]: value }.
+function stackedData(list: Consumption[], groups: string[], keyFn: (c: Consumption) => string, valFn: (c: Consumption) => number) {
+  const bucket = (c: Consumption) => dayjs(c.hour_bucket).format('YYYY-MM-DD');
+  const label = (c: Consumption) => dayjs(c.hour_bucket).format('MM-DD');
+  const acc = new Map<string, Record<string, any>>();
+  for (const c of list) {
+    const b = bucket(c);
+    if (!acc.has(b)) {
+      const row: Record<string, any> = { label: label(c), sort: b };
+      groups.forEach(g => { row[g] = 0; });
+      acc.set(b, row);
+    }
+    const row = acc.get(b)!;
+    row[keyFn(c)] += valFn(c);
+  }
+  return [...acc.values()].sort((a, b) => a.sort.localeCompare(b.sort));
+}
+
 const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
-  const [cur, setCur] = useState<ActivityResponse | null>(null);
-  const [prev, setPrev] = useState<ActivityResponse | null>(null);
+  const [curList, setCurList] = useState<Consumption[]>([]);
+  const [prevList, setPrevList] = useState<Consumption[]>([]);
   const [keys, setKeys] = useState<Key[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
-  // Top API Keys: from a dedicated key-grouped fetch (declared BEFORE any
-  // conditional return — hooks order must be stable across renders).
-  const [keyGroups, setKeyGroups] = useState<ActivityResponse | null>(null);
-  const [appGroups, setAppGroups] = useState<ActivityResponse | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    getActivity({ metric: 'tokens', group_by: 'key', rollup: 'day', since: range.since.toISOString(), until: range.until.toISOString() })
-      .then(res => { if (!cancelled) setKeyGroups(res.data); })
-      .catch(() => {});
-    return () => { cancelled = true; };
-  }, [range]);
-  useEffect(() => {
-    let cancelled = false;
-    getActivity({ metric: 'tokens', group_by: 'app', rollup: 'day', since: range.since.toISOString(), until: range.until.toISOString() })
-      .then(res => { if (!cancelled) setAppGroups(res.data); })
-      .catch(() => {});
-    return () => { cancelled = true; };
-  }, [range]);
 
   useEffect(() => {
     let cancelled = false;
@@ -46,13 +73,13 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
         const len = range.until.diff(range.since, 'millisecond');
         const prevSince = range.since.subtract(len, 'millisecond');
         const [curRes, prevRes, keyRes] = await Promise.all([
-          getActivity({ metric: 'spend', group_by: 'model', rollup: 'day', since: range.since.toISOString(), until: range.until.toISOString() }),
-          getActivity({ metric: 'spend', group_by: 'model', rollup: 'day', since: prevSince.toISOString(), until: range.since.toISOString() }),
+          getConsumptions({ since: range.since.toISOString(), until: range.until.toISOString() }),
+          getConsumptions({ since: prevSince.toISOString(), until: range.since.toISOString() }),
           getKeys(),
         ]);
         if (cancelled) return;
-        setCur(curRes.data);
-        setPrev(prevRes.data);
+        setCurList(curRes.data);
+        setPrevList(prevRes.data);
         setKeys(keyRes.data);
       } catch { if (!cancelled) { setError(true); message.error('Failed to load activity'); } }
       finally { if (!cancelled) setLoading(false); }
@@ -62,114 +89,231 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
   }, [range]);
 
   if (loading) return <Spin style={{ display: 'block', margin: '60px auto' }} />;
-  if (error || !cur || !prev) {
+  if (error) {
     return <Card><Text type="danger">Failed to load activity — check the log file.</Text></Card>;
   }
 
-  const curTotals = cur.totals;
-  const prevTotals = prev.totals;
-  const cacheRate = (tot: { cache: number; tokens: number }) =>
-    tot.tokens > 0 ? ((tot.cache / tot.tokens) * 100).toFixed(1) : '0.0';
-  // Blended $/1M = spend / total tokens * 1e6
-  const blended = curTotals.tokens > 0 ? (curTotals.spend / curTotals.tokens) * 1e6 : 0;
-  const blendedPrev = prevTotals.tokens > 0 ? (prevTotals.spend / prevTotals.tokens) * 1e6 : 0;
+  const sum = (l: Consumption[]) => l.reduce((a, c) => ({
+    spend: a.spend + c.cost_usd,
+    requests: a.requests + c.request_count,
+    tokens: a.tokens + c.input_tokens + c.output_tokens,
+    cache: a.cache + c.cache_hit_tokens,
+    input: a.input + c.input_tokens,
+  }), { spend: 0, requests: 0, tokens: 0, cache: 0, input: 0 });
+
+  const cur = sum(curList);
+  const prev = sum(prevList);
+  const cacheRate = (s: typeof cur) => s.tokens > 0 ? (s.cache / s.tokens) * 100 : 0;
+  const blended = cur.tokens > 0 ? (cur.spend / cur.tokens) * 1e6 : 0;
+  const blendedPrev = prev.tokens > 0 ? (prev.spend / prev.tokens) * 1e6 : 0;
 
   const kpis = [
-    { label: 'Total spend', value: fmtUSD(curTotals.spend), delta: deltaPct(curTotals.spend, prevTotals.spend) },
-    { label: 'Requests', value: fmtCompact(curTotals.requests), delta: deltaPct(curTotals.requests, prevTotals.requests) },
-    { label: 'Token volume', value: fmtTokens(curTotals.tokens), delta: deltaPct(curTotals.tokens, prevTotals.tokens) },
-    { label: 'Cache hit rate', value: `${cacheRate(curTotals)}%`, delta: deltaPct(curTotals.cache, prevTotals.cache) },
-    { label: 'Blended $/1M', value: `$${blended.toFixed(2)}`, delta: deltaPct(blended, blendedPrev) },
+    { label: 'Total spend', value: fmtUSD(cur.spend), delta: deltaPct(cur.spend, prev.spend), series: dailySeries(curList, c => c.cost_usd) },
+    { label: 'Requests', value: fmtCompact(cur.requests), delta: deltaPct(cur.requests, prev.requests), series: dailySeries(curList, c => c.request_count) },
+    { label: 'Token volume', value: fmtTokens(cur.tokens), delta: deltaPct(cur.tokens, prev.tokens), series: dailySeries(curList, c => c.input_tokens + c.output_tokens) },
+    { label: 'Cache hit rate', value: fmtPercent(cacheRate(cur)), delta: deltaPct(cur.cache, prev.cache), series: dailySeries(curList, c => (c.cache_hit_tokens / Math.max(1, c.input_tokens + c.cache_hit_tokens)) * 100) },
+    { label: 'Blended $/1M', value: `$${blended.toFixed(2)}`, delta: deltaPct(blended, blendedPrev), series: dailySeries(curList, c => c.cost_usd) },
   ];
 
-  // Top API Keys: from a dedicated key-grouped fetch.
-  const topKeys = (keyGroups?.summary ?? []).slice(0, 5);
-  const maxKeyTokens = topKeys.length ? Math.max(...topKeys.map(k => k.sum)) : 1;
+  // --- Charts ---
+  // Usage by model (spend, stacked bars)
+  const modelSpend = groupTotals(curList, c => c.model_name || 'Unknown', c => c.cost_usd);
+  const topModels = modelSpend.slice(0, 6).map(([m]) => m);
+  const usageByModel = stackedData(curList, topModels, c => c.model_name || 'Unknown', c => c.cost_usd);
 
-  // Top Apps: grouped by the X-App request header ("" = Unknown).
-  const topApps = (appGroups?.summary ?? []).slice(0, 5);
-  const maxAppTokens = topApps.length ? Math.max(...topApps.map(k => k.sum)) : 1;
+  // Request volume by model (stacked bars)
+  const modelReqs = groupTotals(curList, c => c.model_name || 'Unknown', c => c.request_count);
+  const topReqModels = modelReqs.slice(0, 6).map(([m]) => m);
+  const reqByModel = stackedData(curList, topReqModels, c => c.model_name || 'Unknown', c => c.request_count);
 
-  const keyPrefixFor = (name: string) => {
-    const k = keys.find(x => x.name === name);
-    if (!k) return '';
-    const v = k.key_value || '';
-    return v.length > 12 ? `${v.slice(0, 12)}...` : v;
-  };
+  // Usage type: BYOK vs spend — we split cost into "OpenRouter Credits"
+  // (the gateway's own keys) vs everything else. Simpler: total spend only.
+  const usageType = dailySeries(curList, c => c.cost_usd).map(d => ({ ...d, Spend: d.value }));
+
+  // Token breakdown: Prompt / Completion / Cached (per day)
+  const promptSeries = dailySeries(curList, c => c.input_tokens);
+  const compSeries = dailySeries(curList, c => c.output_tokens);
+  const cacheSeries = dailySeries(curList, c => c.cache_hit_tokens);
+  const tokenBreakdown = promptSeries.map((d, i) => ({
+    label: d.label,
+    Prompt: d.value,
+    Completion: compSeries[i]?.value || 0,
+    Cached: cacheSeries[i]?.value || 0,
+  }));
+
+  // Prompt caching: Cached vs Uncached (per day)
+  const inSeries = dailySeries(curList, c => c.input_tokens);
+  const caching = cacheSeries.map((d, i) => ({
+    label: d.label,
+    Cached: d.value,
+    Uncached: Math.max(0, (inSeries[i]?.value || 0) - d.value),
+  }));
+
+  // Top API Keys (tokens) and Top Apps (X-App header, tokens)
+  const keyTokens = groupTotals(curList, c => {
+    const k = keys.find(x => x.id === c.key_id);
+    return k?.name || `Key #${c.key_id}`;
+  }, c => c.input_tokens + c.output_tokens);
+  const topKeys = keyTokens.slice(0, 5);
+  const maxKeyTokens = topKeys.length ? Math.max(...topKeys.map(([, v]) => v)) : 1;
+
+  const appTokens = groupTotals(curList, c => c.app_name || 'Unknown', c => c.input_tokens + c.output_tokens);
+  const topApps = appTokens.slice(0, 5);
+  const maxAppTokens = topApps.length ? Math.max(...topApps.map(([, v]) => v)) : 1;
+
+  const kpiColors = ['#FF2D55', '#22c1a3', '#6d5cff', '#ffb020', '#8b5cf6'];
 
   return (
     <div>
-      {/* KPI cards with vs prev period chips */}
-      <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
-        {kpis.map(k => (
-          <Col xs={12} sm={8} lg={4} key={k.label}>
-            <Card size="small" style={{ borderRadius: 12 }}>
-              <Text type="secondary" style={{ fontSize: 12 }}>{k.label}</Text>
-              <div style={{ fontSize: 20, fontWeight: 600, margin: '4px 0' }}>{k.value}</div>
-              <Text style={{ fontSize: 12, color: k.delta >= 0 ? '#22c1a3' : '#ff5f6d' }}>
-                {k.delta >= 0 ? '▲' : '▼'} {Math.abs(k.delta).toFixed(1)}%
-                <Text type="secondary" style={{ fontSize: 12 }}> vs prev period</Text>
-              </Text>
-            </Card>
-          </Col>
+      {/* KPI cards with vs-prev chips + sparkline */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 12, marginBottom: 16 }}>
+        {kpis.map((k, i) => (
+          <Card key={k.label} size="small" style={{ borderRadius: 12 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 }}>
+              <div>
+                <Text type="secondary" style={{ fontSize: 12 }}>{k.label}</Text>
+                <div style={{ fontSize: 20, fontWeight: 700, margin: '2px 0', fontVariantNumeric: 'tabular-nums' }}>{k.value}</div>
+                <Text style={{ fontSize: 12, color: k.delta >= 0 ? '#22c1a3' : '#ff2d55' }}>
+                  {k.delta >= 0 ? '▲' : '▼'} {Math.abs(k.delta).toFixed(1)}%
+                  <Text type="secondary" style={{ fontSize: 12 }}> vs prev period</Text>
+                </Text>
+              </div>
+              <div style={{ width: 84, height: 40 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={k.series} margin={{ top: 3, right: 0, bottom: 0, left: 0 }}>
+                    <Line type="monotone" dataKey="value" stroke={kpiColors[i]} strokeWidth={1.5} dot={false} isAnimationActive={false} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          </Card>
         ))}
-      </Row>
+      </div>
 
-      {/* Top API Keys + Top Apps (OpenRouter Overview panels) */}
-      <Row gutter={[16, 16]}>
+      {/* Top API Keys + Top Apps */}
+      <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
         <Col xs={24} lg={12}>
-          <Card
-            style={{ borderRadius: 12 }}
-            title="Top API Keys"
-            extra={<Text type="secondary" style={{ fontSize: 12 }}>by tokens</Text>}
-          >
+          <Card style={{ borderRadius: 12 }} title="Top API Keys" extra={<Text type="secondary" style={{ fontSize: 12 }}>by tokens</Text>}>
             {topKeys.length === 0 && <Text type="secondary">No usage in this period.</Text>}
-            {topKeys.map((k, idx) => (
-              <div key={k.group} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '6px 0' }}>
+            {topKeys.map(([name, val], idx) => (
+              <div key={name} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '6px 0' }}>
                 <Text type="secondary" style={{ width: 20, textAlign: 'right' }}>{idx + 1}</Text>
+                <span style={{ width: 10, height: 10, borderRadius: '50%', background: CHART_COLORS[idx % CHART_COLORS.length] }} />
                 <div style={{ flex: 1 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                    <Text strong>{k.group}</Text>
-                    <Text type="secondary" style={{ fontSize: 12 }}>{keyPrefixFor(k.group)}</Text>
-                  </div>
-                  <Progress
-                    percent={Math.min(100, (k.sum / maxKeyTokens) * 100)}
-                    showInfo={false}
-                    strokeColor={CHART_COLORS[idx % CHART_COLORS.length]}
-                    trailColor={GRID}
-                    size={{ height: 6 }}
-                  />
+                  <Text strong>{name}</Text>
+                  <Progress percent={Math.min(100, (val / maxKeyTokens) * 100)} showInfo={false} strokeColor={CHART_COLORS[idx % CHART_COLORS.length]} trailColor={GRID} size={{ height: 5 }} />
                 </div>
-                <Text strong style={{ width: 90, textAlign: 'right' }}>{fmtTokens(k.sum)}</Text>
+                <Text strong style={{ width: 90, textAlign: 'right' }}>{fmtTokens(val)}</Text>
               </div>
             ))}
           </Card>
         </Col>
         <Col xs={24} lg={12}>
-          <Card
-            style={{ borderRadius: 12 }}
-            title="Top Apps"
-            extra={<Text type="secondary" style={{ fontSize: 12 }}>by tokens</Text>}
-          >
+          <Card style={{ borderRadius: 12 }} title="Top Apps" extra={<Text type="secondary" style={{ fontSize: 12 }}>by tokens · X-App header</Text>}>
             {topApps.length === 0 && <Text type="secondary">No usage in this period.</Text>}
-            {topApps.map((k, idx) => (
-              <div key={k.group} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '6px 0' }}>
+            {topApps.map(([name, val], idx) => (
+              <div key={name} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '6px 0' }}>
                 <Text type="secondary" style={{ width: 20, textAlign: 'right' }}>{idx + 1}</Text>
+                <span style={{ width: 10, height: 10, borderRadius: '50%', background: CHART_COLORS[(idx + 3) % CHART_COLORS.length] }} />
                 <div style={{ flex: 1 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                    <Text strong>{k.group}</Text>
-                  </div>
-                  <Progress
-                    percent={Math.min(100, (k.sum / maxAppTokens) * 100)}
-                    showInfo={false}
-                    strokeColor={CHART_COLORS[(idx + 3) % CHART_COLORS.length]}
-                    trailColor={GRID}
-                    size={{ height: 6 }}
-                  />
+                  <Text strong>{name}</Text>
+                  <Progress percent={Math.min(100, (val / maxAppTokens) * 100)} showInfo={false} strokeColor={CHART_COLORS[(idx + 3) % CHART_COLORS.length]} trailColor={GRID} size={{ height: 5 }} />
                 </div>
-                <Text strong style={{ width: 90, textAlign: 'right' }}>{fmtTokens(k.sum)}</Text>
+                <Text strong style={{ width: 90, textAlign: 'right' }}>{fmtTokens(val)}</Text>
               </div>
             ))}
+          </Card>
+        </Col>
+      </Row>
+
+      {/* Usage by model — stacked bars */}
+      <Card style={{ borderRadius: 12, marginBottom: 16 }} title="Usage by model">
+        <ResponsiveContainer width="100%" height={260}>
+          <BarChart data={usageByModel} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke={GRID} vertical={false} />
+            <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} />
+            <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => fmtUSD(Number(v))} />
+            <Tooltip formatter={(v: any, name: any) => [fmtUSD(Number(v)), String(name)]} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID }} />
+            <Legend wrapperStyle={{ fontSize: 12 }} />
+            {topModels.map((m, i) => (
+              <Bar key={m} dataKey={m} stackId="a" fill={m === 'Other' ? OTHER : CHART_COLORS[i % CHART_COLORS.length]} maxBarSize={22} radius={i === topModels.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]} />
+            ))}
+          </BarChart>
+        </ResponsiveContainer>
+      </Card>
+
+      <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
+        {/* Usage type — stacked area */}
+        <Col xs={24} lg={12}>
+          <Card style={{ borderRadius: 12 }} title="Usage type">
+            <ResponsiveContainer width="100%" height={220}>
+              <AreaChart data={usageType} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+                <defs>
+                  <linearGradient id="spendFill" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#8b5cf6" stopOpacity={0.4} />
+                    <stop offset="100%" stopColor="#8b5cf6" stopOpacity={0.02} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="3 3" stroke={GRID} vertical={false} />
+                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} />
+                <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => fmtUSD(Number(v))} />
+                <Tooltip formatter={(v: any) => [fmtUSD(Number(v)), 'Spend']} contentStyle={{ borderRadius: 8 }} />
+                <Area type="monotone" dataKey="Spend" stroke="#8b5cf6" strokeWidth={2} fill="url(#spendFill)" dot={false} />
+              </AreaChart>
+            </ResponsiveContainer>
+          </Card>
+        </Col>
+        {/* Request volume by model — stacked bars */}
+        <Col xs={24} lg={12}>
+          <Card style={{ borderRadius: 12 }} title="Request volume by model">
+            <ResponsiveContainer width="100%" height={220}>
+              <BarChart data={reqByModel} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke={GRID} vertical={false} />
+                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} />
+                <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={50} tickFormatter={(v) => fmtCompact(Number(v))} />
+                <Tooltip formatter={(v: any, name: any) => [fmtCompact(Number(v)), String(name)]} contentStyle={{ borderRadius: 8 }} />
+                <Legend wrapperStyle={{ fontSize: 12 }} />
+                {topReqModels.map((m, i) => (
+                  <Bar key={m} dataKey={m} stackId="a" fill={m === 'Other' ? OTHER : CHART_COLORS[i % CHART_COLORS.length]} maxBarSize={14} radius={i === topReqModels.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]} />
+                ))}
+              </BarChart>
+            </ResponsiveContainer>
+          </Card>
+        </Col>
+      </Row>
+
+      <Row gutter={[16, 16]}>
+        {/* Token breakdown — stacked bars */}
+        <Col xs={24} lg={12}>
+          <Card style={{ borderRadius: 12 }} title="Token breakdown">
+            <ResponsiveContainer width="100%" height={220}>
+              <BarChart data={tokenBreakdown} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke={GRID} vertical={false} />
+                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} />
+                <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => fmtCompact(Number(v))} />
+                <Tooltip formatter={(v: any, name: any) => [fmtTokens(Number(v)), String(name)]} contentStyle={{ borderRadius: 8 }} />
+                <Legend wrapperStyle={{ fontSize: 12 }} />
+                <Bar dataKey="Completion" stackId="a" fill="#a855f7" maxBarSize={14} />
+                <Bar dataKey="Prompt" stackId="a" fill="#3b82f6" maxBarSize={14} />
+                <Bar dataKey="Cached" stackId="a" fill="#f59e0b" maxBarSize={14} radius={[2, 2, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </Card>
+        </Col>
+        {/* Prompt token caching — stacked bars */}
+        <Col xs={24} lg={12}>
+          <Card style={{ borderRadius: 12 }} title="Prompt token caching">
+            <ResponsiveContainer width="100%" height={220}>
+              <BarChart data={caching} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke={GRID} vertical={false} />
+                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} />
+                <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => fmtCompact(Number(v))} />
+                <Tooltip formatter={(v: any, name: any) => [fmtTokens(Number(v)), String(name)]} contentStyle={{ borderRadius: 8 }} />
+                <Legend wrapperStyle={{ fontSize: 12 }} />
+                <Bar dataKey="Uncached" stackId="a" fill="#94a3b8" maxBarSize={14} />
+                <Bar dataKey="Cached" stackId="a" fill="#f59e0b" maxBarSize={14} radius={[2, 2, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
           </Card>
         </Col>
       </Row>
