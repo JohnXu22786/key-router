@@ -9,7 +9,7 @@ import {
 import {
   getProviders, createProvider, updateProvider, deleteProvider,
   getKeys, createKey, updateKey, deleteKey, reorderKeys, getKeyDetail,
-  Provider, Key,
+  getRoutes, Provider, Key, Route,
 } from '../api/client';
 
 const { Title, Text } = Typography;
@@ -50,6 +50,7 @@ const fmtPercent = (v: number): string => {
 const Providers: React.FC = () => {
   const [providers, setProviders] = useState<Provider[]>([]);
   const [keys, setKeys] = useState<Key[]>([]);
+  const [routes, setRoutes] = useState<Route[]>([]);
   const [loading, setLoading] = useState(false);
   const [provModal, setProvModal] = useState(false);
   const [editingProv, setEditingProv] = useState<Provider | null>(null);
@@ -69,8 +70,8 @@ const Providers: React.FC = () => {
   const fetch = async () => {
     setLoading(true);
     try {
-      const [p, k] = await Promise.all([getProviders(), getKeys()]);
-      setProviders(p.data); setKeys(k.data);
+      const [p, k, r] = await Promise.all([getProviders(), getKeys(), getRoutes()]);
+      setProviders(p.data); setKeys(k.data); setRoutes(r.data);
     } catch { message.error('Failed to load providers'); }
     finally { setLoading(false); }
   };
@@ -97,16 +98,29 @@ const Providers: React.FC = () => {
   const saveKey = async () => {
     try {
       const values = await keyForm.validateFields();
-      if (!statusTouched.current) delete values.status;
+      // Editing must NOT reset fields the user did not touch: only send the
+      // fields actually modified (rate-limit values, strategy, ...) so a
+      // name-only edit leaves the limits exactly as they were. Creating
+      // sends everything.
+      const payload: any = { ...values };
+      if (editingKey) {
+        for (const key of Object.keys(values)) {
+          if (!keyForm.isFieldTouched(key)) delete payload[key];
+        }
+        if (!statusTouched.current) delete payload.status;
+        if (payload.provider_id == null) delete payload.provider_id;
+      }
       // Rate-limit cancellation: emptied input = 0 = unlimited. Cost-metric
       // windows are entered in USD but stored in micro-USD.
       for (const wt of windowTypes) {
-        if (values[wt.limitField] == null) values[wt.limitField] = 0;
-        else if (wt.metricField && values[wt.metricField] === 'cost') {
-          values[wt.limitField] = Math.round(values[wt.limitField] * 1e6);
+        if (payload[wt.limitField] == null) continue;
+        if (payload[wt.limitField] === 0 || payload[wt.limitField] == null) {
+          // explicit 0 = clear the limit
+        } else if (wt.metricField && payload[wt.metricField] === 'cost') {
+          payload[wt.limitField] = Math.round(payload[wt.limitField] * 1e6);
         }
       }
-      if (editingKey) { await updateKey(editingKey.id, values); message.success('Key updated'); }
+      if (editingKey) { await updateKey(editingKey.id, payload); message.success('Key updated'); }
       else { await createKey(values); message.success('Key created'); }
       statusTouched.current = false;
       setKeyModal(false); setEditingKey(null); keyForm.resetFields(); fetch();
@@ -274,6 +288,9 @@ const Providers: React.FC = () => {
                   <Tag>{({ openai: 'OpenAI', anthropic: 'Anthropic' })[p.type] || p.type}</Tag>
                   <Text type="secondary" style={{ fontSize: 12 }}>{p.base_url}</Text>
                   <Text type="secondary" style={{ fontSize: 12 }}>{provKeys.length} key{provKeys.length === 1 ? '' : 's'}</Text>
+                  {routes.filter(r => r.provider_id === p.id && r.enabled).length === 0 && (
+                    <Tag color="orange">no enabled routes</Tag>
+                  )}
                 </Space>
               ),
               extra: (
