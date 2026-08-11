@@ -119,7 +119,8 @@ func autostartEnabled() bool {
 	}
 	defer regCloseKey.Call(hkey)
 
-	// RegGetValueW with a null buffer returns ERROR_MORE_DATA and the size.
+	// RegGetValueW with a null buffer returns ERROR_MORE_DATA (234) and the
+	// required size — NOT an error. ERROR_FILE_NOT_FOUND means no entry.
 	var size uint32 = 0
 	ret, _, _ = regGetValue.Call(
 		hkey,
@@ -130,8 +131,14 @@ func autostartEnabled() bool {
 		0,
 		uintptr(unsafe.Pointer(&size)),
 	)
-	if ret != 0 {
-		return false // ERROR_FILE_NOT_FOUND etc.
+	if syscall.Errno(ret) == syscall.ERROR_FILE_NOT_FOUND {
+		return false // no Run entry
+	}
+	if syscall.Errno(ret) != syscall.ERROR_MORE_DATA && ret != 0 {
+		return false
+	}
+	if size == 0 {
+		return false
 	}
 	buf := make([]uint16, size/2+1)
 	ret, _, _ = regGetValue.Call(

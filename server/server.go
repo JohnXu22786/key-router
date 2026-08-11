@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"key-router/db"
@@ -21,6 +22,25 @@ type App struct {
 	Router *gin.Engine
 	Server *http.Server
 	port   int
+	mu     sync.Mutex
+	stop   bool // set by BeginShutdown: reject new requests, finish in-flight
+}
+
+// RejectingNew reports whether the server is shutting down (new requests
+// should be refused so in-flight SSE streams can finish in the background).
+func (a *App) RejectingNew() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.stop
+}
+
+// BeginShutdown marks the server as shutting down: new requests (relay and
+// admin) return 503 while currently-streaming responses are allowed to
+// finish, then Shutdown waits for them.
+func (a *App) BeginShutdown() {
+	a.mu.Lock()
+	a.stop = true
+	a.mu.Unlock()
 }
 
 // New creates a new server instance
@@ -79,12 +99,18 @@ func (a *App) StartBackground() error {
 	return nil
 }
 
-// Shutdown gracefully stops the HTTP server
+// Shutdown gracefully stops the HTTP server: rejects new connections (via
+// net/http Shutdown) and waits for in-flight SSE streams to complete before
+// returning. BeginShutdown should be called first so application-level
+// requests are also refused while streams finish.
 func (a *App) Shutdown() error {
+	a.BeginShutdown()
 	if a.Server == nil {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Grace period long enough for typical agent streams; Shutdown keeps
+	// serving active connections until they finish or this expires.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	err := a.Server.Shutdown(ctx)
 	if err != nil {

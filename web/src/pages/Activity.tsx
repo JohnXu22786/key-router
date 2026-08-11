@@ -1,14 +1,15 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useMemo } from 'react';
 import { Typography, Segmented, Space, Button, Spin } from 'antd';
 import { ReloadOutlined } from '@ant-design/icons';
+import dayjs from 'dayjs';
 import ActivityOverview from './ActivityOverview';
 import ActivityTrends from './ActivityTrends';
 import ActivityExplore from './ActivityExplore';
 // Shared helpers live in activityShared.ts (NOT here) to avoid a circular
 // import: Activity -> ActivityOverview -> activityShared. A cycle can hand
 // the children undefined constants and crash the page.
-import { RANGES } from './activityShared';
-export { fmtCompact, fmtUSD, fmtTokens, fmtPercent, GRID, AXIS, CHART_COLORS, OTHER_COLOR, fmt3sig } from './activityShared';
+import { makeRanges } from './activityShared';
+export { fmtCompact, fmtUSD, fmtTokens, fmtPercent, GRID, AXIS, CHART_COLORS, OTHER_COLOR, fmt3sig, RANGES } from './activityShared';
 export type { DateRange } from './activityShared';
 
 const { Title } = Typography;
@@ -20,11 +21,16 @@ const Activity: React.FC = () => {
   const [rangeIdx, setRangeIdx] = useState(4); // default 1mo like the saved page
   const [refreshKey, setRefreshKey] = useState(0);
   const [loading, setLoading] = useState(false);
-
-  const range = RANGES[rangeIdx];
+  // "now" is a state so Refresh recomputes the date window to the current
+  // moment — otherwise the ranges freeze at page-load time and the data
+  // never updates.
+  const [now, setNow] = useState(() => dayjs());
+  const ranges = useMemo(() => makeRanges(now), [now]);
+  const range = ranges[rangeIdx];
 
   const handleRefresh = useCallback(async () => {
     setLoading(true);
+    setNow(dayjs()); // slide the window to now
     setRefreshKey(k => k + 1);
     await new Promise(r => setTimeout(r, 50));
     setLoading(false);
@@ -45,7 +51,7 @@ const Activity: React.FC = () => {
         </div>
         <Space wrap>
           <Segmented
-            options={RANGES.map((r, i) => ({ label: r.label, value: i }))}
+            options={ranges.map((r, i) => ({ label: r.label, value: i }))}
             value={rangeIdx}
             onChange={(v) => setRangeIdx(v as number)}
           />
