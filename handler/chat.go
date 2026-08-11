@@ -182,17 +182,22 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 		}
 
 		// Build request metadata with forwarded headers
-		meta := &model.RequestMetadata{
-			Format:      inputFormat,
-			Model:       reqMeta.Model,
-			Stream:      reqMeta.Stream,
-			RequestPath: c.Request.URL.Path,
-			RequestBody: body,
-			Headers:     c.Request.Header.Clone(),
-			TargetModel: targetModel,
-			ExtraParams: group.ExtraParams,
-			Ctx:         c.Request.Context(),
-		}
+			// Route-level extra params override the model group's.
+			extraParams := route.Route.ExtraParams
+			if extraParams == "" {
+				extraParams = group.ExtraParams
+			}
+			meta := &model.RequestMetadata{
+				Format:      inputFormat,
+				Model:       reqMeta.Model,
+				Stream:      reqMeta.Stream,
+				RequestPath: c.Request.URL.Path,
+				RequestBody: body,
+				Headers:     c.Request.Header.Clone(),
+				TargetModel: targetModel,
+				ExtraParams: extraParams,
+				Ctx:         c.Request.Context(),
+			}
 
 		// Forward request to upstream
 		resp, err := relay.ForwardRequest(meta, key, route.Provider)
@@ -390,7 +395,7 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			// (read/conversion failure) must not inflate costs or burn
 			// rate-limit quotas — the client received an error, not work.
 			if streamErr == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				consumption, err := billing.RecordConsumption(key.ID, targetModel, usage)
+				consumption, err := billing.RecordConsumption(key.ID, targetModel, usage, route.Route)
 				if err != nil {
 					log.Printf("[relay] failed to record consumption for key %d: %v", key.ID, err)
 				}
@@ -472,7 +477,7 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			// performed and must not burn the key's request budgets.
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				usage := relay.ParseTokenUsage(responseBody, route.Provider.Type)
-				consumption, err := billing.RecordConsumption(key.ID, targetModel, usage)
+				consumption, err := billing.RecordConsumption(key.ID, targetModel, usage, route.Route)
 				if err != nil {
 					log.Printf("[relay] failed to record consumption for key %d: %v", key.ID, err)
 				}

@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
-import { Button, Modal, Form, Input, Select, Switch, message, Space, Typography, Popconfirm, Tag, Collapse, Table } from 'antd';
+import { Button, Modal, Form, Input, InputNumber, Select, Switch, message, Space, Typography, Popconfirm, Tag, Collapse, Table, Alert } from 'antd';
 import { PlusOutlined, EditOutlined, DeleteOutlined, HolderOutlined } from '@ant-design/icons';
 import { getRoutes, createRoute, updateRoute, deleteRoute, reorderRoutes, getProviders, getModelGroups, Route, Provider, ModelGroup } from '../api/client';
 
@@ -14,6 +14,7 @@ const RoutesPage: React.FC = () => {
   const [editing, setEditing] = useState<Route | null>(null);
   const [activeGroups, setActiveGroups] = useState<string[]>([]);
   const [form] = Form.useForm();
+  const [extraError, setExtraError] = useState('');
   const dragItem = useRef<number | null>(null);
   const persistTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Always-current routes for drag handling — avoids stale-closure reorders
@@ -35,12 +36,34 @@ const RoutesPage: React.FC = () => {
   const handleSave = async () => {
     try {
       const values = await form.validateFields();
+      // Extra params: trim; empty = none.
+      if (values.extra_params != null) values.extra_params = values.extra_params.trim();
+      if (values.extra_params && extraError) {
+        message.error('Fix the JSON in Extra Params first');
+        return;
+      }
       // Only new routes get defaults; editing must keep the stored
       // priority (drag reorder would otherwise be reset)
       if (editing) { await updateRoute(editing.id, values); message.success('Updated'); }
       else { await createRoute({ ...values, priority: 0 }); message.success('Created'); }
-      setModalOpen(false); setEditing(null); form.resetFields(); fetch();
+      setModalOpen(false); setEditing(null); form.resetFields(); setExtraError(''); fetch();
     } catch { message.error('Failed to save route'); }
+  };
+
+  // JSON editor: validate as the user types.
+  const onExtraChange = (v: string) => {
+    const s = (v || '').trim();
+    if (s === '') { setExtraError(''); return; }
+    try {
+      const parsed = JSON.parse(s);
+      if (Array.isArray(parsed) || typeof parsed !== 'object' || parsed === null) {
+        setExtraError('Must be a JSON object, e.g. {"temperature": 0.2}');
+      } else {
+        setExtraError('');
+      }
+    } catch (e: any) {
+      setExtraError(e.message || 'Invalid JSON');
+    }
   };
 
   const handleDelete = async (id: number) => {
@@ -112,6 +135,15 @@ const RoutesPage: React.FC = () => {
       render: (_: unknown, r: Route) => r.provider?.name || `#${r.provider_id}`,
     },
     { title: 'Target Model', dataIndex: 'target_model', key: 'target_model', render: (t: string) => t ? <Tag>{t}</Tag> : <Tag color="default">same</Tag> },
+    {
+      title: 'Pricing ($/1M)', key: 'pricing',
+      render: (_: unknown, r: Route) => {
+        const hasPrice = r.prompt_per_1m || r.completion_per_1m;
+        return hasPrice
+          ? <Tag color="blue">${r.prompt_per_1m.toFixed(4)} / ${r.completion_per_1m.toFixed(4)}</Tag>
+          : <Tag>inherit</Tag>;
+      },
+    },
     { title: 'Enabled', dataIndex: 'enabled', key: 'enabled', render: (e: boolean) => e ? <Tag color="green">Yes</Tag> : <Tag color="red">No</Tag> },
     {
       title: 'Actions', key: 'actions', width: 80,
@@ -194,6 +226,32 @@ const RoutesPage: React.FC = () => {
             <Input placeholder="gpt-4o-2024-08-06" />
           </Form.Item>
           <Form.Item name="enabled" label="Enabled" valuePropName="checked" initialValue={true}><Switch /></Form.Item>
+
+          <Typography.Text strong>Per-Route Pricing ($/1M tokens)</Typography.Text>
+          <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
+            Leave all at 0 to inherit the Pricing table for this route's model. Set values to bill
+            this route at its own rates (e.g. a cheap and a premium key for the same model).
+          </Typography.Paragraph>
+          <Space size="large" wrap style={{ marginBottom: 8 }}>
+            <Form.Item name="prompt_per_1m" label="Prompt $/1M"><InputNumber min={0} step={0.01} style={{ width: 130 }} /></Form.Item>
+            <Form.Item name="completion_per_1m" label="Completion $/1M"><InputNumber min={0} step={0.01} style={{ width: 130 }} /></Form.Item>
+            <Form.Item name="cache_read_per_1m" label="Cache Read $/1M"><InputNumber min={0} step={0.01} style={{ width: 130 }} /></Form.Item>
+            <Form.Item name="cache_write_per_1m" label="Cache Write $/1M"><InputNumber min={0} step={0.01} style={{ width: 130 }} /></Form.Item>
+          </Space>
+
+          <Form.Item
+            name="extra_params"
+            label="Extra Params (JSON object)"
+            extra="Merged into every request this route serves. Overrides the model group's extra params and the client's values — e.g. {&quot;temperature&quot;: 0.2}."
+          >
+            <Input.TextArea
+              rows={4}
+              placeholder={'{\n  "temperature": 0.2\n}'}
+              style={{ fontFamily: 'monospace', fontSize: 12 }}
+              onChange={(e) => onExtraChange(e.target.value)}
+            />
+          </Form.Item>
+          {extraError && <Alert type="error" showIcon message={extraError} style={{ marginBottom: 8 }} />}
         </Form>
       </Modal>
     </div>

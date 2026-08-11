@@ -93,8 +93,18 @@ type Route struct {
 	Priority     int       `gorm:"default:1" json:"priority"`             // Lower = higher priority
 	Weight       int       `gorm:"default:10" json:"weight"`
 	Enabled      bool      `json:"enabled"` // defaulted to true by the create handler
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	// Per-route pricing (USD per 1M tokens). 0 = fall back to the Pricing
+	// table for this route's target model. Lets different routes to the same
+	// model group carry different prices (e.g. a cheap and a premium key).
+	PromptPer1M     float64 `gorm:"default:0" json:"prompt_per_1m"`
+	CompletionPer1M float64 `gorm:"default:0" json:"completion_per_1m"`
+	CacheReadPer1M  float64 `gorm:"default:0" json:"cache_read_per_1m"`
+	CacheWritePer1M float64 `gorm:"default:0" json:"cache_write_per_1m"`
+	// Route-level extra params merged into every request this route serves
+	// (client keys overwritten). Overrides the model group's extra params.
+	ExtraParams string `gorm:"type:text" json:"extra_params"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 
 	ModelGroup ModelGroup `gorm:"foreignKey:ModelGroupID" json:"model_group,omitempty"`
 	Provider   Provider   `gorm:"foreignKey:ProviderID" json:"provider,omitempty"`
