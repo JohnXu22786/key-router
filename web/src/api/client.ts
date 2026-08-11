@@ -102,6 +102,8 @@ export interface Consumption {
   id: number;
   key_id: number;
   hour_bucket: string;
+  model_name: string;
+  app_name: string;
   request_count: number;
   input_tokens: number;
   output_tokens: number;

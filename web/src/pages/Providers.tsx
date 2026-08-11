@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import {
   Table, Button, Modal, Form, Input, InputNumber, Select, message, Space,
-  Typography, Popconfirm, Tag, Descriptions, Progress, Popover,
+  Typography, Popconfirm, Tag, Descriptions, Progress, Collapse,
 } from 'antd';
 import {
   PlusOutlined, EditOutlined, DeleteOutlined, EyeOutlined, HolderOutlined,
@@ -178,27 +178,6 @@ const Providers: React.FC = () => {
     persistOrder(next);
   };
 
-  const provColumns = [
-    { title: 'Name', dataIndex: 'name', key: 'name' },
-    { title: 'Type', dataIndex: 'type', key: 'type', render: (t: string) => ({ openai: 'OpenAI', anthropic: 'Anthropic' })[t] || t },
-    { title: 'Base URL', dataIndex: 'base_url', key: 'base_url', ellipsis: true },
-    {
-      title: 'Keys', key: 'keyCount',
-      render: (_: unknown, p: Provider) => <Tag>{keys.filter(k => k.provider_id === p.id).length}</Tag>,
-    },
-    {
-      title: 'Actions', key: 'actions', width: 80,
-      render: (_: unknown, p: Provider) => (
-        <Space>
-          <Button icon={<EditOutlined />} size="small" onClick={() => { setEditingProv(p); provForm.setFieldsValue(p); setProvModal(true); }} title="Edit" />
-          <Popconfirm title="Delete provider?" onConfirm={() => deleteProvider(p.id)}>
-            <Button icon={<DeleteOutlined />} size="small" danger title="Delete" />
-          </Popconfirm>
-        </Space>
-      ),
-    },
-  ];
-
   const keyColumns = [
     {
       title: '', key: 'drag', width: 40,
@@ -257,38 +236,62 @@ const Providers: React.FC = () => {
         provider to manage its keys — drag to reorder (order = call order), set rate limits
         and recovery strategy per key. Limits apply only to traffic through KeyRouter.
       </Typography.Paragraph>
-      <Button type="primary" icon={<PlusOutlined />} onClick={() => { setEditingProv(null); provForm.resetFields(); setProvModal(true); }} style={{ marginBottom: 16 }}>
-        Add Provider
-      </Button>
+      {/* Both add buttons live at the top (per-page style). Add Key
+          pre-selects the first expanded provider, else the first provider. */}
+      <Space style={{ marginBottom: 16 }}>
+        <Button type="primary" icon={<PlusOutlined />} onClick={() => { setEditingProv(null); provForm.resetFields(); setProvModal(true); }}>
+          Add Provider
+        </Button>
+        <Button type="primary" icon={<PlusOutlined />} onClick={() => {
+          setEditingKey(null); keyForm.resetFields();
+          const firstId = activeProviders.length
+            ? parseInt(activeProviders[0], 10)
+            : (providers[0]?.id || undefined);
+          keyForm.setFieldsValue({ provider_id: firstId, recovery_strategy: 'lazy', status: 'active' });
+          setKeyModal(true);
+        }}>
+          Add Key
+        </Button>
+      </Space>
 
-      <Table
-        dataSource={providers}
-        columns={provColumns}
-        rowKey="id"
-        loading={loading}
-        expandable={{
-          expandedRowKeys: activeProviders,
-          onExpandedRowsChange: (keys: any) => setActiveProviders(keys.map(String)),
-          expandedRowRender: (p) => {
-            const provKeys = keys.filter(k => k.provider_id === p.id);
-            return (
-              <div style={{ padding: '0 8px' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-                  <Text strong>Keys for {p.name}</Text>
-                  <Button
-                    size="small" type="primary" icon={<PlusOutlined />}
-                    onClick={() => { setEditingKey(null); keyForm.resetFields(); keyForm.setFieldsValue({ provider_id: p.id, recovery_strategy: 'lazy', status: 'active' }); setKeyModal(true); }}
-                  >
-                    Add Key
-                  </Button>
-                </div>
-                {provKeys.length === 0 && <Text type="secondary">No keys yet.</Text>}
+      {providers.length === 0 && !loading && (
+        <Typography.Text type="secondary">No providers yet. Add a provider to get started.</Typography.Text>
+      )}
+
+      {providers.map(p => {
+        const provKeys = keys.filter(k => k.provider_id === p.id);
+        return (
+          <Collapse
+            key={p.id}
+            style={{ marginBottom: 12 }}
+            activeKey={activeProviders}
+            onChange={(k: any) => setActiveProviders(Array.isArray(k) ? k.map(String) : [k].map(String))}
+            items={[{
+              key: String(p.id),
+              label: (
+                <Space>
+                  <Text strong>{p.name}</Text>
+                  <Tag>{({ openai: 'OpenAI', anthropic: 'Anthropic' })[p.type] || p.type}</Tag>
+                  <Text type="secondary" style={{ fontSize: 12 }}>{p.base_url}</Text>
+                  <Text type="secondary" style={{ fontSize: 12 }}>{provKeys.length} key{provKeys.length === 1 ? '' : 's'}</Text>
+                </Space>
+              ),
+              extra: (
+                <Space>
+                  <Button size="small" icon={<EditOutlined />} onClick={(e) => { e.stopPropagation(); setEditingProv(p); provForm.setFieldsValue(p); setProvModal(true); }} title="Edit provider" />
+                  <Popconfirm title="Delete provider?" onConfirm={() => deleteProvider(p.id)}>
+                    <Button size="small" danger icon={<DeleteOutlined />} onClick={(e) => e.stopPropagation()} title="Delete provider" />
+                  </Popconfirm>
+                </Space>
+              ),
+              children: (
                 <Table
                   dataSource={provKeys}
                   columns={keyColumns}
                   rowKey="id"
                   size="small"
                   pagination={false}
+                  locale={{ emptyText: 'No keys yet — use the Add Key button above.' }}
                   onRow={(_, index) => ({
                     draggable: true,
                     onDragStart: (e) => handleDragStart(e, keys.indexOf(provKeys[index!])),
@@ -297,11 +300,11 @@ const Providers: React.FC = () => {
                     style: { cursor: 'default' },
                   })}
                 />
-              </div>
-            );
-          },
-        }}
-      />
+              ),
+            }]}
+          />
+        );
+      })}
 
       {/* Provider modal */}
       <Modal title={editingProv ? 'Edit Provider' : 'Add Provider'} open={provModal} onOk={saveProvider} onCancel={() => { setProvModal(false); setEditingProv(null); }}>
