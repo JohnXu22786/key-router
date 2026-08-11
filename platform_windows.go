@@ -38,6 +38,16 @@ func showFatalError(msg string) {
 	messageBoxW.Call(0, uintptr(unsafe.Pointer(text)), uintptr(unsafe.Pointer(title)), 0x10 /* MB_ICONERROR */)
 }
 
+// confirmExit shows a Yes/No confirmation before quitting from the tray.
+// Returns true when the user confirms.
+func confirmExit() bool {
+	title, _ := syscall.UTF16PtrFromString("Exit KeyRouter")
+	text, _ := syscall.UTF16PtrFromString("Are you sure you want to exit KeyRouter?\n\nIn-flight requests will be allowed to finish.")
+	// MB_YESNO (0x4) | MB_ICONQUESTION (0x20) | MB_DEFBUTTON2 (0x100)
+	ret, _, _ := messageBoxW.Call(0, uintptr(unsafe.Pointer(text)), uintptr(unsafe.Pointer(title)), 0x4|0x20|0x100)
+	return ret == 6 // IDYES
+}
+
 // Window constants
 const (
 	hwndMessage = 0x0002

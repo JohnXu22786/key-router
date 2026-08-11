@@ -11,6 +11,7 @@ import {
   getKeys, createKey, updateKey, deleteKey, reorderKeys, getKeyDetail,
   getRoutes, Provider, Key, Route,
 } from '../api/client';
+import { useDragSort } from '../hooks/useDragSort';
 
 const { Title, Text } = Typography;
 
@@ -62,10 +63,14 @@ const Providers: React.FC = () => {
   const [provForm] = Form.useForm();
   const [keyForm] = Form.useForm();
   const statusTouched = useRef(false);
-  const dragItem = useRef<number | null>(null);
   const persistTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const keysRef = useRef<Key[]>([]);
-  keysRef.current = keys;
+
+  // Drag-reorder with live preview animation (keys within a provider).
+  const drag = useDragSort<Key>(
+    keys,
+    (from, to) => keys[from]?.provider_id === keys[to]?.provider_id,
+    (next) => { setKeys(next); persistOrder(next); },
+  );
 
   const fetch = async () => {
     setLoading(true);
@@ -77,6 +82,17 @@ const Providers: React.FC = () => {
   };
 
   useEffect(() => { fetch(); }, []);
+
+  // Poll for key status changes (relay/health checker flip keys as traffic
+  // flows). Keeps expanded groups and scroll position — only row data updates.
+  useEffect(() => {
+    const t = setInterval(() => {
+      Promise.all([getProviders(), getKeys(), getRoutes()])
+        .then(([p, k, r]) => { setProviders(p.data); setKeys(k.data); setRoutes(r.data); })
+        .catch(() => {});
+    }, 10000);
+    return () => clearInterval(t);
+  }, []);
 
   // ---- Provider CRUD ----
   const saveProvider = async () => {
@@ -167,30 +183,6 @@ const Providers: React.FC = () => {
       try { await reorderKeys(payload); } catch { message.error('Failed to save order'); }
     }, 300);
   }, []);
-
-  const handleDragStart = (e: React.DragEvent, index: number) => {
-    dragItem.current = index;
-    e.dataTransfer.effectAllowed = 'move';
-    e.dataTransfer.setData('text/plain', String(index));
-  };
-  const handleDragOver = (e: React.DragEvent) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; };
-  const handleDrop = (e: React.DragEvent, dropIndex: number) => {
-    e.preventDefault();
-    const dragIndex = dragItem.current;
-    if (dragIndex === null || dragIndex === dropIndex) return;
-    const current = keysRef.current;
-    if (current[dragIndex].provider_id !== current[dropIndex].provider_id) {
-      message.warning('Keys can only be reordered within the same provider');
-      dragItem.current = null;
-      return;
-    }
-    const next = [...current];
-    const [removed] = next.splice(dragIndex, 1);
-    next.splice(dropIndex, 0, removed);
-    setKeys(next);
-    dragItem.current = null;
-    persistOrder(next);
-  };
 
   const keyColumns = [
     {
@@ -309,13 +301,17 @@ const Providers: React.FC = () => {
                   size="small"
                   pagination={false}
                   locale={{ emptyText: 'No keys yet — use the Add Key button above.' }}
-                  onRow={(_, index) => ({
-                    draggable: true,
-                    onDragStart: (e) => handleDragStart(e, keys.indexOf(provKeys[index!])),
-                    onDragOver: handleDragOver,
-                    onDrop: (e) => handleDrop(e, keys.indexOf(provKeys[index!])),
-                    style: { cursor: 'default' },
-                  })}
+                  onRow={(_, index) => {
+                    const globalIndex = keys.indexOf(provKeys[index!]);
+                    return {
+                      draggable: true,
+                      onDragStart: (e) => drag.onDragStart(e, globalIndex),
+                      onDragOver: (e) => drag.onDragOver(e, globalIndex),
+                      onDrop: drag.onDrop,
+                      onDragEnd: drag.onDragEnd,
+                      style: { cursor: 'default', ...drag.rowStyle(globalIndex) },
+                    };
+                  }}
                 />
               ),
             }]}

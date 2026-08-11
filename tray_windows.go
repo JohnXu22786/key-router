@@ -45,6 +45,9 @@ func StartTray(hwnd uintptr) <-chan struct{} {
 
 // onTrayReady populates the tray menu.
 func onTrayReady() {
+	if ico := trayIconData(); ico != nil {
+		systray.SetIcon(ico)
+	}
 	systray.SetTitle("KeyRouter")
 	systray.SetTooltip("KeyRouter — local AI API gateway")
 	showItem := systray.AddMenuItem("Show KeyRouter", "Restore the main window")
@@ -64,6 +67,10 @@ func onTrayReady() {
 				}
 			case <-quitItem.ClickedCh:
 				log.Println("[tray] exit requested")
+				if !confirmExit() {
+					log.Println("[tray] exit cancelled")
+					continue
+				}
 				tray.mu.Lock()
 				ctx := tray.ctx
 				tray.mu.Unlock()

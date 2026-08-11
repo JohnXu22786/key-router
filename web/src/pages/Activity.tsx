@@ -36,6 +36,13 @@ const Activity: React.FC = () => {
     setLoading(false);
   }, []);
 
+  // Keep the displayed range fresh: slide "now" every minute (the range
+  // header and the queries are derived from it) and when switching tabs.
+  useEffect(() => {
+    const t = setInterval(() => setNow(dayjs()), 60000);
+    return () => clearInterval(t);
+  }, []);
+  useEffect(() => { setNow(dayjs()); }, [tab]);
   useEffect(() => { setRefreshKey(k => k + 1); }, [rangeIdx]);
 
   const onTabChange = (k: string) => setTab(k as TabKey);
