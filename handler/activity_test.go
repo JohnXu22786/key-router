@@ -17,8 +17,6 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-
-
 // bootstrapActivity sets up the app with mock consumption data and returns
 // the engine. It inserts two models over two days so the activity endpoint
 // has something to aggregate.
@@ -98,8 +96,8 @@ func TestActivityEdgeCases(t *testing.T) {
 			}
 			// Decode into the shape the frontend consumes.
 			var out struct {
-				Metric  string `json:"metric"`
-				Series  []struct {
+				Metric string `json:"metric"`
+				Series []struct {
 					Bucket string  `json:"bucket"`
 					Group  string  `json:"group"`
 					Value  float64 `json:"value"`
