@@ -7,7 +7,6 @@ import {
   DashboardOutlined,
   CloudServerOutlined,
   AppstoreOutlined,
-  DollarOutlined,
   BarChartOutlined,
   SettingOutlined,
   QuestionCircleOutlined,
@@ -17,7 +16,6 @@ import {
 import Dashboard from './pages/Dashboard';
 import Providers from './pages/Providers';
 import Models from './pages/Models';
-import Pricing from './pages/Pricing';
 import Activity from './pages/Activity';
 import Settings from './pages/Settings';
 import Help from './pages/Help';
@@ -46,7 +44,6 @@ const LayoutWithRouter: React.FC = () => {
     { type: 'divider' as const },
     { key: '/providers', icon: <CloudServerOutlined />, label: <Link to="/providers">Providers</Link> },
     { key: '/models', icon: <AppstoreOutlined />, label: <Link to="/models">Models</Link> },
-    { key: '/pricing', icon: <DollarOutlined />, label: <Link to="/pricing">Pricing</Link> },
     { type: 'divider' as const },
     { key: '/stats', icon: <BarChartOutlined />, label: <Link to="/stats">Activity</Link> },
     { key: '/settings', icon: <SettingOutlined />, label: <Link to="/settings">Settings</Link> },
@@ -55,7 +52,13 @@ const LayoutWithRouter: React.FC = () => {
 
   return (
     <Layout style={{ minHeight: '100vh' }}>
-      <Sider collapsible collapsed={collapsed} onCollapse={setCollapsed}>
+      {/* Sider is fixed; only the content column scrolls */}
+      <Sider
+        collapsible
+        collapsed={collapsed}
+        onCollapse={setCollapsed}
+        style={{ position: 'fixed', left: 0, top: 0, bottom: 0, height: '100vh', overflow: 'auto', zIndex: 10 }}
+      >
         <div style={{ height: 64, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
           <Title level={4} style={{ color: '#fff', margin: 0 }}>
             {collapsed ? 'KR' : 'KeyRouter'}
@@ -68,7 +71,7 @@ const LayoutWithRouter: React.FC = () => {
           items={menuItems}
         />
       </Sider>
-      <Layout>
+      <Layout style={{ marginLeft: collapsed ? 80 : 200, minHeight: '100vh' }}>
         <Content style={{ margin: 24 }}>
           {updateInfo && (
             <Alert
@@ -90,7 +93,6 @@ const LayoutWithRouter: React.FC = () => {
             <Route path="/" element={<ErrorBoundary><Dashboard /></ErrorBoundary>} />
             <Route path="/providers" element={<ErrorBoundary><Providers /></ErrorBoundary>} />
             <Route path="/models" element={<ErrorBoundary><Models /></ErrorBoundary>} />
-            <Route path="/pricing" element={<ErrorBoundary><Pricing /></ErrorBoundary>} />
             <Route path="/settings" element={<ErrorBoundary><Settings /></ErrorBoundary>} />
             <Route path="/stats" element={<ErrorBoundary><Activity /></ErrorBoundary>} />
             <Route path="/help" element={<ErrorBoundary><Help /></ErrorBoundary>} />
