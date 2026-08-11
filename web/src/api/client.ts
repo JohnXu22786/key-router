@@ -47,6 +47,8 @@ export interface ModelGroup {
   name: string;
   enabled: boolean;
   retry_times: number;
+  context_length: number;
+  max_output_tokens: number;
   extra_params: string;
   created_at: string;
   updated_at: string;

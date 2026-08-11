@@ -51,14 +51,29 @@ func (h *ChatHandler) HandleModels(c *gin.Context) {
 		return
 	}
 
+	// The response carries per-model metadata (context_length /
+	// max_output_tokens) so model-discovery tools (opencode's
+	// models-discovery plugin, and the upcoming official auto-discovery)
+	// can populate accurate limits without a hand-written models map.
 	data := make([]gin.H, 0, len(groups))
 	for _, g := range groups {
-		data = append(data, gin.H{
+		entry := gin.H{
 			"id":       g.GroupID,
 			"object":   "model",
 			"created":  0,
 			"owned_by": "key-router",
-		})
+		}
+		if g.Name != "" {
+			entry["name"] = g.Name
+		}
+		if g.ContextLength > 0 {
+			entry["context_length"] = g.ContextLength
+			entry["max_context_length"] = g.ContextLength
+		}
+		if g.MaxOutputTokens > 0 {
+			entry["max_output_tokens"] = g.MaxOutputTokens
+		}
+		data = append(data, entry)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
