@@ -1199,6 +1199,14 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 	metric := c.DefaultQuery("metric", "spend")
 	groupBy := c.DefaultQuery("group_by", "model")
 	rollup := c.DefaultQuery("rollup", "day")
+	// Top-N for the chart: series beyond this many groups are folded into an
+	// "Other" series (#94a3b8) like OpenRouter. 0 = no folding.
+	topN := 0
+	if t := c.Query("top"); t != "" {
+		if n, err := strconv.Atoi(t); err == nil && n > 0 {
+			topN = n
+		}
+	}
 	if metric != "spend" && metric != "tokens" && metric != "requests" && metric != "cache" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "metric must be spend|tokens|requests|cache"})
 		return
@@ -1297,18 +1305,30 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 	}
 
 	// Aggregate: bucket -> group -> sum.
-	type acc struct{ sum float64 }
 	agg := make(map[string]map[string]*activityAcc)
 	bucketOrder := make([]string, 0)
 	groupOrder := make([]string, 0)
 	seenGroup := make(map[string]bool)
+
+	// Build a CONTINUOUS bucket axis over the full since..until range so
+	// days/hours without traffic still appear (OR renders the full range).
+	if rollup == "hour" {
+		for t := since.Truncate(time.Hour); !t.After(until); t = t.Add(time.Hour) {
+			bucketOrder = append(bucketOrder, bucketOf(t))
+		}
+	} else {
+		start := time.Date(since.Year(), since.Month(), since.Day(), 0, 0, 0, 0, since.Location())
+		for t := start; !t.After(until); t = t.Add(24 * time.Hour) {
+			bucketOrder = append(bucketOrder, bucketOf(t))
+		}
+	}
+	for _, b := range bucketOrder {
+		agg[b] = make(map[string]*activityAcc)
+	}
+
 	for i := range rows {
 		b := bucketOf(rows[i].HourBucket)
 		g := groupOf(&rows[i])
-		if _, ok := agg[b]; !ok {
-			agg[b] = make(map[string]*activityAcc)
-			bucketOrder = append(bucketOrder, b)
-		}
 		if _, ok := agg[b][g]; !ok {
 			agg[b][g] = &activityAcc{}
 		}
@@ -1319,8 +1339,20 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 		}
 	}
 
-	// Sort bucket order chronologically (appended in row order, so it's
-	// already chronological after dedupe).
+	// Series groups are ordered by total Sum (desc) so the chart's Top-N set
+	// matches the summary table's ordering.
+	sort.Slice(groupOrder, func(i, j int) bool {
+		var si, sj float64
+		for _, b := range bucketOrder {
+			if m, ok := agg[b][groupOrder[i]]; ok {
+				si += m.sum
+			}
+			if m, ok := agg[b][groupOrder[j]]; ok {
+				sj += m.sum
+			}
+		}
+		return si > sj
+	})
 
 	// Build the response.
 	resp := ActivityResponse{
@@ -1339,9 +1371,16 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 		resp.Totals["cache"] += float64(rows[i].CacheHitTokens)
 	}
 
-	// Series: for each bucket, for each group.
+	// Series: for each bucket, for each group. Groups beyond the Top-N are
+	// folded into a single "Other" series (OR behavior).
+	seriesGroups := groupOrder
+	otherActive := false
+	if topN > 0 && len(groupOrder) > topN {
+		seriesGroups = groupOrder[:topN]
+		otherActive = true
+	}
 	for _, b := range bucketOrder {
-		for _, g := range groupOrder {
+		for _, g := range seriesGroups {
 			v := float64(0)
 			if m, ok := agg[b][g]; ok {
 				v = m.sum
@@ -1353,19 +1392,36 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 				IsZero: v == 0,
 			})
 		}
+		if otherActive {
+			var ov float64
+			for _, g := range groupOrder[topN:] {
+				if m, ok := agg[b][g]; ok {
+					ov += m.sum
+				}
+			}
+			resp.Series = append(resp.Series, ActivitySeriesPoint{
+				Bucket: b,
+				Group:  "Other",
+				Value:  ov,
+				IsZero: ov == 0,
+			})
+		}
 	}
 
 	// Summary: per group Min/Max/Avg/Sum/Value/Percent. Value = sum in the
-	// LAST bucket (OpenRouter's "Value" column).
+	// LAST bucket (OpenRouter's "Value" column). Min/Max/Avg are computed
+	// over the group's NON-EMPTY buckets only (OR semantics — an idle day is
+	// not a $0 sample; a model that ran one day shows Min==Max==Avg==that
+	// day's value).
 	groupTotals := make(map[string]float64)
+	groupBucketCount := make(map[string]int)
 	for _, g := range groupOrder {
 		var sum float64
 		for _, b := range bucketOrder {
-			v := float64(0)
 			if m, ok := agg[b][g]; ok {
-				v = m.sum
+				sum += m.sum
+				groupBucketCount[g]++
 			}
-			sum += v
 		}
 		groupTotals[g] = sum
 	}
@@ -1375,8 +1431,8 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 	}
 	for _, g := range groupOrder {
 		avg := float64(0)
-		if len(bucketOrder) > 0 {
-			avg = groupTotals[g] / float64(len(bucketOrder))
+		if n := groupBucketCount[g]; n > 0 {
+			avg = groupTotals[g] / float64(n)
 		}
 		percent := float64(0)
 		if totalSum > 0 {
@@ -1385,19 +1441,18 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 		var min, max float64
 		first := true
 		for _, b := range bucketOrder {
-			v := float64(0)
 			if m, ok := agg[b][g]; ok {
-				v = m.sum
-			}
-			if first {
-				min, max = v, v
-				first = false
-			} else {
-				if v < min {
-					min = v
-				}
-				if v > max {
-					max = v
+				v := m.sum
+				if first {
+					min, max = v, v
+					first = false
+				} else {
+					if v < min {
+						min = v
+					}
+					if v > max {
+						max = v
+					}
 				}
 			}
 		}

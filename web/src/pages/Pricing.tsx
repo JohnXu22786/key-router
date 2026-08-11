@@ -5,6 +5,17 @@ import { getPricings, createPricing, updatePricing, deletePricing, getRoutes, ge
 
 const { Title } = Typography;
 
+// fmtPrice shows at least 2 decimals; if the stored value has more digits
+// (user entered them), preserve the full precision.
+const fmtPrice = (v: number): string => {
+  if (v == null || Number.isNaN(v)) return '-';
+  const s = String(v);
+  const dot = s.indexOf('.');
+  const decimals = dot >= 0 ? s.length - dot - 1 : 0;
+  const digits = Math.max(2, decimals);
+  return `$${v.toFixed(digits)}`;
+};
+
 const Pricing: React.FC = () => {
   const [pricings, setPricings] = useState<PricingType[]>([]);
   const [routes, setRoutes] = useState<Route[]>([]);
@@ -47,12 +58,11 @@ const Pricing: React.FC = () => {
   };
 
   const columns = [
-    { title: 'ID', dataIndex: 'id', key: 'id', width: 60 },
     { title: 'Model', dataIndex: 'model_name', key: 'model_name', render: (v: string) => <Tag color="blue">{v}</Tag> },
-    { title: 'Prompt $/1M', dataIndex: 'prompt_per_1m', key: 'prompt_per_1m', render: (v: number) => `$${v?.toFixed(6)}` },
-    { title: 'Completion $/1M', dataIndex: 'completion_per_1m', key: 'completion_per_1m', render: (v: number) => `$${v?.toFixed(6)}` },
-    { title: 'Cache Read $/1M', dataIndex: 'cache_read_per_1m', key: 'cache_read_per_1m', render: (v: number) => v ? `$${v.toFixed(6)}` : '-' },
-    { title: 'Cache Write $/1M', dataIndex: 'cache_write_per_1m', key: 'cache_write_per_1m', render: (v: number) => v ? `$${v.toFixed(6)}` : '-' },
+    { title: 'Prompt $/1M', dataIndex: 'prompt_per_1m', key: 'prompt_per_1m', render: (v: number) => fmtPrice(v) },
+    { title: 'Completion $/1M', dataIndex: 'completion_per_1m', key: 'completion_per_1m', render: (v: number) => fmtPrice(v) },
+    { title: 'Cache Read $/1M', dataIndex: 'cache_read_per_1m', key: 'cache_read_per_1m', render: (v: number) => v ? fmtPrice(v) : '-' },
+    { title: 'Cache Write $/1M', dataIndex: 'cache_write_per_1m', key: 'cache_write_per_1m', render: (v: number) => v ? fmtPrice(v) : '-' },
     {
       title: 'Actions', key: 'actions', width: 80,
       render: (_: unknown, r: PricingType) => (
