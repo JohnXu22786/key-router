@@ -79,8 +79,8 @@ type ModelGroup struct {
 	// ContextLength / MaxOutputTokens describe the model's limits (0 =
 	// unknown). Exposed via GET /v1/models so tools like opencode can pick
 	// up accurate limits for auto-discovered models.
-	ContextLength    int64 `gorm:"default:0" json:"context_length"`
-	MaxOutputTokens  int64 `gorm:"default:0" json:"max_output_tokens"`
+	ContextLength   int64 `gorm:"default:0" json:"context_length"`
+	MaxOutputTokens int64 `gorm:"default:0" json:"max_output_tokens"`
 	// ExtraParams is a JSON object merged into every forwarded request body
 	// for this group. Client-sent keys are OVERWRITTEN (extra params win),
 	// so e.g. {"temperature": 0.2} pins the sampling temperature.
