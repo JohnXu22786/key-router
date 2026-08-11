@@ -12,6 +12,7 @@ import {
   getProviders, ModelGroup, Route, Provider,
 } from '../api/client';
 import JsonEditor from '../components/JsonEditor';
+import { useDragSort } from '../hooks/useDragSort';
 
 const { Title, Text } = Typography;
 
@@ -32,10 +33,16 @@ const Models: React.FC = () => {
   const [extraError, setExtraError] = useState('');
   const [groupForm] = Form.useForm();
   const [routeForm] = Form.useForm();
-  const dragItem = useRef<number | null>(null);
   const persistTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const routesRef = useRef<Route[]>([]);
   routesRef.current = routes;
+
+  // Drag-reorder with live preview animation (routes within a model group).
+  const drag = useDragSort<Route>(
+    routes,
+    (from, to) => routes[from]?.model_group_id === routes[to]?.model_group_id,
+    (next) => { setRoutes(next); persistOrder(next); },
+  );
 
   const fetch = async () => {
     setLoading(true);
@@ -47,6 +54,17 @@ const Models: React.FC = () => {
   };
 
   useEffect(() => { fetch(); }, []);
+
+  // Poll for status changes (route/group state, key health). Keeps expanded
+  // groups and scroll position — only row data updates.
+  useEffect(() => {
+    const t = setInterval(() => {
+      Promise.all([getModelGroups(), getRoutes(), getProviders()])
+        .then(([g, r, p]) => { setGroups(g.data); setRoutes(r.data); setProviders(p.data); })
+        .catch(() => {});
+    }, 10000);
+    return () => clearInterval(t);
+  }, []);
 
   // ---- Model Group CRUD ----
   const saveGroup = async () => {
@@ -97,30 +115,6 @@ const Models: React.FC = () => {
       try { await reorderRoutes(payload); } catch { message.error('Failed to save order'); }
     }, 300);
   }, []);
-
-  const handleDragStart = (e: React.DragEvent, index: number) => {
-    dragItem.current = index;
-    e.dataTransfer.effectAllowed = 'move';
-    e.dataTransfer.setData('text/plain', String(index));
-  };
-  const handleDragOver = (e: React.DragEvent) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; };
-  const handleDrop = (e: React.DragEvent, dropIndex: number) => {
-    e.preventDefault();
-    const dragIndex = dragItem.current;
-    if (dragIndex === null || dragIndex === dropIndex) return;
-    const current = routesRef.current;
-    if (current[dragIndex].model_group_id !== current[dropIndex].model_group_id) {
-      message.warning('Routes can only be reordered within the same model group');
-      dragItem.current = null;
-      return;
-    }
-    const next = [...current];
-    const [removed] = next.splice(dragIndex, 1);
-    next.splice(dropIndex, 0, removed);
-    setRoutes(next);
-    dragItem.current = null;
-    persistOrder(next);
-  };
 
   const routeColumns = [
     {
@@ -225,12 +219,14 @@ const Models: React.FC = () => {
                 locale={{ emptyText: 'No routes yet — use the Add Route button above.' }}
                 onRow={(_, index) => {
                   const all = routes.filter(r => r.model_group_id === g.id);
+                  const globalIndex = routes.indexOf(all[index!]);
                   return {
                     draggable: true,
-                    onDragStart: (e) => handleDragStart(e, routes.indexOf(all[index!])),
-                    onDragOver: handleDragOver,
-                    onDrop: (e) => handleDrop(e, routes.indexOf(all[index!])),
-                    style: { cursor: 'default' },
+                    onDragStart: (e) => drag.onDragStart(e, globalIndex),
+                    onDragOver: (e) => drag.onDragOver(e, globalIndex),
+                    onDrop: drag.onDrop,
+                    onDragEnd: drag.onDragEnd,
+                    style: { cursor: 'default', ...drag.rowStyle(globalIndex) },
                   };
                 }}
               />
