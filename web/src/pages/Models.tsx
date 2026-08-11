@@ -1,0 +1,296 @@
+import React, { useEffect, useState, useCallback, useRef } from 'react';
+import {
+  Table, Button, Modal, Form, Input, InputNumber, Select, Switch, message, Space,
+  Typography, Popconfirm, Tag, Alert, Collapse,
+} from 'antd';
+import {
+  PlusOutlined, EditOutlined, DeleteOutlined, HolderOutlined,
+} from '@ant-design/icons';
+import {
+  getModelGroups, createModelGroup, updateModelGroup, deleteModelGroup,
+  getRoutes, createRoute, updateRoute, deleteRoute, reorderRoutes,
+  getProviders, ModelGroup, Route, Provider,
+} from '../api/client';
+import JsonEditor from '../components/JsonEditor';
+
+const { Title, Text } = Typography;
+
+// Models page: Model Groups are the top-level rows; each expands to manage
+// that group's Routes (drag order = call order, per-route pricing and extra
+// params). This is the OR-style resource tree: ModelGroup 1—N Route, and a
+// Route references one Provider (many-to-many via routes).
+const Models: React.FC = () => {
+  const [groups, setGroups] = useState<ModelGroup[]>([]);
+  const [routes, setRoutes] = useState<Route[]>([]);
+  const [providers, setProviders] = useState<Provider[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [groupModal, setGroupModal] = useState(false);
+  const [routeModal, setRouteModal] = useState(false);
+  const [editingGroup, setEditingGroup] = useState<ModelGroup | null>(null);
+  const [editingRoute, setEditingRoute] = useState<Route | null>(null);
+  const [activeGroups, setActiveGroups] = useState<string[]>([]);
+  const [extraError, setExtraError] = useState('');
+  const [groupForm] = Form.useForm();
+  const [routeForm] = Form.useForm();
+  const dragItem = useRef<number | null>(null);
+  const persistTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const routesRef = useRef<Route[]>([]);
+  routesRef.current = routes;
+
+  const fetch = async () => {
+    setLoading(true);
+    try {
+      const [g, r, p] = await Promise.all([getModelGroups(), getRoutes(), getProviders()]);
+      setGroups(g.data); setRoutes(r.data); setProviders(p.data);
+    } catch { message.error('Failed to load models'); }
+    finally { setLoading(false); }
+  };
+
+  useEffect(() => { fetch(); }, []);
+
+  // ---- Model Group CRUD ----
+  const saveGroup = async () => {
+    try {
+      const values = await groupForm.validateFields();
+      if (editingGroup) { await updateModelGroup(editingGroup.id, values); message.success('Updated'); }
+      else { await createModelGroup(values); message.success('Created'); }
+      setGroupModal(false); setEditingGroup(null); groupForm.resetFields(); fetch();
+    } catch { message.error('Failed to save model group'); }
+  };
+
+  const deleteGroup = async (id: number) => {
+    try {
+      await deleteModelGroup(id); message.success('Deleted'); fetch();
+    } catch { message.error('Failed to delete model group'); }
+  };
+
+  // ---- Route CRUD ----
+  const saveRoute = async () => {
+    try {
+      const values = await routeForm.validateFields();
+      if (values.extra_params != null) values.extra_params = values.extra_params.trim();
+      if (values.extra_params && extraError) {
+        message.error('Fix the JSON in Extra Params first');
+        return;
+      }
+      if (editingRoute) { await updateRoute(editingRoute.id, values); message.success('Updated'); }
+      else { await createRoute({ ...values, priority: 0 }); message.success('Created'); }
+      setRouteModal(false); setEditingRoute(null); routeForm.resetFields(); setExtraError(''); fetch();
+    } catch { message.error('Failed to save route'); }
+  };
+
+  const deleteRoute = async (id: number) => {
+    try {
+      await deleteRoute(id); message.success('Deleted'); fetch();
+    } catch { message.error('Failed to delete route'); }
+  };
+
+  const persistOrder = useCallback((ordered: Route[]) => {
+    if (persistTimer.current) clearTimeout(persistTimer.current);
+    persistTimer.current = setTimeout(async () => {
+      const groupCounts: Record<number, number> = {};
+      const payload = ordered.map(r => {
+        const idx = groupCounts[r.model_group_id] ?? 0;
+        groupCounts[r.model_group_id] = idx + 1;
+        return { id: r.id, priority: idx };
+      });
+      try { await reorderRoutes(payload); } catch { message.error('Failed to save order'); }
+    }, 300);
+  }, []);
+
+  const handleDragStart = (e: React.DragEvent, index: number) => {
+    dragItem.current = index;
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', String(index));
+  };
+  const handleDragOver = (e: React.DragEvent) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; };
+  const handleDrop = (e: React.DragEvent, dropIndex: number) => {
+    e.preventDefault();
+    const dragIndex = dragItem.current;
+    if (dragIndex === null || dragIndex === dropIndex) return;
+    const current = routesRef.current;
+    if (current[dragIndex].model_group_id !== current[dropIndex].model_group_id) {
+      message.warning('Routes can only be reordered within the same model group');
+      dragItem.current = null;
+      return;
+    }
+    const next = [...current];
+    const [removed] = next.splice(dragIndex, 1);
+    next.splice(dropIndex, 0, removed);
+    setRoutes(next);
+    dragItem.current = null;
+    persistOrder(next);
+  };
+
+  const routeColumns = [
+    {
+      title: '', key: 'drag', width: 40,
+      render: () => <HolderOutlined style={{ cursor: 'grab', color: '#999' }} />,
+    },
+    {
+      title: 'Provider', key: 'provider',
+      render: (_: unknown, r: Route) => r.provider?.name || `#${r.provider_id}`,
+    },
+    { title: 'Target Model', dataIndex: 'target_model', key: 'target_model', render: (t: string) => t ? <Tag>{t}</Tag> : <Tag color="default">same</Tag> },
+    {
+      title: 'Pricing ($/1M)', key: 'pricing',
+      render: (_: unknown, r: Route) => {
+        const hasPrice = r.prompt_per_1m || r.completion_per_1m;
+        return hasPrice
+          ? <Tag color="blue">${r.prompt_per_1m.toFixed(4)} / ${r.completion_per_1m.toFixed(4)}</Tag>
+          : <Tag>inherit</Tag>;
+      },
+    },
+    { title: 'Enabled', dataIndex: 'enabled', key: 'enabled', render: (e: boolean) => e ? <Tag color="green">Yes</Tag> : <Tag color="red">No</Tag> },
+    {
+      title: 'Actions', key: 'actions', width: 80,
+      render: (_: unknown, r: Route) => (
+        <Space>
+          <Button icon={<EditOutlined />} size="small" onClick={() => { setEditingRoute(r); setExtraError(''); routeForm.setFieldsValue(r); setRouteModal(true); }} title="Edit" />
+          <Popconfirm title="Delete?" onConfirm={() => deleteRoute(r.id)}>
+            <Button icon={<DeleteOutlined />} size="small" danger title="Delete" />
+          </Popconfirm>
+        </Space>
+      ),
+    },
+  ];
+
+  const groupColumns = [
+    { title: 'Group ID', dataIndex: 'group_id', key: 'group_id', render: (g: string) => <Tag color="blue">{g}</Tag> },
+    { title: 'Name', dataIndex: 'name', key: 'name' },
+    { title: 'Context', key: 'ctx', render: (_: unknown, g: ModelGroup) => g.context_length ? <Tag>{g.context_length.toLocaleString()}</Tag> : <Tag>?</Tag> },
+    { title: 'Enabled', dataIndex: 'enabled', key: 'enabled', render: (e: boolean) => e ? <Tag color="green">Yes</Tag> : <Tag color="red">No</Tag> },
+    {
+      title: 'Routes', key: 'routeCount',
+      render: (_: unknown, g: ModelGroup) => <Tag>{routes.filter(r => r.model_group_id === g.id).length}</Tag>,
+    },
+    {
+      title: 'Actions', key: 'actions', width: 80,
+      render: (_: unknown, g: ModelGroup) => (
+        <Space>
+          <Button icon={<EditOutlined />} size="small" onClick={() => { setEditingGroup(g); groupForm.setFieldsValue(g); setGroupModal(true); }} title="Edit" />
+          <Popconfirm title="Delete (removes its routes)?" onConfirm={() => deleteGroup(g.id)}>
+            <Button icon={<DeleteOutlined />} size="small" danger title="Delete" />
+          </Popconfirm>
+        </Space>
+      ),
+    },
+  ];
+
+  return (
+    <div>
+      <Title level={3}>Models</Title>
+      <Typography.Paragraph type="secondary">
+        Model groups are the models your API keys can serve. Expand a group to manage its
+        routes — drag to reorder (drag order IS the call order), set per-route pricing and
+        extra params.
+      </Typography.Paragraph>
+      <Button type="primary" icon={<PlusOutlined />} onClick={() => { setEditingGroup(null); groupForm.resetFields(); setGroupModal(true); }} style={{ marginBottom: 16 }}>
+        Add Model Group
+      </Button>
+
+      <Table
+        dataSource={groups}
+        columns={groupColumns}
+        rowKey="id"
+        loading={loading}
+        expandable={{
+          expandedRowKeys: activeGroups,
+          onExpandedRowsChange: (keys: any) => setActiveGroups(keys.map(String)),
+          expandedRowRender: (g) => (
+            <div style={{ padding: '0 8px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                <Text strong>Routes for {g.group_id}</Text>
+                <Button
+                  size="small" type="primary" icon={<PlusOutlined />}
+                  onClick={() => { setEditingRoute(null); routeForm.resetFields(); routeForm.setFieldsValue({ model_group_id: g.id, enabled: true }); setRouteModal(true); }}
+                >
+                  Add Route
+                </Button>
+              </div>
+              <Table
+                dataSource={routes.filter(r => r.model_group_id === g.id)}
+                columns={routeColumns}
+                rowKey="id"
+                size="small"
+                pagination={false}
+                onRow={(_, index) => {
+                  const all = routes.filter(r => r.model_group_id === g.id);
+                  return {
+                    draggable: true,
+                    onDragStart: (e) => handleDragStart(e, routes.indexOf(all[index!])),
+                    onDragOver: handleDragOver,
+                    onDrop: (e) => handleDrop(e, routes.indexOf(all[index!])),
+                    style: { cursor: 'default' },
+                  };
+                }}
+              />
+            </div>
+          ),
+        }}
+      />
+
+      {/* Model Group modal */}
+      <Modal title={editingGroup ? 'Edit Model Group' : 'Add Model Group'} open={groupModal} onOk={saveGroup} onCancel={() => { setGroupModal(false); setEditingGroup(null); }} width={560}>
+        <Form form={groupForm} layout="vertical">
+          <Form.Item name="group_id" label="Group ID (matches incoming model name)" rules={[{ required: true }]}>
+            <Input placeholder="gpt-4o" />
+          </Form.Item>
+          <Form.Item name="name" label="Display Name"><Input placeholder="GPT-4o Pool" /></Form.Item>
+          <Form.Item name="enabled" label="Enabled" valuePropName="checked" initialValue={true}><Switch /></Form.Item>
+          <Form.Item name="retry_times" label="Retry Times" tooltip="0 = use the global retry setting (Settings page). A positive value overrides it for this group.">
+            <InputNumber min={0} max={20} />
+          </Form.Item>
+          <Space size="large" wrap>
+            <Form.Item name="context_length" label="Context Length (tokens)" tooltip="Exposed via GET /v1/models so tools like opencode can auto-configure limits. 0 = unknown.">
+              <InputNumber min={0} step={1000} style={{ width: 180 }} placeholder="128000" />
+            </Form.Item>
+            <Form.Item name="max_output_tokens" label="Max Output (tokens)" tooltip="Exposed via GET /v1/models. 0 = unknown.">
+              <InputNumber min={0} step={1000} style={{ width: 180 }} placeholder="16384" />
+            </Form.Item>
+          </Space>
+        </Form>
+      </Modal>
+
+      {/* Route modal */}
+      <Modal title={editingRoute ? 'Edit Route' : 'Add Route'} open={routeModal} onOk={saveRoute} onCancel={() => { setRouteModal(false); setEditingRoute(null); }} width={640}>
+        <Form form={routeForm} layout="vertical">
+          <Form.Item name="model_group_id" label="Model Group" rules={[{ required: true }]}>
+            <Select placeholder="Select model group" options={groups.map(g => ({ value: g.id, label: `${g.group_id} (${g.name})` }))} />
+          </Form.Item>
+          <Form.Item name="provider_id" label="Provider" rules={[{ required: true }]}>
+            <Select placeholder="Select provider" options={providers.map(p => ({ value: p.id, label: p.name }))} />
+          </Form.Item>
+          <Form.Item name="target_model" label="Target Model (leave empty to use incoming model name)">
+            <Input placeholder="gpt-4o-2024-08-06" />
+          </Form.Item>
+          <Form.Item name="enabled" label="Enabled" valuePropName="checked" initialValue={true}><Switch /></Form.Item>
+          <Typography.Text strong>Per-Route Pricing ($/1M tokens)</Typography.Text>
+          <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
+            Leave all at 0 to inherit the Pricing table for this route's model.
+          </Typography.Paragraph>
+          <Space size="large" wrap style={{ marginBottom: 8 }}>
+            <Form.Item name="prompt_per_1m" label="Prompt $/1M"><InputNumber min={0} step={0.01} style={{ width: 130 }} /></Form.Item>
+            <Form.Item name="completion_per_1m" label="Completion $/1M"><InputNumber min={0} step={0.01} style={{ width: 130 }} /></Form.Item>
+            <Form.Item name="cache_read_per_1m" label="Cache Read $/1M"><InputNumber min={0} step={0.01} style={{ width: 130 }} /></Form.Item>
+            <Form.Item name="cache_write_per_1m" label="Cache Write $/1M"><InputNumber min={0} step={0.01} style={{ width: 130 }} /></Form.Item>
+          </Space>
+          <Form.Item
+            name="extra_params"
+            label="Extra Params (JSON object)"
+            extra="Merged into every request this route serves. Overrides the client's values — e.g. {&quot;temperature&quot;: 0.2}. Auto-pairing quotes/brackets and indentation supported."
+          >
+            <JsonEditor
+              rows={14}
+              placeholder={'{\n  "temperature": 0.2\n}'}
+              onValid={(valid) => setExtraError(valid ? '' : 'Fix the JSON in Extra Params first')}
+            />
+          </Form.Item>
+          {extraError && <Alert type="error" showIcon message={extraError} style={{ marginBottom: 8 }} />}
+        </Form>
+      </Modal>
+    </div>
+  );
+};
+
+export default Models;

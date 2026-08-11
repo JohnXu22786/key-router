@@ -2,6 +2,7 @@ import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { Button, Modal, Form, Input, InputNumber, Select, Switch, message, Space, Typography, Popconfirm, Tag, Collapse, Table, Alert } from 'antd';
 import { PlusOutlined, EditOutlined, DeleteOutlined, HolderOutlined } from '@ant-design/icons';
 import { getRoutes, createRoute, updateRoute, deleteRoute, reorderRoutes, getProviders, getModelGroups, Route, Provider, ModelGroup } from '../api/client';
+import JsonEditor from '../components/JsonEditor';
 
 const { Title, Text } = Typography;
 
@@ -242,13 +243,12 @@ const RoutesPage: React.FC = () => {
           <Form.Item
             name="extra_params"
             label="Extra Params (JSON object)"
-            extra="Merged into every request this route serves. Overrides the model group's extra params and the client's values — e.g. {&quot;temperature&quot;: 0.2}."
+            extra="Merged into every request this route serves. Overrides the client's values — e.g. {&quot;temperature&quot;: 0.2}. Auto-pairing quotes/brackets and indentation supported."
           >
-            <Input.TextArea
-              rows={4}
+            <JsonEditor
+              rows={16}
               placeholder={'{\n  "temperature": 0.2\n}'}
-              style={{ fontFamily: 'monospace', fontSize: 12 }}
-              onChange={(e) => onExtraChange(e.target.value)}
+              onValid={(valid) => setExtraError(valid ? '' : 'Fix the JSON in Extra Params first')}
             />
           </Form.Item>
           {extraError && <Alert type="error" showIcon message={extraError} style={{ marginBottom: 8 }} />}

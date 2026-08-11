@@ -106,10 +106,12 @@ func (c *Calculator) CalculateCost(modelName string, usage *model.TokenUsage) fl
 // RecordConsumption writes a consumption record to the database.
 // modelName is the model actually served (post route-target resolution); it
 // powers the Activity page's by-model aggregation.
+// appName is the client app from the X-App request header ("" when absent);
+// it powers the Activity page's "Top Apps" panel.
 // routePrice, when non-nil and non-zero, overrides the Pricing table (each
 // route can carry its own per-1M rates — e.g. a cheap and a premium key for
 // the same model).
-func RecordConsumption(keyID int64, modelName string, usage *model.TokenUsage, routePrice *model.Route) (*model.Consumption, error) {
+func RecordConsumption(keyID int64, modelName, appName string, usage *model.TokenUsage, routePrice *model.Route) (*model.Consumption, error) {
 	// Truncate to the LOCAL hour: time.Truncate aligns to UTC hours, which
 	// misaligns buckets in non-whole-hour-offset zones (e.g. +05:30).
 	nowT := time.Now()
@@ -161,6 +163,7 @@ func RecordConsumption(keyID int64, modelName string, usage *model.TokenUsage, r
 		KeyID:        keyID,
 		HourBucket:   now,
 		ModelName:    modelName,
+		AppName:      appName,
 		RequestCount: 1,
 		CostUSD:      cost,
 	}

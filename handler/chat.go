@@ -51,14 +51,29 @@ func (h *ChatHandler) HandleModels(c *gin.Context) {
 		return
 	}
 
+	// The response carries per-model metadata (context_length /
+	// max_output_tokens) so model-discovery tools (opencode's
+	// models-discovery plugin, and the upcoming official auto-discovery)
+	// can populate accurate limits without a hand-written models map.
 	data := make([]gin.H, 0, len(groups))
 	for _, g := range groups {
-		data = append(data, gin.H{
+		entry := gin.H{
 			"id":       g.GroupID,
 			"object":   "model",
 			"created":  0,
 			"owned_by": "key-router",
-		})
+		}
+		if g.Name != "" {
+			entry["name"] = g.Name
+		}
+		if g.ContextLength > 0 {
+			entry["context_length"] = g.ContextLength
+			entry["max_context_length"] = g.ContextLength
+		}
+		if g.MaxOutputTokens > 0 {
+			entry["max_output_tokens"] = g.MaxOutputTokens
+		}
+		data = append(data, entry)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -182,11 +197,7 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 		}
 
 		// Build request metadata with forwarded headers
-		// Route-level extra params override the model group's.
-		extraParams := route.Route.ExtraParams
-		if extraParams == "" {
-			extraParams = group.ExtraParams
-		}
+		// Route-level extra params (model groups have none).
 		meta := &model.RequestMetadata{
 			Format:      inputFormat,
 			Model:       reqMeta.Model,
@@ -195,7 +206,7 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			RequestBody: body,
 			Headers:     c.Request.Header.Clone(),
 			TargetModel: targetModel,
-			ExtraParams: extraParams,
+			ExtraParams: route.Route.ExtraParams,
 			Ctx:         c.Request.Context(),
 		}
 
@@ -395,7 +406,7 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			// (read/conversion failure) must not inflate costs or burn
 			// rate-limit quotas — the client received an error, not work.
 			if streamErr == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				consumption, err := billing.RecordConsumption(key.ID, targetModel, usage, route.Route)
+				consumption, err := billing.RecordConsumption(key.ID, targetModel, c.Request.Header.Get("X-App"), usage, route.Route)
 				if err != nil {
 					log.Printf("[relay] failed to record consumption for key %d: %v", key.ID, err)
 				}
@@ -477,7 +488,7 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			// performed and must not burn the key's request budgets.
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				usage := relay.ParseTokenUsage(responseBody, route.Provider.Type)
-				consumption, err := billing.RecordConsumption(key.ID, targetModel, usage, route.Route)
+				consumption, err := billing.RecordConsumption(key.ID, targetModel, c.Request.Header.Get("X-App"), usage, route.Route)
 				if err != nil {
 					log.Printf("[relay] failed to record consumption for key %d: %v", key.ID, err)
 				}

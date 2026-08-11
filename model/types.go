@@ -76,12 +76,13 @@ type ModelGroup struct {
 	Name       string `gorm:"type:varchar(255);not null" json:"name"`
 	Enabled    bool   `json:"enabled"`                      // defaulted to true by the create handler
 	RetryTimes int    `gorm:"default:0" json:"retry_times"` // 0 = inherit global server.retry_times
-	// ExtraParams is a JSON object merged into every forwarded request body
-	// for this group. Client-sent keys are OVERWRITTEN (extra params win),
-	// so e.g. {"temperature": 0.2} pins the sampling temperature.
-	ExtraParams string    `gorm:"type:text" json:"extra_params"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	// ContextLength / MaxOutputTokens describe the model's limits (0 =
+	// unknown). Exposed via GET /v1/models so tools like opencode can pick
+	// up accurate limits for auto-discovered models.
+	ContextLength   int64     `gorm:"default:0" json:"context_length"`
+	MaxOutputTokens int64     `gorm:"default:0" json:"max_output_tokens"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 // Route maps a ModelGroup to a Provider
@@ -148,6 +149,7 @@ type Consumption struct {
 	KeyID            int64     `gorm:"not null;index:idx_key_hour,unique" json:"key_id"`
 	HourBucket       time.Time `gorm:"not null;index:idx_key_hour,unique" json:"hour_bucket"` // truncated to hour
 	ModelName        string    `gorm:"type:varchar(255);default:'';index" json:"model_name"`  // model actually served (after route target resolution)
+	AppName          string    `gorm:"type:varchar(255);default:'';index" json:"app_name"`    // client app from the X-App request header (Activity "Top Apps")
 	RequestCount     int64     `gorm:"default:0" json:"request_count"`
 	InputTokens      int64     `gorm:"default:0" json:"input_tokens"`
 	OutputTokens     int64     `gorm:"default:0" json:"output_tokens"`

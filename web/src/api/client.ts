@@ -47,7 +47,8 @@ export interface ModelGroup {
   name: string;
   enabled: boolean;
   retry_times: number;
-  extra_params: string;
+  context_length: number;
+  max_output_tokens: number;
   created_at: string;
   updated_at: string;
 }
@@ -186,6 +187,7 @@ export interface UpdateInfo {
 }
 export const checkUpdate = () => api.post<UpdateInfo>('/updates/check');
 export const applyUpdate = () => api.post('/updates/apply');
+export const getAutoCheckState = () => api.get<UpdateInfo & { checked: boolean }>('/updates/state');
 
 // Health
 export const getHealth = () => api.get('/health');
