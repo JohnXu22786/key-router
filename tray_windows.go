@@ -37,9 +37,8 @@ func StartTray(hwnd uintptr) <-chan struct{} {
 		log.Println("[tray] app hidden to tray")
 	})
 
-	go func() {
-		systray.Run(onTrayReady, onTrayExit)
-	}()
+	// Register (not Run): the webview message loop drives the tray icon.
+	systray.Register(onTrayReady, onTrayExit)
 	return tray.quitChan
 }
 
