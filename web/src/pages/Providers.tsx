@@ -234,6 +234,17 @@ const Providers: React.FC = () => {
           {s === 'disabled' && r.disabled_reason && (
             <Tag color="red">{reasonLabels[r.disabled_reason] || r.disabled_reason}</Tag>
           )}
+          {/* Only for active keys: a rate_limited/disabled key already has
+              a tag explaining its state — this one explains why an ACTIVE
+              key is being skipped (window budget exhausted). */}
+          {s === 'active' && r.limited_windows && r.limited_windows.length > 0 && (
+            <Tag
+              color="orange"
+              title="Window budget(s) exhausted — this key is skipped until usage drops below the limit"
+            >
+              Limit hit: {r.limited_windows.map(w => windowTypes.find(t => t.key === w)?.label ?? w).join(', ')}
+            </Tag>
+          )}
         </Space>
       ),
     },

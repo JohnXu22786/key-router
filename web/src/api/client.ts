@@ -38,6 +38,9 @@ export interface Key {
   total_spent: number;
   sort_order: number;
   counts?: Record<string, { count: number; token_count: number }>;
+  // Window types whose limits are currently exhausted (e.g. "rpm", "rpd") —
+  // why the selector skips this key even though its status is "active".
+  limited_windows?: string[];
   provider?: Provider;
   created_at: string;
   updated_at: string;
