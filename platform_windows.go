@@ -33,13 +33,13 @@ var extractIconExW = shell32.NewProc("ExtractIconExW")
 
 // Window message constants
 const (
-	wmClose    = 0x0010
-	wmDestroy  = 0x0002
-	wmSetIcon  = 0x0080
-	iconSmall  = 0 // ICON_SMALL — title bar
-	iconBig    = 1 // ICON_BIG   — taskbar / Alt-Tab
-	swHide     = 0
-	swShow     = 0x0005
+	wmClose   = 0x0010
+	wmDestroy = 0x0002
+	wmSetIcon = 0x0080
+	iconSmall = 0 // ICON_SMALL — title bar
+	iconBig   = 1 // ICON_BIG   — taskbar / Alt-Tab
+	swHide    = 0
+	swShow    = 0x0005
 )
 
 // detachConsole detaches from the console window (GUI mode)
