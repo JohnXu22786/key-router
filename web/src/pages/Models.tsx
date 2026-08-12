@@ -34,6 +34,13 @@ const Models: React.FC = () => {
   const [groupForm] = Form.useForm();
   const [routeForm] = Form.useForm();
   const persistTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Number of drag orders committed but not yet persisted: the 10s poll
+  // must not overwrite the local order with pre-persist server state.
+  // Captured at fetch START as well (with the persist generation), so a
+  // poll that raced a commit or a persist is discarded even if the persist
+  // settles before the poll response arrives.
+  const pendingPersistsRef = useRef(0);
+  const persistGenRef = useRef(0);
   const routesRef = useRef<Route[]>([]);
   routesRef.current = routes;
 
@@ -59,8 +66,17 @@ const Models: React.FC = () => {
   // groups and scroll position — only row data updates.
   useEffect(() => {
     const t = setInterval(() => {
+      // A fetch that raced a commit or a persist may carry pre-persist data:
+      // skip routes unless no persist was pending at fetch start AND none is
+      // pending now AND the persist generation is unchanged, or the poll
+      // would revert the UI until the next one.
+      const wasPersisting = pendingPersistsRef.current > 0;
+      const gen = persistGenRef.current;
       Promise.all([getModelGroups(), getRoutes(), getProviders()])
-        .then(([g, r, p]) => { setGroups(g.data); setRoutes(r.data); setProviders(p.data); })
+        .then(([g, r, p]) => {
+          setGroups(g.data); setProviders(p.data);
+          if (!wasPersisting && pendingPersistsRef.current === 0 && gen === persistGenRef.current) setRoutes(r.data);
+        })
         .catch(() => {});
     }, 10000);
     return () => clearInterval(t);
@@ -104,6 +120,7 @@ const Models: React.FC = () => {
   };
 
   const persistOrder = useCallback((ordered: Route[]) => {
+    pendingPersistsRef.current++;
     if (persistTimer.current) clearTimeout(persistTimer.current);
     persistTimer.current = setTimeout(async () => {
       const groupCounts: Record<number, number> = {};
@@ -112,14 +129,17 @@ const Models: React.FC = () => {
         groupCounts[r.model_group_id] = idx + 1;
         return { id: r.id, priority: idx };
       });
-      try { await reorderRoutes(payload); } catch { message.error('Failed to save order'); }
+      try { await reorderRoutes(payload); }
+      catch { message.error('Failed to save order'); }
+      pendingPersistsRef.current--;
+      persistGenRef.current++;
     }, 300);
   }, []);
 
   const routeColumns = [
     {
       title: '', key: 'drag', width: 40,
-      render: () => <span data-drag-handle style={{ cursor: 'grab', display: 'inline-block' }}><HolderOutlined style={{ color: '#999' }} /></span>,
+      render: () => <span data-drag-handle style={{ cursor: 'grab', display: 'inline-block', touchAction: 'none' }}><HolderOutlined style={{ color: '#999' }} /></span>,
     },
     {
       title: 'Provider', key: 'provider',
@@ -221,11 +241,11 @@ const Models: React.FC = () => {
                   const all = routes.filter(r => r.model_group_id === g.id);
                   const globalIndex = routes.indexOf(all[index!]);
                   return {
-                    'data-row-index': globalIndex,
                     style: { cursor: 'default', ...drag.rowStyle(globalIndex) },
                     onPointerDown: (e: React.PointerEvent) => drag.onPointerDown(e, globalIndex),
                     onPointerMove: drag.onPointerMove,
                     onPointerUp: drag.onPointerUp,
+                    onPointerCancel: drag.onPointerCancel,
                   };
                 }}
               />
