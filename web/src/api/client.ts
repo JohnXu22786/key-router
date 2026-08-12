@@ -187,7 +187,7 @@ export interface UpdateInfo {
   asset_name?: string;
   asset_url?: string;
   asset_size?: number;
-  checked_at: string;
+  checked_at?: string;
   error?: string;
 }
 export const checkUpdate = () => api.post<UpdateInfo>('/updates/check');

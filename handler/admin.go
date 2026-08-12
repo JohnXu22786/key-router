@@ -51,16 +51,33 @@ func (h *AdminHandler) SetAutoCheckInfo(info *update.UpdateInfo) {
 	h.autoCheckMu.Unlock()
 }
 
-// GetAutoCheckState returns the last auto-check result ("" when none yet).
+// GetAutoCheckState returns the last auto-check result (checked=false when no
+// auto-check has found an update yet) plus the always-known local facts —
+// current version and install mode — so the UI can label the copy (portable
+// vs installed) correctly before the first check.
 func (h *AdminHandler) GetAutoCheckState(c *gin.Context) {
 	h.autoCheckMu.Lock()
 	info := h.autoCheckInfo
 	h.autoCheckMu.Unlock()
-	if info == nil {
-		c.JSON(http.StatusOK, gin.H{"checked": false})
-		return
+
+	resp := gin.H{
+		"current_version":  h.Updater.CurrentVersion,
+		"latest_version":   h.Updater.CurrentVersion,
+		"update_available": false,
+		"install_mode":     h.Updater.InstallMode(),
+		"checked":          info != nil,
 	}
-	c.JSON(http.StatusOK, info)
+	if info != nil {
+		resp["latest_version"] = info.LatestVersion
+		resp["update_available"] = info.UpdateAvailable
+		resp["checked_at"] = info.CheckedAt
+		if info.AssetName != "" {
+			resp["asset_name"] = info.AssetName
+			resp["asset_url"] = info.AssetURL
+			resp["asset_size"] = info.AssetSize
+		}
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // NewAdminHandler creates a new admin handler
@@ -1178,6 +1195,7 @@ func (h *AdminHandler) CheckUpdate(c *gin.Context) {
 			"current_version":  h.Updater.CurrentVersion,
 			"latest_version":   h.Updater.CurrentVersion,
 			"update_available": false,
+			"install_mode":     h.Updater.InstallMode(),
 			"error":            err.Error(),
 		})
 		return
