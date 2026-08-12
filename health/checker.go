@@ -61,9 +61,9 @@ const activeProbeInterval = 1 * time.Hour
 // NewChecker creates a new health checker
 func NewChecker() *Checker {
 	return &Checker{
-		interval:      120 * time.Second, // default
-		failCount:     make(map[int64]int),
-		authFailCount: make(map[int64]int),
+		interval:        120 * time.Second, // default
+		failCount:       make(map[int64]int),
+		authFailCount:   make(map[int64]int),
 		lastActiveProbe: make(map[int64]time.Time),
 	}
 }
