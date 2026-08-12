@@ -59,10 +59,13 @@ const LayoutWithRouter: React.FC = () => {
         onCollapse={setCollapsed}
         style={{ position: 'fixed', left: 0, top: 0, bottom: 0, height: '100vh', overflow: 'auto', zIndex: 10 }}
       >
-        <div style={{ height: 64, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-          <Title level={4} style={{ color: '#fff', margin: 0 }}>
-            {collapsed ? 'KR' : 'KeyRouter'}
-          </Title>
+        <div style={{ height: 64, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
+          <img src="/app-icon-512.png" alt="KeyRouter" style={{ width: 28, height: 28 }} />
+          {!collapsed && (
+            <Title level={4} style={{ color: '#fff', margin: 0 }}>
+              KeyRouter
+            </Title>
+          )}
         </div>
         <Menu
           theme="dark"
