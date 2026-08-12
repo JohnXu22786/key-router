@@ -34,6 +34,8 @@ export interface Key {
   rpw_metric: string;
   rpm_month_limit: number;
   rpm_metric: string;
+  total_spend_limit: number;
+  total_spent: number;
   sort_order: number;
   counts?: Record<string, { count: number; token_count: number }>;
   provider?: Provider;
@@ -125,6 +127,7 @@ export const createKey = (data: Partial<Key>) => api.post<Key>('/keys', data);
 export const updateKey = (id: number, data: Partial<Key>) => api.put<Key>(`/keys/${id}`, data);
 export const deleteKey = (id: number) => api.delete(`/keys/${id}`);
 export const reorderKeys = (keys: { id: number; sort_order: number }[]) => api.post('/keys/reorder', { keys });
+export const resetKeySpend = (id: number) => api.post(`/keys/${id}/reset-spend`);
 
 // Model Groups
 export const getModelGroups = () => api.get<ModelGroup[]>('/model-groups');

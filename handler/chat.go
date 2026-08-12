@@ -416,6 +416,11 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 				} else {
 					h.Engine.WindowManager.IncrementAllWithCost(key.ID, 0, costMicro)
 				}
+				// Lifetime budget: accumulate spend; if the key's total
+				// budget is exhausted, take it out of rotation permanently.
+				if costMicro > 0 {
+					h.applySpendLimit(key.ID, costMicro)
+				}
 			}
 		} else {
 			// Read response body BEFORE committing the status code so that a
@@ -494,6 +499,9 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 				}
 				costMicro := int64(consumption.CostUSD * 1e6)
 				h.Engine.RecordSuccess(key.ID, usage.TotalTokens, costMicro)
+				if costMicro > 0 {
+					h.applySpendLimit(key.ID, costMicro)
+				}
 			}
 
 			// 3xx without Location is useless to the client (and a redirect
@@ -568,6 +576,32 @@ func writeRelayError(c *gin.Context, inputFormat string, status int, code, errTy
 			"code":    code,
 		},
 	})
+}
+
+// applySpendLimit accumulates the key's lifetime spend (micro-USD) after a
+// successful relayed request. If the key has a total spend budget and it is
+// now exhausted, the key is disabled permanently with reason
+// "spend_limit_exhausted" until an admin resets it. The accumulation is
+// atomic (DB-side increment) so concurrent requests can't lose spend.
+func (h *ChatHandler) applySpendLimit(keyID, costMicro int64) {
+	// Atomically add and read back the new total.
+	var key model.Key
+	if err := db.GetDB().Model(&model.Key{}).
+		Where("id = ?", keyID).
+		UpdateColumn("total_spent", gorm.Expr("total_spent + ?", costMicro)).Error; err != nil {
+		log.Printf("[relay] failed to accumulate spend for key %d: %v", keyID, err)
+		return
+	}
+	if err := db.GetDB().First(&key, keyID).Error; err != nil {
+		log.Printf("[relay] failed to reload key %d spend: %v", keyID, err)
+		return
+	}
+	if key.TotalSpendLimit <= 0 || key.TotalSpent < key.TotalSpendLimit {
+		return
+	}
+	log.Printf("[relay] key %d spent total %d (limit %d) — disabling (spend budget exhausted)",
+		keyID, key.TotalSpent, key.TotalSpendLimit)
+	h.Engine.MarkKeyDisabled(keyID, "spend_limit_exhausted")
 }
 
 // extractAppName derives the client app name from the request headers,

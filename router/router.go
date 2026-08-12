@@ -96,6 +96,7 @@ func Setup(
 		api.GET("/keys", adminHandler.GetKeys)
 		api.POST("/keys", adminHandler.CreateKey)
 		api.PUT("/keys/:id", adminHandler.UpdateKey)
+		api.POST("/keys/:id/reset-spend", adminHandler.ResetKeySpend)
 		api.DELETE("/keys/:id", adminHandler.DeleteKey)
 		api.POST("/keys/reorder", adminHandler.ReorderKeys)
 

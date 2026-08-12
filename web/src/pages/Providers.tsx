@@ -8,7 +8,7 @@ import {
 } from '@ant-design/icons';
 import {
   getProviders, createProvider, updateProvider, deleteProvider,
-  getKeys, createKey, updateKey, deleteKey, reorderKeys, getKeyDetail,
+  getKeys, createKey, updateKey, deleteKey, reorderKeys, getKeyDetail, resetKeySpend,
   getRoutes, Provider, Key, Route,
 } from '../api/client';
 import { useDragSort } from '../hooks/useDragSort';
@@ -24,6 +24,7 @@ const reasonLabels: Record<string, string> = {
   insufficient_quota: 'Insufficient quota',
   rate_limited: 'Rate limited',
   upstream_error: 'Upstream error',
+  spend_limit_exhausted: 'Spend budget exhausted',
 };
 
 const metricOptions = [
@@ -171,6 +172,13 @@ const Providers: React.FC = () => {
     setKeyModal(true);
   };
 
+  const handleResetSpend = async (id: number) => {
+    try {
+      await resetKeySpend(id);
+      message.success('Lifetime budget reset — key re-enabled');
+      fetch();
+    } catch { message.error('Failed to reset key spend'); }
+  };
   const persistOrder = useCallback((ordered: Key[]) => {
     if (persistTimer.current) clearTimeout(persistTimer.current);
     persistTimer.current = setTimeout(async () => {
@@ -354,22 +362,55 @@ const Providers: React.FC = () => {
           <div style={{ marginTop: 8 }}>
             <Typography.Text strong>Rate Limits</Typography.Text>
             <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
-              Leave a field empty to remove the limit (0 = unlimited). For 5-hour/daily/weekly/monthly windows, the metric can be requests, tokens, or cost — cost limits are in USD.
+              Leave a field empty to remove the limit (0 = unlimited). Windows use requests, tokens, or cost (USD).
             </Typography.Paragraph>
-            <Space size="large" style={{ marginTop: 8, marginBottom: 8, display: 'flex' }}>
-              <Form.Item name="rpm_limit" label="RPM (requests)"><InputNumber min={0} placeholder="500" /></Form.Item>
-              <Form.Item name="tpm_limit" label="TPM (tokens)"><InputNumber min={0} placeholder="200000" /></Form.Item>
-            </Space>
-            <Space size="large" style={{ display: 'flex', flexWrap: 'wrap' }}>
-              <Form.Item name="rp5h_limit" label="5-Hour Limit"><InputNumber min={0} placeholder="5000" style={{ width: 100 }} /></Form.Item>
-              <Form.Item name="rp5h_metric" label="Metric"><Select style={{ width: 120 }} options={metricOptions} /></Form.Item>
-              <Form.Item name="rpd_limit" label="Daily Limit"><InputNumber min={0} placeholder="10000" style={{ width: 100 }} /></Form.Item>
-              <Form.Item name="rpd_metric" label="Metric"><Select style={{ width: 120 }} options={metricOptions} /></Form.Item>
-              <Form.Item name="rpw_limit" label="Weekly Limit"><InputNumber min={0} placeholder="50000" style={{ width: 100 }} /></Form.Item>
-              <Form.Item name="rpw_metric" label="Metric"><Select style={{ width: 120 }} options={metricOptions} /></Form.Item>
-              <Form.Item name="rpm_month_limit" label="Monthly Limit"><InputNumber min={0} placeholder="200000" style={{ width: 100 }} /></Form.Item>
-              <Form.Item name="rpm_metric" label="Metric"><Select style={{ width: 120 }} options={metricOptions} /></Form.Item>
-            </Space>
+            {/* Window limits: fixed 3-column grid, no auto-wrap */}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '0 16px' }}>
+              <Form.Item name="rpm_limit" label="RPM (requests)"><InputNumber min={0} placeholder="500" style={{ width: '100%' }} /></Form.Item>
+              <Form.Item name="tpm_limit" label="TPM (tokens)"><InputNumber min={0} placeholder="200000" style={{ width: '100%' }} /></Form.Item>
+              <div />{/* spacer for row 1 col 3 */}
+              <Form.Item name="rp5h_limit" label="5-Hour Limit"><InputNumber min={0} placeholder="5000" style={{ width: '100%' }} /></Form.Item>
+              <Form.Item name="rp5h_metric" label="5-Hour Metric"><Select style={{ width: '100%' }} options={metricOptions} /></Form.Item>
+              <div />
+              <Form.Item name="rpd_limit" label="Daily Limit"><InputNumber min={0} placeholder="10000" style={{ width: '100%' }} /></Form.Item>
+              <Form.Item name="rpd_metric" label="Daily Metric"><Select style={{ width: '100%' }} options={metricOptions} /></Form.Item>
+              <div />
+              <Form.Item name="rpw_limit" label="Weekly Limit"><InputNumber min={0} placeholder="50000" style={{ width: '100%' }} /></Form.Item>
+              <Form.Item name="rpw_metric" label="Weekly Metric"><Select style={{ width: '100%' }} options={metricOptions} /></Form.Item>
+              <div />
+              <Form.Item name="rpm_month_limit" label="Monthly Limit"><InputNumber min={0} placeholder="200000" style={{ width: '100%' }} /></Form.Item>
+              <Form.Item name="rpm_metric" label="Monthly Metric"><Select style={{ width: '100%' }} options={metricOptions} /></Form.Item>
+            </div>
+
+            {/* Lifetime budget (spend cap) */}
+            <Typography.Text strong style={{ display: 'block', marginTop: 12 }}>Lifetime Budget</Typography.Text>
+            <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginBottom: 8 }}>
+              A one-time total spend cap (USD). Once the key has served this much cost it is disabled and stays
+              disabled until you reset it. 0 = no budget.
+            </Typography.Paragraph>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: 16, alignItems: 'end' }}>
+              <Form.Item name="total_spend_limit" label="Total Budget (USD)">
+                <InputNumber min={0} step={1} placeholder="50" style={{ width: '100%' }} />
+              </Form.Item>
+              {editingKey && (
+                <Form.Item label="Spent">
+                  <Text style={{ lineHeight: '32px', fontVariantNumeric: 'tabular-nums' }}>
+                    ${(((editingKey.total_spent || 0) / 1e6).toFixed(2))}
+                  </Text>
+                </Form.Item>
+              )}
+              {editingKey && editingKey.total_spent > 0 && (
+                <Popconfirm
+                  title="Reset lifetime budget?"
+                  description="This resets the spent amount to $0 and re-enables the key (undoes spend_limit_exhausted)."
+                  okText="Reset"
+                  okButtonProps={{ danger: true }}
+                  onConfirm={() => handleResetSpend(editingKey.id)}
+                >
+                  <Button style={{ marginBottom: 24 }} danger>Reset Spent</Button>
+                </Popconfirm>
+              )}
+            </div>
           </div>
         </Form>
       </Modal>

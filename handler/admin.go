@@ -25,7 +25,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// version is injected at build time via -ldflags "-X main.version=..." — the
+// version is injected at build time via -ldflags "-X main.version=..." Ã¢â‚¬â€ the
 // handler package mirrors the value so /api/health reports the release version.
 var version = "0.1.0"
 
@@ -124,7 +124,7 @@ func validateProvider(p *model.Provider) error {
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return errors.New("base_url must be a valid URL (scheme + host)")
 	}
-	// Only HTTP(S) makes sense for an API gateway; a typo'd scheme (ftp://…)
+	// Only HTTP(S) makes sense for an API gateway; a typo'd scheme (ftp://Ã¢â‚¬Â¦)
 	// would otherwise surface as a confusing 502 at request time
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return errors.New("base_url must use http or https")
@@ -410,7 +410,7 @@ func (h *AdminHandler) UpdateKey(c *gin.Context) {
 	}
 
 	// Status/cooldown/reason/strategy are owned by the relay and health
-	// checker — the edit form doesn't send them, and a stale page-load
+	// checker Ã¢â‚¬â€ the edit form doesn't send them, and a stale page-load
 	// snapshot must not re-enable a key the relay just disabled (or shrink a
 	// fresh cooldown). Only an EXPLICIT status transition in the payload is
 	// honored.
@@ -444,7 +444,7 @@ func (h *AdminHandler) UpdateKey(c *gin.Context) {
 		return
 	}
 	// A key edit (e.g. fixing the key_value of an auth_failed key) must
-	// resume health-check probing — clear the consecutive-failure latch.
+	// resume health-check probing Ã¢â‚¬â€ clear the consecutive-failure latch.
 	h.HealthChecker.ResetFailCount(id)
 	h.Engine.Refresh()
 	c.JSON(http.StatusOK, k)
@@ -793,7 +793,7 @@ func (h *AdminHandler) DeleteRoute(c *gin.Context) {
 }
 
 // ReorderKeys batch-updates key sort_order based on visual ordering (the
-// order the user arranged keys within a provider — sort order = call order).
+// order the user arranged keys within a provider Ã¢â‚¬â€ sort order = call order).
 // sort_order is per-provider: the payload carries the full ordered key list
 // for one provider.
 func (h *AdminHandler) ReorderKeys(c *gin.Context) {
@@ -1060,7 +1060,7 @@ func (h *AdminHandler) GetStatsConsumptions(c *gin.Context) {
 		}
 	}
 
-	// Generous cap: 24h × 7d = 168 rows per key, so this covers hundreds of
+	// Generous cap: 24h Ãƒâ€” 7d = 168 rows per key, so this covers hundreds of
 	// keys without truncating the Stats page charts.
 	if err := query.Order("hour_bucket DESC").Limit(100000).Find(&consumptions).Error; err != nil {
 		log.Printf("[admin] GetStatsConsumptions error: %v", err)
@@ -1071,6 +1071,34 @@ func (h *AdminHandler) GetStatsConsumptions(c *gin.Context) {
 }
 
 // GetKeyStatuses returns health status of all keys
+// ResetKeySpend resets a key's lifetime spend budget usage back to zero and
+// re-enables the key (undoes a "spend_limit_exhausted" disable). The UI
+// confirms before calling this.
+func (h *AdminHandler) ResetKeySpend(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid key id"})
+		return
+	}
+	res := db.GetDB().Model(&model.Key{}).
+		Where("id = ?", id).
+		Updates(map[string]interface{}{
+			"total_spent":     0,
+			"status":          model.KeyStatusActive,
+			"disabled_reason": "",
+		})
+	if res.Error != nil {
+		log.Printf("[admin] ResetKeySpend error: %v", res.Error)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to reset key spend"})
+		return
+	}
+	if res.RowsAffected == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "key not found"})
+		return
+	}
+	h.Engine.Refresh() // reload in-memory status
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
 func (h *AdminHandler) GetKeyStatuses(c *gin.Context) {
 	results, err := health.GetKeyStatuses()
 	if err != nil {
@@ -1410,7 +1438,7 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 
 	// Summary: per group Min/Max/Avg/Sum/Value/Percent. Value = sum in the
 	// LAST bucket (OpenRouter's "Value" column). Min/Max/Avg are computed
-	// over the group's NON-EMPTY buckets only (OR semantics — an idle day is
+	// over the group's NON-EMPTY buckets only (OR semantics Ã¢â‚¬â€ an idle day is
 	// not a $0 sample; a model that ran one day shows Min==Max==Avg==that
 	// day's value).
 	groupTotals := make(map[string]float64)
