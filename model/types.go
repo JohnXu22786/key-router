@@ -57,6 +57,13 @@ type Key struct {
 	RPWMetric        string     `gorm:"type:varchar(10);default:'requests'" json:"rpw_metric"`
 	RPMLimitMonth    int64      `gorm:"default:0" json:"rpm_month_limit"` // monthly limit
 	RPMMetric        string     `gorm:"type:varchar(10);default:'requests'" json:"rpm_metric"`
+	// TotalSpendLimit is a one-time lifetime budget for the key, in micro-USD
+	// (1e6 per $1; 0 = unlimited). Once TotalSpent reaches the limit the key
+	// is disabled with reason "spend_limit_exhausted" and stays disabled
+	// until an admin resets it (with confirmation).
+	TotalSpendLimit int64 `gorm:"default:0" json:"total_spend_limit"`
+	// TotalSpent is the accumulated cost served by this key, in micro-USD.
+	TotalSpent int64 `gorm:"default:0" json:"total_spent"`
 	// SortOrder is the caller-priority within the provider group (0 = called
 	// first). It coexists with the recovery strategy: immediate keys are
 	// always preferred over lazy keys, and within each strategy keys are
