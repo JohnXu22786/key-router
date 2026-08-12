@@ -114,7 +114,9 @@ func main() {
 	persistDone := make(chan struct{})
 	go func() {
 		defer close(persistDone)
-		ticker := time.NewTicker(60 * time.Second)
+		// Persist window counters frequently so a crash or a forced kill loses
+		// at most the last few seconds of rate-limit usage, not the whole day.
+		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
