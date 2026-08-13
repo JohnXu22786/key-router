@@ -4,7 +4,7 @@ Section: net
 Priority: optional
 Architecture: amd64
 Depends: libwebkit2gtk-4.0-37, libgtk-3-0
-Maintainer: LocalRouter <noreply@github.com>
+Maintainer: KeyRouter <noreply@github.com>
 Homepage: https://github.com/JohnXu22786/key-router
 Description: Local AI API gateway desktop app
  Multi-key management, automatic failover, format conversion, rate
