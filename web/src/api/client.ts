@@ -164,7 +164,7 @@ export const getConsumptions = (params?: { key_id?: number; since?: string; unti
 export const getKeyDetail = (id: number) => api.get(`/stats/keys/${id}`);
 
 // Activity (OpenRouter-style: overview / trends / explore)
-export interface ActivitySeriesPoint { bucket: string; group: string; value: number; is_zero: boolean; }
+export interface ActivitySeriesPoint { bucket: string; group: string; subgroup?: string; value: number; is_zero: boolean; }
 export interface ActivityGroupSummary { group: string; min: number; max: number; avg: number; sum: number; value: number; percent: number; }
 export interface ActivityResponse {
   metric: string;
@@ -175,7 +175,7 @@ export interface ActivityResponse {
   buckets: string[];
   totals: { spend: number; tokens: number; requests: number; cache: number };
 }
-export const getActivity = (params: { metric?: string; group_by?: string; rollup?: string; top?: number; since?: string; until?: string }) =>
+export const getActivity = (params: { metric?: string; group_by?: string; subgroup?: string; rollup?: string; top?: number; since?: string; until?: string }) =>
   api.get<ActivityResponse>('/stats/activity', { params });
 
 // Actions

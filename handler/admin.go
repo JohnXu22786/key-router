@@ -1229,10 +1229,11 @@ func (h *AdminHandler) ApplyUpdate(c *gin.Context) {
 
 // ActivitySeriesPoint is one (time bucket, group) value for the stacked chart.
 type ActivitySeriesPoint struct {
-	Bucket string  `json:"bucket"` // "MM-DD" or "MM-DD HH:00"
-	Group  string  `json:"group"`  // model name / key name / app name
-	Value  float64 `json:"value"`
-	IsZero bool    `json:"is_zero"` // explicit zero for chart stacking
+	Bucket   string  `json:"bucket"`             // "MM-DD" or "MM-DD HH:00"
+	Group    string  `json:"group"`              // model name / key name / app name
+	Subgroup string  `json:"subgroup,omitempty"` // second dimension (empty when no subgroup)
+	Value    float64 `json:"value"`
+	IsZero   bool    `json:"is_zero"` // explicit zero for chart stacking
 }
 
 // activityAcc accumulates one (bucket, group) cell.
@@ -1263,13 +1264,17 @@ type ActivityResponse struct {
 // GetActivity aggregates consumption for the Activity page.
 // Query params:
 //
-//	metric:  spend | tokens | requests | cache   (default spend)
+//	metric:   spend | tokens | requests | cache   (default spend)
 //	group_by: model | key | app                    (default model)
-//	rollup:  hour | day                            (default day)
+//	subgroup: model | key | app                    (optional second dimension,
+//	          must differ from group_by; splits each group's series into
+//	          per-subgroup stacks, e.g. spend by model, split by API key)
+//	rollup:   hour | day                           (default day)
 //	since / until: RFC3339, inclusive range
 func (h *AdminHandler) GetActivity(c *gin.Context) {
 	metric := c.DefaultQuery("metric", "spend")
 	groupBy := c.DefaultQuery("group_by", "model")
+	subgroup := c.DefaultQuery("subgroup", "")
 	rollup := c.DefaultQuery("rollup", "day")
 	// Top-N for the chart: series beyond this many groups are folded into an
 	// "Other" series (#94a3b8) like OpenRouter. 0 = no folding.
@@ -1286,6 +1291,16 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 	if groupBy != "model" && groupBy != "key" && groupBy != "app" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "group_by must be model|key|app"})
 		return
+	}
+	if subgroup != "" {
+		if subgroup != "model" && subgroup != "key" && subgroup != "app" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "subgroup must be model|key|app"})
+			return
+		}
+		if subgroup == groupBy {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "subgroup must differ from group_by"})
+			return
+		}
 	}
 	if rollup != "hour" && rollup != "day" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "rollup must be hour|day"})
@@ -1322,10 +1337,10 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 		return
 	}
 
-	// Load key names (for group_by=key/app display).
+	// Load key names (for group_by/subgroup = key display).
 	keyNames := make(map[int64]string)
 	var keys []model.Key
-	if groupBy == "key" || groupBy == "app" {
+	if groupBy == "key" || groupBy == "app" || subgroup == "key" {
 		if err := db.GetDB().Find(&keys).Error; err == nil {
 			for i := range keys {
 				keyNames[keys[i].ID] = keys[i].Name
@@ -1365,6 +1380,28 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 			return float64(r.RequestCount)
 		default: // cache
 			return float64(r.CacheHitTokens)
+		}
+	}
+
+	// subgroupOf maps a row to its subgroup label (only used when the
+	// subgroup param is set).
+	subgroupOf := func(r *model.Consumption) string {
+		switch subgroup {
+		case "model":
+			if r.ModelName == "" {
+				return "Unknown"
+			}
+			return r.ModelName
+		case "key":
+			if n, ok := keyNames[r.KeyID]; ok && n != "" {
+				return n
+			}
+			return fmt.Sprintf("Key #%d", r.KeyID)
+		default: // app
+			if r.AppName != "" {
+				return r.AppName
+			}
+			return "Unknown"
 		}
 	}
 
@@ -1411,6 +1448,55 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 		}
 	}
 
+	// Subgroup aggregation: bucket -> group -> subgroup -> sum. Only built
+	// when requested; the summary table stays per primary group, the series
+	// is split per subgroup.
+	subAgg := make(map[string]map[string]map[string]*activityAcc)
+	subgroupOrder := make(map[string][]string) // group -> subgroups, by sum desc
+	if subgroup != "" {
+		seenSubgroup := make(map[string]bool)
+		for i := range rows {
+			b := bucketOf(rows[i].HourBucket)
+			g := groupOf(&rows[i])
+			sg := subgroupOf(&rows[i])
+			if subAgg[b] == nil {
+				subAgg[b] = make(map[string]map[string]*activityAcc)
+			}
+			if subAgg[b][g] == nil {
+				subAgg[b][g] = make(map[string]*activityAcc)
+			}
+			if subAgg[b][g][sg] == nil {
+				subAgg[b][g][sg] = &activityAcc{}
+			}
+			subAgg[b][g][sg].sum += valueOf(&rows[i])
+			if !seenSubgroup[g+"\x00"+sg] {
+				seenSubgroup[g+"\x00"+sg] = true
+				subgroupOrder[g] = append(subgroupOrder[g], sg)
+			}
+		}
+		// Order each group's subgroups by total sum (desc, name asc on ties)
+		// so the chart's stack order is deterministic.
+		for g := range subgroupOrder {
+			sort.Slice(subgroupOrder[g], func(i, j int) bool {
+				var si, sj float64
+				for _, b := range bucketOrder {
+					if m, ok := subAgg[b][g]; ok {
+						if a, ok := m[subgroupOrder[g][i]]; ok {
+							si += a.sum
+						}
+						if a, ok := m[subgroupOrder[g][j]]; ok {
+							sj += a.sum
+						}
+					}
+				}
+				if si != sj {
+					return si > sj
+				}
+				return subgroupOrder[g][i] < subgroupOrder[g][j]
+			})
+		}
+	}
+
 	// Series groups are ordered by total Sum (desc) so the chart's Top-N set
 	// matches the summary table's ordering.
 	sort.Slice(groupOrder, func(i, j int) bool {
@@ -1444,7 +1530,9 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 	}
 
 	// Series: for each bucket, for each group. Groups beyond the Top-N are
-	// folded into a single "Other" series (OR behavior).
+	// folded into a single "Other" series (OR behavior). With a subgroup,
+	// each top group is split into per-subgroup stacks (subgroups ordered by
+	// sum desc); "Other" stays a single aggregated stack.
 	seriesGroups := groupOrder
 	otherActive := false
 	if topN > 0 && len(groupOrder) > topN {
@@ -1453,6 +1541,24 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 	}
 	for _, b := range bucketOrder {
 		for _, g := range seriesGroups {
+			if subgroup != "" {
+				for _, sg := range subgroupOrder[g] {
+					v := float64(0)
+					if m, ok := subAgg[b][g]; ok {
+						if a, ok := m[sg]; ok {
+							v = a.sum
+						}
+					}
+					resp.Series = append(resp.Series, ActivitySeriesPoint{
+						Bucket:   b,
+						Group:    g,
+						Subgroup: sg,
+						Value:    v,
+						IsZero:   v == 0,
+					})
+				}
+				continue
+			}
 			v := float64(0)
 			if m, ok := agg[b][g]; ok {
 				v = m.sum

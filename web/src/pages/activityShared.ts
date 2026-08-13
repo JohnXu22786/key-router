@@ -91,3 +91,28 @@ export const fmt3sig = (v: number): string => {
   const s = v.toPrecision(3);
   return `$${parseFloat(s)}`;
 };
+
+export interface FaviconInfo { url: string | null; letter: string; color: string; }
+
+// Vendor icons saved from the OpenRouter reference page (web/public/icons).
+const VENDOR_ICONS: { match: RegExp; url: string }[] = [
+  { match: /deepseek/i, url: '/icons/DeepSeek.png' },
+  { match: /claude|anthropic/i, url: '/icons/Anthropic.svg' },
+  { match: /gemini|google/i, url: '/icons/GoogleGemini.svg' },
+  { match: /gpt|o1[-\s]|o3[-\s]|o4[-\s]|openai|chatgpt/i, url: '/icons/OpenAI.svg' },
+];
+
+// modelFavicon resolves a model name to a vendor favicon (OpenRouter shows
+// one per row in the Explore table). Unknown vendors fall back to a
+// deterministic letter avatar so the cell never looks empty.
+export function modelFavicon(name: string): FaviconInfo {
+  const m = VENDOR_ICONS.find(v => v.match.test(name));
+  if (m) return { url: m.url, letter: '', color: '' };
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+  return {
+    url: null,
+    letter: (name.charAt(0) || '?').toUpperCase(),
+    color: CHART_COLORS[h % CHART_COLORS.length],
+  };
+}

@@ -51,6 +51,12 @@ func bootstrapActivity(t *testing.T) *gin.Engine {
 	day1late := day1.Add(time.Hour)
 	db.GetDB().Create(&model.Consumption{KeyID: key.ID, HourBucket: day1late, ModelName: "", RequestCount: 1, InputTokens: 10, OutputTokens: 0, CostUSD: 0})
 
+	// Second key with its own spend on g1 so subgroup=key splits a group.
+	db.GetDB().Create(&model.Key{ProviderID: prov.ID, KeyValue: "k2", Name: "k2"})
+	var key2 model.Key
+	db.GetDB().Where("name = ?", "k2").First(&key2)
+	db.GetDB().Create(&model.Consumption{KeyID: key2.ID, HourBucket: day1, ModelName: "g1", RequestCount: 7, InputTokens: 200, OutputTokens: 40, CacheHitTokens: 20, CostUSD: 0.02})
+
 	engine := selector.NewEngine()
 	checker := health.NewChecker()
 	return router.Setup(embed.FS{}, engine, checker)
@@ -80,6 +86,8 @@ func TestActivityEdgeCases(t *testing.T) {
 		{"cache daily", "metric=cache&group_by=model&rollup=day", 200},
 		{"bad metric", "metric=bogus", 400},
 		{"bad group_by", "metric=spend&group_by=nope", 400},
+		{"bad subgroup", "metric=spend&subgroup=bogus", 400},
+		{"subgroup same as group_by", "metric=spend&group_by=model&subgroup=model", 400},
 		{"bad since", "metric=spend&since=notadate", 400},
 	}
 	for _, c := range cases {
@@ -138,5 +146,79 @@ func TestActivityEdgeCases(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestActivitySubgroup exercises the optional second dimension: series must
+// be split per (group, subgroup), subgroups ordered by sum desc within each
+// group, and "Other" stays a single aggregated stack. The fixture gives g1
+// spend on day1 from k2 ($0.02) and k1 ($0.01) — a precise ordering check.
+func TestActivitySubgroup(t *testing.T) {
+	e := bootstrapActivity(t)
+	t.Cleanup(func() {
+		if sqlDB, err := db.GetDB().DB(); err == nil {
+			sqlDB.Close()
+		}
+	})
+
+	now := time.Now()
+	day1Label := time.Date(now.Year(), now.Month(), now.Day()-1, 12, 0, 0, 0, now.Location()).Format("01-02")
+
+	req := httptest.NewRequest("GET", "/api/stats/activity?metric=spend&group_by=model&subgroup=key&rollup=day&top=1", nil)
+	req.Host = "localhost:9999"
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Series []struct {
+			Bucket   string  `json:"bucket"`
+			Group    string  `json:"group"`
+			Subgroup string  `json:"subgroup"`
+			Value    float64 `json:"value"`
+		} `json:"series"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("bad json: %v\n%s", err, rec.Body.String())
+	}
+	// g1 has spend from both k1 and k2 — both must appear as subgroups, and
+	// on day1 (their only day) the values must be exact and ordered sum-desc
+	// (k2 0.02 before k1 0.01) so the chart stack is deterministic.
+	var g1Day1 []float64
+	otherWithSubgroup := 0
+	for _, s := range out.Series {
+		if s.Group == "g1" && s.Bucket == day1Label {
+			g1Day1 = append(g1Day1, s.Value)
+		}
+		if s.Group == "Other" && s.Subgroup != "" {
+			otherWithSubgroup++
+		}
+	}
+	if len(g1Day1) != 2 || g1Day1[0] != 0.02 || g1Day1[1] != 0.01 {
+		t.Fatalf("g1 day1 subgroup values = %v, want [0.02 0.01] (sum desc)", g1Day1)
+	}
+	if otherWithSubgroup != 0 {
+		t.Fatalf("Other must stay unsplit, got %d subgroup points", otherWithSubgroup)
+	}
+
+	// Subgroup must also work with group_by=key and hourly rollup (smoke).
+	req2 := httptest.NewRequest("GET", "/api/stats/activity?metric=tokens&group_by=key&subgroup=model&rollup=hour&top=5", nil)
+	req2.Host = "localhost:9999"
+	rec2 := httptest.NewRecorder()
+	e.ServeHTTP(rec2, req2)
+	if rec2.Code != 200 {
+		t.Fatalf("key x model status = %d: %s", rec2.Code, rec2.Body.String())
+	}
+	var out2 struct {
+		Series []struct {
+			Subgroup string `json:"subgroup"`
+		} `json:"series"`
+	}
+	if err := json.Unmarshal(rec2.Body.Bytes(), &out2); err != nil {
+		t.Fatalf("bad json: %v\n%s", err, rec2.Body.String())
+	}
+	if len(out2.Series) == 0 {
+		t.Fatalf("expected series points for group_by=key&subgroup=model")
 	}
 }

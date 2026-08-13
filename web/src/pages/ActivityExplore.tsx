@@ -1,8 +1,20 @@
-import React, { useEffect, useState } from 'react';
-import { Card, Typography, Spin, message, Segmented, Select, Space, Table, Tag, Progress } from 'antd';
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
+import React, { useEffect, useMemo, useState } from 'react';
+import { Card, Typography, Spin, message, Select, Dropdown, Button, Space, Tooltip, Table } from 'antd';
+import type { TableProps } from 'antd';
+import {
+  BarChart, Bar, AreaChart, Area, LineChart, Line, XAxis, YAxis, CartesianGrid,
+  Tooltip as ChartTip, ResponsiveContainer,
+} from 'recharts';
+import {
+  PlusOutlined, EllipsisOutlined, ExpandOutlined, ShrinkOutlined,
+  CaretUpOutlined, CaretDownOutlined, SwapOutlined,
+  ArrowRightOutlined, ArrowDownOutlined, CheckOutlined,
+} from '@ant-design/icons';
 import { getActivity, ActivityResponse, ActivityGroupSummary } from '../api/client';
-import { DateRange, fmtUSD, fmtTokens, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtPercent, fmt3sig } from './activityShared';
+import {
+  DateRange, fmtUSDInt, fmtTokens, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS,
+  fmtPercent, fmt3sig, fmtDayLabel, modelFavicon,
+} from './activityShared';
 
 const { Text } = Typography;
 
@@ -26,43 +38,68 @@ const ROLLUP = [
   { value: 'hour', label: 'Hourly' },
 ];
 
-// Table formatter: 3 significant figures for spend, compact for counts.
+const TOPS = [5, 10, 15, 20];
+
+// Second dimension available per primary group (must differ from group_by).
+const SUBGROUP_OPTIONS: Record<string, { value: string; label: string }[]> = {
+  model: [{ value: 'key', label: 'API Key' }, { value: 'app', label: 'App' }],
+  key: [{ value: 'model', label: 'Model' }, { value: 'app', label: 'App' }],
+  app: [{ value: 'model', label: 'Model' }, { value: 'key', label: 'API Key' }],
+};
+
+const CHART_TYPES = [
+  { key: 'bar', label: 'Bar chart' },
+  { key: 'area', label: 'Area chart' },
+  { key: 'line', label: 'Line chart' },
+] as const;
+
+// Separator between a group and its subgroup in chart row keys. Names can
+// contain most printable chars, so a control char is safe.
+const SEP = '\u0001';
+const keyFor = (g: string, sg: string) => (sg ? g + SEP + sg : g);
+const displayFor = (g: string, sg: string) => (sg ? `${g} · ${sg}` : g);
+
 const fmtForTable = (metric: string) => (v: number) =>
   metric === 'spend' ? fmt3sig(v) : metric === 'tokens' || metric === 'cache' ? fmtTokens(v) : fmtCompact(v);
 
-function toChartData(resp: ActivityResponse): Array<Record<string, any>> {
-  const groups = Array.from(new Set(resp.series.map(s => s.group)));
-  const data: Array<Record<string, any>> = resp.buckets.map(b => {
-    const row: Record<string, any> = { label: b };
-    groups.forEach(g => { row[g] = 0; });
-    return row;
-  });
-  const bucketIdx = new Map(resp.buckets.map((b, i) => [b, i]));
-  for (const p of resp.series) {
-    const i = bucketIdx.get(p.bucket);
-    if (i !== undefined) data[i][p.group] = p.value;
-  }
-  return data;
-}
+// Numeric summary columns of the table, in display order.
+const NUM_COLS: { key: keyof ActivityGroupSummary; label: string }[] = [
+  { key: 'min', label: 'Min' },
+  { key: 'max', label: 'Max' },
+  { key: 'avg', label: 'Avg' },
+  { key: 'sum', label: 'Sum' },
+  { key: 'value', label: 'Value' },
+];
 
 const ActivityExplore: React.FC<ExploreProps> = ({ range }) => {
   const [metric, setMetric] = useState('spend');
   const [groupBy, setGroupBy] = useState('model');
+  const [subgroup, setSubgroup] = useState('');
   const [rollup, setRollup] = useState('day');
   const [topN, setTopN] = useState(10);
+  const [chartType, setChartType] = useState<'bar' | 'area' | 'line'>('bar');
+  const [legendPos, setLegendPos] = useState<'bottom' | 'right'>('bottom');
+  const [expanded, setExpanded] = useState(false);
+  const [hidden, setHidden] = useState<Set<string>>(new Set());
+  // Table sort: null = backend order (sum desc, "Rank by: Current metric").
+  const [sortKey, setSortKey] = useState<keyof ActivityGroupSummary | 'group' | null>(null);
+  const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('asc');
   const [data, setData] = useState<ActivityResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
+  const [loadMs, setLoadMs] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
     const fetch = async () => {
       setLoading(true);
       setError(false);
+      const t0 = performance.now();
       try {
         const res = await getActivity({
           metric,
           group_by: groupBy,
+          subgroup: subgroup || undefined,
           rollup,
           top: topN,
           since: range.since.toISOString(),
@@ -70,106 +107,325 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range }) => {
         });
         if (cancelled) return;
         setData(res.data);
+        setLoadMs(Math.max(1, Math.round(performance.now() - t0)));
       } catch { if (!cancelled) { setError(true); message.error('Failed to load explore'); } }
       finally { if (!cancelled) setLoading(false); }
     };
     fetch();
     return () => { cancelled = true; };
-  }, [range, metric, groupBy, rollup, topN]);
+  }, [range, metric, groupBy, subgroup, rollup, topN]);
+
+  // Ordered list of chart series (group, subgroup) as they appear in the
+  // backend response (sum desc; per-group subgroups when set).
+  const seriesKeys = useMemo(() => {
+    const out: { key: string; group: string; subgroup: string }[] = [];
+    const seen = new Set<string>();
+    for (const p of data?.series ?? []) {
+      const key = keyFor(p.group, p.subgroup || '');
+      if (!seen.has(key)) {
+        seen.add(key);
+        out.push({ key, group: p.group, subgroup: p.subgroup || '' });
+      }
+    }
+    return out;
+  }, [data]);
+
+  // Color per chart series (Other keeps its dedicated slate color).
+  const seriesColor = (i: number, group: string) =>
+    group === 'Other' ? OTHER_COLOR : CHART_COLORS[i % CHART_COLORS.length];
+  const groupColors = useMemo(() => {
+    const m = new Map<string, string>();
+    seriesKeys.forEach((sk, i) => { if (!m.has(sk.group)) m.set(sk.group, seriesColor(i, sk.group)); });
+    return m;
+  }, [seriesKeys]);
+
+  // Chart rows: bucket -> { label, [seriesKey]: value }. Hidden series are
+  // dropped entirely (stacked bars/areas stay intact; lines vanish).
+  const chartData = useMemo(() => {
+    if (!data) return [];
+    const bucketIdx = new Map(data.buckets.map((b, i) => [b, i]));
+    const rows: Array<Record<string, any>> = data.buckets.map(b => {
+      const row: Record<string, any> = { label: b };
+      seriesKeys.forEach(sk => { if (!hidden.has(sk.key)) row[sk.key] = 0; });
+      return row;
+    });
+    for (const p of data.series) {
+      const i = bucketIdx.get(p.bucket);
+      const key = keyFor(p.group, p.subgroup || '');
+      if (i === undefined || hidden.has(key)) continue;
+      rows[i][key] = p.value;
+    }
+    return rows;
+  }, [data, seriesKeys, hidden]);
+
+  // NOTE: all hooks must be called before any early return below.
+  const summary = (data?.summary ?? []).slice(0, topN);
+  const sorted = useMemo(() => {
+    if (!sortKey) return summary;
+    const dir = sortOrder === 'asc' ? 1 : -1;
+    return [...summary].sort((a, b) => {
+      if (sortKey === 'group') return a.group.localeCompare(b.group) * dir;
+      return ((a[sortKey] as number) - (b[sortKey] as number)) * dir;
+    });
+  }, [data, topN, sortKey, sortOrder]);
 
   if (loading) return <Spin style={{ display: 'block', margin: '60px auto' }} />;
   if (error || !data) {
     return <Card><Text type="danger">Failed to load explore — check the log file.</Text></Card>;
   }
 
-  const fmtAxis = (metric === 'spend' ? fmtUSD : metric === 'tokens' || metric === 'cache' ? fmtTokens : fmtCompact);
+  const fmtAxis = (v: number) => (metric === 'spend' ? fmtUSDInt(v) : fmtCompact(v));
   const fmtTable = fmtForTable(metric);
-  const chartData = toChartData(data);
-  const groups = Array.from(new Set(data.series.map(s => s.group)));
-  const summary: ActivityGroupSummary[] = data.summary.slice(0, topN);
-  const metricLabel = METRICS.find(m => m.key === metric)!.label;
   const groupLabel = GROUP_BY.find(g => g.value === groupBy)!.label;
-  const maxPercent = Math.max(...summary.map(s => s.percent), 1);
+  const subgroupOptions = SUBGROUP_OPTIONS[groupBy];
+
+  // --- Legend interactions (OR: dot toggles hide, name = show only) ---
+  const toggleHidden = (key: string) => {
+    setHidden(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      return next;
+    });
+  };
+  const showOnly = (key: string) => {
+    setHidden(prev => {
+      const othersVisible = prev.size === seriesKeys.length - 1 && !prev.has(key);
+      if (othersVisible) return new Set(); // already show-only: restore all
+      return new Set(seriesKeys.filter(sk => sk.key !== key).map(sk => sk.key));
+    });
+  };
+
+  const handleSort = (key: keyof ActivityGroupSummary | 'group') => {
+    if (sortKey !== key) { setSortKey(key); setSortOrder('asc'); }
+    else if (sortOrder === 'asc') setSortOrder('desc');
+    else { setSortKey(null); setSortOrder('asc'); }
+  };
+
+  const sortHeader = (label: string, key: keyof ActivityGroupSummary | 'group') => {
+    const active = sortKey === key;
+    const icon = !active
+      ? <SwapOutlined style={{ fontSize: 11, color: AXIS }} />
+      : sortOrder === 'asc'
+        ? <CaretUpOutlined style={{ fontSize: 11, color: CHART_COLORS[0] }} />
+        : <CaretDownOutlined style={{ fontSize: 11, color: CHART_COLORS[0] }} />;
+    return (
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, cursor: 'pointer' }} onClick={() => handleSort(key)}>
+        {label}{icon}
+      </span>
+    );
+  };
+
+  const columns: TableProps<ActivityGroupSummary>['columns'] = [
+    {
+      title: sortHeader(groupLabel, 'group'),
+      dataIndex: 'group',
+      key: 'group',
+      render: (g: string) => <ModelCell name={g} />,
+    },
+    ...NUM_COLS.map(c => ({
+      title: sortHeader(c.label, c.key),
+      dataIndex: c.key,
+      key: c.key,
+      align: 'right' as const,
+      width: 100,
+      render: (v: number) => fmtTable(v),
+    })),
+    {
+      title: sortHeader('% of Total', 'percent'),
+      dataIndex: 'percent',
+      key: 'percent',
+      align: 'right' as const,
+      width: 160,
+      render: (v: number, row: ActivityGroupSummary) => (
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, justifyContent: 'flex-end', width: '100%' }}>
+          <div style={{ width: 64, height: 8, borderRadius: 999, background: GRID, overflow: 'hidden' }}>
+            {/* OR scales the bar to the percent itself (not the row max) */}
+            <div style={{ width: `${Math.min(v, 100)}%`, height: '100%', borderRadius: 999, background: groupColors.get(row.group) || CHART_COLORS[0] }} />
+          </div>
+          <span style={{ width: 56, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{fmtPercent(v)}</span>
+        </span>
+      ),
+    },
+  ];
+
+  const chartHeight = expanded ? 400 : 150;
+
+  const chart = (
+    <ResponsiveContainer width="100%" height={chartHeight}>
+      {chartType === 'bar' && (
+        <BarChart data={chartData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke={GRID} vertical={false} />
+          <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={28} tickFormatter={fmtDayLabel} />
+          <YAxis tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} width={60} tickFormatter={fmtAxis} />
+          <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID }} labelFormatter={(l) => fmtDayLabel(String(l))} />
+          {/* dataKey is a function accessor: recharts resolves string keys via
+              lodash paths, so dots in names like "claude-3.5" would break */}
+          {seriesKeys.map((sk, i) => (
+            <Bar key={sk.key} dataKey={(d: any) => d[sk.key]} name={displayFor(sk.group, sk.subgroup)} stackId="1" fill={seriesColor(i, sk.group)} maxBarSize={21} isAnimationActive={false} />
+          ))}
+        </BarChart>
+      )}
+      {chartType === 'area' && (
+        <AreaChart data={chartData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke={GRID} vertical={false} />
+          <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={28} tickFormatter={fmtDayLabel} />
+          <YAxis tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} width={60} tickFormatter={fmtAxis} />
+          <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID }} labelFormatter={(l) => fmtDayLabel(String(l))} />
+          {seriesKeys.map((sk, i) => (
+            <Area key={sk.key} dataKey={(d: any) => d[sk.key]} name={displayFor(sk.group, sk.subgroup)} type="monotone" stackId="1" stroke={seriesColor(i, sk.group)} strokeWidth={1.5} fill={seriesColor(i, sk.group)} fillOpacity={0.35} dot={false} />
+          ))}
+        </AreaChart>
+      )}
+      {chartType === 'line' && (
+        <LineChart data={chartData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke={GRID} vertical={false} />
+          <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={28} tickFormatter={fmtDayLabel} />
+          <YAxis tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} width={60} tickFormatter={fmtAxis} />
+          <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID }} labelFormatter={(l) => fmtDayLabel(String(l))} />
+          {seriesKeys.map((sk, i) => (
+            <Line key={sk.key} dataKey={(d: any) => d[sk.key]} name={displayFor(sk.group, sk.subgroup)} type="monotone" stroke={seriesColor(i, sk.group)} strokeWidth={1.5} dot={false} />
+          ))}
+        </LineChart>
+      )}
+    </ResponsiveContainer>
+  );
+
+  const legendEntry = (sk: { key: string; group: string; subgroup: string }, i: number) => {
+    const isHidden = hidden.has(sk.key);
+    const display = displayFor(sk.group, sk.subgroup);
+    return (
+      <span key={sk.key} style={{ display: 'inline-flex', alignItems: 'center', borderRadius: 4, fontSize: 12, color: 'inherit', opacity: isHidden ? 0.4 : 1, transition: 'opacity .15s' }}>
+        <Tooltip title={isHidden ? `Show ${display}` : `Hide ${display}`}>
+          <button onClick={() => toggleHidden(sk.key)} style={{ border: 'none', background: 'none', cursor: 'pointer', padding: '2px 4px' }}>
+            <span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: 2, background: seriesColor(i, sk.group) }} />
+          </button>
+        </Tooltip>
+        <Tooltip title={`Show only ${display}`}>
+          <button onClick={() => showOnly(sk.key)} style={{ border: 'none', background: 'none', cursor: 'pointer', padding: '2px 4px', color: 'inherit' }}>
+            <span style={{ maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{display}</span>
+          </button>
+        </Tooltip>
+      </span>
+    );
+  };
+
+  const moveLegendBtn = (
+    <Tooltip title={legendPos === 'bottom' ? 'Move legend to right' : 'Move legend to bottom'}>
+      <button onClick={() => setLegendPos(p => (p === 'bottom' ? 'right' : 'bottom'))} style={{ marginLeft: 'auto', border: 'none', background: 'none', cursor: 'pointer', color: AXIS, padding: 4 }}>
+        {legendPos === 'bottom' ? <ArrowRightOutlined /> : <ArrowDownOutlined />}
+      </button>
+    </Tooltip>
+  );
+
+  const chartTypeItems = CHART_TYPES.map(t => ({
+    key: t.key,
+    label: t.label,
+    icon: chartType === t.key ? <CheckOutlined /> : undefined,
+  }));
 
   return (
     <div>
-      {/* Control row — OR style: "Total Usage ($) by Model | Rollup: Daily | Top 10 | Rank by: Current metric" */}
-      <Space wrap style={{ marginBottom: 16 }}>
-        <Select value={metric} onChange={setMetric} style={{ width: 170 }}
+      {/* Control row — OR layout: [Metric] by [Group] [+Subgroup] | [Rollup] | [Top][N][Rank by] ... [chart settings][Expand] */}
+      <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, marginBottom: 16 }}>
+        <Select size="small" value={metric} onChange={(v: string) => setMetric(v)} style={{ minWidth: 150 }}
           options={METRICS.map(m => ({ value: m.key, label: m.label }))} />
-        <Text type="secondary">by</Text>
-        <Select value={groupBy} onChange={setGroupBy} style={{ width: 120 }}
+        <span style={{ height: 24, display: 'inline-flex', alignItems: 'center', padding: '0 8px', borderRadius: 6, border: '1px solid ' + GRID, background: '#f5f5f5', fontSize: 12, color: AXIS }}>by</span>
+        <Select size="small" value={groupBy} onChange={(v: string) => { setGroupBy(v); setSubgroup(''); setHidden(new Set()); }} style={{ minWidth: 110 }}
           options={GROUP_BY} />
-        <Text type="secondary">Rollup:</Text>
-        <Select value={rollup} onChange={setRollup} style={{ width: 100 }}
-          options={ROLLUP} />
-        <Text type="secondary">Top</Text>
-        <Select value={topN} onChange={setTopN} style={{ width: 80 }}
-          options={[5, 10, 15, 20].map(n => ({ value: n, label: String(n) }))} />
-        <Text type="secondary">Rank by: <Tag color="default">Current metric</Tag></Text>
-      </Space>
+        <Dropdown menu={{
+          items: subgroupOptions.map(o => ({ key: o.value, label: o.label })),
+          onClick: ({ key }) => { setSubgroup(key); setHidden(new Set()); },
+        }}>
+          <Button size="small" icon={<PlusOutlined />}>Subgroup</Button>
+        </Dropdown>
+        {subgroup && (
+          <Select size="small" value={subgroup} onChange={(v?: string) => { setSubgroup(v || ''); setHidden(new Set()); }} allowClear style={{ minWidth: 110 }} options={subgroupOptions} />
+        )}
+        <span style={{ width: 1, height: 16, background: GRID, margin: '0 2px' }} />
+        <Select size="small" value={rollup} onChange={(v: string) => setRollup(v)} style={{ minWidth: 130 }}
+          options={ROLLUP.map(r => ({ value: r.value, label: `Rollup: ${r.label}` }))} />
+        <span style={{ width: 1, height: 16, background: GRID, margin: '0 2px' }} />
+        <span style={{ height: 24, display: 'inline-flex', alignItems: 'center', padding: '0 8px', borderRadius: 6, border: '1px solid ' + GRID, background: '#fff', fontSize: 12, color: '#333' }}>Top</span>
+        <Select size="small" value={topN} onChange={(v: number) => setTopN(v)} style={{ minWidth: 55 }}
+          options={TOPS.map(n => ({ value: n, label: String(n) }))} />
+        <Select size="small" value="current" style={{ minWidth: 155 }}
+          options={[{ value: 'current', label: 'Rank by: Current metric' }]} />
+        <div style={{ marginLeft: 'auto', display: 'flex' }}>
+          <Space.Compact>
+            <Dropdown menu={{ items: chartTypeItems, onClick: ({ key }) => setChartType(key as 'bar' | 'area' | 'line') }}>
+              <Button size="small" icon={<EllipsisOutlined />} aria-label="Chart display settings" />
+            </Dropdown>
+            <Button size="small" onClick={() => setExpanded(!expanded)}>
+              {expanded ? <ShrinkOutlined /> : <ExpandOutlined />}
+              <span style={{ width: 56, textAlign: 'center' }}>{expanded ? 'Collapse' : 'Expand'}</span>
+            </Button>
+          </Space.Compact>
+        </div>
+      </div>
 
-      {/* Stacked BAR chart (OR uses bars, not area) */}
+      {/* Chart + custom legend (OR: no inline legend, hide/show-only dots below) */}
       <Card style={{ borderRadius: 12, marginBottom: 16 }}>
-        <ResponsiveContainer width="100%" height={300}>
-          <BarChart data={chartData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke={GRID} vertical={false} />
-            <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={24} />
-            <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={64} tickFormatter={fmtAxis} />
-            <Tooltip
-              formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]}
-              labelStyle={{ color: AXIS }}
-              contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID }}
-            />
-            <Legend wrapperStyle={{ fontSize: 12 }} />
-            {groups.map((g, i) => {
-              const isOther = g === 'Other';
-              const last = i === groups.length - 1;
-              return (
-                <Bar
-                  key={g}
-                  dataKey={g}
-                  stackId="1"
-                  fill={isOther ? OTHER_COLOR : CHART_COLORS[i % CHART_COLORS.length]}
-                  maxBarSize={14}
-                  radius={last ? [2, 2, 0, 0] : [0, 0, 0, 0]}
-                />
-              );
-            })}
-          </BarChart>
-        </ResponsiveContainer>
+        {legendPos === 'right' ? (
+          <div style={{ display: 'flex', gap: 16 }}>
+            <div style={{ flex: 1, minWidth: 0 }}>{chart}</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 180, maxHeight: chartHeight, overflowY: 'auto' }}>
+              {seriesKeys.map((sk, i) => legendEntry(sk, i))}
+              <div style={{ marginTop: 'auto', display: 'flex' }}>{moveLegendBtn}</div>
+            </div>
+          </div>
+        ) : (
+          <>
+            {chart}
+            <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'flex-start', gap: '2px 4px', paddingTop: 12, marginTop: 12, borderTop: '1px solid ' + GRID }}>
+              {seriesKeys.map((sk, i) => legendEntry(sk, i))}
+              {moveLegendBtn}
+            </div>
+          </>
+        )}
       </Card>
 
-      {/* Summary table: Min | Max | Avg | Sum | Value | % of Total (3-sig-fig money, % bar) */}
-      <Card style={{ borderRadius: 12 }}>
-        <Table<ActivityGroupSummary>
-          dataSource={summary}
-          rowKey="group"
-          size="small"
-          pagination={false}
-          columns={[
-            { title: groupLabel, dataIndex: 'group', key: 'group' },
-            { title: 'Min', dataIndex: 'min', key: 'min', align: 'right', width: 100, render: (v: number) => fmtTable(v) },
-            { title: 'Max', dataIndex: 'max', key: 'max', align: 'right', width: 100, render: (v: number) => fmtTable(v) },
-            { title: 'Avg', dataIndex: 'avg', key: 'avg', align: 'right', width: 100, render: (v: number) => fmtTable(v) },
-            { title: 'Sum', dataIndex: 'sum', key: 'sum', align: 'right', width: 110, render: (v: number) => <Text strong>{fmtTable(v)}</Text> },
-            { title: 'Value', dataIndex: 'value', key: 'value', align: 'right', width: 100, render: (v: number) => fmtTable(v) },
-            {
-              title: '% of Total', dataIndex: 'percent', key: 'percent', align: 'right', width: 140,
-              render: (v: number) => (
-                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, justifyContent: 'flex-end', width: '100%' }}>
-                  <Progress percent={(v / maxPercent) * 100} showInfo={false} size={{ height: 6 }} style={{ width: 60 }} strokeColor={CHART_COLORS[0]} trailColor={GRID} />
-                  <span style={{ width: 44, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{fmtPercent(v)}</span>
-                </span>
-              ),
-            },
-          ]}
-        />
-        <Text type="secondary" style={{ fontSize: 12, marginTop: 8, display: 'block' }}>
-          {data.summary.length} rows · {data.buckets.length} {rollup === 'day' ? 'days' : 'hours'}
-        </Text>
-      </Card>
+      {/* Summary table: favicon | Min | Max | Avg | Sum | Value | % of Total */}
+      {summary.length === 0 ? (
+        <Card style={{ borderRadius: 12 }}>
+          <Text type="secondary">No usage in this period.</Text>
+        </Card>
+      ) : (
+        <Card style={{ borderRadius: 12 }}>
+          <Table<ActivityGroupSummary>
+            dataSource={sorted}
+            rowKey="group"
+            size="small"
+            pagination={false}
+            sticky
+            scroll={{ y: 400, x: 800 }}
+            columns={columns}
+          />
+          <Text type="secondary" style={{ fontSize: 12, marginTop: 8, display: 'block' }}>
+            {data.summary.length} rows · {loadMs}ms
+          </Text>
+        </Card>
+      )}
     </div>
+  );
+};
+
+// ModelCell renders the row's favicon (vendor icon when recognizable,
+// letter avatar otherwise) + truncated name, like OpenRouter.
+const ModelCell: React.FC<{ name: string }> = ({ name }) => {
+  const fav = modelFavicon(name);
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, maxWidth: '100%' }}>
+      {fav.url ? (
+        <span style={{ width: 14, height: 14, borderRadius: 3, overflow: 'hidden', border: '1px solid ' + GRID, flexShrink: 0, display: 'inline-flex' }}>
+          <img src={fav.url} alt="" width={14} height={14} style={{ objectFit: 'cover' }} />
+        </span>
+      ) : (
+        <span style={{ width: 14, height: 14, borderRadius: 3, background: fav.color, color: '#fff', fontSize: 9, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, fontWeight: 600 }}>
+          {fav.letter}
+        </span>
+      )}
+      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</span>
+    </span>
   );
 };
 
