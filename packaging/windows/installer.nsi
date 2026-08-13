@@ -1,4 +1,4 @@
-; LocalRouter is the old product name — KeyRouter Windows installer (NSIS)
+; KeyRouter Windows installer (NSIS)
 ; Built by .github/workflows/release.yml:
 ;   makensis /DTAG=<tag> /DVERSION=<numeric-version> /DAPP_EXE=<path-to-binary> installer.nsi
 ; The binary is installed as KeyRouter.exe; user data is stored in
