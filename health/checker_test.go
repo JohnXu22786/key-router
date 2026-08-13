@@ -1,9 +1,11 @@
 package health
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -104,6 +106,187 @@ func TestCheckKeyRecoversAfterCooldownExpiry(t *testing.T) {
 	}
 	if !recovered {
 		t.Error("onRecovered not fired after cooldown expiry")
+	}
+}
+
+// TestCheckKeyDoesNotRecoverAuthFailedKey guards the auth_failed -> active
+// -> auth_failed ping-pong: many OpenAI-compatible gateways answer GET
+// /v1/models with 200 even for an INVALID key, so a models-listing probe
+// cannot prove the key is usable. A key the relay disabled for auth failure
+// must stay disabled until a REAL request (a chat completion) succeeds —
+// otherwise the checker recovers it on the next pass and the very next
+// client request disables it again (the exact flapping users saw).
+func TestCheckKeyDoesNotRecoverAuthFailedKey(t *testing.T) {
+	// The gateway's models endpoint does not authenticate (200 for any key)
+	// but the chat endpoint rejects the key with 401.
+	c, k := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/models" {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"data":[]}`))
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	db.GetDB().Model(&model.Key{}).Where("id = ?", k.ID).Updates(map[string]interface{}{
+		"status":          model.KeyStatusDisabled,
+		"disabled_reason": "auth_failed",
+	})
+	db.GetDB().First(k)
+
+	recovered := false
+	c.SetOnKeyRecovered(func(keyID int64) { recovered = true })
+
+	c.checkKey(k)
+
+	var after model.Key
+	db.GetDB().First(&after, k.ID)
+	if after.Status != model.KeyStatusDisabled {
+		t.Errorf("status = %q, want disabled (key still fails auth on the chat endpoint)", after.Status)
+	}
+	if after.DisabledReason != "auth_failed" {
+		t.Errorf("disabled_reason = %q, want auth_failed", after.DisabledReason)
+	}
+	if recovered {
+		t.Error("onRecovered fired for a key that still fails auth on the chat endpoint")
+	}
+}
+
+// TestCheckKeyRecoversAuthFailedKeyWhenUsable: recovery is gated on the key
+// being genuinely usable, not blocked forever. Once the chat-completion
+// probe succeeds (e.g. the admin fixed the key), a disabled auth_failed key
+// returns to active.
+func TestCheckKeyRecoversAuthFailedKeyWhenUsable(t *testing.T) {
+	c, k := newTestEnv(t, okUpstream)
+	db.GetDB().Model(&model.Key{}).Where("id = ?", k.ID).Updates(map[string]interface{}{
+		"status":          model.KeyStatusDisabled,
+		"disabled_reason": "auth_failed",
+	})
+	db.GetDB().First(k)
+
+	recovered := false
+	c.SetOnKeyRecovered(func(keyID int64) { recovered = true })
+
+	c.checkKey(k)
+
+	var after model.Key
+	db.GetDB().First(&after, k.ID)
+	if after.Status != model.KeyStatusActive {
+		t.Errorf("status = %q, want active (key usable again)", after.Status)
+	}
+	if after.DisabledReason != "" {
+		t.Errorf("disabled_reason = %q, want cleared after recovery", after.DisabledReason)
+	}
+	if !recovered {
+		t.Error("onRecovered not fired for a key whose probe now succeeds")
+	}
+}
+
+// TestOpenAIProbeUsesChatCompletions pins the OpenAI health probe to a real
+// authenticated chat-completion request. A GET /v1/models probe returns 200
+// even for an invalid key on many gateways and would recover disabled
+// auth_failed keys (the auth_failed -> active -> auth_failed ping-pong);
+// only an auth failure on the chat endpoint proves the key is still broken.
+func TestOpenAIProbeUsesChatCompletions(t *testing.T) {
+	var probePath, probeMethod, probeAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		probePath = r.URL.Path
+		probeMethod = r.Method
+		probeAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(server.Close)
+
+	c := NewChecker()
+	result := c.testKey("sk-test", &model.Provider{Type: "openai", BaseURL: server.URL})
+
+	if probePath != "/v1/chat/completions" {
+		t.Errorf("probe path = %q, want /v1/chat/completions (models listing can't prove key usability)", probePath)
+	}
+	if probeMethod != http.MethodPost {
+		t.Errorf("probe method = %q, want POST (a GET can't be a chat completion)", probeMethod)
+	}
+	if probeAuth != "Bearer sk-test" {
+		t.Errorf("probe auth = %q, want the key presented like real traffic", probeAuth)
+	}
+	if !result.Alive {
+		t.Errorf("alive = false, want true for a 200 chat probe")
+	}
+}
+
+// TestShouldProbeKeySkipsRateLimitedCooldown bounds probe spend: a
+// rate-limited key whose cooldown is still running must not be probed — the
+// probe cannot change its state (recovery is blocked during the cooldown)
+// and every probe is now a billable chat completion. Once the cooldown
+// expires, probing resumes.
+func TestShouldProbeKeySkipsRateLimitedCooldown(t *testing.T) {
+	c, k := newTestEnv(t, okUpstream)
+	until := time.Now().Add(10 * time.Minute)
+	db.GetDB().Model(&model.Key{}).Where("id = ?", k.ID).Updates(map[string]interface{}{
+		"status":             model.KeyStatusRateLimited,
+		"rate_limited_until": until,
+	})
+	db.GetDB().First(k)
+
+	if c.shouldProbeKey(k) {
+		t.Error("shouldProbeKey = true, want false (cooldown still running)")
+	}
+
+	expired := time.Now().Add(-1 * time.Minute)
+	db.GetDB().Model(&model.Key{}).Where("id = ?", k.ID).Updates(map[string]interface{}{
+		"rate_limited_until": expired,
+	})
+	db.GetDB().First(k)
+
+	if !c.shouldProbeKey(k) {
+		t.Error("shouldProbeKey = false, want true (cooldown expired)")
+	}
+}
+
+// TestClassifyOpenAIProbe403IsNotAuthFailure pins 403 as model/endpoint
+// access (the KEY itself authenticated), matching the relay's own 403
+// handling (a 30s cooldown, never a disable — see handler/chat.go). The
+// chat probe uses a hardcoded model a key may not be entitled to, so a 403
+// must not classify the key as auth_failed and get it disabled.
+func TestClassifyOpenAIProbe403IsNotAuthFailure(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusForbidden,
+		Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"The model gpt-4o-mini is not allowed for this key"}}`)),
+	}
+	result := classifyOpenAIProbe(resp)
+	if !result.Alive {
+		t.Errorf("403 probe = %+v, want alive (key authenticated, model access denied)", result)
+	}
+}
+
+// TestCheckKeyRecoversAuthFailedKeyOn403 pins the recovery semantics for a
+// 403 probe: a key disabled for auth_failed is recovered by a 403 response,
+// because a 403 proves the key itself authenticates (the model is denied,
+// not the key) — the same proof the relay accepts (403 -> 30s cooldown,
+// never a disable). Recovery is gated on the probe not classifying the key
+// as failing; 403 is deliberately not "failing".
+func TestCheckKeyRecoversAuthFailedKeyOn403(t *testing.T) {
+	c, k := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	})
+	db.GetDB().Model(&model.Key{}).Where("id = ?", k.ID).Updates(map[string]interface{}{
+		"status":          model.KeyStatusDisabled,
+		"disabled_reason": "auth_failed",
+	})
+	db.GetDB().First(k)
+
+	recovered := false
+	c.SetOnKeyRecovered(func(keyID int64) { recovered = true })
+
+	c.checkKey(k)
+
+	var after model.Key
+	db.GetDB().First(&after, k.ID)
+	if after.Status != model.KeyStatusActive {
+		t.Errorf("status = %q, want active (403 proves the key authenticates)", after.Status)
+	}
+	if !recovered {
+		t.Error("onRecovered not fired for a key that authenticated (403)")
 	}
 }
 

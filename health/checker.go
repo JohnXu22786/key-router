@@ -197,11 +197,18 @@ func (c *Checker) checkAll() {
 
 // shouldProbeKey decides whether a key is due for a probe this pass.
 //   - Disabled keys with an empty reason are admin-disabled — never probed.
-//   - Disabled (system) / rate-limited keys: every pass.
+//   - Disabled (system) / rate-limited keys: every pass, EXCEPT a
+//     rate-limited key whose cooldown is still running — probing it can't
+//     change its state (recovery is blocked during the cooldown) and each
+//     probe is a billable chat completion.
 //   - Active keys: at most once per activeProbeInterval (throttled).
 func (c *Checker) shouldProbeKey(key *model.Key) bool {
 	if key.Status == model.KeyStatusDisabled && key.DisabledReason == "" {
 		return false // deliberately disabled by an admin
+	}
+	if key.Status == model.KeyStatusRateLimited &&
+		key.RateLimitedUntil != nil && time.Now().Before(*key.RateLimitedUntil) {
+		return false // cooldown still running — probing can't recover it
 	}
 	if key.Status != model.KeyStatusActive {
 		return true
@@ -226,8 +233,11 @@ func (c *Checker) ResetFailCount(keyID int64) {
 
 // ProbeResult classifies the outcome of a health probe. The classification
 // drives both the key's disabled_reason (user-visible feedback: 欠费, auth
-// failure, ...) and the recovery decision — recovery happens ONLY on a
-// successful probe, never on a timer.
+// failure, ...) and the recovery decision — recovery happens ONLY when a
+// probe does not classify the key as failing, never on a timer. "Not
+// failing" includes a 403 (model access denied — the key itself
+// authenticated), which is exactly the proof a disabled auth_failed key
+// needs to re-enter rotation.
 type ProbeResult struct {
 	Alive  bool
 	Reason string // "" when alive; otherwise one of:
@@ -236,9 +246,10 @@ type ProbeResult struct {
 
 // checkKey probes a single key.
 //   - Active key: probe validates it is still usable (quota/auth); on
-//     auth_failed/insufficient_quota the key is auto-disabled. A success
-//     leaves it active.
-//   - Disabled/rate-limited key: recovery happens ONLY on a successful probe.
+//     auth_failed/insufficient_quota the key is auto-disabled. A probe that
+//     does not classify the key as failing leaves it active.
+//   - Disabled/rate-limited key: recovery happens ONLY when a probe does not
+//     classify the key as failing (never on a timer).
 func (c *Checker) checkKey(key *model.Key) {
 	// Disabled keys are only auto-recovered when the disabled_reason was set
 	// by the system (auth_failed / insufficient_quota / ...). A key disabled
@@ -249,9 +260,9 @@ func (c *Checker) checkKey(key *model.Key) {
 	}
 
 	// Back off from keys that keep failing: after 6 consecutive failed probes
-	// (e.g. a billable Anthropic inference probe), stop probing until the key
-	// changes status or is edited (ResetFailCount) — otherwise a broken key
-	// generates charges forever.
+	// (each probe is now a billable chat completion), stop probing until the
+	// key is edited (ResetFailCount) — otherwise a broken key generates
+	// charges forever.
 	c.mu.Lock()
 	if c.failCount[key.ID] >= 6 {
 		c.mu.Unlock()
@@ -427,12 +438,20 @@ func (c *Checker) testKey(keyValue string, provider *model.Provider) ProbeResult
 		return c.testAnthropic(keyValue, provider)
 	}
 
-	// OpenAI-format providers: test by listing models (a lightweight request).
-	// Relay builds upstream URLs as baseURL + "/v1/...", so the health probe
-	// must use the same convention (BaseURL without the /v1 suffix).
-	testURL := baseURL + "/v1/models"
+	// OpenAI-format providers: probe with the smallest REAL request (a
+	// max_tokens=1 chat completion). GET /v1/models is not a valid probe:
+	// many OpenAI-compatible gateways answer it with 200 even for an INVALID
+	// key, so a key the relay disabled for auth_failed would pass the models
+	// probe, get recovered to "active", and be disabled again by the very
+	// next request — the auth_failed → active → auth_failed ping-pong users
+	// see. A chat completion authenticates exactly like real traffic, so
+	// recovery is gated on the key being genuinely usable. (Relay builds
+	// upstream URLs as baseURL + "/v1/...", so the probe follows the same
+	// convention.)
+	testURL := baseURL + "/v1/chat/completions"
+	body := `{"model":"gpt-4o-mini","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`
 
-	req, err := http.NewRequest("GET", testURL, nil)
+	req, err := http.NewRequest("POST", testURL, strings.NewReader(body))
 	if err != nil {
 		return ProbeResult{Alive: false, Reason: "upstream_error"}
 	}
@@ -482,14 +501,18 @@ func (c *Checker) testAnthropic(keyValue string, provider *model.Provider) Probe
 }
 
 // classifyOpenAIProbe classifies an OpenAI-format probe response.
-// A 400 ("model not found") or 404 (no /models endpoint) still proves the key
-// authenticated and is usable; only auth/quota/rate-limit failures and
-// upstream 5xx mean the key is not usable. A 429 whose body carries a quota
-// error code is classified as insufficient_quota (disabled), not a transient
-// rate limit — an over-quota key never recovers on its own.
+// Only 401 (bad key) and quota signals (402, 429 + quota error code) mean
+// the key is unusable. A 400/404 ("model not found", endpoint not
+// supported) AND a 403 (model/endpoint access denied — the KEY itself
+// authenticated, e.g. a key not entitled to the probe's model) still prove
+// the key works, mirroring the relay's own 403 handling (a 30s cooldown,
+// never a disable — 403 is often model access, not key invalidity). A 429
+// whose body carries a quota error code is classified as insufficient_quota
+// (disabled), not a transient rate limit — an over-quota key never recovers
+// on its own.
 func classifyOpenAIProbe(resp *http.Response) ProbeResult {
 	switch {
-	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+	case resp.StatusCode == http.StatusUnauthorized:
 		return ProbeResult{Alive: false, Reason: "auth_failed"}
 	case resp.StatusCode == http.StatusPaymentRequired:
 		return ProbeResult{Alive: false, Reason: "insufficient_quota"}
