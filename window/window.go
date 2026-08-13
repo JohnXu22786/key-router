@@ -67,6 +67,7 @@ func (sw *SlidingWindow) advance() {
 		for i := range sw.buckets {
 			sw.buckets[i] = 0
 			sw.tokenBuckets[i] = 0
+			sw.costBuckets[i] = 0
 		}
 		sw.head = 0
 		sw.lastCleanup = now
@@ -77,6 +78,7 @@ func (sw *SlidingWindow) advance() {
 		sw.head = (sw.head + 1) % len(sw.buckets)
 		sw.buckets[sw.head] = 0
 		sw.tokenBuckets[sw.head] = 0
+		sw.costBuckets[sw.head] = 0
 	}
 
 	sw.lastCleanup = sw.lastCleanup.Add(time.Duration(bucketsToAdvance) * sw.bucketSize)
