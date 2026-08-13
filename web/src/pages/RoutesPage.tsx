@@ -17,7 +17,6 @@ const RoutesPage: React.FC = () => {
   const [form] = Form.useForm();
   const [extraError, setExtraError] = useState('');
   const dragItem = useRef<number | null>(null);
-  const persistTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Always-current routes for drag handling — avoids stale-closure reorders
   // when a second drop or a background fetch lands before a re-render
   const routesRef = useRef<Route[]>([]);
@@ -74,22 +73,19 @@ const RoutesPage: React.FC = () => {
   };
 
   const persistOrder = useCallback((ordered: Route[]) => {
-    // Debounce: cancel previous pending save
-    if (persistTimer.current) clearTimeout(persistTimer.current);
-    persistTimer.current = setTimeout(async () => {
-      // Priorities are PER-GROUP (0..n-1 within each model group): the
-      // table mixes groups, so a global index would silently renumber every
-      // other group's routes.
-      const groupCounts: Record<number, number> = {};
-      const payload = ordered.map(r => {
-        const idx = groupCounts[r.model_group_id] ?? 0;
-        groupCounts[r.model_group_id] = idx + 1;
-        return { id: r.id, priority: idx };
-      });
-      try {
-        await reorderRoutes(payload);
-      } catch { message.error('Failed to save order'); }
-    }, 300);
+    // Persist IMMEDIATELY on drop — no debounce: an edit must be written
+    // the moment it happens, so a crash or a forced kill right after a drop
+    // cannot lose the new order.
+    // Priorities are PER-GROUP (0..n-1 within each model group): the
+    // table mixes groups, so a global index would silently renumber every
+    // other group's routes.
+    const groupCounts: Record<number, number> = {};
+    const payload = ordered.map(r => {
+      const idx = groupCounts[r.model_group_id] ?? 0;
+      groupCounts[r.model_group_id] = idx + 1;
+      return { id: r.id, priority: idx };
+    });
+    reorderRoutes(payload).catch(() => message.error('Failed to save order'));
   }, []);
 
   // Drag handlers

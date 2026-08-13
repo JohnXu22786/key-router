@@ -33,7 +33,6 @@ const Models: React.FC = () => {
   const [extraError, setExtraError] = useState('');
   const [groupForm] = Form.useForm();
   const [routeForm] = Form.useForm();
-  const persistTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Number of drag orders committed but not yet persisted: the 10s poll
   // must not overwrite the local order with pre-persist server state.
   // Captured at fetch START as well (with the persist generation), so a
@@ -120,20 +119,24 @@ const Models: React.FC = () => {
   };
 
   const persistOrder = useCallback((ordered: Route[]) => {
+    // Persist IMMEDIATELY on drop — no debounce: an edit must be written
+    // the moment it happens, so a crash or a forced kill right after a drop
+    // cannot lose the new order. Each drop fires one request; the poll guard
+    // below keeps the 10s refresh from overwriting the local order while the
+    // write is in flight.
     pendingPersistsRef.current++;
-    if (persistTimer.current) clearTimeout(persistTimer.current);
-    persistTimer.current = setTimeout(async () => {
-      const groupCounts: Record<number, number> = {};
-      const payload = ordered.map(r => {
-        const idx = groupCounts[r.model_group_id] ?? 0;
-        groupCounts[r.model_group_id] = idx + 1;
-        return { id: r.id, priority: idx };
+    const groupCounts: Record<number, number> = {};
+    const payload = ordered.map(r => {
+      const idx = groupCounts[r.model_group_id] ?? 0;
+      groupCounts[r.model_group_id] = idx + 1;
+      return { id: r.id, priority: idx };
+    });
+    reorderRoutes(payload)
+      .catch(() => message.error('Failed to save order'))
+      .finally(() => {
+        pendingPersistsRef.current--;
+        persistGenRef.current++;
       });
-      try { await reorderRoutes(payload); }
-      catch { message.error('Failed to save order'); }
-      pendingPersistsRef.current--;
-      persistGenRef.current++;
-    }, 300);
   }, []);
 
   const routeColumns = [
