@@ -183,6 +183,11 @@ func main() {
 	w.SetSize(900, 580, webview.HintNone)
 	w.Navigate(url)
 
+	// Apply the app icon to the window itself (title bar + taskbar button).
+	// The webview library only sets the generic IDI_APPLICATION class icon,
+	// so this must be done explicitly via WM_SETICON (no-op on other OSes).
+	setWindowIcon(uintptr(w.Window()))
+
 	// System tray (Windows): clicking the window X hides to the tray instead
 	// of quitting; the tray menu restores the window or exits for real. On
 	// other platforms StartTray is a no-op and closing quits as before.

@@ -1,3 +1,12 @@
+// Generates the app icon files from app-icon.svg:
+//   - app-icon.ico (multi-size Windows .ico: tray + NSIS installer)
+//   - app-icon-512.png (Linux .desktop / macOS .icns source / web favicon)
+//
+// The Windows exe resource (icon + manifest) is a separate step; the result
+// is committed at the repo root as app_windows_amd64.syso (Go only links
+// .syso files that live in the package directory):
+//   go install github.com/akavel/rsrc@latest
+//   cd packaging/windows && rsrc -ico ../icon/app-icon.ico -manifest app.manifest -o ../../app_windows_amd64.syso
 const sharp = require('sharp');
 const pngToIco = require('png-to-ico').default || require('png-to-ico');
 const fs = require('fs');
