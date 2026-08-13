@@ -193,8 +193,9 @@ func main() {
 	setWindowIcon(uintptr(w.Window()))
 
 	// System tray (Windows): clicking the window X hides to the tray instead
-	// of quitting; the tray menu restores the window or exits for real. On
-	// other platforms StartTray is a no-op and closing quits as before.
+	// of quitting; single-clicking the tray icon restores the window, the
+	// right-click menu restores it or exits for real. On other platforms
+	// StartTray is a no-op and closing quits as before.
 	trayQuit := StartTray(uintptr(w.Window()))
 
 	// Run the message loop. With the tray active, Run() returns only when
