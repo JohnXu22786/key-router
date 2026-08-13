@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { BrowserRouter, Routes, Route, Link, Navigate, useLocation } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, Link, Navigate, useLocation, useNavigate } from 'react-router-dom';
 import {
   Layout, Menu, Typography, theme, ConfigProvider, Alert, Button, Space,
 } from 'antd';
@@ -28,6 +28,7 @@ const LayoutWithRouter: React.FC = () => {
   const [collapsed, setCollapsed] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<any>(null);
   const location = useLocation();
+  const navigate = useNavigate();
 
   // Auto-update check result: the app checks on startup + daily (backend);
   // here we surface a banner when a new version exists — no auto-apply.
@@ -82,7 +83,7 @@ const LayoutWithRouter: React.FC = () => {
               description={
                 <Space>
                   <span>You are running {updateInfo.current_version}. Update is not applied automatically.</span>
-                  <Button size="small" type="primary" icon={<DownloadOutlined />} onClick={() => window.location.hash = '#/settings'}>
+                  <Button size="small" type="primary" icon={<DownloadOutlined />} onClick={() => navigate('/settings')}>
                     Go to Settings to update
                   </Button>
                 </Space>

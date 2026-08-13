@@ -194,7 +194,10 @@ export interface UpdateInfo {
   error?: string;
 }
 export const checkUpdate = () => api.post<UpdateInfo>('/updates/check');
-export const applyUpdate = () => api.post('/updates/apply');
+// The apply request blocks while the installer downloads (tens of MB) and
+// the UAC prompt is answered — the global 10s timeout would abort it. The
+// timeout matches the backend's 30-minute download deadline.
+export const applyUpdate = () => api.post('/updates/apply', null, { timeout: 30 * 60 * 1000 });
 export const getAutoCheckState = () => api.get<UpdateInfo & { checked: boolean }>('/updates/state');
 
 // Health

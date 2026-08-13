@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -54,14 +55,23 @@ const (
 // be replaced in place).
 const installedMarker = "KeyRouter.installed"
 
+// ErrUpdateCancelled is returned when the user declines the UAC elevation
+// prompt for the installer. The app must NOT exit in that case (there is no
+// update to apply), so the error is distinct from a launch failure.
+var ErrUpdateCancelled = errors.New("update cancelled — the elevation prompt was declined")
+
 // Client checks and applies updates.
 type Client struct {
-	// CurrentVersion is the running app version (injected at build time).
-	CurrentVersion string
+	// currentVersion is the running app version (injected at build time).
+	currentVersion string
 	// BaseURL overrides the GitHub API base (tests).
 	baseURL string
-	// HTTP client with timeout for API + downloads.
+	// HTTP client with timeout for API checks (short: a hanging API must not
+	// block the UI for long).
 	http *http.Client
+	// download is the client for asset downloads: a multi-minute installer
+	// download must not be cut off by the API client's short timeout.
+	download *http.Client
 	// InstallMode cached per check.
 	mode string
 }
@@ -69,10 +79,16 @@ type Client struct {
 // NewClient creates an update client.
 func NewClient(currentVersion string) *Client {
 	return &Client{
-		CurrentVersion: currentVersion,
+		currentVersion: currentVersion,
 		baseURL:        "https://api.github.com",
 		http:           &http.Client{Timeout: 30 * time.Second},
+		download:       &http.Client{Timeout: 30 * time.Minute},
 	}
+}
+
+// CurrentVersion returns the running app version.
+func (c *Client) CurrentVersion() string {
+	return c.currentVersion
 }
 
 // GitHubAPIURL returns the releases/latest endpoint URL.
@@ -88,7 +104,7 @@ func (c *Client) Check() (*UpdateInfo, error) {
 		return nil, err
 	}
 	// GitHub API requires a User-Agent; without one it 403s.
-	req.Header.Set("User-Agent", "KeyRouter-updater/"+c.CurrentVersion)
+	req.Header.Set("User-Agent", "KeyRouter-updater/"+c.currentVersion)
 	req.Header.Set("Accept", "application/vnd.github+json")
 
 	resp, err := c.http.Do(req)
@@ -100,8 +116,8 @@ func (c *Client) Check() (*UpdateInfo, error) {
 	if resp.StatusCode == http.StatusNotFound {
 		// No releases yet — nothing to update to.
 		return &UpdateInfo{
-			CurrentVersion:  c.CurrentVersion,
-			LatestVersion:   c.CurrentVersion,
+			CurrentVersion:  c.currentVersion,
+			LatestVersion:   c.currentVersion,
 			UpdateAvailable: false,
 			InstallMode:     c.installMode(),
 			CheckedAt:       time.Now(),
@@ -117,20 +133,23 @@ func (c *Client) Check() (*UpdateInfo, error) {
 	}
 
 	info := &UpdateInfo{
-		CurrentVersion:  c.CurrentVersion,
+		CurrentVersion:  c.currentVersion,
 		LatestVersion:   release.TagName,
-		UpdateAvailable: compareVersions(release.TagName, c.CurrentVersion) > 0,
+		UpdateAvailable: compareVersions(release.TagName, c.currentVersion) > 0,
 		InstallMode:     c.installMode(),
 		CheckedAt:       time.Now(),
 	}
 
-	// Resolve the asset for this OS/arch/mode.
+	// Resolve the asset for this OS/arch/mode. A release without a matching
+	// asset cannot be applied, so report it as an error instead of showing
+	// "update available" and failing on Apply.
 	asset, ok := c.findAsset(release.Assets)
-	if ok {
-		info.AssetName = asset.Name
-		info.AssetURL = asset.BrowserDownloadURL
-		info.AssetSize = asset.Size
+	if !ok {
+		return nil, fmt.Errorf("release %s has no asset for this platform/install mode (%s)", release.TagName, c.platformAssetPattern())
 	}
+	info.AssetName = asset.Name
+	info.AssetURL = asset.BrowserDownloadURL
+	info.AssetSize = asset.Size
 
 	return info, nil
 }
@@ -258,11 +277,16 @@ func (c *Client) Apply(info *UpdateInfo) error {
 	if err != nil {
 		return fmt.Errorf("failed to create temp file: %w", err)
 	}
-	// Installed-mode hands the file to an installer that runs asynchronously,
-	// so the temp file must NOT be removed here; portable-mode removes it
-	// after staging. Use a deferred cleanup only for the portable path.
+	// The temp file becomes the installer's own once it launches (the
+	// installer reads it while running; the relaunch helper deletes it
+	// afterwards), so installed-mode keeps it on full success and removes it
+	// on every failure path; portable-mode always cleans it up here. The
+	// file is closed first: Windows cannot delete an open file, and the
+	// early-return paths (download errors) never reach tmp.Close().
+	keepForInstaller := false
 	defer func() {
-		if c.installMode() != "installed" {
+		if !keepForInstaller {
+			tmp.Close()
 			os.Remove(tmp.Name())
 		}
 	}()
@@ -271,9 +295,11 @@ func (c *Client) Apply(info *UpdateInfo) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("User-Agent", "KeyRouter-updater/"+c.CurrentVersion)
+	req.Header.Set("User-Agent", "KeyRouter-updater/"+c.currentVersion)
 
-	resp, err := c.http.Do(req)
+	// The download client has a long timeout: installers are tens of MB and
+	// slow connections take minutes (the API client's 30s would abort them).
+	resp, err := c.download.Do(req)
 	if err != nil {
 		return fmt.Errorf("download failed: %w", err)
 	}
@@ -297,26 +323,138 @@ func (c *Client) Apply(info *UpdateInfo) error {
 	_ = hex.EncodeToString(hasher.Sum(nil)) // sha available for logging
 
 	if c.installMode() == "installed" {
-		return c.applyInstalled(tmp.Name(), info)
+		if err := c.applyInstalled(tmp.Name(), info); err != nil {
+			return err
+		}
+		keepForInstaller = true
+		return nil
 	}
 	return c.applyPortable(tmp.Name(), info)
 }
 
-// applyInstalled launches the downloaded installer. For NSIS the /S flag
-// performs a silent install; the app itself exits when the installer starts
-// (the marker file is next to the exe, replaced by the installer).
-// The installer must run ELEVATED (Program Files is not writable otherwise),
-// so it is launched via ShellExecute with "runas" instead of exec.Command —
-// Windows will show the UAC prompt.
+// applyInstalled launches the downloaded installer and schedules the app to
+// exit so the installer can replace the running exe:
+//
+//   - The installer must run ELEVATED (Program Files is not writable
+//     otherwise), so it is launched via ShellExecuteEx with the "runas" verb
+//     — Windows shows the UAC prompt, and a declined prompt is reported as
+//     ErrUpdateCancelled so the app stays open (there is no update to apply).
+//   - A small detached batch helper waits for this process to exit (the
+//     installer needs the exe unlocked) and for the installer to finish,
+//     then starts the updated copy NON-elevated — the helper is a child of
+//     this process and inherits its token, whereas the installer's own
+//     children would stay elevated — and deletes the downloaded installer.
+//     Without the helper the update still applies but the app is not
+//     auto-started (the user starts it manually).
+//   - The handler calls the exit hook (after responding), which closes the
+//     window and runs the normal graceful shutdown.
 func (c *Client) applyInstalled(downloadPath string, info *UpdateInfo) error {
 	if runtime.GOOS != "windows" {
 		return fmt.Errorf("installed-mode auto-update is only supported on Windows; run the %s installer manually", info.AssetName)
 	}
-	if err := runAsElevated(downloadPath, "/S"); err != nil {
+	if err := launchInstaller(downloadPath, "/S"); err != nil {
+		if errors.Is(err, ErrUpdateCancelled) {
+			return ErrUpdateCancelled
+		}
 		return fmt.Errorf("failed to launch installer: %w", err)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		log.Printf("[update] cannot locate running executable (no relaunch helper): %v", err)
+		return nil
+	}
+	if err := launchRelaunchHelper(installedRelaunchScript(exe, downloadPath, os.Getpid())); err != nil {
+		log.Printf("[update] failed to schedule relaunch helper (the updated app must be started manually): %v", err)
+		return nil
 	}
 	log.Printf("[update] launched installer %s (%s)", info.AssetName, downloadPath)
 	return nil
+}
+
+// launchInstaller starts the downloaded setup exe elevated. Overridable in
+// tests.
+var launchInstaller = runAsElevated
+
+// launchRelaunchHelper writes the installed-mode relaunch batch to a unique
+// temp file (CreateTemp: no symlink following, no clobbering a still-running
+// helper from a previous attempt) and starts it detached — it must outlive
+// this process. Overridable in tests.
+var launchRelaunchHelper = func(content string) error {
+	f, err := os.CreateTemp(os.TempDir(), "keyrouter-update-relaunch-*.bat")
+	if err != nil {
+		return err
+	}
+	path := f.Name()
+	if _, err := f.WriteString(content); err != nil {
+		f.Close()
+		os.Remove(path)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(path)
+		return err
+	}
+	cmd := exec.Command("cmd", "/c", path)
+	cmd.SysProcAttr = hideWindowAttr()
+	if err := cmd.Start(); err != nil {
+		os.Remove(path)
+		return err
+	}
+	return nil
+}
+
+// installedRelaunchScript returns the .bat content that:
+//
+//  1. waits for THIS process (by PID) to exit — the installer must be able
+//     to overwrite the exe;
+//  2. waits for the installer process to APPEAR — ShellExecuteEx returns
+//     when the UAC prompt is shown, before the user answers, so the
+//     installer may not exist yet; skipping this phase would delete the
+//     installer and relaunch the old app while the prompt is still up;
+//  3. waits for the installer to EXIT;
+//  4. starts the updated copy (unless this process somehow still lives) and
+//     deletes the downloaded installer plus itself.
+//
+// Each phase gives up after ~5 minutes and proceeds anyway (declined UAC
+// prompt, hung installer, PID reuse). No parenthesized blocks are used, so
+// no delayed expansion is needed and paths containing "!" stay intact. Runs
+// as a child of the old copy, so the relaunched app is NOT elevated.
+func installedRelaunchScript(appPath, installerPath string, pid int) string {
+	return fmt.Sprintf(`@echo off
+set /a n=0
+:wait_app
+tasklist /FI "PID eq %[1]d" 2>nul | find /I "%[1]d" >nul
+if errorlevel 1 goto wait_app_done
+set /a n+=1
+if %%n%% GEQ 300 goto check_alive
+ping -n 2 127.0.0.1 >nul
+goto wait_app
+:wait_app_done
+set /a n=0
+:wait_installer_start
+tasklist /FI "IMAGENAME eq %[2]s" 2>nul | find /I "%[2]s" >nul
+if not errorlevel 1 goto found_installer
+set /a n+=1
+if %%n%% GEQ 300 goto check_alive
+ping -n 2 127.0.0.1 >nul
+goto wait_installer_start
+:found_installer
+set /a n=0
+:wait_installer_end
+tasklist /FI "IMAGENAME eq %[2]s" 2>nul | find /I "%[2]s" >nul
+if errorlevel 1 goto check_alive
+set /a n+=1
+if %%n%% GEQ 300 goto check_alive
+ping -n 2 127.0.0.1 >nul
+goto wait_installer_end
+:check_alive
+tasklist /FI "PID eq %[1]d" 2>nul | find /I "%[1]d" >nul
+if not errorlevel 1 goto cleanup
+start "" "%[3]s"
+:cleanup
+del /Q "%[4]s" >nul 2>&1
+del "%%~f0"
+`, pid, filepath.Base(installerPath), appPath, installerPath)
 }
 
 // applyPortable replaces the running executable. Because the process is
@@ -333,8 +471,12 @@ func (c *Client) applyPortable(downloadPath string, info *UpdateInfo) error {
 	exeName := filepath.Base(exe)
 
 	// Move the downloaded file into the app dir under a temp name, then run
-	// the swap script.
+	// the swap script. A stale .new from a failed previous attempt would
+	// make the rename fail forever, so clear it first.
 	newPath := filepath.Join(dir, exeName+".new")
+	if err := os.Remove(newPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to clear stale staging file: %w", err)
+	}
 	if err := os.Rename(downloadPath, newPath); err != nil {
 		// Cross-device move (temp dir on another volume): copy instead.
 		if err := copyFile(downloadPath, newPath); err != nil {
@@ -346,8 +488,14 @@ func (c *Client) applyPortable(downloadPath string, info *UpdateInfo) error {
 		return c.launchWindowsSwap(dir, exeName, newPath)
 	}
 
-	// POSIX: rename the running exe aside, move the new one in, relaunch.
+	// POSIX: rename the running exe aside, move the new one in. The new
+	// process must NOT start while this one still holds the server port, so
+	// a detached shell waits for this process to exit and then execs the new
+	// binary (the handler triggers the exit right after responding).
 	oldPath := filepath.Join(dir, exeName+".old")
+	if err := os.Remove(oldPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to clear stale backup file: %w", err)
+	}
 	if err := os.Rename(exe, oldPath); err != nil {
 		return fmt.Errorf("failed to rename running executable: %w", err)
 	}
@@ -356,45 +504,74 @@ func (c *Client) applyPortable(downloadPath string, info *UpdateInfo) error {
 		os.Rename(oldPath, exe)
 		return fmt.Errorf("failed to replace executable: %w", err)
 	}
-	return c.relaunch(exe)
+	if err := launchPosixRelaunch(exe); err != nil {
+		// Roll the swap back so a failed update leaves the app usable.
+		os.Rename(exe, newPath)
+		os.Rename(oldPath, exe)
+		return fmt.Errorf("failed to schedule relaunch: %w", err)
+	}
+	return nil
+}
+
+// launchPosixRelaunch starts a detached shell that waits for this process
+// (by PID) to exit, then execs the new binary. The old process must exit
+// before the new one binds the server port.
+func launchPosixRelaunch(exe string) error {
+	script := fmt.Sprintf("while kill -0 %d 2>/dev/null; do sleep 1; done\nexec \"%s\"", os.Getpid(), exe)
+	return exec.Command("sh", "-c", script).Start()
 }
 
 // launchWindowsSwap writes a small batch script that waits for this process
-// to exit, swaps exe.new into place, and relaunches. Returns the command to
-// start it; the app should then exit promptly.
+// (by PID) to exit, swaps exe.new into place, and relaunches. Returns the
+// command to start it; the app should then exit promptly. The script gets a
+// unique name so a retry can't splice new content into a still-running
+// helper from a previous attempt (cmd re-reads batch files line by line).
 func (c *Client) launchWindowsSwap(dir, exeName, newPath string) error {
-	script := filepath.Join(dir, exeName+".update.bat")
-	content := fmt.Sprintf(`@echo off
-:wait
-tasklist /FI "IMAGENAME eq %[1]s" 2>nul | find /I "%[1]s" >nul
-if not errorlevel 1 (
-  timeout /t 1 /nobreak >nul
-  goto wait
-)
-move /Y "%[2]s" "%[3]s" >nul
-start "" "%[3]s"
-del "%%~f0"
-`, exeName, newPath, filepath.Join(dir, exeName))
-
-	if err := os.WriteFile(script, []byte(content), 0755); err != nil {
+	f, err := os.CreateTemp(dir, exeName+".update-*.bat")
+	if err != nil {
+		return fmt.Errorf("failed to create update script: %w", err)
+	}
+	script := f.Name()
+	content := windowsSwapScript(newPath, filepath.Join(dir, exeName), os.Getpid())
+	if _, err := f.WriteString(content); err != nil {
+		f.Close()
+		os.Remove(script)
+		return fmt.Errorf("failed to write update script: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(script)
 		return fmt.Errorf("failed to write update script: %w", err)
 	}
 	cmd := exec.Command("cmd", "/c", script)
+	cmd.SysProcAttr = hideWindowAttr()
 	if err := cmd.Start(); err != nil {
+		os.Remove(script)
 		return fmt.Errorf("failed to launch update script: %w", err)
 	}
 	return nil
 }
 
-// relaunch starts the (new) executable detached and returns.
-func (c *Client) relaunch(exe string) error {
-	cmd := exec.Command(exe)
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to relaunch app: %w", err)
-	}
-	return nil
+// windowsSwapScript returns the .bat content that waits for THIS process (by
+// PID) to exit (the exe is locked while the process lives), swaps the staged
+// exe into place, relaunches it, and deletes itself. The wait gives up after
+// ~5 minutes (PID reuse) and proceeds anyway — by then the old process is
+// gone either way. No parenthesized blocks are used, so no delayed expansion
+// is needed and paths containing "!" stay intact.
+func windowsSwapScript(newPath, exePath string, pid int) string {
+	return fmt.Sprintf(`@echo off
+set /a n=0
+:wait
+tasklist /FI "PID eq %[1]d" 2>nul | find /I "%[1]d" >nul
+if errorlevel 1 goto proceed
+set /a n+=1
+if %%n%% GEQ 300 goto proceed
+ping -n 2 127.0.0.1 >nul
+goto wait
+:proceed
+move /Y "%[2]s" "%[3]s" >nul
+start "" "%[3]s"
+del "%%~f0"
+`, pid, newPath, exePath)
 }
 
 // compareVersions compares two version strings of the form vX.Y.Z (or
@@ -451,4 +628,27 @@ func copyFile(src, dst string) error {
 	defer out.Close()
 	_, err = io.Copy(out, in)
 	return err
+}
+
+// CleanupStaleDownloads removes leftover updater temp files (interrupted
+// downloads, cancelled installers, stray helpers) from the system temp dir.
+// Called at startup; best-effort — it must never fail the app. Files newer
+// than the threshold are kept (a helper may still be running mid-update).
+func CleanupStaleDownloads() {
+	cleanupStaleDownloads(os.TempDir(), 24*time.Hour)
+}
+
+func cleanupStaleDownloads(dir string, olderThan time.Duration) {
+	matches, err := filepath.Glob(filepath.Join(dir, "keyrouter-update-*"))
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-olderThan)
+	for _, m := range matches {
+		if fi, err := os.Stat(m); err == nil && fi.ModTime().Before(cutoff) {
+			if err := os.Remove(m); err != nil {
+				log.Printf("[update] failed to remove stale temp file %s: %v", m, err)
+			}
+		}
+	}
 }

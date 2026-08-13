@@ -6,6 +6,7 @@
 
 Unicode true
 !include "MUI2.nsh"
+!include "LogicLib.nsh"
 
 Name "KeyRouter"
 OutFile "..\..\dist\KeyRouter-${TAG}-windows-amd64-setup.exe"
@@ -28,6 +29,29 @@ RequestExecutionLevel admin
 !insertmacro MUI_LANGUAGE "English"
 
 Section "Install"
+  ; The in-app updater launches this installer silently (/S) and then exits
+  ; the running copy so the exe can be replaced. The process may take a
+  ; moment to shut down (in-flight streams finish first), so on silent
+  ; installs wait for it — up to ~3 minutes — before writing; otherwise the
+  ; overwrite fails silently and the update looks like it "never happened".
+  ; Interactive installs skip the wait: an immediate File error tells the
+  ; user to close the app (the old behavior). tasklist's exit code is 0
+  ; whether or not a process matched, so the match is detected via find on
+  ; the output.
+  ${If} ${Silent}
+    StrCpy $0 0
+    ${Do}
+      ${If} $0 >= 300
+        ${ExitDo} ; give up after ~2-3 min — the File below reports the failure
+      ${EndIf}
+      nsExec::ExecToStack 'cmd /c "tasklist /FI "IMAGENAME eq KeyRouter.exe" | find /I "KeyRouter.exe" >nul"'
+      Pop $1 ; find's exit code (0 = KeyRouter.exe still running)
+      Pop $2 ; output (unused)
+      Sleep 300
+      IntOp $0 $0 + 1
+    ${LoopWhile} $1 = 0
+  ${EndIf}
+
   ; Per-machine install (HKLM, Program Files): shortcuts and uninstall keys
   ; go to the all-users context so every account sees them.
   SetShellVarContext all
