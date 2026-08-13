@@ -3,7 +3,9 @@ package handler_test
 import (
 	"embed"
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"testing"
 	"time"
@@ -85,10 +87,13 @@ func TestActivityEdgeCases(t *testing.T) {
 		{"key hourly tokens top5", "metric=tokens&group_by=key&rollup=hour&top=5", 200},
 		{"app daily requests", "metric=requests&group_by=app&rollup=day", 200},
 		{"cache daily", "metric=cache&group_by=model&rollup=day", 200},
+		{"model weekly spend", "metric=spend&group_by=model&rollup=week", 200},
+		{"model monthly spend", "metric=spend&group_by=model&rollup=month", 200},
 		{"bad metric", "metric=bogus", 400},
 		{"bad group_by", "metric=spend&group_by=nope", 400},
 		{"bad subgroup", "metric=spend&subgroup=bogus", 400},
 		{"subgroup same as group_by", "metric=spend&group_by=model&subgroup=model", 400},
+		{"bad rollup", "metric=spend&rollup=minute", 400},
 		{"bad since", "metric=spend&since=notadate", 400},
 	}
 	for _, c := range cases {
@@ -163,7 +168,9 @@ func TestActivitySubgroup(t *testing.T) {
 	})
 
 	now := time.Now()
-	day1Label := time.Date(now.Year(), now.Month(), now.Day()-1, 12, 0, 0, 0, now.Location()).Format("01-02")
+	// Bucket labels are year-qualified ("YYYY-MM-DD") since the time-scale
+	// rework, so the subgroup fixture's day label must match that format.
+	day1Label := time.Date(now.Year(), now.Month(), now.Day()-1, 12, 0, 0, 0, now.Location()).Format("2006-01-02")
 
 	req := httptest.NewRequest("GET", "/api/stats/activity?metric=spend&group_by=model&subgroup=key&rollup=day&top=1", nil)
 	req.Host = "localhost:9999"
@@ -221,5 +228,39 @@ func TestActivitySubgroup(t *testing.T) {
 	}
 	if len(out2.Series) == 0 {
 		t.Fatalf("expected series points for group_by=key&subgroup=model")
+	}
+}
+
+// TestActivityWeekRollupMondayAlignment pins the week-rollup edge case: a
+// range starting on a Sunday must open on the PREVIOUS Monday (week buckets
+// are labeled by their Monday start date).
+func TestActivityWeekRollupMondayAlignment(t *testing.T) {
+	e := bootstrapActivity(t)
+	t.Cleanup(func() {
+		if sqlDB, err := db.GetDB().DB(); err == nil {
+			sqlDB.Close()
+		}
+	})
+
+	// Aug 16 2026 is a Sunday.
+	since := time.Date(2026, 8, 16, 10, 0, 0, 0, time.Local)
+	until := since.Add(3 * 24 * time.Hour)
+	qs := fmt.Sprintf("metric=spend&group_by=model&rollup=week&since=%s&until=%s",
+		url.QueryEscape(since.Format(time.RFC3339)), url.QueryEscape(until.Format(time.RFC3339)))
+	req := httptest.NewRequest("GET", "/api/stats/activity?"+qs, nil)
+	req.Host = "localhost:9999"
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Buckets []string `json:"buckets"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Buckets) == 0 || out.Buckets[0] != "2026-08-10" {
+		t.Fatalf("first week bucket = %v, want 2026-08-10 (Monday of the Sunday's week)", out.Buckets)
 	}
 }

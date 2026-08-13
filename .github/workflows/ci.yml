@@ -30,6 +30,7 @@ jobs:
         run: |
           npm ci
           npm run build
+          npm test
         working-directory: web
 
       - name: Install WebKit/GTK dependencies (cgo)
