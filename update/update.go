@@ -454,7 +454,17 @@ start "" "%[3]s"
 :cleanup
 del /Q "%[4]s" >nul 2>&1
 del "%%~f0"
-`, pid, filepath.Base(installerPath), appPath, installerPath)
+`, pid, windowsBase(installerPath), appPath, installerPath)
+}
+
+// windowsBase returns the final path element treating both separators —
+// the helper bats are Windows-only, but this function must behave the same
+// when tests run on any platform (filepath.Base is OS-dependent).
+func windowsBase(p string) string {
+	if i := strings.LastIndexAny(p, `\/`); i >= 0 {
+		return p[i+1:]
+	}
+	return p
 }
 
 // applyPortable replaces the running executable. Because the process is
