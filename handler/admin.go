@@ -58,6 +58,23 @@ type AdminHandler struct {
 	// the new binary / installer can replace it (portable swap script,
 	// installed installer). Nil = no exit (used in tests).
 	ExitAfterUpdate func()
+	// RestartSchedule is set by main (via router.SetRestartHook). Called by
+	// Restart BEFORE the response is written: it schedules a fresh instance
+	// (wait-for-exit helper). An error means no restart will happen — the
+	// request fails with 500 and a later attempt can succeed. Nil = no
+	// restart (used in tests).
+	RestartSchedule func() error
+	// RestartQuit is set by main (via router.SetRestartHook). Called by
+	// Restart AFTER the response has been written and flushed: it triggers
+	// the graceful shutdown — new requests are rejected while in-flight API
+	// calls drain, then the process exits so the scheduled fresh instance
+	// can take over. Nil = no restart (used in tests).
+	RestartQuit func()
+	// restartMu/restarting guard Restart against concurrent calls: only the
+	// first request may schedule the relaunch — two fresh instances would
+	// fight over the server port.
+	restartMu  sync.Mutex
+	restarting bool
 	// autoCheckInfo holds the most recent auto-check result (set by
 	// AutoCheck's callback; read by GetAutoCheckState).
 	autoCheckMu   sync.Mutex
@@ -1226,6 +1243,39 @@ func (h *AdminHandler) ReloadConfig(c *gin.Context) {
 	h.Engine.Refresh()
 	h.Engine.Calculator.RefreshPricing()
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "message": "configuration reloaded"})
+}
+
+// Restart accepts a gateway restart: new requests are rejected (503) while
+// in-flight API calls drain, then the process exits and a fresh instance
+// takes over (so settings like the server port take effect). The fresh
+// instance is scheduled BEFORE the response so a scheduling failure is
+// reported as 500 (and a later attempt can succeed); the 200 is then
+// written and flushed before the quit hook runs — the process may exit as
+// soon as the drain completes, so callers must not depend on the
+// connection staying open.
+func (h *AdminHandler) Restart(c *gin.Context) {
+	if h.RestartSchedule == nil || h.RestartQuit == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "restart is not supported in this build"})
+		return
+	}
+	h.restartMu.Lock()
+	if h.restarting {
+		h.restartMu.Unlock()
+		c.JSON(http.StatusConflict, gin.H{"error": "restart already in progress"})
+		return
+	}
+	if err := h.RestartSchedule(); err != nil {
+		h.restartMu.Unlock()
+		log.Printf("[admin] restart scheduling failed: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to schedule restart: " + err.Error()})
+		return
+	}
+	h.restarting = true
+	h.restartMu.Unlock()
+
+	c.JSON(http.StatusOK, gin.H{"status": "restarting"})
+	c.Writer.Flush()
+	h.RestartQuit()
 }
 
 // GetAutostart returns the current launch-at-login state.

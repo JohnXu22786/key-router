@@ -176,6 +176,13 @@ func main() {
 	// calls the hook after responding to the UI.
 	router.SetUpdateExitHook(requestExitForUpdate)
 
+	// The gateway restart endpoint: /api/restart schedules a fresh instance
+	// before responding (a scheduling failure becomes a 500), then triggers
+	// the graceful shutdown after the response is flushed — new requests
+	// are rejected while in-flight API calls drain, the process exits, and
+	// the wait-for-exit helper starts the new instance.
+	router.SetRestartHook(update.ScheduleRelaunchAfterExit, requestRestartQuit)
+
 	// Remove leftover updater temp files (interrupted downloads, cancelled
 	// installers) from previous runs. Best-effort — never fails startup.
 	update.CleanupStaleDownloads()
@@ -219,6 +226,10 @@ func main() {
 	// Record the window handle for the post-update exit path (closes the
 	// window when no close-to-tray handler is installed).
 	setUpdateExitWindow(uintptr(w.Window()))
+	// Record the restart quit path: on non-Windows, terminating the webview
+	// loop is what starts the graceful shutdown (Windows uses the window
+	// close path instead).
+	setRestartQuitFn(func() { w.Terminate() })
 
 	// System tray (Windows): clicking the window X hides to the tray instead
 	// of quitting; single-clicking the tray icon restores the window, the
