@@ -40,6 +40,14 @@ type Checker struct {
 	// failing key (e.g. a billable Anthropic inference probe) is not probed
 	// every interval forever.
 	failCount map[int64]int
+	// authFailCount tracks consecutive AUTH/quota probe failures (auth_failed
+	// / insufficient_quota) separately from failCount: the auto-disable
+	// decision requires a REPEAT auth failure. A single transient auth blip
+	// that happens to follow unrelated failures (rate_limited,
+	// upstream_error) must not take the key out of rotation — that status
+	// flip would recover on the next successful probe, which is exactly the
+	// auth_failed flash users see.
+	authFailCount map[int64]int
 	// lastActiveProbe throttles probes of ACTIVE keys: checking every key
 	// every interval would burn billable Anthropic probes and hammer the
 	// upstreams. Active keys are probed at most once per activeProbeInterval.
@@ -55,6 +63,7 @@ func NewChecker() *Checker {
 	return &Checker{
 		interval:        120 * time.Second, // default
 		failCount:       make(map[int64]int),
+		authFailCount:   make(map[int64]int),
 		lastActiveProbe: make(map[int64]time.Time),
 	}
 }
@@ -206,12 +215,13 @@ func (c *Checker) shouldProbeKey(key *model.Key) bool {
 	return false
 }
 
-// ResetFailCount clears the consecutive-failure latch for a key (e.g. after
-// an admin edit or a status change) so probing resumes
+// ResetFailCount clears the consecutive-failure latches for a key (e.g.
+// after an admin edit or a status change) so probing resumes
 func (c *Checker) ResetFailCount(keyID int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.failCount, keyID)
+	delete(c.authFailCount, keyID)
 }
 
 // ProbeResult classifies the outcome of a health probe. The classification
@@ -268,13 +278,21 @@ func (c *Checker) checkKey(key *model.Key) {
 		return
 	}
 
-	// Reset the failure counter on success
+	// Reset the failure counters on success
 	c.mu.Lock()
 	delete(c.failCount, key.ID)
+	delete(c.authFailCount, key.ID)
 	c.mu.Unlock()
 
-	// Active keys that probe fine stay active — nothing to do.
+	// Active keys that probe fine stay active — but clear any failure reason
+	// a transient earlier probe failure persisted (it is invisible while
+	// the key is active and would otherwise linger in the DB forever).
 	if key.Status == model.KeyStatusActive {
+		if key.DisabledReason != "" {
+			db.GetDB().Model(&model.Key{}).
+				Where("id = ? AND status = ? AND disabled_reason <> ''", key.ID, model.KeyStatusActive).
+				Updates(map[string]interface{}{"disabled_reason": ""})
+		}
 		return
 	}
 
@@ -289,16 +307,28 @@ func (c *Checker) checkKey(key *model.Key) {
 	if current.Status == model.KeyStatusDisabled && current.DisabledReason == "" {
 		return // deliberately disabled while probing
 	}
+	// The relay may have re-cooled this key while the probe was in flight,
+	// or the upstream's Retry-After window is still running. The probe
+	// proves the key authenticates, but the cooldown is the upstream's own
+	// instruction to wait: recovering early re-admits a hot key, the next
+	// request re-triggers the 429, and the status ping-pongs between
+	// rate_limited and active.
+	if current.Status == model.KeyStatusRateLimited &&
+		current.RateLimitedUntil != nil && time.Now().Before(*current.RateLimitedUntil) {
+		return
+	}
 
 	log.Printf("[health] key %d (%s...) recovered, marking active",
 		key.ID, truncateKey(key.KeyValue))
 
-	// Guarded update: don't clobber a fresher state written while our
-	// probe was in flight. Deliberately-disabled keys (empty reason) are
-	// excluded; system-disabled and rate-limited keys are the ones we recover.
+	// Guarded update: don't clobber a fresher state written while our probe
+	// was in flight. Deliberately-disabled keys (empty reason) are excluded;
+	// system-disabled and rate-limited keys are the ones we recover — but a
+	// rate_limited_until still in the future (the relay re-cooled this key
+	// between the re-check above and this write) must NOT be wiped.
 	res := db.GetDB().Model(&model.Key{}).
-		Where("id = ? AND (status <> ? OR disabled_reason <> ?)",
-			key.ID, model.KeyStatusDisabled, "").
+		Where("id = ? AND (status <> ? OR disabled_reason <> ?) AND (rate_limited_until IS NULL OR rate_limited_until <= ?)",
+			key.ID, model.KeyStatusDisabled, "", time.Now()).
 		Updates(map[string]interface{}{
 			"status":             model.KeyStatusActive,
 			"rate_limited_until": nil,
@@ -341,11 +371,38 @@ func (c *Checker) recordFailure(key *model.Key, reason string) {
 			key.DisabledReason = reason // keep the in-memory copy in sync
 		}
 	}
+	// Count the consecutive failures first so persistently broken keys back
+	// off AND the disable decision below can require a repeat: the counts
+	// are read before this probe is added. Auth/quota failures are counted
+	// separately (authFailCount) so the disable gate only trips on repeated
+	// auth failures, not on an auth blip after unrelated probe failures.
+	isAuth := reason == "auth_failed" || reason == "insufficient_quota"
+	c.mu.Lock()
+	c.failCount[key.ID]++
+	if c.failCount[key.ID] > 6 {
+		c.failCount[key.ID] = 6
+	}
+	consecutiveAuthFailures := c.authFailCount[key.ID]
+	if isAuth {
+		c.authFailCount[key.ID]++
+	} else {
+		// A non-auth failure breaks the auth-failure streak: the disable
+		// gate below must only trip on REPEATED auth failures, not on a
+		// single stale auth blip that happened earlier.
+		c.authFailCount[key.ID] = 0
+	}
+	c.mu.Unlock()
+
 	// Auth/quota failures permanently take the key out of rotation (no point
-	// routing traffic to it); rate limits and upstream errors stay as-is so
-	// the relay's own retry/failover handles them and this probe keeps
-	// checking.
-	if (reason == "auth_failed" || reason == "insufficient_quota") && key.Status != model.KeyStatusDisabled {
+	// routing traffic to it) — but only after the key has failed probes with
+	// AUTH failures CONSECUTIVELY. A single transient probe failure (upstream
+	// hiccup) must not yank a healthy key: the status would flip to disabled
+	// and back to active on the very next successful probe, which is exactly
+	// the auth_failed/rate_limited flash users see. Rate limits and upstream
+	// errors stay as-is so the relay's own retry/failover handles them and
+	// this probe keeps checking.
+	if isAuth &&
+		key.Status != model.KeyStatusDisabled && consecutiveAuthFailures >= 1 {
 		if c.onFailed != nil {
 			c.onFailed(key.ID, reason)
 		} else {
@@ -361,13 +418,6 @@ func (c *Checker) recordFailure(key *model.Key, reason string) {
 			}
 		}
 	}
-	// Count the consecutive failure so persistently broken keys back off
-	c.mu.Lock()
-	c.failCount[key.ID]++
-	if c.failCount[key.ID] > 6 {
-		c.failCount[key.ID] = 6
-	}
-	c.mu.Unlock()
 }
 
 func (c *Checker) testKey(keyValue string, provider *model.Provider) ProbeResult {
