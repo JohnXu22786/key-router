@@ -30,6 +30,10 @@ var version = "0.1.0"
 //go:embed web/dist/*
 var staticFS embed.FS
 
+// web/dist is generated build output (gitignored, never committed — hashed
+// asset filenames made every frontend change collide in merges). Build it
+// first: `cd web && npm run build`, or `go build` fails on this embed.
+
 func main() {
 	// Detach from console window (GUI mode; Windows-only, see platform files)
 	detachConsole()
