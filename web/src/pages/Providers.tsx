@@ -64,7 +64,6 @@ const Providers: React.FC = () => {
   const [provForm] = Form.useForm();
   const [keyForm] = Form.useForm();
   const statusTouched = useRef(false);
-  const persistTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Number of drag orders committed but not yet persisted: the 10s poll
   // must not overwrite the local order with pre-persist server state.
   // Captured at fetch START as well (with the persist generation), so a
@@ -196,20 +195,24 @@ const Providers: React.FC = () => {
     } catch { message.error('Failed to reset key spend'); }
   };
   const persistOrder = useCallback((ordered: Key[]) => {
+    // Persist IMMEDIATELY on drop — no debounce: an edit must be written
+    // the moment it happens, so a crash or a forced kill right after a drop
+    // cannot lose the new order. Each drop fires one request; the poll guard
+    // below keeps the 10s refresh from overwriting the local order while the
+    // write is in flight.
     pendingPersistsRef.current++;
-    if (persistTimer.current) clearTimeout(persistTimer.current);
-    persistTimer.current = setTimeout(async () => {
-      const providerCounts: Record<number, number> = {};
-      const payload = ordered.map(k => {
-        const idx = providerCounts[k.provider_id] ?? 0;
-        providerCounts[k.provider_id] = idx + 1;
-        return { id: k.id, sort_order: idx };
+    const providerCounts: Record<number, number> = {};
+    const payload = ordered.map(k => {
+      const idx = providerCounts[k.provider_id] ?? 0;
+      providerCounts[k.provider_id] = idx + 1;
+      return { id: k.id, sort_order: idx };
+    });
+    reorderKeys(payload)
+      .catch(() => message.error('Failed to save order'))
+      .finally(() => {
+        pendingPersistsRef.current--;
+        persistGenRef.current++;
       });
-      try { await reorderKeys(payload); }
-      catch { message.error('Failed to save order'); }
-      pendingPersistsRef.current--;
-      persistGenRef.current++;
-    }, 300);
   }, []);
 
   const keyColumns = [
