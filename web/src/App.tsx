@@ -24,6 +24,11 @@ import { getAutoCheckState } from './api/client';
 const { Sider, Content } = Layout;
 const { Title } = Typography;
 
+// The desktop shell loads this page from http://localhost:<port> — surface
+// that address in the sidebar footer so clients know where to point.
+const port = window.location.port || '9998';
+const serverUrl = `http://localhost:${port}`;
+
 // LayoutWithRouter is rendered inside BrowserRouter context so useLocation() works
 const LayoutWithRouter: React.FC = () => {
   const [collapsed, setCollapsed] = useState(false);
@@ -56,7 +61,20 @@ const LayoutWithRouter: React.FC = () => {
         collapsible
         collapsed={collapsed}
         onCollapse={setCollapsed}
-        style={{ position: 'fixed', left: 0, top: 0, bottom: 0, height: '100vh', overflow: 'auto', zIndex: 10 }}
+        style={{
+          position: 'fixed', left: 0, top: 0, bottom: 0, height: '100vh',
+          display: 'flex', flexDirection: 'column', overflow: 'hidden', zIndex: 10,
+          // The app has no global box-sizing reset (antd's reset.css is opt-in),
+          // so the sider opts into border-box: only then does antd's -has-trigger
+          // padding-bottom (48px) shrink the content box and leave room for the
+          // footer above the trigger.
+          boxSizing: 'border-box',
+        }}
+        // body = the sider's children container; column flex keeps the menu
+        // scrollable while the footer stays pinned above the collapse trigger
+        // (with border-box, antd's -has-trigger rule ends the body 48px above
+        // the bottom — exactly at the trigger's top edge).
+        styles={{ body: { display: 'flex', flexDirection: 'column', minHeight: 0, flex: 1 } }}
       >
         <div style={{ height: 64, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
           <img src="/app-icon-512.png" alt="KeyRouter" style={{ width: 28, height: 28 }} />
@@ -66,12 +84,32 @@ const LayoutWithRouter: React.FC = () => {
             </Title>
           )}
         </div>
-        <Menu
-          theme="dark"
-          mode="inline"
-          selectedKeys={[location.pathname]}
-          items={menuItems}
-        />
+        <div style={{ flex: 1, minHeight: 0, overflow: 'auto' }}>
+          <Menu
+            theme="dark"
+            mode="inline"
+            selectedKeys={[location.pathname]}
+            items={menuItems}
+          />
+        </div>
+        {/* Listen address, above the collapse trigger. Collapsed, only the
+            port fits. */}
+        <div
+          title={serverUrl}
+          style={{
+            padding: '8px 12px',
+            textAlign: 'center',
+            fontSize: 12,
+            lineHeight: '16px',
+            color: 'rgba(255, 255, 255, 0.65)',
+            whiteSpace: 'nowrap',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            borderTop: '1px solid rgba(255, 255, 255, 0.08)',
+          }}
+        >
+          {collapsed ? `:${port}` : serverUrl}
+        </div>
       </Sider>
       <Layout style={{ marginLeft: collapsed ? 80 : 200, minHeight: '100vh' }}>
         <Content style={{ margin: 24 }}>
