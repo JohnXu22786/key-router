@@ -13,6 +13,7 @@ import {
 } from '../api/client';
 import { subscribeEvents, jsonEqual } from '../api/events';
 import { useDragSort } from '../hooks/useDragSort';
+import { usdToMicroUsd, microUsdToUsd } from './keyLimits';
 
 const { Title, Text } = Typography;
 
@@ -209,6 +210,21 @@ const Providers: React.FC = () => {
   const saveKey = async () => {
     try {
       const values = await keyForm.validateFields();
+      // Unit conversion: cost-metric windows and the lifetime budget are
+      // entered in USD but stored in micro-USD (1e6 per $1). Convert on
+      // `values` so BOTH the create and edit paths send stored units — the
+      // create path sends `values` directly. (A missing conversion here once
+      // stored a "$30" budget as 30 micro-USD, disabling the key the moment
+      // its next request pushed total_spent past it.)
+      for (const wt of windowTypes) {
+        if (values[wt.limitField] == null || values[wt.limitField] === 0) continue;
+        if (wt.metricField && values[wt.metricField] === 'cost') {
+          values[wt.limitField] = usdToMicroUsd(values[wt.limitField]);
+        }
+      }
+      if (values.total_spend_limit != null && values.total_spend_limit !== 0) {
+        values.total_spend_limit = usdToMicroUsd(values.total_spend_limit);
+      }
       // Editing must NOT reset fields the user did not touch: only send the
       // fields actually modified (rate-limit values, strategy, ...) so a
       // name-only edit leaves the limits exactly as they were. Creating
@@ -220,16 +236,6 @@ const Providers: React.FC = () => {
         }
         if (!statusTouched.current) delete payload.status;
         if (payload.provider_id == null) delete payload.provider_id;
-      }
-      // Rate-limit cancellation: emptied input = 0 = unlimited. Cost-metric
-      // windows are entered in USD but stored in micro-USD.
-      for (const wt of windowTypes) {
-        if (payload[wt.limitField] == null) continue;
-        if (payload[wt.limitField] === 0 || payload[wt.limitField] == null) {
-          // explicit 0 = clear the limit
-        } else if (wt.metricField && payload[wt.metricField] === 'cost') {
-          payload[wt.limitField] = Math.round(payload[wt.limitField] * 1e6);
-        }
       }
       if (editingKey) { await updateKey(editingKey.id, payload); message.success('Key updated'); }
       else { await createKey(values); message.success('Key created'); }
@@ -262,6 +268,8 @@ const Providers: React.FC = () => {
         if (metric === 'cost') values[wt.limitField] = (k as any)[wt.limitField] / 1e6;
       }
     }
+    // Lifetime budget is stored in micro-USD; the form's field is in USD.
+    values.total_spend_limit = microUsdToUsd(k.total_spend_limit || 0);
     keyForm.setFieldsValue(values);
     setKeyModal(true);
   };
@@ -338,6 +346,7 @@ const Providers: React.FC = () => {
           {r.rpm_limit > 0 && <Tag>{r.rpm_limit} rpm</Tag>}
           {r.tpm_limit > 0 && <Tag>{r.tpm_limit} tpm</Tag>}
           {r.rpd_limit > 0 && <Tag>{r.rpd_metric === 'cost' ? `$${(r.rpd_limit / 1e6).toFixed(2)}/d` : `${r.rpd_limit}/d`}</Tag>}
+          {r.total_spend_limit > 0 && <Tag>${microUsdToUsd(r.total_spend_limit).toFixed(2)} budget</Tag>}
         </Space>
       ),
     },
@@ -354,6 +363,11 @@ const Providers: React.FC = () => {
       ),
     },
   ];
+
+  // Lifetime-budget figures for the detail panel (micro-USD from the API).
+  const budget = detailData?.key
+    ? { spent: detailData.key.total_spent || 0, limit: detailData.key.total_spend_limit || 0 }
+    : null;
 
   return (
     <div>
@@ -572,6 +586,26 @@ const Providers: React.FC = () => {
                 );
               })}
             </div>
+            {/* Lifetime budget: a one-time spend cap, not a sliding window.
+                Shown on the panel so the full limit story is visible — the
+                key disables permanently once spent reaches the cap. */}
+            {budget && (
+              <div style={{ maxWidth: 480, marginTop: 12 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <Text strong>Lifetime Budget</Text>
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    {budget.limit > 0
+                      ? `$${microUsdToUsd(budget.spent).toFixed(2)} / $${microUsdToUsd(budget.limit).toFixed(2)}`
+                      : `$${microUsdToUsd(budget.spent).toFixed(2)} (no budget)`}
+                  </Text>
+                </div>
+                <Progress
+                  size="small"
+                  percent={budget.limit > 0 ? Math.min(100, budget.spent / budget.limit * 100) : 0}
+                  status={budget.limit > 0 && budget.spent >= budget.limit ? 'exception' : undefined}
+                />
+              </div>
+            )}
           </div>
         )}
       </Modal>
