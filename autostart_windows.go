@@ -30,7 +30,15 @@ const (
 	keyQuery    = 0x0001
 	keyRead     = 0x20019
 	// RegGetValue flags
-	rrfNoExpand = 0x00000004
+	// RRF_RT_REG_SZ: read plain REG_SZ values — the type we write to the Run
+	// key. RegGetValueW refuses values whose type isn't covered by the
+	// RRF_RT_* mask; the old constant 0x4 was actually RRF_RT_REG_EXPAND_SZ,
+	// so the read always rejected the REG_SZ entry with
+	// ERROR_UNSUPPORTED_TYPE (1630) and autostartEnabled() reported false.
+	rrfRtRegSz = 0x00000002
+	// RRF_NOEXPAND: return the stored string verbatim (no %VAR% expansion)
+	// so it compares against the raw executable path.
+	rrfNoExpand = 0x10000000
 )
 
 // autostartAppPath returns the executable path used for the Run entry.
@@ -119,14 +127,16 @@ func autostartEnabled() bool {
 	}
 	defer regCloseKey.Call(hkey)
 
-	// RegGetValueW with a null buffer returns ERROR_MORE_DATA (234) and the
-	// required size — NOT an error. ERROR_FILE_NOT_FOUND means no entry.
+	// RegGetValueW with a null buffer returns the required size (as
+	// ERROR_SUCCESS or ERROR_MORE_DATA) — neither is an error.
+	// ERROR_FILE_NOT_FOUND means no entry; a value whose type isn't in the
+	// RRF_RT_* mask returns ERROR_UNSUPPORTED_TYPE (1630) → disabled.
 	var size uint32 = 0
 	ret, _, _ = regGetValue.Call(
 		hkey,
 		0,
 		uintptr(unsafePtr(runValue)),
-		uintptr(rrfNoExpand),
+		uintptr(rrfRtRegSz|rrfNoExpand),
 		0,
 		0,
 		uintptr(unsafe.Pointer(&size)),
@@ -145,7 +155,7 @@ func autostartEnabled() bool {
 		hkey,
 		0,
 		uintptr(unsafePtr(runValue)),
-		uintptr(rrfNoExpand),
+		uintptr(rrfRtRegSz|rrfNoExpand),
 		0,
 		uintptr(unsafe.Pointer(&buf[0])),
 		uintptr(unsafe.Pointer(&size)),

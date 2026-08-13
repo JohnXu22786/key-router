@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { Card, Form, Input, InputNumber, Button, message, Typography, Spin, Modal, Space, Tag, Alert, Switch } from 'antd';
 import { KeyOutlined, ReloadOutlined, DownloadOutlined, CheckCircleOutlined, RocketOutlined } from '@ant-design/icons';
-import { getSettings, updateSettings, reloadConfig, checkUpdate, applyUpdate, getHealth, getAutostart, setAutostart, UpdateInfo } from '../api/client';
+import { getSettings, updateSettings, reloadConfig, checkUpdate, applyUpdate, getHealth, getAutostart, setAutostart, getAutoCheckState, UpdateInfo } from '../api/client';
 
 const { Title } = Typography;
 
@@ -15,6 +15,9 @@ const Settings: React.FC = () => {
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
   const [checking, setChecking] = useState(false);
   const [applying, setApplying] = useState(false);
+  // Install mode from /updates/state: a local fact, so the Installed/Portable
+  // label is correct even before the first "Check for Updates".
+  const [installMode, setInstallMode] = useState<'portable' | 'installed' | null>(null);
   // Running app version from /api/health (injected at build time via ldflags)
   const [appVersion, setAppVersion] = useState<string>('');
   // Launch-at-login state
@@ -71,6 +74,13 @@ const Settings: React.FC = () => {
           const as = await getAutostart();
           setAutostartState(as.data);
         } catch { /* unsupported platform — hide the switch */ }
+        // Install mode + last auto-check result (local endpoint, no network):
+        // lets the update card label this copy correctly before the first check.
+        try {
+          const st = await getAutoCheckState();
+          setInstallMode(st.data.install_mode);
+          if (st.data.checked) setUpdateInfo(st.data);
+        } catch { /* the card still works via "Check for Updates" */ }
       } catch { message.error('Failed to load settings'); }
       finally { setLoading(false); }
     };
@@ -141,6 +151,10 @@ const Settings: React.FC = () => {
 
   if (loading) return <Spin size="large" style={{ display: 'block', margin: '100px auto' }} />;
 
+  // Install mode known from the last check (if any) or from the local
+  // /updates/state facts fetched on mount.
+  const mode = updateInfo?.install_mode ?? installMode;
+
   return (
     <div>
       <Title level={3}>Settings</Title>
@@ -183,18 +197,20 @@ const Settings: React.FC = () => {
         extra={
           <Space>
             <Tag color={updateInfo?.update_available ? 'gold' : 'default'}>
-              {updateInfo ? `v${updateInfo.current_version}${updateInfo.update_available ? ` → v${updateInfo.latest_version}` : ' (latest)'}` : '—'}
+              {updateInfo ? `v${updateInfo.current_version}${updateInfo.update_available ? ` → v${updateInfo.latest_version}` : ' (latest)'}` : appVersion ? `v${appVersion}` : '—'}
             </Tag>
-            <Tag>{updateInfo?.install_mode === 'installed' ? 'Installed' : 'Portable'}</Tag>
+            <Tag>{mode === 'installed' ? 'Installed' : mode === 'portable' ? 'Portable' : '—'}</Tag>
           </Space>
         }
       >
         <Space direction="vertical" style={{ width: '100%' }}>
-          <Typography.Paragraph type="secondary" style={{ marginBottom: 8 }}>
-            {updateInfo?.install_mode === 'installed'
-              ? 'This is an installed copy: updates download and launch the setup installer.'
-              : 'This is a portable copy: updates download and replace the executable directly.'}
-          </Typography.Paragraph>
+          {mode && (
+            <Typography.Paragraph type="secondary" style={{ marginBottom: 8 }}>
+              {mode === 'installed'
+                ? 'This is an installed copy: updates download and launch the setup installer.'
+                : 'This is a portable copy: updates download and replace the executable directly.'}
+            </Typography.Paragraph>
+          )}
           {updateInfo?.error && (
             <Alert type="warning" showIcon message={`Update check failed: ${updateInfo.error}`} />
           )}
