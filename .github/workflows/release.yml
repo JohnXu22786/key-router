@@ -130,12 +130,13 @@ jobs:
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
           New-Item -ItemType Directory -Force dist | Out-Null
-          # NSIS 3.12 official zip from SourceForge. We used to `choco install
+          # NSIS from GitHub releases (negrutiu/nsis). We used to `choco install
           # nsis`, but community.chocolatey.org was down (504 Gateway Timeout)
-          # and broke releases; the official zip is a stable direct download.
-          Invoke-WebRequest -Uri "https://downloads.sourceforge.net/project/nsis/NSIS%203/3.12/nsis-3.12.zip" -OutFile "$env:TEMP\nsis-3.12.zip"
-          Expand-Archive -Path "$env:TEMP\nsis-3.12.zip" -DestinationPath "$env:TEMP\nsis" -Force
-          $env:PATH = "$env:TEMP\nsis\nsis-3.12;$env:PATH"
+          # and broke releases; the GitHub release asset is a stable download.
+          Invoke-WebRequest -Uri "https://github.com/negrutiu/nsis/releases/download/v3.13.7497.330/nsis-3.13.7497.330-negrutiu-x86.exe" -OutFile "$env:TEMP\nsis-setup.exe"
+          # /D must be the last argument and unquoted; C:\nsis has no spaces.
+          Start-Process -Wait -FilePath "$env:TEMP\nsis-setup.exe" -ArgumentList "/S", "/D=C:\nsis"
+          $env:PATH = "C:\nsis;$env:PATH"
           makensis /DTAG="${{ needs.version.outputs.tag }}" /DVERSION="${{ needs.version.outputs.ver }}" "/DAPP_EXE=${{ github.workspace }}\${{ matrix.asset }}" packaging/windows/installer.nsi
           Copy-Item "${{ matrix.asset }}" "dist\${{ matrix.asset }}"
 
