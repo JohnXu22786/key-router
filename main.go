@@ -200,7 +200,9 @@ func main() {
 	// Create desktop window with WebView2
 	w := webview.New(false) // false = no devtools
 	defer w.Destroy()
-	w.SetTitle(fmt.Sprintf("KeyRouter v%s — %s", version, url))
+	// Title bar shows only the app name; the listen address is displayed in
+	// the sidebar footer instead (web/src/App.tsx).
+	w.SetTitle("KeyRouter")
 	w.SetSize(1000, 580, webview.HintNone)
 	w.Navigate(url)
 
