@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Card, Typography, Spin, message, Select, Dropdown, Button, Space, Tooltip, Table } from 'antd';
 import type { TableProps } from 'antd';
 import {
@@ -13,7 +13,7 @@ import {
 import { getActivity, ActivityResponse, ActivityGroupSummary } from '../api/client';
 import {
   DateRange, fmtUSDInt, fmtTokens, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS,
-  fmtPercent, fmt3sig, fmtDayLabel, modelFavicon,
+  fmtPercent, fmt3sig, fmtTick, fmtBucket, modelFavicon, Granularity,
 } from './activityShared';
 
 const { Text } = Typography;
@@ -59,6 +59,10 @@ const SEP = '\u0001';
 const keyFor = (g: string, sg: string) => (sg ? g + SEP + sg : g);
 const displayFor = (g: string, sg: string) => (sg ? `${g} · ${sg}` : g);
 
+// rollupGran maps the API rollup value to a chart-label granularity.
+const rollupGran = (rollup: string): Granularity =>
+  rollup === 'hour' ? 'hour' : rollup === 'month' ? 'month' : 'day';
+
 const fmtForTable = (metric: string) => (v: number) =>
   metric === 'spend' ? fmt3sig(v) : metric === 'tokens' || metric === 'cache' ? fmtTokens(v) : fmtCompact(v);
 
@@ -88,9 +92,18 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range }) => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
   const [loadMs, setLoadMs] = useState(0);
+  // A preset/control switch drops the stale response (spinner); the 60s
+  // range slide (same fetch key) keeps the previous chart while refetching.
+  // Compared inside the effect: render-time ref writes would be defeated by
+  // StrictMode's double render.
+  const fetchKey = `${range.key}|${metric}|${groupBy}|${subgroup}|${rollup}|${topN}`;
+  const prevKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
+    const prevKey = prevKeyRef.current;
+    prevKeyRef.current = fetchKey;
+    if (prevKey !== null && prevKey !== fetchKey) { setData(null); }
     const fetch = async () => {
       setLoading(true);
       setError(false);
@@ -258,9 +271,9 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range }) => {
       {chartType === 'bar' && (
         <BarChart data={chartData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
           <CartesianGrid strokeDasharray="3 3" stroke={GRID} vertical={false} />
-          <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={28} tickFormatter={fmtDayLabel} />
+          <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={28} tickFormatter={(v) => fmtTick(rollupGran(rollup), String(v))} />
           <YAxis tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} width={60} tickFormatter={fmtAxis} />
-          <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID }} labelFormatter={(l) => fmtDayLabel(String(l))} />
+          <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID }} labelFormatter={(l) => fmtBucket(rollupGran(rollup), String(l))} />
           {/* dataKey is a function accessor: recharts resolves string keys via
               lodash paths, so dots in names like "claude-3.5" would break */}
           {seriesKeys.map((sk, i) => (
@@ -271,9 +284,9 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range }) => {
       {chartType === 'area' && (
         <AreaChart data={chartData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
           <CartesianGrid strokeDasharray="3 3" stroke={GRID} vertical={false} />
-          <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={28} tickFormatter={fmtDayLabel} />
+          <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={28} tickFormatter={(v) => fmtTick(rollupGran(rollup), String(v))} />
           <YAxis tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} width={60} tickFormatter={fmtAxis} />
-          <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID }} labelFormatter={(l) => fmtDayLabel(String(l))} />
+          <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID }} labelFormatter={(l) => fmtBucket(rollupGran(rollup), String(l))} />
           {seriesKeys.map((sk, i) => (
             <Area key={sk.key} dataKey={(d: any) => d[sk.key]} name={displayFor(sk.group, sk.subgroup)} type="monotone" stackId="1" stroke={seriesColor(i, sk.group)} strokeWidth={1.5} fill={seriesColor(i, sk.group)} fillOpacity={0.35} dot={false} />
           ))}
@@ -282,9 +295,9 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range }) => {
       {chartType === 'line' && (
         <LineChart data={chartData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
           <CartesianGrid strokeDasharray="3 3" stroke={GRID} vertical={false} />
-          <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={28} tickFormatter={fmtDayLabel} />
+          <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={28} tickFormatter={(v) => fmtTick(rollupGran(rollup), String(v))} />
           <YAxis tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} width={60} tickFormatter={fmtAxis} />
-          <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID }} labelFormatter={(l) => fmtDayLabel(String(l))} />
+          <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID }} labelFormatter={(l) => fmtBucket(rollupGran(rollup), String(l))} />
           {seriesKeys.map((sk, i) => (
             <Line key={sk.key} dataKey={(d: any) => d[sk.key]} name={displayFor(sk.group, sk.subgroup)} type="monotone" stroke={seriesColor(i, sk.group)} strokeWidth={1.5} dot={false} />
           ))}

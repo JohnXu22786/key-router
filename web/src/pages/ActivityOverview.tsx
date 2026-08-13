@@ -1,11 +1,11 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Card, Row, Col, Typography, Spin, message, Space } from 'antd';
 import {
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   BarChart, Bar, Legend, LineChart, Line,
 } from 'recharts';
 import { getConsumptions, getKeys, Consumption, Key } from '../api/client';
-import { DateRange, fmtUSD, fmtTokens, fmtCompact, fmtTokensBare, fmtDayLabel, fmtUSDInt, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtPercent } from './activityShared';
+import { DateRange, fmtUSD, fmtTokens, fmtCompact, fmtTokensBare, fmtUSDInt, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtPercent, fmtTick, fmtBucket, series, stackedData, groupTotals, Granularity } from './activityShared';
 import dayjs from 'dayjs';
 
 const { Text } = Typography;
@@ -28,57 +28,32 @@ let keysRefForOverview = new Map<string, string>();
 const deltaPct = (cur: number, prev: number) =>
   prev > 0 ? ((cur - prev) / prev) * 100 : (cur > 0 ? 100 : 0);
 
-// OR palette (from the saved page): chart-N tokens + semantic colors.
-
-
-// Build a per-day series from raw consumption records.
-function dailySeries(list: Consumption[], keyFn: (c: Consumption) => number, label = 'MM-DD') {
-  const acc = new Map<string, { label: string; sort: string; value: number }>();
-  for (const c of list) {
-    const d = dayjs(c.hour_bucket).format('YYYY-MM-DD');
-    const row = acc.get(d) || { label: dayjs(c.hour_bucket).format(label), sort: d, value: 0 };
-    row.value += keyFn(c);
-    acc.set(d, row);
-  }
-  return [...acc.values()].sort((a, b) => a.sort.localeCompare(b.sort));
-}
-
-// Group total by a key, returning sorted desc.
-function groupTotals(list: Consumption[], keyFn: (c: Consumption) => string, valFn: (c: Consumption) => number) {
-  const acc = new Map<string, number>();
-  for (const c of list) {
-    acc.set(keyFn(c), (acc.get(keyFn(c)) || 0) + valFn(c));
-  }
-  return [...acc.entries()].sort((a, b) => b[1] - a[1]);
-}
-
-// Stacked chart data: bucket -> { label, [group]: value }.
-function stackedData(list: Consumption[], groups: string[], keyFn: (c: Consumption) => string, valFn: (c: Consumption) => number) {
-  const bucket = (c: Consumption) => dayjs(c.hour_bucket).format('YYYY-MM-DD');
-  const label = (c: Consumption) => dayjs(c.hour_bucket).format('MM-DD');
-  const acc = new Map<string, Record<string, any>>();
-  for (const c of list) {
-    const b = bucket(c);
-    if (!acc.has(b)) {
-      const row: Record<string, any> = { label: label(c), sort: b };
-      groups.forEach(g => { row[g] = 0; });
-      acc.set(b, row);
-    }
-    const row = acc.get(b)!;
-    row[keyFn(c)] += valFn(c);
-  }
-  return [...acc.values()].sort((a, b) => a.sort.localeCompare(b.sort));
-}
-
 const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
   const [curList, setCurList] = useState<Consumption[]>([]);
   const [prevList, setPrevList] = useState<Consumption[]>([]);
   const [keys, setKeys] = useState<Key[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
+  // Last SUCCESSFUL window: while a refetch fails (server down, the 60s
+  // slide keeps sliding "now"), the stale data stays rendered against the
+  // window it actually covers instead of re-bucketing onto a slid axis.
+  const [win, setWin] = useState<{ since: dayjs.Dayjs; until: dayjs.Dayjs; granularity: Granularity } | null>(null);
+  // Compares the fetch key INSIDE the effect (never during render, which
+  // StrictMode's double render would defeat): a preset/window switch drops
+  // the stale data so the previous window's values are never shown under
+  // the new window's axes; the 60s slide (same key) keeps them while
+  // refetching.
+  const prevKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
+    const prevKey = prevKeyRef.current;
+    prevKeyRef.current = range.key;
+    if (prevKey !== null && prevKey !== range.key) {
+      setCurList([]);
+      setPrevList([]);
+      setWin(null);
+    }
     const fetch = async () => {
       setLoading(true);
       setError(false);
@@ -94,6 +69,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
         setCurList(curRes.data);
         setPrevList(prevRes.data);
         setKeys(keyRes.data);
+        setWin({ since: range.since, until: range.until, granularity: range.granularity });
         keysRefForOverview = new Map(keyRes.data.map(k => [k.name || `Key #${k.id}`, k.key_value || '']));
       } catch { if (!cancelled) { setError(true); message.error('Failed to load activity'); } }
       finally { if (!cancelled) setLoading(false); }
@@ -131,20 +107,31 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
   const prevRate = rateFor(prevList);
   const blended = cur.tokens > 0 ? (cur.spend / cur.tokens) * 1e6 : 0;
   const blendedPrev = prev.tokens > 0 ? (prev.spend / prev.tokens) * 1e6 : 0;
-  // Daily blended $/1M series for the sparkline.
-  const blendedSeries = dailySeries(curList, c => c.cost_usd).map((d, i) => {
-    const t = dailySeries(curList, c => c.input_tokens + c.output_tokens);
-    return { label: d.label, value: (t[i]?.value || 0) > 0 ? (d.value / (t[i]?.value || 0)) * 1e6 : 0 };
-  });
-  const rateSeries = dailySeries(curList, c => (c.cache_hit_tokens / Math.max(1, c.input_tokens + c.cache_hit_tokens)) * 100);
+
+  // Time series, bucketed at the range's granularity so the line follows
+  // the selected view scale (24h -> hourly points, 1mo -> daily, 1y -> monthly).
+  // While a refetch is in flight or failing, the axes stay on the last
+  // successful window so stale data is never re-bucketed onto a slid axis.
+  const axSince = win?.since ?? range.since;
+  const axUntil = win?.until ?? range.until;
+  const gran = win?.granularity ?? range.granularity;
+  const costSeries = series(curList, c => c.cost_usd, axSince, axUntil, gran);
+  const tokenSeries = series(curList, c => c.input_tokens + c.output_tokens, axSince, axUntil, gran);
+  const reqSeries = series(curList, c => c.request_count, axSince, axUntil, gran);
+  // Blended $/1M per bucket (cost / tokens in the SAME bucket).
+  const blendedSeries = costSeries.map((d, i) => ({
+    label: d.label,
+    value: (tokenSeries[i]?.value || 0) > 0 ? (d.value / (tokenSeries[i]?.value || 0)) * 1e6 : 0,
+  }));
+  const rateSeries = series(curList, c => (c.cache_hit_tokens / Math.max(1, c.input_tokens + c.cache_hit_tokens)) * 100, axSince, axUntil, gran);
 
   // deltaFor: for the Blended $/1M KPI a RISE is negative (cost per token up
   // = bad), so the "bad" flag inverts the color.
   const kpis = [
-    { label: 'Total spend', value: fmtUSD(cur.spend), delta: deltaPct(cur.spend, prev.spend), badUp: false, series: dailySeries(curList, c => c.cost_usd) },
-    { label: 'Requests', value: fmtCompact(cur.requests), delta: deltaPct(cur.requests, prev.requests), badUp: false, series: dailySeries(curList, c => c.request_count) },
-    { label: 'Token volume', value: fmtTokensBare(cur.tokens), delta: deltaPct(cur.tokens, prev.tokens), badUp: false, series: dailySeries(curList, c => c.input_tokens + c.output_tokens) },
-    { label: 'Cache hit rate', value: fmtPercent(curRate), delta: prevRate > 0 ? ((curRate - prevRate) / prevRate) * 100 : (curRate > 0 ? 100 : 0), badUp: false, series: rateSeries },
+    { label: 'Total spend', value: fmtUSD(cur.spend), delta: deltaPct(cur.spend, prev.spend), badUp: false, series: costSeries },
+    { label: 'Requests', value: fmtCompact(cur.requests), delta: deltaPct(cur.requests, prev.requests), badUp: false, series: reqSeries },
+    { label: 'Token volume', value: fmtTokensBare(cur.tokens), delta: deltaPct(cur.tokens, prev.tokens), badUp: false, series: tokenSeries },
+    { label: 'Cache hit rate', value: fmtPercent(curRate), delta: deltaPct(curRate, prevRate), badUp: false, series: rateSeries },
     { label: 'Blended $/1M', value: `$${blended.toFixed(2)}`, delta: deltaPct(blended, blendedPrev), badUp: true, series: blendedSeries },
   ];
 
@@ -152,7 +139,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
   // Usage by model (spend, stacked bars, top-5 + Other like OR)
   const modelSpend = groupTotals(curList, c => c.model_name || 'Unknown', c => c.cost_usd);
   const topModels = modelSpend.slice(0, 5).map(([m]) => m);
-  const usageByModel = stackedData(curList, [...topModels, 'Other'], c => c.model_name || 'Unknown', c => c.cost_usd);
+  const usageByModel = stackedData(curList, [...topModels, 'Other'], c => c.model_name || 'Unknown', c => c.cost_usd, axSince, axUntil, gran);
   // Fold everything below top-5 into "Other" per bucket.
   const otherModelSet = new Set(modelSpend.slice(5).map(([m]) => m));
   usageByModel.forEach(row => {
@@ -167,7 +154,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
   // Request volume by model (stacked bars, top-5 + Other)
   const modelReqs = groupTotals(curList, c => c.model_name || 'Unknown', c => c.request_count);
   const topReqModels = modelReqs.slice(0, 5).map(([m]) => m);
-  const reqByModel = stackedData(curList, [...topReqModels, 'Other'], c => c.model_name || 'Unknown', c => c.request_count);
+  const reqByModel = stackedData(curList, [...topReqModels, 'Other'], c => c.model_name || 'Unknown', c => c.request_count, axSince, axUntil, gran);
   const otherReqSet = new Set(modelReqs.slice(5).map(([m]) => m));
   reqByModel.forEach(row => {
     let sum = 0;
@@ -177,23 +164,22 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
     (row as any).Other = sum;
   });
 
-  // Usage type: BYOK vs spend — we split cost into "OpenRouter Credits"
-  // (the gateway's own keys) vs everything else. Simpler: total spend only.
-  const usageType = dailySeries(curList, c => c.cost_usd).map(d => ({ ...d, Spend: d.value }));
+  // Usage type: total spend only.
+  const usageType = costSeries.map(d => ({ ...d, Spend: d.value }));
 
   // Token breakdown: Prompt / Completion (no reasoning field in the model;
   // cached tokens stay in Prompt so nothing is double-counted).
-  const promptSeries = dailySeries(curList, c => c.input_tokens);
-  const compSeries = dailySeries(curList, c => c.output_tokens);
-  const cacheSeries = dailySeries(curList, c => c.cache_hit_tokens);
+  const promptSeries = series(curList, c => c.input_tokens, axSince, axUntil, gran);
+  const compSeries = series(curList, c => c.output_tokens, axSince, axUntil, gran);
   const tokenBreakdown = promptSeries.map((d, i) => ({
     label: d.label,
     Prompt: d.value,
     Completion: compSeries[i]?.value || 0,
   }));
 
-  // Prompt caching: Cached vs Uncached (per day)
-  const inSeries = dailySeries(curList, c => c.input_tokens);
+  // Prompt caching: Cached vs Uncached (per bucket)
+  const inSeries = series(curList, c => c.input_tokens, axSince, axUntil, gran);
+  const cacheSeries = series(curList, c => c.cache_hit_tokens, axSince, axUntil, gran);
   const caching = cacheSeries.map((d, i) => ({
     label: d.label,
     Cached: d.value,
@@ -206,11 +192,9 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
     return k?.name || `Key #${c.key_id}`;
   }, c => c.input_tokens + c.output_tokens);
   const topKeys = keyTokens.slice(0, 5);
-  const maxKeyTokens = topKeys.length ? Math.max(...topKeys.map(([, v]) => v)) : 1;
 
   const appTokens = groupTotals(curList, c => c.app_name || 'Unknown', c => c.input_tokens + c.output_tokens);
   const topApps = appTokens.slice(0, 5);
-  const maxAppTokens = topApps.length ? Math.max(...topApps.map(([, v]) => v)) : 1;
 
   const kpiColors = ['#FF2D55', '#FF2D55', '#FF2D55', '#FF2D55', '#FF2D55'];
 
@@ -250,7 +234,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
         })}
       </div>
 
-      {/* Top API Keys + Top Apps */}
+      {/* Top API Keys + Top Apps — side by side like OR */}
       <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
         <Col xs={24} lg={12}>
           <Card style={{ borderRadius: 12 }} title="Top API Keys" extra={<Text type="secondary" style={{ fontSize: 12 }}>by tokens</Text>}>
@@ -277,7 +261,6 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
                 <span style={{ width: 10, height: 10, borderRadius: '50%', background: CHART_COLORS[(idx + 3) % CHART_COLORS.length], flexShrink: 0 }} />
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <Text strong style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</Text>
-                  <Text type="secondary" style={{ fontSize: 12 }}>{maskKey(keyValueFor(name))}</Text>
                 </div>
                 <Text strong style={{ width: 90, textAlign: 'right' }}>{fmtTokens(val)}</Text>
               </div>
@@ -291,9 +274,9 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
         <ResponsiveContainer width="100%" height={260}>
           <BarChart data={usageByModel} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
-            <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={fmtDayLabel} />
+            <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={(v) => fmtTick(gran, String(v))} />
             <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => fmtUSDInt(Number(v))} />
-            <Tooltip formatter={(v: any, name: any) => [fmtUSD(Number(v)), String(name)]} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID }} labelFormatter={(l) => fmtDayLabel(String(l))} />
+            <Tooltip formatter={(v: any, name: any) => [fmtUSD(Number(v)), String(name)]} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
             <Legend wrapperStyle={{ fontSize: 12 }} />
             {topModels.map((m, i) => (
               <Bar key={m} dataKey={m} stackId="a" fill={m === 'Other' ? OTHER_COLOR : CHART_COLORS[i % CHART_COLORS.length]} maxBarSize={22} radius={i === topModels.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]} />
@@ -309,9 +292,9 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
             <ResponsiveContainer width="100%" height={260}>
               <AreaChart data={usageType} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
-                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={fmtDayLabel} />
+                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={(v) => fmtTick(gran, String(v))} />
                 <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => fmtUSDInt(Number(v))} />
-                <Tooltip formatter={(v: any) => [fmtUSD(Number(v)), 'Spend']} contentStyle={{ borderRadius: 8 }} labelFormatter={(l) => fmtDayLabel(String(l))} />
+                <Tooltip formatter={(v: any) => [fmtUSD(Number(v)), 'Spend']} contentStyle={{ borderRadius: 8 }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
                 <Area type="monotone" dataKey="Spend" stroke="#8b5cf6" strokeWidth={2} fill="#8b5cf6" fillOpacity={0.4} dot={false} />
               </AreaChart>
             </ResponsiveContainer>
@@ -323,9 +306,9 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
             <ResponsiveContainer width="100%" height={260}>
               <BarChart data={reqByModel} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
-                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={fmtDayLabel} />
+                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={(v) => fmtTick(gran, String(v))} />
                 <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={50} tickFormatter={(v) => fmtCompact(Number(v))} />
-                <Tooltip formatter={(v: any, name: any) => [fmtCompact(Number(v)), String(name)]} contentStyle={{ borderRadius: 8 }} labelFormatter={(l) => fmtDayLabel(String(l))} />
+                <Tooltip formatter={(v: any, name: any) => [fmtCompact(Number(v)), String(name)]} contentStyle={{ borderRadius: 8 }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
                 <Legend wrapperStyle={{ fontSize: 12 }} />
                 {topReqModels.map((m, i) => (
                   <Bar key={m} dataKey={m} stackId="a" fill={m === 'Other' ? OTHER_COLOR : CHART_COLORS[i % CHART_COLORS.length]} maxBarSize={14} radius={i === topReqModels.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]} />
@@ -345,9 +328,9 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
             <ResponsiveContainer width="100%" height={260}>
               <BarChart data={tokenBreakdown} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
-                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={fmtDayLabel} />
+                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={(v) => fmtTick(gran, String(v))} />
                 <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => fmtCompact(Number(v))} />
-                <Tooltip formatter={(v: any, name: any) => [fmtTokens(Number(v)), String(name)]} contentStyle={{ borderRadius: 8 }} labelFormatter={(l) => fmtDayLabel(String(l))} />
+                <Tooltip formatter={(v: any, name: any) => [fmtTokens(Number(v)), String(name)]} contentStyle={{ borderRadius: 8 }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
                 <Legend wrapperStyle={{ fontSize: 12 }} />
                 <Bar dataKey="Completion" stackId="a" fill="#a855f7" maxBarSize={14} />
                 <Bar dataKey="Prompt" stackId="a" fill="#3b82f6" maxBarSize={14} radius={[2, 2, 0, 0]} />
@@ -361,9 +344,9 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
             <ResponsiveContainer width="100%" height={260}>
               <BarChart data={caching} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
-                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={fmtDayLabel} />
+                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={(v) => fmtTick(gran, String(v))} />
                 <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => fmtCompact(Number(v))} />
-                <Tooltip formatter={(v: any, name: any) => [fmtTokens(Number(v)), String(name)]} contentStyle={{ borderRadius: 8 }} labelFormatter={(l) => fmtDayLabel(String(l))} />
+                <Tooltip formatter={(v: any, name: any) => [fmtTokens(Number(v)), String(name)]} contentStyle={{ borderRadius: 8 }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
                 <Legend wrapperStyle={{ fontSize: 12 }} />
                 <Bar dataKey="Uncached" stackId="a" fill="#94a3b8" maxBarSize={14} />
                 <Bar dataKey="Cached" stackId="a" fill="#f59e0b" maxBarSize={14} radius={[2, 2, 0, 0]} />

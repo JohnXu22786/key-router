@@ -1,8 +1,8 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Card, Row, Col, Typography, Spin, message, Tag, Segmented, Select, Space } from 'antd';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, LineChart, Line } from 'recharts';
 import { getActivity, ActivityResponse } from '../api/client';
-import { DateRange, fmtUSD, fmtDayLabel, fmtUSDInt, CHART_COLORS, OTHER_COLOR, GRID, AXIS } from './activityShared';
+import { DateRange, fmtUSD, fmtUSDInt, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtTick, fmtBucket } from './activityShared';
 
 const { Text } = Typography;
 
@@ -47,17 +47,30 @@ const ActivityTrends: React.FC<TrendsProps> = ({ range }) => {
   const [cur, setCur] = useState<ActivityResponse | null>(null);
   const [prev, setPrev] = useState<ActivityResponse | null>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(false);
+  // A preset/mode/metric switch drops the stale response (spinner); the 30s
+  // range slide (same fetch key) keeps the previous chart while refetching.
+  // Compared inside the effect: render-time ref writes would be defeated by
+  // StrictMode's double render.
+  const fetchKey = `${range.key}|${mode}|${metric}`;
+  const prevKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
+    const prevKey = prevKeyRef.current;
+    prevKeyRef.current = fetchKey;
+    if (prevKey !== null && prevKey !== fetchKey) { setCur(null); setPrev(null); }
     const fetch = async () => {
       setLoading(true);
       try {
         const len = range.until.diff(range.since, 'millisecond');
         const prevSince = range.since.subtract(len, 'millisecond');
+        // Roll up at the range's granularity: 24h -> hourly, a month ->
+        // daily, a year -> monthly (OR buckets the chart by the view scale).
+        const rollup = range.granularity;
         const [curRes, prevRes] = await Promise.all([
-          getActivity({ metric, group_by: mode, rollup: 'day', top: 9, since: range.since.toISOString(), until: range.until.toISOString() }),
-          getActivity({ metric, group_by: mode, rollup: 'day', top: 9, since: prevSince.toISOString(), until: range.since.toISOString() }),
+          getActivity({ metric, group_by: mode, rollup, top: 9, since: range.since.toISOString(), until: range.until.toISOString() }),
+          getActivity({ metric, group_by: mode, rollup, top: 9, since: prevSince.toISOString(), until: range.since.toISOString() }),
         ]);
         if (cancelled) return;
         setCur(curRes.data);
@@ -69,13 +82,15 @@ const ActivityTrends: React.FC<TrendsProps> = ({ range }) => {
     return () => { cancelled = true; };
   }, [range, mode, metric]);
 
-  // Only blank on the very first load: while refreshing (range slide,
-  // metric/mode switch) the previous data stays visible until the new data
-  // arrives — a refresh must never flash a white page.
-  if (loading && !cur && !prev) return <Spin style={{ display: 'block', margin: '60px auto' }} />;
-  if (!cur || !prev) {
+  // A background refetch (range slide, metric/mode switch) keeps the
+  // previous data on screen; the spinner only replaces an EMPTY panel and
+  // errors only replace real content — a refresh must never flash a blank
+  // page.
+  if (loading && !cur) return <Spin style={{ display: 'block', margin: '60px auto' }} />;
+  if (error && !cur) {
     return <Card><Text type="danger">Failed to load trends — check the log file.</Text></Card>;
   }
+  if (!cur || !prev) return null;
 
   const chartData = toChartData(cur);
   const groups = Array.from(new Set(cur.series.map(s => s.group)));
@@ -123,18 +138,18 @@ const ActivityTrends: React.FC<TrendsProps> = ({ range }) => {
             <ResponsiveContainer width="100%" height={300}>
               <BarChart data={chartData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
-                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={24} tickFormatter={fmtDayLabel} />
+                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={24} tickFormatter={(v) => fmtTick(range.granularity, String(v))} />
                 <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => metric === 'spend' ? fmtUSDInt(Number(v)) : fmt(Number(v))} />
-                <Tooltip formatter={(v: any, name: any) => [fmt(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID }} labelFormatter={(l) => fmtDayLabel(String(l))} />
+                <Tooltip formatter={(v: any, name: any) => [fmt(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID }} labelFormatter={(l) => fmtBucket(range.granularity, String(l))} />
                 <Legend wrapperStyle={{ fontSize: 12 }} />
-                {groups.slice(0, 9).map((g, i) => (
+                {groups.map((g, i) => (
                   <Bar
                     key={g}
                     dataKey={g}
                     stackId="1"
                     fill={g === 'Other' ? OTHER_COLOR : CHART_COLORS[i % CHART_COLORS.length]}
                     maxBarSize={12}
-                    radius={i === Math.min(groups.length, 9) - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]}
+                    radius={i === groups.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]}
                   />
                 ))}
               </BarChart>

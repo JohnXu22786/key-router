@@ -1365,7 +1365,7 @@ type ActivityResponse struct {
 //	subgroup: model | key | app                    (optional second dimension,
 //	          must differ from group_by; splits each group's series into
 //	          per-subgroup stacks, e.g. spend by model, split by API key)
-//	rollup:   hour | day                           (default day)
+//	rollup:   hour | day | week | month             (default day)
 //	since / until: RFC3339, inclusive range
 func (h *AdminHandler) GetActivity(c *gin.Context) {
 	metric := c.DefaultQuery("metric", "spend")
@@ -1398,8 +1398,8 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 			return
 		}
 	}
-	if rollup != "hour" && rollup != "day" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "rollup must be hour|day"})
+	if rollup != "hour" && rollup != "day" && rollup != "week" && rollup != "month" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "rollup must be hour|day|week|month"})
 		return
 	}
 
@@ -1501,32 +1501,20 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 		}
 	}
 
-	// Bucket label.
-	bucketOf := func(t time.Time) string {
-		if rollup == "hour" {
-			return t.Format("01-02 15:00")
-		}
-		return t.Format("01-02")
-	}
-
 	// Aggregate: bucket -> group -> sum.
 	agg := make(map[string]map[string]*activityAcc)
-	bucketOrder := make([]string, 0)
+	// Bucket labels are year-qualified ("YYYY-MM-DD", "YYYY-MM-DD 15:00",
+	// "2006-01-02", "YYYY-MM") so a long or year-spanning range never
+	// collides two same-month-day buckets into one aggregate.
+	bucketOrder := buildActivityAxis(since, until, rollup)
+	// bucketOf labels a consumption row's hour bucket; must match the axis
+	// labels exactly (shared formatter) so rows land on the axis.
+	bucketOf := func(t time.Time) string {
+		return activityBucketLabel(t, rollup)
+	}
 	groupOrder := make([]string, 0)
 	seenGroup := make(map[string]bool)
 
-	// Build a CONTINUOUS bucket axis over the full since..until range so
-	// days/hours without traffic still appear (OR renders the full range).
-	if rollup == "hour" {
-		for t := since.Truncate(time.Hour); !t.After(until); t = t.Add(time.Hour) {
-			bucketOrder = append(bucketOrder, bucketOf(t))
-		}
-	} else {
-		start := time.Date(since.Year(), since.Month(), since.Day(), 0, 0, 0, 0, since.Location())
-		for t := start; !t.After(until); t = t.Add(24 * time.Hour) {
-			bucketOrder = append(bucketOrder, bucketOf(t))
-		}
-	}
 	for _, b := range bucketOrder {
 		agg[b] = make(map[string]*activityAcc)
 	}
@@ -1760,4 +1748,69 @@ func lastBucketValue(agg map[string]map[string]*activityAcc, bucketOrder []strin
 		}
 	}
 	return 0
+}
+
+// mondayOf returns the Monday (week start, midnight) of t's week.
+// Used for week rollup buckets: weeks are labeled by their start date.
+func mondayOf(t time.Time) time.Time {
+	d := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
+	off := (int(d.Weekday()) + 6) % 7 // days since Monday (Sunday = 6)
+	return d.AddDate(0, 0, -off)
+}
+
+// activityBucketLabel is the ONE place that maps a time to a rollup bucket
+// label (year-qualified "YYYY-MM-DD", "YYYY-MM-DD 15:00", "2006-01-02",
+// "YYYY-MM"). Both the axis builder and the row aggregation use it, so a
+// row can never be labeled off the axis and silently dropped.
+func activityBucketLabel(t time.Time, rollup string) string {
+	switch rollup {
+	case "hour":
+		return t.Format("2006-01-02 15:00")
+	case "week":
+		return mondayOf(t).Format("2006-01-02")
+	case "month":
+		return t.Format("2006-01")
+	default:
+		return t.Format("2006-01-02")
+	}
+}
+
+// buildActivityAxis builds a CONTINUOUS bucket axis over since..until at the
+// requested rollup (hour|day|week|month), so days/hours without traffic still
+// appear (OR renders the full range). Hour buckets are floored to the LOCAL
+// hour (billing truncates hour_bucket to the local hour too — UTC Truncate
+// would misalign in half-hour-offset zones like +05:30); day/week step
+// calendar-wise (AddDate) so a 25-hour DST fall-back day neither duplicates
+// a date label nor skips a week; the repeated wall-clock hour of a fall-back
+// keeps a single bucket (both passes aggregate into it by label).
+func buildActivityAxis(since, until time.Time, rollup string) []string {
+	bucketOf := func(t time.Time) string {
+		return activityBucketLabel(t, rollup)
+	}
+
+	var bucketOrder []string
+	switch rollup {
+	case "hour":
+		start := time.Date(since.Year(), since.Month(), since.Day(), since.Hour(), 0, 0, 0, since.Location())
+		for t := start; !t.After(until); t = t.Add(time.Hour) {
+			if b := bucketOf(t); len(bucketOrder) == 0 || bucketOrder[len(bucketOrder)-1] != b {
+				bucketOrder = append(bucketOrder, b)
+			}
+		}
+	case "day":
+		start := time.Date(since.Year(), since.Month(), since.Day(), 0, 0, 0, 0, since.Location())
+		for t := start; !t.After(until); t = t.AddDate(0, 0, 1) {
+			bucketOrder = append(bucketOrder, bucketOf(t))
+		}
+	case "week":
+		for t := mondayOf(since); !t.After(until); t = t.AddDate(0, 0, 7) {
+			bucketOrder = append(bucketOrder, bucketOf(t))
+		}
+	default: // month
+		start := time.Date(since.Year(), since.Month(), 1, 0, 0, 0, 0, since.Location())
+		for t := start; !t.After(until); t = t.AddDate(0, 1, 0) {
+			bucketOrder = append(bucketOrder, bucketOf(t))
+		}
+	}
+	return bucketOrder
 }
