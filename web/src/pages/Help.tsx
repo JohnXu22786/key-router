@@ -69,12 +69,15 @@ const Help: React.FC = () => {
 
       <Card title="Format Conversion" style={{ marginBottom: 16 }}>
         <Paragraph>
-          KeyRouter supports both OpenAI and Anthropic API formats. Your client can use either format,
-          and the router will convert to the provider's format automatically.
+          KeyRouter supports the OpenAI chat completions API, the OpenAI Responses API
+          (<Text code>/v1/responses</Text>), and the Anthropic API format. Your client can use
+          any of them, and the router will convert to the provider's format automatically.
+          Gateways without a native <Text code>/v1/responses</Text> endpoint are converted to
+          chat completions automatically.
         </Paragraph>
         <Descriptions column={2} size="small" bordered>
-          <Descriptions.Item label="Client → Router">OpenAI or Anthropic format</Descriptions.Item>
-          <Descriptions.Item label="Router → Provider">OpenAI or Anthropic format (per provider type)</Descriptions.Item>
+          <Descriptions.Item label="Client → Router">OpenAI, Responses API, or Anthropic format</Descriptions.Item>
+          <Descriptions.Item label="Router → Provider">OpenAI (chat or Responses) or Anthropic format (per provider type)</Descriptions.Item>
           <Descriptions.Item label="Streaming">SSE chunks converted in real-time</Descriptions.Item>
           <Descriptions.Item label="Tools / Functions">Converted between formats</Descriptions.Item>
         </Descriptions>

@@ -89,7 +89,7 @@ func (a *App) StartBackground() error {
 	// Start server in goroutine
 	go func() {
 		log.Printf("[server] listening on http://localhost:%d", port)
-		log.Printf("[server] forwarding API: http://localhost:%d/v1/chat/completions", port)
+		log.Printf("[server] forwarding API: http://localhost:%d/v1/chat/completions (+ /v1/responses, /v1/messages, /v1/embeddings)", port)
 
 		if err := a.Server.Serve(ln); err != nil && err != http.ErrServerClosed {
 			log.Printf("[server] failed to serve: %v", err)

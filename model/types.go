@@ -203,7 +203,7 @@ const (
 
 // RequestMetadata holds information about an incoming API request
 type RequestMetadata struct {
-	Format      string      // "openai" or "anthropic"
+	Format      string      // "openai", "anthropic" or "responses" (client-facing protocol)
 	Model       string      // Model name from request body
 	Stream      bool        // Whether streaming is requested
 	RequestPath string      // Original URL path
@@ -235,8 +235,10 @@ type TokenUsage struct {
 	CacheHitTokens   int64
 	CacheWriteTokens int64
 	TotalTokens      int64
-	// Format is the upstream format the usage was parsed from ("openai" or
-	// "anthropic"). OpenAI's prompt_tokens INCLUDES cached tokens (billing
-	// must subtract them); Anthropic's input_tokens EXCLUDES them.
+	// Format is the upstream format the usage was parsed from ("openai",
+	// "anthropic" or "responses"). OpenAI's prompt_tokens INCLUDES cached
+	// tokens (billing must subtract them); Anthropic's input_tokens EXCLUDES
+	// them. Responses-API usage follows OpenAI semantics, so its records
+	// report Format "openai".
 	Format string
 }
