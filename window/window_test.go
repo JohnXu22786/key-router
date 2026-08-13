@@ -84,6 +84,35 @@ func TestSlidingWindow_OldBucketsAreZero(t *testing.T) {
 	})
 }
 
+// TestSlidingWindow_CostExpiry guards the cost-metric rate limit windows:
+// cost buckets must expire exactly like request/token buckets when the head
+// rotates. Regression: advance() used to zero only buckets and tokenBuckets,
+// so cost-metric windows (5h/daily/weekly/monthly) never decayed and every
+// window showed the lifetime total cost.
+func TestSlidingWindow_CostExpiry(t *testing.T) {
+	t.Run("full rotation zeroes cost", func(t *testing.T) {
+		sw := NewSlidingWindow(model.WindowRP5h, 60, 5*time.Minute)
+		sw.AddCost(2_000_000) // $2 in bucket 0
+		// advance past all buckets
+		testAdvanceTime(sw, 60)
+		if got := sw.CostCount(); got != 0 {
+			t.Errorf("CostCount() after full rotation = %d, want 0", got)
+		}
+	})
+
+	t.Run("partial rotation expires only old cost", func(t *testing.T) {
+		sw := NewSlidingWindow(model.WindowRPM, 10, time.Second)
+		sw.AddCost(100) // bucket 0
+		testAdvanceTime(sw, 5)
+		sw.AddCost(50) // bucket 5
+		// advance 5 more: bucket 0 (100) slides out, bucket 5 (50) stays
+		testAdvanceTime(sw, 5)
+		if got := sw.CostCount(); got != 50 {
+			t.Errorf("CostCount() after partial rotation = %d, want 50", got)
+		}
+	})
+}
+
 func TestWindowManager_AllWindows(t *testing.T) {
 	t.Run("can create and use all window types", func(t *testing.T) {
 		wm := NewWindowManager()
