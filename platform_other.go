@@ -12,3 +12,7 @@ func detachConsole() {}
 func showFatalError(msg string) {
 	log.Printf("FATAL: %s", msg)
 }
+
+// setWindowIcon is a no-op on non-Windows platforms (each platform's window
+// shows the icon from its own packaging: .desktop/icns/etc.)
+func setWindowIcon(hwnd uintptr) {}
