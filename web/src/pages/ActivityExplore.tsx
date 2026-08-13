@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Card, Typography, Spin, message, Select, Dropdown, Button, Space, Tooltip, Table } from 'antd';
+import { Card, Typography, Spin, message, Select, Dropdown, Button, Space, Tooltip, Table, theme } from 'antd';
 import type { TableProps } from 'antd';
 import {
   BarChart, Bar, AreaChart, Area, LineChart, Line, XAxis, YAxis, CartesianGrid,
@@ -81,6 +81,8 @@ const NUM_COLS: { key: keyof ActivityGroupSummary; label: string }[] = [
 ];
 
 const ActivityExplore: React.FC<ExploreProps> = ({ range, initialMetric, initialGroupBy }) => {
+  // Hand-drawn control chips ("by", "Top") must follow the theme too.
+  const { token } = theme.useToken();
   const [metric, setMetric] = useState(initialMetric ?? 'spend');
   const [groupBy, setGroupBy] = useState(initialGroupBy ?? 'model');
   const [subgroup, setSubgroup] = useState('');
@@ -278,7 +280,7 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, initialMetric, initial
           <CartesianGrid strokeDasharray="3 3" stroke={GRID} vertical={false} />
           <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={28} tickFormatter={(v) => fmtTick(rollupGran(rollup), String(v))} />
           <YAxis tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} width={60} tickFormatter={fmtAxis} />
-          <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID }} labelFormatter={(l) => fmtBucket(rollupGran(rollup), String(l))} />
+          <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(rollupGran(rollup), String(l))} />
           {/* dataKey is a function accessor: recharts resolves string keys via
               lodash paths, so dots in names like "claude-3.5" would break */}
           {seriesKeys.map((sk, i) => (
@@ -291,7 +293,7 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, initialMetric, initial
           <CartesianGrid strokeDasharray="3 3" stroke={GRID} vertical={false} />
           <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={28} tickFormatter={(v) => fmtTick(rollupGran(rollup), String(v))} />
           <YAxis tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} width={60} tickFormatter={fmtAxis} />
-          <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID }} labelFormatter={(l) => fmtBucket(rollupGran(rollup), String(l))} />
+          <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(rollupGran(rollup), String(l))} />
           {seriesKeys.map((sk, i) => (
             <Area key={sk.key} dataKey={(d: any) => d[sk.key]} name={displayFor(sk.group, sk.subgroup)} type="monotone" stackId="1" stroke={seriesColor(i, sk.group)} strokeWidth={1.5} fill={seriesColor(i, sk.group)} fillOpacity={0.35} dot={false} />
           ))}
@@ -302,7 +304,7 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, initialMetric, initial
           <CartesianGrid strokeDasharray="3 3" stroke={GRID} vertical={false} />
           <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={28} tickFormatter={(v) => fmtTick(rollupGran(rollup), String(v))} />
           <YAxis tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} width={60} tickFormatter={fmtAxis} />
-          <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID }} labelFormatter={(l) => fmtBucket(rollupGran(rollup), String(l))} />
+          <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(rollupGran(rollup), String(l))} />
           {seriesKeys.map((sk, i) => (
             <Line key={sk.key} dataKey={(d: any) => d[sk.key]} name={displayFor(sk.group, sk.subgroup)} type="monotone" stroke={seriesColor(i, sk.group)} strokeWidth={1.5} dot={false} />
           ))}
@@ -350,7 +352,7 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, initialMetric, initial
       <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, marginBottom: 16 }}>
         <Select size="small" value={metric} onChange={(v: string) => setMetric(v)} style={{ minWidth: 150 }}
           options={METRICS.map(m => ({ value: m.key, label: m.label }))} />
-        <span style={{ height: 24, display: 'inline-flex', alignItems: 'center', padding: '0 8px', borderRadius: 6, border: '1px solid ' + GRID, background: '#f5f5f5', fontSize: 12, color: AXIS }}>by</span>
+        <span style={{ height: 24, display: 'inline-flex', alignItems: 'center', padding: '0 8px', borderRadius: 6, border: '1px solid ' + GRID, background: token.colorFillAlter, fontSize: 12, color: AXIS }}>by</span>
         <Select size="small" value={groupBy} onChange={(v: string) => { setGroupBy(v); setSubgroup(''); setHidden(new Set()); }} style={{ minWidth: 110 }}
           options={GROUP_BY} />
         <Dropdown menu={{
@@ -366,7 +368,7 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, initialMetric, initial
         <Select size="small" value={rollup} onChange={(v: string) => setRollup(v)} style={{ minWidth: 130 }}
           options={ROLLUP.map(r => ({ value: r.value, label: `Rollup: ${r.label}` }))} />
         <span style={{ width: 1, height: 16, background: GRID, margin: '0 2px' }} />
-        <span style={{ height: 24, display: 'inline-flex', alignItems: 'center', padding: '0 8px', borderRadius: 6, border: '1px solid ' + GRID, background: '#fff', fontSize: 12, color: '#333' }}>Top</span>
+        <span style={{ height: 24, display: 'inline-flex', alignItems: 'center', padding: '0 8px', borderRadius: 6, border: '1px solid ' + GRID, background: token.colorBgContainer, fontSize: 12, color: token.colorText }}>Top</span>
         <Select size="small" value={topN} onChange={(v: number) => setTopN(v)} style={{ minWidth: 55 }}
           options={TOPS.map(n => ({ value: n, label: String(n) }))} />
         <Select size="small" value="current" style={{ minWidth: 155 }}

@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Card, Row, Col, Typography, Spin, message, Space } from 'antd';
+import { Card, Row, Col, Typography, Spin, message, Space, theme } from 'antd';
 import {
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   BarChart, Bar, Legend, LineChart, Line,
@@ -22,6 +22,9 @@ const deltaPct = (cur: number, prev: number) =>
   prev > 0 ? ((cur - prev) / prev) * 100 : (cur > 0 ? 100 : 0);
 
 const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
+  // Recharts tooltips default to a white card; paint them with theme tokens
+  // so they match light/dark.
+  const { token } = theme.useToken();
   const [curList, setCurList] = useState<Consumption[]>([]);
   const [prevList, setPrevList] = useState<Consumption[]>([]);
   const [keys, setKeys] = useState<Key[]>([]);
@@ -206,7 +209,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
                 <div>
                   <Text type="secondary" style={{ fontSize: 12 }}>{k.label}</Text>
                   <div style={{ fontSize: 20, fontWeight: 700, margin: '2px 0', fontVariantNumeric: 'tabular-nums' }}>{k.value}</div>
-                  <span style={{ fontSize: 12, color: negative ? '#bf0024' : '#007544', display: 'inline-flex', alignItems: 'center', gap: 2 }}>
+                  <span style={{ fontSize: 12, color: negative ? token.colorError : token.colorSuccess, display: 'inline-flex', alignItems: 'center', gap: 2 }}>
                     {rising
                       ? <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M7 17L17 7M17 7H7M17 7V17" /></svg>
                       : <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M7 7l10 10M17 17H7M17 7v10" /></svg>}
@@ -269,7 +272,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
             <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
             <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={(v) => fmtTick(gran, String(v))} />
             <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => fmtUSDInt(Number(v))} />
-            <Tooltip formatter={(v: any, name: any) => [fmtUSD(Number(v)), String(name)]} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
+            <Tooltip formatter={(v: any, name: any) => [fmtUSD(Number(v)), String(name)]} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
             <Legend wrapperStyle={{ fontSize: 12 }} />
             {topModels.map((m, i) => (
               <Bar key={m} dataKey={m} stackId="a" fill={m === 'Other' ? OTHER_COLOR : CHART_COLORS[i % CHART_COLORS.length]} maxBarSize={22} radius={i === topModels.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]} />
@@ -287,7 +290,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
                 <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
                 <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={(v) => fmtTick(gran, String(v))} />
                 <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => fmtUSDInt(Number(v))} />
-                <Tooltip formatter={(v: any) => [fmtUSD(Number(v)), 'Spend']} contentStyle={{ borderRadius: 8 }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
+                <Tooltip formatter={(v: any) => [fmtUSD(Number(v)), 'Spend']} contentStyle={{ borderRadius: 8, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
                 <Area type="monotone" dataKey="Spend" stroke="#8b5cf6" strokeWidth={2} fill="#8b5cf6" fillOpacity={0.4} dot={false} />
               </AreaChart>
             </ResponsiveContainer>
@@ -301,7 +304,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
                 <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
                 <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={(v) => fmtTick(gran, String(v))} />
                 <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={50} tickFormatter={(v) => fmtCompact(Number(v))} />
-                <Tooltip formatter={(v: any, name: any) => [fmtCompact(Number(v)), String(name)]} contentStyle={{ borderRadius: 8 }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
+                <Tooltip formatter={(v: any, name: any) => [fmtCompact(Number(v)), String(name)]} contentStyle={{ borderRadius: 8, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
                 <Legend wrapperStyle={{ fontSize: 12 }} />
                 {topReqModels.map((m, i) => (
                   <Bar key={m} dataKey={m} stackId="a" fill={m === 'Other' ? OTHER_COLOR : CHART_COLORS[i % CHART_COLORS.length]} maxBarSize={14} radius={i === topReqModels.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]} />
@@ -323,7 +326,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
                 <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
                 <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={(v) => fmtTick(gran, String(v))} />
                 <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => fmtCompact(Number(v))} />
-                <Tooltip formatter={(v: any, name: any) => [fmtTokens(Number(v)), String(name)]} contentStyle={{ borderRadius: 8 }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
+                <Tooltip formatter={(v: any, name: any) => [fmtTokens(Number(v)), String(name)]} contentStyle={{ borderRadius: 8, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
                 <Legend wrapperStyle={{ fontSize: 12 }} />
                 <Bar dataKey="Completion" stackId="a" fill="#a855f7" maxBarSize={14} />
                 <Bar dataKey="Prompt" stackId="a" fill="#3b82f6" maxBarSize={14} radius={[2, 2, 0, 0]} />
@@ -339,7 +342,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
                 <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
                 <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={(v) => fmtTick(gran, String(v))} />
                 <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => fmtCompact(Number(v))} />
-                <Tooltip formatter={(v: any, name: any) => [fmtTokens(Number(v)), String(name)]} contentStyle={{ borderRadius: 8 }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
+                <Tooltip formatter={(v: any, name: any) => [fmtTokens(Number(v)), String(name)]} contentStyle={{ borderRadius: 8, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
                 <Legend wrapperStyle={{ fontSize: 12 }} />
                 <Bar dataKey="Uncached" stackId="a" fill="#94a3b8" maxBarSize={14} />
                 <Bar dataKey="Cached" stackId="a" fill="#f59e0b" maxBarSize={14} radius={[2, 2, 0, 0]} />

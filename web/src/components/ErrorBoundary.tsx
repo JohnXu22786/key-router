@@ -1,5 +1,5 @@
 import React from 'react';
-import { Card, Typography, Button, Space } from 'antd';
+import { Card, Typography, Button, Space, theme } from 'antd';
 import { ReloadOutlined } from '@ant-design/icons';
 
 const { Text } = Typography;
@@ -13,6 +13,26 @@ interface State {
   error: Error | null;
   info: React.ErrorInfo | null;
 }
+
+// ErrorBoundary is a class (error boundaries need lifecycle methods), so the
+// theme-aware stack trace is a small function component of its own.
+const StackTrace: React.FC<{ stack: string }> = ({ stack }) => {
+  const { token } = theme.useToken();
+  return (
+    <pre
+      style={{
+        fontSize: 11,
+        maxHeight: 200,
+        overflow: 'auto',
+        background: token.colorFillAlter,
+        padding: 8,
+        borderRadius: 6,
+      }}
+    >
+      {stack.split('\n').slice(0, 12).join('\n')}
+    </pre>
+  );
+};
 
 // ErrorBoundary wraps route pages so a rendering error in one page never
 // blanks the whole app: the sidebar/navigation stay alive and the user can
@@ -45,18 +65,7 @@ class ErrorBoundary extends React.Component<Props, State> {
               {this.state.error.message || String(this.state.error)}
             </Text>
             {this.state.info?.componentStack && (
-              <pre
-                style={{
-                  fontSize: 11,
-                  maxHeight: 200,
-                  overflow: 'auto',
-                  background: '#fafafa',
-                  padding: 8,
-                  borderRadius: 6,
-                }}
-              >
-                {this.state.info.componentStack.split('\n').slice(0, 12).join('\n')}
-              </pre>
+              <StackTrace stack={this.state.info.componentStack} />
             )}
             <Space>
               <Button icon={<ReloadOutlined />} onClick={this.handleRetry}>Retry</Button>

@@ -1,7 +1,9 @@
 import React, { useEffect, useState, useCallback } from 'react';
-import { Card, Form, Input, InputNumber, Button, message, Typography, Spin, Modal, Space, Tag, Alert, Switch, Descriptions, Divider } from 'antd';
-import { KeyOutlined, ReloadOutlined, DownloadOutlined, CheckCircleOutlined, RocketOutlined, GlobalOutlined, FileTextOutlined, BugOutlined, SafetyCertificateOutlined, UserOutlined, CopyrightOutlined } from '@ant-design/icons';
+import { Card, Form, Input, InputNumber, Button, message, Typography, Spin, Modal, Space, Tag, Alert, Switch, Descriptions, Divider, Radio } from 'antd';
+import { KeyOutlined, ReloadOutlined, DownloadOutlined, CheckCircleOutlined, RocketOutlined, GlobalOutlined, FileTextOutlined, BugOutlined, SafetyCertificateOutlined, UserOutlined, CopyrightOutlined, SunOutlined, MoonOutlined, DesktopOutlined } from '@ant-design/icons';
 import { getSettings, updateSettings, reloadConfig, checkUpdate, applyUpdate, getHealth, getAutostart, setAutostart, getAutoCheckState, UpdateInfo } from '../api/client';
+import { ThemeMode } from '../theme';
+import { useThemeMode } from '../ThemeContext';
 
 const { Title } = Typography;
 
@@ -56,6 +58,8 @@ const Settings: React.FC = () => {
   // Launch-at-login state
   const [autostart, setAutostartState] = useState<{ enabled: boolean; supported: boolean } | null>(null);
   const [autostartSaving, setAutostartSaving] = useState(false);
+  // Theme mode (light / dark / follow system) — saved instantly, no "Save Settings".
+  const { mode: themeMode, setMode: setThemeMode } = useThemeMode();
 
   const generateToken = useCallback(() => {
     const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
@@ -202,7 +206,18 @@ const Settings: React.FC = () => {
   return (
     <div>
       <Title level={3}>Settings</Title>
-      <Card>
+      <Card title="Appearance" style={{ marginBottom: 16 }}>
+        <Form layout="vertical">
+          <Form.Item label="Theme Mode" tooltip="Applies immediately. 'Follow System' matches the OS theme and updates live.">
+            <Radio.Group value={themeMode} onChange={(e) => setThemeMode(e.target.value as ThemeMode)}>
+              <Radio.Button value="light"><SunOutlined /> Light</Radio.Button>
+              <Radio.Button value="dark"><MoonOutlined /> Dark</Radio.Button>
+              <Radio.Button value="system"><DesktopOutlined /> Follow System</Radio.Button>
+            </Radio.Group>
+          </Form.Item>
+        </Form>
+      </Card>
+      <Card style={{ marginTop: 16 }}>
         <Form form={form} layout="vertical">
           <Form.Item name="server.port" label="Server Port" tooltip="Takes effect after restarting the app.">
             <InputNumber min={1024} max={65535} style={{ width: '100%' }} />
