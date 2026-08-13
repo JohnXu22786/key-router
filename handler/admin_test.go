@@ -115,7 +115,7 @@ func (f *fakeUpdater) Apply(info *update.UpdateInfo) error {
 func applyContext(t *testing.T) (*handler.AdminHandler, *httptest.ResponseRecorder, *gin.Context) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
-	h := handler.NewAdminHandler(nil, nil)
+	h := handler.NewAdminHandler(nil, nil, events.NewHub())
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest("POST", "/api/updates/apply", nil)
