@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Card, Row, Col, Typography, Spin, message, Select, Popover, Segmented } from 'antd';
+import { Card, Row, Col, Typography, Spin, message, Select, Popover, Segmented, theme } from 'antd';
 import { PicRightOutlined, PicLeftOutlined, SettingOutlined, RightOutlined } from '@ant-design/icons';
 import {
   BarChart, Bar, AreaChart, Area, LineChart, Line, XAxis, YAxis, CartesianGrid,
@@ -71,6 +71,8 @@ interface SectionProps {
 }
 
 const TrendSection: React.FC<SectionProps> = ({ title, groupBy, range, onNavigate, keysByName }) => {
+  // Recharts tooltips default to a white card; paint them with theme tokens.
+  const { token } = theme.useToken();
   const [metric, setMetric] = useState('spend');
   const [cur, setCur] = useState<ActivityResponse | null>(null);
   const [prev, setPrev] = useState<ActivityResponse | null>(null);
@@ -185,7 +187,7 @@ const TrendSection: React.FC<SectionProps> = ({ title, groupBy, range, onNavigat
       <RTooltip
         formatter={(v: any, name: any) => [fmt(Number(v)), String(name)]}
         labelStyle={{ color: AXIS }}
-        contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID }}
+        contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID, background: token.colorBgContainer, color: token.colorText }}
         labelFormatter={(l) => fmtBucket(range.granularity, String(l))}
       />
     </>

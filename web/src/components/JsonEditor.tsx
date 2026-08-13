@@ -1,5 +1,5 @@
 import React, { useRef, useCallback } from 'react';
-import { Typography } from 'antd';
+import { Typography, theme } from 'antd';
 
 const { Text } = Typography;
 
@@ -52,6 +52,9 @@ const JsonEditor: React.FC<JsonEditorProps> = ({
 }) => {
   const ref = useRef<HTMLTextAreaElement>(null);
   const lastValid = useRef(true);
+  // Theme tokens: the editor's custom chrome (border, gutter, text) is drawn
+  // by hand, so it must follow light/dark instead of hardcoding light colors.
+  const { token } = theme.useToken();
 
   // Insert text at the cursor, replacing the selection; returns new caret pos.
   const insertAtCaret = useCallback((insert: string, caretOffset = insert.length) => {
@@ -149,18 +152,18 @@ const JsonEditor: React.FC<JsonEditorProps> = ({
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-      <div style={{ display: 'flex', border: '1px solid #d9d9d9', borderRadius: 6, overflow: 'hidden', background: '#fff', ...style }}>
+      <div style={{ display: 'flex', border: `1px solid ${token.colorBorder}`, borderRadius: 6, overflow: 'hidden', background: token.colorBgContainer, ...style }}>
         {/* Line numbers gutter */}
         <div
           style={{
             padding: '4px 8px',
-            borderRight: '1px solid #f0f0f0',
-            background: '#fafafa',
+            borderRight: `1px solid ${token.colorSplit}`,
+            background: token.colorFillAlter,
             textAlign: 'right',
             fontFamily: 'monospace',
             fontSize: 12,
             lineHeight: '20px',
-            color: '#bbb',
+            color: token.colorTextPlaceholder,
             userSelect: 'none',
             minWidth: 36,
             overflow: 'hidden',
@@ -187,7 +190,7 @@ const JsonEditor: React.FC<JsonEditorProps> = ({
             fontFamily: 'monospace',
             fontSize: 12,
             lineHeight: '20px',
-            color: '#1f1f1f',
+            color: token.colorText,
             background: 'transparent',
           }}
         />
