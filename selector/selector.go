@@ -181,33 +181,52 @@ func firstBySortOrder(keys []*model.Key) *model.Key {
 	return best
 }
 
-// isKeyWithinLimits checks all rate limit windows against the key's metric type
-func (e *Engine) isKeyWithinLimits(k *model.Key) bool {
+// limitedWindows returns the window types whose limits are currently
+// exhausted for the key — the reasons SelectKey skips it while its status
+// stays "active". Empty when the key is within all limits. Cost-metric
+// windows compare against the cost bucket, token-metric windows against
+// tokens, everything else against the request count.
+func (e *Engine) limitedWindows(k *model.Key) []string {
+	var windows []string
 	// RPM always checks request count
 	if k.RPMLimit > 0 && e.WindowManager.GetCount(k.ID, model.WindowRPM) >= k.RPMLimit {
-		return false
+		windows = append(windows, string(model.WindowRPM))
 	}
 	// TPM always checks token count
 	if k.TPMLimit > 0 && e.WindowManager.GetTokens(k.ID, model.WindowTPM) >= k.TPMLimit {
-		return false
+		windows = append(windows, string(model.WindowTPM))
 	}
 	// 5-hour: check based on configured metric
 	if k.RP5hLimit > 0 && e.getMetricCount(k.ID, model.WindowRP5h, k.RP5hMetric) >= k.RP5hLimit {
-		return false
+		windows = append(windows, string(model.WindowRP5h))
 	}
 	// Daily
 	if k.RPDLimit > 0 && e.getMetricCount(k.ID, model.WindowRPD, k.RPDMetric) >= k.RPDLimit {
-		return false
+		windows = append(windows, string(model.WindowRPD))
 	}
 	// Weekly
 	if k.RPWLimit > 0 && e.getMetricCount(k.ID, model.WindowRPW, k.RPWMetric) >= k.RPWLimit {
-		return false
+		windows = append(windows, string(model.WindowRPW))
 	}
 	// Monthly
 	if k.RPMLimitMonth > 0 && e.getMetricCount(k.ID, model.WindowRPMo, k.RPMMetric) >= k.RPMLimitMonth {
-		return false
+		windows = append(windows, string(model.WindowRPMo))
 	}
-	return true
+	return windows
+}
+
+// isKeyWithinLimits checks all rate limit windows against the key's metric type
+func (e *Engine) isKeyWithinLimits(k *model.Key) bool {
+	return len(e.limitedWindows(k)) == 0
+}
+
+// LimitedWindows returns the window types whose limits are currently
+// exhausted for the key — why SelectKey skips it even though its status is
+// still "active". Exposed for the admin API so the UI can explain a key
+// that is healthy but not being routed. It only touches the caller-owned
+// key and the self-synchronized WindowManager, so no engine lock is needed.
+func (e *Engine) LimitedWindows(k *model.Key) []string {
+	return e.limitedWindows(k)
 }
 
 // getMetricCount returns the count for a window using the appropriate metric

@@ -245,13 +245,16 @@ func (h *AdminHandler) GetKeys(c *gin.Context) {
 		return
 	}
 
-	// Add window counts
+	// Add window counts and the currently-exhausted windows (why the
+	// selector skips a key whose status is still "active" — e.g. its RPM
+	// budget is spent, so traffic falls through to the next key).
 	type KeyWithCounts struct {
 		model.Key
 		Counts map[string]struct {
 			Count      int64 `json:"count"`
 			TokenCount int64 `json:"token_count"`
 		} `json:"counts"`
+		LimitedWindows []string `json:"limited_windows,omitempty"`
 	}
 	result := make([]KeyWithCounts, 0, len(keys))
 	for _, k := range keys {
@@ -272,6 +275,7 @@ func (h *AdminHandler) GetKeys(c *gin.Context) {
 				TokenCount: h.Engine.WindowManager.GetTokens(k.ID, wt),
 			}
 		}
+		kwc.LimitedWindows = h.Engine.LimitedWindows(&k)
 		result = append(result, kwc)
 	}
 
