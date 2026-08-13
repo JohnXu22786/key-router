@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -20,6 +21,18 @@ import (
 // selected provider regardless of retries (e.g. embeddings → anthropic).
 var ErrUnsupportedRoute = errors.New("unsupported route")
 
+// RelayResponse is the result of ForwardRequest: the upstream response plus
+// the protocol the upstream actually spoke. For a /v1/responses request the
+// two can differ — an OpenAI-format gateway without Responses API support
+// gets an automatic chat-completions fallback.
+type RelayResponse struct {
+	Resp *http.Response
+	// UpstreamFormat is "openai", "anthropic" or "responses" — the format
+	// of Resp's body. The response side converts back to the client's
+	// format based on this, never on the provider config alone.
+	UpstreamFormat string
+}
+
 // streamTransport bounds time-to-first-byte for streaming requests while
 // reusing connections across requests (per-request Transports would leak
 // idle conns and pay a fresh TLS handshake per stream).
@@ -30,7 +43,7 @@ var streamTransport = &http.Transport{
 
 // ForwardRequest forwards an API request to the upstream provider
 // Returns the response with proper streaming support
-func ForwardRequest(meta *model.RequestMetadata, key *model.Key, provider *model.Provider) (*http.Response, error) {
+func ForwardRequest(meta *model.RequestMetadata, key *model.Key, provider *model.Provider) (*RelayResponse, error) {
 	// Determine target format
 	targetFormat := provider.Type
 
@@ -42,22 +55,42 @@ func ForwardRequest(meta *model.RequestMetadata, key *model.Key, provider *model
 	}
 
 	// Map the request path for cross-format requests: the client sends
-	// /v1/chat/completions (OpenAI) or /v1/messages (Anthropic), but the
-	// upstream speaks the other endpoint.
+	// /v1/chat/completions (OpenAI), /v1/messages (Anthropic) or
+	// /v1/responses (OpenAI Responses API), but the upstream speaks the
+	// other endpoint.
+	//
+	// upstreamFormat tracks the protocol the upstream actually receives (and
+	// will answer in). For /v1/responses requests it can differ from
+	// targetFormat: an OpenAI-format gateway gets /v1/responses when it
+	// supports it natively, and /v1/chat/completions otherwise (fallback
+	// below).
 	upstreamPath := meta.RequestPath
-	if format.NeedConvert(meta.Format, targetFormat) {
+	upstreamFormat := targetFormat
+	var bodyToSend []byte
+	var err error
+	switch {
+	case meta.Format == "responses" && targetFormat == "anthropic":
+		// The Responses API is OpenAI's equivalent of the Messages API:
+		// convert the request and let the response side convert back.
+		upstreamPath = "/v1/messages"
+		bodyToSend, err = format.ResponsesRequestToAnthropic(meta.RequestBody, meta.TargetModel)
+		if err != nil {
+			return nil, fmt.Errorf("format conversion error: %w", err)
+		}
+	case meta.Format == "responses":
+		// Native /v1/responses passthrough (model name may be rewritten).
+		upstreamPath = "/v1/responses"
+		upstreamFormat = "responses"
+		bodyToSend, err = replaceModelName(meta.RequestBody, meta.TargetModel)
+		if err != nil {
+			return nil, fmt.Errorf("model replacement error: %w", err)
+		}
+	case format.NeedConvert(meta.Format, targetFormat):
 		if targetFormat == "anthropic" {
 			upstreamPath = "/v1/messages"
 		} else {
 			upstreamPath = "/v1/chat/completions"
 		}
-	}
-	upstreamURL := strings.TrimRight(provider.BaseURL, "/") + upstreamPath
-
-	// Convert body format if needed
-	var bodyToSend []byte
-	var err error
-	if format.NeedConvert(meta.Format, targetFormat) {
 		if meta.Format == "openai" && targetFormat == "anthropic" {
 			bodyToSend, err = format.OpenAIRequestToAnthropic(meta.RequestBody, meta.TargetModel)
 		} else if meta.Format == "anthropic" && targetFormat == "openai" {
@@ -68,13 +101,14 @@ func ForwardRequest(meta *model.RequestMetadata, key *model.Key, provider *model
 		if err != nil {
 			return nil, fmt.Errorf("format conversion error: %w", err)
 		}
-	} else {
+	default:
 		// Same format, just possibly replace model name
 		bodyToSend, err = replaceModelName(meta.RequestBody, meta.TargetModel)
 		if err != nil {
 			return nil, fmt.Errorf("model replacement error: %w", err)
 		}
 	}
+	upstreamURL := strings.TrimRight(provider.BaseURL, "/") + upstreamPath
 
 	// Merge the model group's extra params (client keys are OVERWRITTEN by
 	// the group config — e.g. {"temperature": 0.2} pins sampling).
@@ -167,40 +201,82 @@ func ForwardRequest(meta *model.RequestMetadata, key *model.Key, provider *model
 		client.Transport = streamTransport // bounds TTFB, shares connections
 	}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("upstream request failed: %w", err)
+	// doOnce performs the upstream request, retrying once without the
+	// stream_options WE injected for converted streams (strict OpenAI-
+	// compatible endpoints reject unknown parameters with a 400). Only
+	// applies to converted requests — client-sent stream_options are the
+	// client's feature and are never stripped. (Set to true for the fallback
+	// chat body below, which carries our injected stream_options.)
+	streamOptionsInjected := meta.Format == "anthropic" && targetFormat == "openai"
+	// Pre-declared so the closure can retry itself on the stream_options 400.
+	var doOnce func(body []byte) (*http.Response, error)
+	doOnce = func(body []byte) (*http.Response, error) {
+		req.Body = io.NopCloser(bytes.NewReader(body))
+		req.ContentLength = int64(len(body))
+		req.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(body)), nil
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("upstream request failed: %w", err)
+		}
+		if resp.StatusCode == http.StatusBadRequest && streamOptionsInjected && bodyHasStreamOptions(body) {
+			cleanBody := stripStreamOptions(body)
+			if cleanBody != nil {
+				io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+				resp.Body.Close()
+				resp2, retryErr := doOnce(cleanBody)
+				if retryErr != nil {
+					return nil, retryErr
+				}
+				return resp2, nil
+			}
+		}
+		return resp, nil
 	}
 
-	// Strict OpenAI-compatible endpoints may reject the stream_options WE
-	// injected for converted streams (unknown parameter → 400). Retry once
-	// without it so such endpoints still work. Only applies to converted
-	// requests (client-sent stream_options are the client's feature and are
-	// never stripped).
-	if resp.StatusCode == http.StatusBadRequest &&
-		format.NeedConvert(meta.Format, targetFormat) &&
-		bodyHasStreamOptions(bodyToSend) {
-		cleanBody := stripStreamOptions(bodyToSend)
-		if cleanBody != nil {
+	resp, err := doOnce(bodyToSend)
+	if err != nil {
+		return nil, err
+	}
+
+	// OpenAI-format gateways that don't implement the Responses API return
+	// 404/405/501 for /v1/responses. Convert the request to chat completions
+	// and retry once; the response side converts back so the client still
+	// gets Responses-API output. (400 is deliberately NOT a fallback signal:
+	// genuine request errors must not be masked by a conversion retry.)
+	if meta.Format == "responses" && targetFormat == "openai" &&
+		(resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed ||
+			resp.StatusCode == http.StatusNotImplemented) {
+		// Convert from the UNMERGED body (like the Anthropic path does) so
+		// route extra_params survive the conversion, then re-apply the
+		// group's overrides on the converted chat body.
+		convBody, convErr := format.ResponsesRequestToChatCompletion(meta.RequestBody, meta.TargetModel)
+		if convErr == nil {
+			if meta.ExtraParams != "" {
+				convBody, convErr = mergeExtraParams(convBody, meta.ExtraParams)
+			}
+		}
+		if convErr == nil {
 			io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
-			req.Body = nil
-			req.ContentLength = int64(len(cleanBody))
-			req.Body = io.NopCloser(bytes.NewReader(cleanBody))
-			// GetBody must match the NEW body so any transport-level replay
-			// (redirects, retries) doesn't resend the stale original
-			req.GetBody = func() (io.ReadCloser, error) {
-				return io.NopCloser(bytes.NewReader(cleanBody)), nil
+			// Re-point the same request (headers, auth, context intact) at
+			// the chat completions endpoint (recompute the URL so a base
+			// path in provider.BaseURL survives).
+			if u, perr := url.Parse(strings.TrimRight(provider.BaseURL, "/") + "/v1/chat/completions"); perr == nil {
+				req.URL.Path = u.Path
+				req.URL.RawPath = u.RawPath
 			}
-			retryResp, retryErr := client.Do(req)
+			streamOptionsInjected = true // the converted chat body carries our stream_options
+			retryResp, retryErr := doOnce(convBody)
 			if retryErr != nil {
-				return nil, fmt.Errorf("upstream request failed: %w", retryErr)
+				return nil, retryErr
 			}
-			return retryResp, nil
+			return &RelayResponse{Resp: retryResp, UpstreamFormat: "openai"}, nil
 		}
 	}
 
-	return resp, nil
+	return &RelayResponse{Resp: resp, UpstreamFormat: upstreamFormat}, nil
 }
 
 // bodyHasStreamOptions reports whether the body carries stream_options
@@ -230,8 +306,11 @@ func stripStreamOptions(body []byte) []byte {
 }
 
 // StreamResponse streams an SSE response from upstream to the client response writer.
+// upstreamFormat is the format the upstream actually spoke ("openai",
+// "anthropic" or "responses") — for /v1/responses requests it can differ
+// from the provider type (chat-completions fallback).
 // Returns captured token usage if available from the stream end events.
-func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, targetFormat, modelName string) (*model.TokenUsage, error) {
+func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, upstreamFormat, modelName string) (*model.TokenUsage, error) {
 	usage := &model.TokenUsage{}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -283,7 +362,7 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, tar
 		body = bytes.TrimSpace(body)
 		body = bytes.TrimPrefix(body, []byte{0xEF, 0xBB, 0xBF})
 		body = bytes.TrimSpace(body)
-		usage = ParseTokenUsage(body, targetFormat)
+		usage = ParseTokenUsage(body, upstreamFormat)
 
 		// A 200 with a JSON error body (some gateways do this for
 		// context-length/model errors) must be surfaced as an error, not
@@ -302,12 +381,72 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, tar
 			WriteStreamError(w, inputFormat, msg)
 			return usage, fmt.Errorf("upstream returned an error: %s", msg)
 		}
+
+		// A Responses-format client gets its full event sequence synthesized
+		// from the JSON body (created → ... → completed), regardless of which
+		// protocol the upstream actually spoke.
+		if inputFormat == "responses" {
+			var events [][]byte
+			if upstreamFormat == "responses" {
+				// Native: the body already IS a response object — wrap it in
+				// lifecycle events so stream clients get a consumable
+				// sequence (created → completed).
+				events, err = responsesBodyToEvents(body)
+				if err != nil {
+					WriteStreamError(w, inputFormat, "failed to convert upstream response")
+					return usage, fmt.Errorf("failed to convert upstream response: %w", err)
+				}
+			} else {
+				conv := format.NewResponsesStreamConverter(upstreamFormat)
+				conv.SetModel(modelName)
+				// An empty body (stream:true returned nothing) must still
+				// yield a clean empty completion — skip conversion so
+				// CloseStream synthesizes created → completed.
+				if len(bytes.TrimSpace(body)) > 0 {
+					if upstreamFormat == "openai" {
+						// Normalize the full completion into a chunk the
+						// chat-mode converter understands, then attach the
+						// usage parsed from the full body.
+						pseudo := completionToStreamChunk(body, modelName)
+						converted, convErr := conv.Convert(pseudo)
+						if convErr != nil && convErr != format.ErrSkipChunk {
+							WriteStreamError(w, inputFormat, "failed to convert upstream response")
+							return usage, fmt.Errorf("failed to convert upstream response: %w", convErr)
+						}
+						if u := ParseTokenUsage(body, upstreamFormat); u.TotalTokens > 0 {
+							conv.SetUsage(u.PromptTokens, u.CompletionTokens, u.CacheHitTokens)
+						}
+						events = append(events, converted...)
+					} else {
+						// Anthropic mode: the converter accepts a full
+						// message object.
+						converted, convErr := conv.Convert(body)
+						if convErr != nil && convErr != format.ErrSkipChunk {
+							WriteStreamError(w, inputFormat, "failed to convert upstream response")
+							return usage, fmt.Errorf("failed to convert upstream response: %w", convErr)
+						}
+						events = append(events, converted...)
+					}
+				}
+				events = append(events, conv.CloseStream()...)
+			}
+			for _, ev := range events {
+				out := append([]byte("data: "), ev...)
+				out = append(out, '\n', '\n')
+				if _, err := w.Write(out); err != nil {
+					return usage, err
+				}
+			}
+			flusher.Flush()
+			return usage, nil
+		}
+
 		// Convert the body for cross-format routes so the client gets its
 		// own format even when the upstream ignored stream:true.
 		frame := body
-		if format.NeedConvert(targetFormat, inputFormat) {
+		if format.NeedConvert(upstreamFormat, inputFormat) {
 			var convErr error
-			if targetFormat == "anthropic" {
+			if upstreamFormat == "anthropic" {
 				frame, convErr = ConvertAnthropicResponseToOpenAI(body, modelName)
 			} else {
 				frame, convErr = ConvertOpenAIResponseToAnthropic(body)
@@ -384,10 +523,15 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, tar
 	// Stateful converter for streams where the CLIENT speaks OpenAI and the
 	// upstream is Anthropic (maps tool_use blocks to tool_calls deltas)
 	var oaiConv *format.OpenAIStreamConverter
+	// Stateful converter for streams where the CLIENT speaks the Responses
+	// API and the upstream speaks chat completions or Anthropic Messages
+	// (synthesizes response.created / output deltas / response.completed)
+	var rsc *format.ResponsesStreamConverter
 	// Whether the upstream emitted the client-format terminator itself
 	sawDone := false
 	sawStop := false
 	sawDelta := false
+	sawCompleted := false
 	// A same-format stream may end with an error frame and no terminator —
 	// don't append [DONE] after it (SDKs treat [DONE] as success)
 	sawErrorFrame := false
@@ -396,12 +540,11 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, tar
 		line := scanner.Text()
 
 		// Forward SSE non-data lines (e.g. Anthropic "event: message_start").
-		// When converting OpenAI→Anthropic (client speaks OpenAI, upstream is
-		// Anthropic) these must be dropped: OpenAI streams are data-frame-only
-		// and the event names leak Anthropic framing (strict SSE parsers
-		// break on them).
+		// They must be dropped whenever the stream is being converted: the
+		// event names leak the upstream's framing and strict SSE parsers
+		// break on them.
 		if !strings.HasPrefix(line, "data:") {
-			if inputFormat == "openai" && targetFormat == "anthropic" {
+			if format.NeedConvert(upstreamFormat, inputFormat) {
 				continue
 			}
 			_, err := fmt.Fprintf(w, "%s\n", line)
@@ -415,10 +558,10 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, tar
 
 		// Handle "[DONE]" message (tolerate "data:[DONE]" without space)
 		if strings.TrimSpace(strings.TrimPrefix(line, "data:")) == "[DONE]" {
-			// Anthropic-format clients don't speak "[DONE]"; drop it when
-			// converting to anthropic. The loop appends a [DONE] for
-			// OpenAI-format clients when converting from anthropic.
-			if inputFormat == "anthropic" {
+			// Anthropic-format and Responses-format clients don't speak
+			// "[DONE]"; drop it when converting. The loop appends a [DONE]
+			// for OpenAI-format clients when converting from anthropic.
+			if inputFormat == "anthropic" || inputFormat == "responses" {
 				continue
 			}
 			sawDone = true
@@ -457,28 +600,51 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, tar
 					sawDelta = true
 				}
 			}
-			if isErrorPayload(ev.Error) {
+			// A native Responses stream ends with response.completed /
+			// response.failed — nothing may be synthesized after them. The
+			// streaming error event ({"type":"error",...}) is also terminal.
+			if inputFormat == "responses" && ev.Type == "response.completed" {
+				sawCompleted = true
+			}
+			if isErrorPayload(ev.Error) || (inputFormat == "responses" &&
+				(ev.Type == "response.failed" || ev.Type == "error")) {
 				sawErrorFrame = true
 			}
 		}
 
 		// Try to extract token usage from stream events
-		extractStreamUsage([]byte(jsonStr), inputFormat, targetFormat, usage)
+		extractStreamUsage([]byte(jsonStr), inputFormat, upstreamFormat, usage)
 
 		// Convert format if needed; each event becomes its own data frame
 		var converted [][]byte
 		var err error
 
-		if format.NeedConvert(targetFormat, inputFormat) {
+		if format.NeedConvert(upstreamFormat, inputFormat) {
 			switch {
-			case inputFormat == "anthropic" && targetFormat == "openai":
+			case inputFormat == "responses" && upstreamFormat == "openai":
+				// Client speaks the Responses API, upstream is chat
+				// completions: convert each chunk into Responses events.
+				if rsc == nil {
+					rsc = format.NewResponsesStreamConverter("openai")
+					rsc.SetModel(modelName)
+				}
+				converted, err = rsc.Convert([]byte(jsonStr))
+			case inputFormat == "responses" && upstreamFormat == "anthropic":
+				// Client speaks the Responses API, upstream is Anthropic:
+				// convert each event into Responses events.
+				if rsc == nil {
+					rsc = format.NewResponsesStreamConverter("anthropic")
+					rsc.SetModel(modelName)
+				}
+				converted, err = rsc.Convert([]byte(jsonStr))
+			case inputFormat == "anthropic" && upstreamFormat == "openai":
 				// Client speaks Anthropic, upstream is OpenAI: convert each
 				// OpenAI chunk into properly-ordered Anthropic events.
 				if anthConv == nil {
 					anthConv = format.NewAnthropicStreamConverter()
 				}
 				converted, err = anthConv.Convert([]byte(jsonStr), modelName)
-			case inputFormat == "openai" && targetFormat == "anthropic":
+			case inputFormat == "openai" && upstreamFormat == "anthropic":
 				// Client speaks OpenAI, upstream is Anthropic: convert each
 				// Anthropic event into an OpenAI chunk (incl. tool_calls).
 				if oaiConv == nil {
@@ -545,6 +711,19 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, tar
 		flusher.Flush()
 	}
 
+	// Same for converted Responses streams: a clean EOF before the usage
+	// chunk or before message_stop still needs its response.completed.
+	if rsc != nil && !rsc.Finished() {
+		for _, ev := range rsc.CloseStream() {
+			out := append([]byte("data: "), ev...)
+			out = append(out, '\n', '\n')
+			if _, err := w.Write(out); err != nil {
+				return usage, err
+			}
+		}
+		flusher.Flush()
+	}
+
 	// Synthesize termination for ANY clean-EOF stream that lacks it, in the
 	// client's format: same-format streams (most common case) have no
 	// converter to do this, so an upstream that drops the connection after
@@ -573,13 +752,33 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, tar
 			}
 		}
 		flusher.Flush()
+	} else if inputFormat == "responses" && !sawCompleted && !sawErrorFrame && rsc == nil {
+		// A native Responses stream ends with response.completed; an
+		// upstream that drops the connection instead leaves the SDK waiting
+		// forever. Synthesize a minimal completion so clients can finish.
+		completed, _ := json.Marshal(map[string]interface{}{
+			"type": "response.completed",
+			"response": map[string]interface{}{
+				"id":         "resp_local",
+				"object":     "response",
+				"created_at": time.Now().Unix(),
+				"status":     "completed",
+				"model":      modelName,
+				"output":     []interface{}{},
+				"usage":      nil,
+			},
+		})
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", completed); err != nil {
+			return usage, err
+		}
+		flusher.Flush()
 	}
 
 	// A stream that ended with an upstream error frame must not be recorded
 	// as a successful, billable completion — return an error so the handler
 	// skips consumption/budget recording (the client already received the
 	// error frame).
-	if sawErrorFrame || (oaiConv != nil && oaiConv.Errored()) {
+	if sawErrorFrame || (oaiConv != nil && oaiConv.Errored()) || (rsc != nil && rsc.Errored()) {
 		return usage, errors.New("upstream stream error")
 	}
 
@@ -710,16 +909,19 @@ func completionToStreamChunk(body []byte, modelName string) []byte {
 
 // extractStreamUsage tries to parse token usage from streaming events.
 // Usage always arrives in the UPSTREAM's format, so the branch is chosen by
-// targetFormat alone — this prevents e.g. an Anthropic message_delta event
+// upstreamFormat alone — this prevents e.g. an Anthropic message_delta event
 // from being misparsed by the OpenAI branch (which would zero the prompt
 // tokens captured at message_start).
-func extractStreamUsage(data []byte, inputFormat, targetFormat string, usage *model.TokenUsage) {
+func extractStreamUsage(data []byte, inputFormat, upstreamFormat string, usage *model.TokenUsage) {
 	// Usage always arrives in the UPSTREAM's format, so the branch is chosen by
-	// targetFormat alone — this prevents e.g. an Anthropic message_delta event
+	// upstreamFormat alone — this prevents e.g. an Anthropic message_delta event
 	// from being misparsed by the OpenAI branch (which would zero the prompt
 	// tokens captured at message_start).
-	usage.Format = targetFormat
-	switch targetFormat {
+	//
+	// usage.Format is only assigned where values are actually captured: a
+	// non-conforming trailing frame after response.completed must not reset
+	// billing semantics (responses → openai) to "responses".
+	switch upstreamFormat {
 	case "openai":
 		// OpenAI final chunk may include usage
 		var chunk struct {
@@ -733,6 +935,7 @@ func extractStreamUsage(data []byte, inputFormat, targetFormat string, usage *mo
 			} `json:"usage"`
 		}
 		if err := json.Unmarshal(data, &chunk); err == nil && chunk.Usage != nil {
+			usage.Format = "openai"
 			usage.PromptTokens = chunk.Usage.PromptTokens
 			usage.CompletionTokens = chunk.Usage.CompletionTokens
 			usage.TotalTokens = chunk.Usage.TotalTokens
@@ -764,6 +967,7 @@ func extractStreamUsage(data []byte, inputFormat, targetFormat string, usage *mo
 			case "message_start":
 				// input tokens and cache figures live inside message.usage
 				if event.Message != nil && event.Message.Usage != nil {
+					usage.Format = "anthropic"
 					usage.PromptTokens = event.Message.Usage.InputTokens
 					usage.CacheWriteTokens = event.Message.Usage.CacheCreationTokens
 					usage.CacheHitTokens = event.Message.Usage.CacheReadTokens
@@ -777,6 +981,35 @@ func extractStreamUsage(data []byte, inputFormat, targetFormat string, usage *mo
 			// they must count toward our token budgets too (OpenAI's
 			// total_tokens already includes them)
 			usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens + usage.CacheHitTokens + usage.CacheWriteTokens
+		}
+	case "responses":
+		// A native Responses stream carries usage only in response.completed
+		// (nested under "response"). The Responses API's input_tokens INCLUDE
+		// cached tokens — same semantics as OpenAI, so billing subtracts
+		// cached tokens at the cache-read rate.
+		var event struct {
+			Type     string `json:"type"`
+			Response *struct {
+				Usage *struct {
+					InputTokens  int64 `json:"input_tokens"`
+					OutputTokens int64 `json:"output_tokens"`
+					TotalTokens  int64 `json:"total_tokens"`
+					InputDetails *struct {
+						CachedTokens int64 `json:"cached_tokens"`
+					} `json:"input_tokens_details"`
+				} `json:"usage"`
+			} `json:"response"`
+		}
+		if err := json.Unmarshal(data, &event); err == nil && event.Type == "response.completed" &&
+			event.Response != nil && event.Response.Usage != nil {
+			u := event.Response.Usage
+			usage.PromptTokens = u.InputTokens
+			usage.CompletionTokens = u.OutputTokens
+			usage.TotalTokens = u.TotalTokens
+			if u.InputDetails != nil {
+				usage.CacheHitTokens = u.InputDetails.CachedTokens
+			}
+			usage.Format = "openai" // responses semantics == OpenAI semantics
 		}
 	}
 }
@@ -792,14 +1025,24 @@ func WriteStreamError(w http.ResponseWriter, inputFormat string, errMsg string) 
 	w.Header().Set("Content-Type", "text/event-stream")
 
 	var errPayload []byte
-	if inputFormat == "openai" {
+	switch {
+	case inputFormat == "openai":
 		errPayload, _ = json.Marshal(map[string]interface{}{
 			"error": map[string]string{
 				"message": errMsg,
 				"type":    "stream_error",
 			},
 		})
-	} else {
+	case inputFormat == "responses":
+		// The Responses API's streaming error event carries code/message at
+		// the top level (not nested under "error")
+		errPayload, _ = json.Marshal(map[string]interface{}{
+			"type":    "error",
+			"code":    "stream_error",
+			"message": errMsg,
+			"param":   nil,
+		})
+	default:
 		errPayload, _ = json.Marshal(map[string]interface{}{
 			"type": "error",
 			"error": map[string]string{
@@ -1147,6 +1390,29 @@ func ParseTokenUsage(body []byte, format string) *model.TokenUsage {
 			// they must count toward our token budgets too
 			usage.TotalTokens = resp.Usage.InputTokens + resp.Usage.OutputTokens +
 				resp.Usage.CacheCreationTokens + resp.Usage.CacheReadTokens
+		}
+	} else if format == "responses" {
+		// Native /v1/responses bodies carry usage with Responses semantics:
+		// input_tokens INCLUDES cached tokens (like OpenAI's prompt_tokens),
+		// so the usage record reports Format "openai" for billing.
+		var resp struct {
+			Usage *struct {
+				InputTokens  int64 `json:"input_tokens"`
+				OutputTokens int64 `json:"output_tokens"`
+				TotalTokens  int64 `json:"total_tokens"`
+				InputDetails *struct {
+					CachedTokens int64 `json:"cached_tokens"`
+				} `json:"input_tokens_details"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal(body, &resp); err == nil && resp.Usage != nil {
+			usage.PromptTokens = resp.Usage.InputTokens
+			usage.CompletionTokens = resp.Usage.OutputTokens
+			usage.TotalTokens = resp.Usage.TotalTokens
+			if resp.Usage.InputDetails != nil {
+				usage.CacheHitTokens = resp.Usage.InputDetails.CachedTokens
+			}
+			usage.Format = "openai"
 		}
 	}
 

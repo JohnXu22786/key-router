@@ -19,7 +19,7 @@
 KeyRouter runs on your machine and exposes **one OpenAI-compatible endpoint** that fronts **many upstream providers and API keys**. It handles the messy parts of working with multiple LLM providers:
 
 - **Multi-key pooling** — spread traffic across many API keys from many providers, with weighted routing and automatic failover when a key is rate-limited, banned, or out of quota.
-- **Format conversion** — send **OpenAI-format** requests to Anthropic providers (and vice versa). Requests, responses, streaming SSE, tools, and images are converted transparently.
+- **Format conversion** — send **OpenAI-format** requests (`/v1/chat/completions`, **and the newer Responses API** `/v1/responses`) to Anthropic providers (and vice versa). Requests, responses, streaming SSE, tools, and images are converted transparently. `/v1/responses` also works against OpenAI-compatible gateways that don't implement it — those get an automatic chat-completions fallback.
 - **Rate limiting** — per-key RPM / TPM / 5-hour / daily / weekly / monthly budgets with sliding windows that survive restarts.
 - **Health checking** — disabled or cooled-down keys are probed automatically and brought back when they recover.
 - **Billing & stats** — per-model token pricing (including cache pricing and a `*` wildcard rule), per-key cost tracking, and usage charts.
@@ -70,6 +70,8 @@ resp = client.chat.completions.create(
     messages=[{"role": "user", "content": "Hello!"}],
 )
 ```
+
+The **Responses API** works the same way — `client.responses.create(...)` against the same base URL. Requests are routed by the `model` field like any other request; OpenAI/Anthropic providers and non-Responses OpenAI-compatible gateways are all supported (gateways without `/v1/responses` are converted to chat completions automatically).
 
 > The gateway listens on `127.0.0.1` only — it is **not** exposed to your LAN. API keys are stored locally in SQLite.
 

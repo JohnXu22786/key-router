@@ -89,6 +89,7 @@ func Setup(
 	// OpenAI format
 	r.POST("/v1/chat/completions", chatHandler.HandleChatCompletion)
 	r.POST("/v1/embeddings", chatHandler.HandleEmbeddings)
+	r.POST("/v1/responses", chatHandler.HandleResponses) // OpenAI Responses API
 	r.GET("/v1/models", chatHandler.HandleModels)
 
 	// Anthropic format

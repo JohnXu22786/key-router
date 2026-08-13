@@ -38,6 +38,11 @@ func (h *ChatHandler) HandleChatCompletion(c *gin.Context) {
 	h.handleRelay(c, "openai")
 }
 
+// HandleResponses handles POST /v1/responses (OpenAI Responses API)
+func (h *ChatHandler) HandleResponses(c *gin.Context) {
+	h.handleRelay(c, "responses")
+}
+
 // HandleMessages handles POST /v1/messages (Anthropic format)
 func (h *ChatHandler) HandleMessages(c *gin.Context) {
 	h.handleRelay(c, "anthropic")
@@ -211,7 +216,7 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 		}
 
 		// Forward request to upstream
-		resp, err := relay.ForwardRequest(meta, key, route.Provider)
+		rr, err := relay.ForwardRequest(meta, key, route.Provider)
 		if err != nil {
 			// Unsupported routes are per-route: another route in the group
 			// may still serve the request (e.g. embeddings via an openai
@@ -234,6 +239,7 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			attempt++
 			continue
 		}
+		resp := rr.Resp
 
 		// Drain a bounded amount of retry-eligible bodies before closing so
 		// SMALL error bodies still let the connection be reused; larger ones
@@ -338,7 +344,7 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 				status = http.StatusBadGateway
 				code = "upstream_redirect"
 			}
-			if format.NeedConvert(inputFormat, route.Provider.Type) {
+			if format.NeedConvert(inputFormat, rr.UpstreamFormat) {
 				msg := extractUpstreamError(errBody, resp.StatusCode)
 				if status == http.StatusBadGateway {
 					msg = "upstream returned a redirect"
@@ -390,8 +396,10 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			// Commit status before streaming starts
 			c.Status(resp.StatusCode)
 
-			// Stream response and capture token usage from stream end events
-			usage, streamErr := relay.StreamResponse(c.Writer, resp, inputFormat, route.Provider.Type, targetModel)
+			// Stream response and capture token usage from stream end events.
+			// The upstream format comes from the relay (a /v1/responses
+			// request may have been fallback-routed to chat completions).
+			usage, streamErr := relay.StreamResponse(c.Writer, resp, inputFormat, rr.UpstreamFormat, targetModel)
 			resp.Body.Close()
 
 			if streamErr != nil {
@@ -445,7 +453,7 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			// envelope (like the streaming path) so SDK error parsers work.
 			// NOTE: this runs BEFORE c.Status() so the envelope's own status
 			// and Content-Type can be written.
-			if resp.StatusCode >= 400 && format.NeedConvert(inputFormat, route.Provider.Type) {
+			if resp.StatusCode >= 400 && format.NeedConvert(inputFormat, rr.UpstreamFormat) {
 				msg := extractUpstreamError(responseBody, resp.StatusCode)
 				writeRelayError(c, inputFormat, resp.StatusCode, "upstream_error", "upstream_error", msg)
 				return
@@ -469,13 +477,19 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			// Convert format if needed. Only successful 2xx bodies are
 			// converted: converting an error/redirect envelope into the
 			// client's format would produce a fake "successful" empty
-			// completion and lose the real error message.
+			// completion and lose the real error message. The dispatch is on
+			// the format the upstream actually spoke.
 			bodyToWrite := responseBody
-			if resp.StatusCode >= 200 && resp.StatusCode < 300 && format.NeedConvert(inputFormat, route.Provider.Type) {
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 && format.NeedConvert(inputFormat, rr.UpstreamFormat) {
 				var convErr error
-				if inputFormat == "openai" {
+				switch {
+				case inputFormat == "responses" && rr.UpstreamFormat == "anthropic":
+					bodyToWrite, convErr = relay.AnthropicResponseToResponses(responseBody, targetModel)
+				case inputFormat == "responses" && rr.UpstreamFormat == "openai":
+					bodyToWrite, convErr = relay.ChatCompletionResponseToResponses(responseBody, targetModel)
+				case inputFormat == "openai":
 					bodyToWrite, convErr = relay.ConvertAnthropicResponseToOpenAI(responseBody, targetModel)
-				} else {
+				default:
 					bodyToWrite, convErr = relay.ConvertOpenAIResponseToAnthropic(responseBody)
 				}
 				if convErr != nil {
@@ -492,7 +506,7 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			// responses: 3xx/4xx/5xx represent work the upstream never
 			// performed and must not burn the key's request budgets.
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				usage := relay.ParseTokenUsage(responseBody, route.Provider.Type)
+				usage := relay.ParseTokenUsage(responseBody, rr.UpstreamFormat)
 				consumption, err := billing.RecordConsumption(key.ID, targetModel, extractAppName(c.Request.Header, meta.RequestBody), usage, route.Route)
 				if err != nil {
 					log.Printf("[relay] failed to record consumption for key %d: %v", key.ID, err)
