@@ -2,8 +2,9 @@ import { describe, it, expect } from 'vitest';
 import dayjs from 'dayjs';
 import {
   makeRanges, customRange, granularityFor, series, stackedData, bucketAxis,
-  fmtTick, fmtBucket, fmtDayLabel, CUSTOM_KEY,
+  fmtTick, fmtBucket, fmtDayLabel, CUSTOM_KEY, computeTrending, toChartData,
 } from './activityShared';
+import type { ActivityResponse } from '../api/client';
 
 // A fixed "now" matching the OR snapshot context: Thursday, Aug 13 2026,
 // 16:05 local. The dynamic badge expectations (16h / 4d / 13d / 7mo) are
@@ -215,5 +216,76 @@ describe('label formatters', () => {
   it('falls back to the raw label for unparseable input', () => {
     expect(fmtDayLabel('nonsense')).toBe('nonsense');
     expect(fmtTick('day', 'nonsense')).toBe('nonsense');
+  });
+});
+// --- computeTrending (Trends "Trending" card) ------------------------------
+
+// resp builds a minimal ActivityResponse with the given summary/series.
+function resp(summary: Array<{ group: string; sum: number }>, series: Array<{ bucket: string; group: string; value: number }>, buckets: string[]): ActivityResponse {
+  return {
+    metric: 'spend', group_by: 'model', rollup: 'day',
+    series: series.map(p => ({ ...p, is_zero: p.value === 0 })),
+    summary: summary.map(s => ({ group: s.group, min: s.sum, max: s.sum, avg: s.sum, sum: s.sum, value: s.sum, percent: 0 })),
+    buckets, totals: { spend: 0, tokens: 0, requests: 0, cache: 0 },
+  };
+}
+
+describe('computeTrending', () => {
+  it('ranks by absolute drop (prev − cur), New rows by current value', () => {
+    const cur = resp(
+      [{ group: 'a', sum: 4 }, { group: 'b', sum: 10 }, { group: 'c', sum: 5 }, { group: 'd', sum: 3 }],
+      [], ['01-01', '01-02']);
+    const prev = resp(
+      [{ group: 'a', sum: 10 }, { group: 'b', sum: 5 }, { group: 'd', sum: 100 }],
+      [], ['01-01', '01-02']);
+    // drops: d 100−3=97, a 10−4=6; gainer b 5−10=−5 sinks; new c ranks by cur 5
+    const rows = computeTrending(cur, prev);
+    expect(rows.map(r => r.group)).toEqual(['d', 'a', 'c', 'b']);
+    expect(rows[0]).toMatchObject({ group: 'd', pct: -97, isNew: false });
+    expect(rows[2]).toMatchObject({ group: 'c', pct: 100, isNew: true });
+  });
+
+  it('excludes "Other" and caps at 6 rows', () => {
+    const groups = ['m1', 'm2', 'm3', 'm4', 'm5', 'm6', 'm7', 'Other'];
+    const cur = resp(groups.map(g => ({ group: g, sum: 1 })), [], ['01-01']);
+    const prev = resp(groups.map(g => ({ group: g, sum: 10 })), [], ['01-01']);
+    const rows = computeTrending(cur, prev);
+    expect(rows).toHaveLength(6);
+    expect(rows.some(r => r.group === 'Other')).toBe(false);
+  });
+
+  it('skips entities with no usage in either period', () => {
+    const cur = resp([{ group: 'a', sum: 5 }], [], ['01-01']);
+    const prev = resp([{ group: 'b', sum: 0 }], [], ['01-01']);
+    expect(computeTrending(cur, prev)).toHaveLength(1);
+  });
+
+  it('sparkline = previous-period series, flat zeros when no prior usage', () => {
+    const cur = resp([{ group: 'a', sum: 5 }, { group: 'b', sum: 5 }], [], ['01-01', '01-02']);
+    const prev = resp(
+      [{ group: 'a', sum: 10 }],
+      [{ bucket: '01-01', group: 'a', value: 2 }, { bucket: '01-02', group: 'a', value: 8 }],
+      ['01-01', '01-02']);
+    const rows = computeTrending(cur, prev);
+    expect(rows.find(r => r.group === 'a')!.spark).toEqual([2, 8]);
+    expect(rows.find(r => r.group === 'b')!.spark).toEqual([0, 0]);
+  });
+});
+
+describe('toChartData', () => {
+  it('zero-fills every group per bucket in series order', () => {
+    const r = resp(
+      [{ group: 'a', sum: 1 }, { group: 'b', sum: 2 }],
+      [
+        { bucket: '01-01', group: 'a', value: 1 },
+        { bucket: '01-01', group: 'b', value: 2 },
+        { bucket: '01-02', group: 'a', value: 0 },
+        { bucket: '01-02', group: 'b', value: 0 },
+      ],
+      ['01-01', '01-02']);
+    expect(toChartData(r)).toEqual([
+      { label: '01-01', a: 1, b: 2 },
+      { label: '01-02', a: 0, b: 0 },
+    ]);
   });
 });

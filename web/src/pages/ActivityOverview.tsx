@@ -5,19 +5,12 @@ import {
   BarChart, Bar, Legend, LineChart, Line,
 } from 'recharts';
 import { getConsumptions, getKeys, Consumption, Key } from '../api/client';
-import { DateRange, fmtUSD, fmtTokens, fmtCompact, fmtTokensBare, fmtUSDInt, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtPercent, fmtTick, fmtBucket, series, stackedData, groupTotals, Granularity } from './activityShared';
+import { DateRange, fmtUSD, fmtTokens, fmtCompact, fmtTokensBare, fmtUSDInt, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtPercent, fmtTick, fmtBucket, series, stackedData, groupTotals, Granularity, maskKey } from './activityShared';
 import dayjs from 'dayjs';
 
 const { Text } = Typography;
 
 interface OverviewProps { range: DateRange; }
-
-// maskKey renders a masked key like "sk-or-v1-063...f48" (first ~12 + last 3).
-const maskKey = (raw: string): string => {
-  if (!raw) return '';
-  if (raw.length <= 16) return raw;
-  return `${raw.slice(0, 12)}...${raw.slice(-3)}`;
-};
 
 // keyValueFor is bound inside the component to the loaded keys.
 function keyValueFor(name: string): string {

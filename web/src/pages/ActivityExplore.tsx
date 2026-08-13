@@ -18,7 +18,12 @@ import {
 
 const { Text } = Typography;
 
-interface ExploreProps { range: DateRange; }
+interface ExploreProps {
+  range: DateRange;
+  // Seeded by the Trends "Explore" links (metric/grouping of the section).
+  initialMetric?: string;
+  initialGroupBy?: string;
+}
 
 const METRICS = [
   { key: 'spend', label: 'Total Usage ($)' },
@@ -75,9 +80,9 @@ const NUM_COLS: { key: keyof ActivityGroupSummary; label: string }[] = [
   { key: 'value', label: 'Value' },
 ];
 
-const ActivityExplore: React.FC<ExploreProps> = ({ range }) => {
-  const [metric, setMetric] = useState('spend');
-  const [groupBy, setGroupBy] = useState('model');
+const ActivityExplore: React.FC<ExploreProps> = ({ range, initialMetric, initialGroupBy }) => {
+  const [metric, setMetric] = useState(initialMetric ?? 'spend');
+  const [groupBy, setGroupBy] = useState(initialGroupBy ?? 'model');
   const [subgroup, setSubgroup] = useState('');
   const [rollup, setRollup] = useState('day');
   const [topN, setTopN] = useState(10);
