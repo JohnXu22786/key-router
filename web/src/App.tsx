@@ -1,10 +1,9 @@
 import React, { useEffect, useState } from 'react';
-import { BrowserRouter, Routes, Route, Link, useLocation } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, Link, Navigate, useLocation } from 'react-router-dom';
 import {
   Layout, Menu, Typography, theme, ConfigProvider, Alert, Button, Space,
 } from 'antd';
 import {
-  DashboardOutlined,
   CloudServerOutlined,
   AppstoreOutlined,
   BarChartOutlined,
@@ -13,7 +12,6 @@ import {
   DownloadOutlined,
 } from '@ant-design/icons';
 
-import Dashboard from './pages/Dashboard';
 import Providers from './pages/Providers';
 import Models from './pages/Models';
 import Activity from './pages/Activity';
@@ -40,12 +38,11 @@ const LayoutWithRouter: React.FC = () => {
   }, []);
 
   const menuItems = [
-    { key: '/', icon: <DashboardOutlined />, label: <Link to="/">Dashboard</Link> },
+    { key: '/', icon: <BarChartOutlined />, label: <Link to="/">Activity</Link> },
     { type: 'divider' as const },
     { key: '/providers', icon: <CloudServerOutlined />, label: <Link to="/providers">Providers</Link> },
     { key: '/models', icon: <AppstoreOutlined />, label: <Link to="/models">Models</Link> },
     { type: 'divider' as const },
-    { key: '/stats', icon: <BarChartOutlined />, label: <Link to="/stats">Activity</Link> },
     { key: '/settings', icon: <SettingOutlined />, label: <Link to="/settings">Settings</Link> },
     { key: '/help', icon: <QuestionCircleOutlined />, label: <Link to="/help">Help</Link> },
   ];
@@ -93,11 +90,12 @@ const LayoutWithRouter: React.FC = () => {
             />
           )}
           <Routes>
-            <Route path="/" element={<ErrorBoundary><Dashboard /></ErrorBoundary>} />
+            <Route path="/" element={<ErrorBoundary><Activity /></ErrorBoundary>} />
+            {/* /stats was the Activity page's URL before it became the home page */}
+            <Route path="/stats" element={<Navigate to="/" replace />} />
             <Route path="/providers" element={<ErrorBoundary><Providers /></ErrorBoundary>} />
             <Route path="/models" element={<ErrorBoundary><Models /></ErrorBoundary>} />
             <Route path="/settings" element={<ErrorBoundary><Settings /></ErrorBoundary>} />
-            <Route path="/stats" element={<ErrorBoundary><Activity /></ErrorBoundary>} />
             <Route path="/help" element={<ErrorBoundary><Help /></ErrorBoundary>} />
           </Routes>
         </Content>
