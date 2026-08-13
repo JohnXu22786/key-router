@@ -184,7 +184,7 @@ func main() {
 	w := webview.New(false) // false = no devtools
 	defer w.Destroy()
 	w.SetTitle(fmt.Sprintf("KeyRouter v%s — %s", version, url))
-	w.SetSize(900, 580, webview.HintNone)
+	w.SetSize(1000, 580, webview.HintNone)
 	w.Navigate(url)
 
 	// Bind the browser-opening helper for the UI's external links (project
