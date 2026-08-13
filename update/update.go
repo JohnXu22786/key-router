@@ -202,6 +202,12 @@ func (c *Client) SetInstallMode(mode string) {
 	c.mode = mode
 }
 
+// InstallMode returns the detected install mode ("portable" or "installed"),
+// resolving it on first use and caching the result.
+func (c *Client) InstallMode() string {
+	return c.installMode()
+}
+
 // AutoCheck runs a check on startup and then daily. On finding a newer
 // version it calls onUpdate (the app shows a notification banner — it never
 // applies automatically). The check is best-effort: network failures are
