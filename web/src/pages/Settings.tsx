@@ -1,9 +1,42 @@
 import React, { useEffect, useState, useCallback } from 'react';
-import { Card, Form, Input, InputNumber, Button, message, Typography, Spin, Modal, Space, Tag, Alert, Switch } from 'antd';
-import { KeyOutlined, ReloadOutlined, DownloadOutlined, CheckCircleOutlined, RocketOutlined } from '@ant-design/icons';
+import { Card, Form, Input, InputNumber, Button, message, Typography, Spin, Modal, Space, Tag, Alert, Switch, Descriptions, Divider } from 'antd';
+import { KeyOutlined, ReloadOutlined, DownloadOutlined, CheckCircleOutlined, RocketOutlined, GlobalOutlined, FileTextOutlined, BugOutlined, SafetyCertificateOutlined, UserOutlined, CopyrightOutlined } from '@ant-design/icons';
 import { getSettings, updateSettings, reloadConfig, checkUpdate, applyUpdate, getHealth, getAutostart, setAutostart, getAutoCheckState, UpdateInfo } from '../api/client';
 
 const { Title } = Typography;
+
+// Project links shown in the About card (same repo the updater queries).
+const REPO_URL = 'https://github.com/JohnXu22786/key-router';
+
+// Open a link in the system browser. The desktop shell binds "openExternal"
+// (a Go function — see main.go / openurl.go) because the embedded webview
+// cannot open new windows itself; in a plain browser (vite dev) the binding
+// doesn't exist and we fall back to a new tab.
+const openExternal = (url: string) => {
+  const opener = (window as any).openExternal as ((u: string) => Promise<void>) | undefined;
+  if (opener) {
+    opener(url);
+    return;
+  }
+  window.open(url, '_blank', 'noopener');
+};
+
+// Shared for onClick (left-click / keyboard) and onAuxClick (middle-click):
+// the shell must never let the webview open a new window for these links,
+// so any click that would navigate is routed to the system browser instead.
+// Right-click (auxclick button 2) is left alone so the context menu works.
+const openLink = (url: string) => (e: React.MouseEvent<HTMLElement>) => {
+  if (e.type === 'auxclick' && e.button !== 1) return;
+  e.preventDefault();
+  openExternal(url);
+};
+
+// Descriptions labels render inside a <span> in bordered mode, so the icon
+// wrapper must stay inline — a <div> (what Space renders) would be invalid
+// nesting inside that span.
+const iconLabel = (icon: React.ReactNode, text: string) => (
+  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>{icon}{text}</span>
+);
 
 const Settings: React.FC = () => {
   const [form] = Form.useForm();
@@ -239,7 +272,7 @@ const Settings: React.FC = () => {
       </Card>
 
       <Card title="About" style={{ marginTop: 16 }}>
-        <Space direction="vertical">
+        <Space direction="vertical" size="middle" style={{ width: '100%' }}>
           <Space>
             <Typography.Text strong>KeyRouter</Typography.Text>
             {appVersion && <Tag color="blue">v{appVersion}</Tag>}
@@ -247,6 +280,87 @@ const Settings: React.FC = () => {
           <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
             Local AI API gateway — multi-key management, failover, format conversion, rate limiting and billing.
           </Typography.Paragraph>
+          <Divider style={{ margin: 0 }} />
+          <Descriptions column={1} size="small" bordered>
+            <Descriptions.Item label={iconLabel(<CopyrightOutlined />, 'License')}>
+              <Tag color="green">AGPL-3.0</Tag>{' '}
+              <Typography.Link
+                href={`${REPO_URL}/blob/main/LICENSE`}
+                target="_blank"
+                rel="noreferrer"
+                onClick={openLink(`${REPO_URL}/blob/main/LICENSE`)}
+                onAuxClick={openLink(`${REPO_URL}/blob/main/LICENSE`)}
+              >
+                View license text
+              </Typography.Link>
+            </Descriptions.Item>
+            <Descriptions.Item label={iconLabel(<GlobalOutlined />, 'Homepage')}>
+              <Typography.Link
+                href={REPO_URL}
+                target="_blank"
+                rel="noreferrer"
+                onClick={openLink(REPO_URL)}
+                onAuxClick={openLink(REPO_URL)}
+              >
+                {REPO_URL}
+              </Typography.Link>
+            </Descriptions.Item>
+            <Descriptions.Item label={iconLabel(<DownloadOutlined />, 'Releases')}>
+              <Typography.Link
+                href={`${REPO_URL}/releases`}
+                target="_blank"
+                rel="noreferrer"
+                onClick={openLink(`${REPO_URL}/releases`)}
+                onAuxClick={openLink(`${REPO_URL}/releases`)}
+              >
+                Download the latest version
+              </Typography.Link>
+            </Descriptions.Item>
+            <Descriptions.Item label={iconLabel(<FileTextOutlined />, 'Documentation')}>
+              <Typography.Link
+                href={`${REPO_URL}/blob/main/README.md`}
+                target="_blank"
+                rel="noreferrer"
+                onClick={openLink(`${REPO_URL}/blob/main/README.md`)}
+                onAuxClick={openLink(`${REPO_URL}/blob/main/README.md`)}
+              >
+                README — quick start & usage guide
+              </Typography.Link>
+            </Descriptions.Item>
+            <Descriptions.Item label={iconLabel(<BugOutlined />, 'Issues & Feedback')}>
+              <Typography.Link
+                href={`${REPO_URL}/issues`}
+                target="_blank"
+                rel="noreferrer"
+                onClick={openLink(`${REPO_URL}/issues`)}
+                onAuxClick={openLink(`${REPO_URL}/issues`)}
+              >
+                Report bugs or request features
+              </Typography.Link>
+            </Descriptions.Item>
+            <Descriptions.Item label={iconLabel(<SafetyCertificateOutlined />, 'Security')}>
+              <Typography.Link
+                href={`${REPO_URL}/security/advisories/new`}
+                target="_blank"
+                rel="noreferrer"
+                onClick={openLink(`${REPO_URL}/security/advisories/new`)}
+                onAuxClick={openLink(`${REPO_URL}/security/advisories/new`)}
+              >
+                Report a vulnerability privately
+              </Typography.Link>
+            </Descriptions.Item>
+            <Descriptions.Item label={iconLabel(<UserOutlined />, 'Maintainer')}>
+              <Typography.Link
+                href="https://github.com/JohnXu22786"
+                target="_blank"
+                rel="noreferrer"
+                onClick={openLink('https://github.com/JohnXu22786')}
+                onAuxClick={openLink('https://github.com/JohnXu22786')}
+              >
+                John Tsui
+              </Typography.Link>
+            </Descriptions.Item>
+          </Descriptions>
         </Space>
       </Card>
 
