@@ -8,6 +8,7 @@ import (
 	"os"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -350,6 +351,14 @@ func requestExit() {
 		log.Println("[tray] exit cancelled")
 		return
 	}
+	requestExitNow()
+}
+
+// requestExitNow performs the actual quit: tray icon removal, real window
+// close (or a direct WM_CLOSE when no close-to-tray handler is installed),
+// and closing the quit channel. Used by the tray Exit flow after the
+// confirmation and by the post-update exit (no confirmation there).
+func requestExitNow() {
 	tray.mu.Lock()
 	if tray.exitRequested {
 		tray.mu.Unlock()
@@ -366,6 +375,41 @@ func requestExit() {
 	}
 	if ctx != nil {
 		requestTrayQuit(ctx) // posts WM_CLOSE → window really closes
+	} else if webviewWindowHwnd != 0 {
+		// No close-to-tray handler (tray setup failed): a plain WM_CLOSE
+		// reaches the webview window directly and destroys it.
+		ret, _, _ := postMessage.Call(webviewWindowHwnd, wmClose, 0, 0)
+		if ret == 0 {
+			// Stale handle (window already destroyed): hard-exit after the
+			// response has flushed.
+			go func() {
+				time.Sleep(500 * time.Millisecond)
+				os.Exit(0)
+			}()
+		}
+	} else {
+		// No window at all — hard-exit (the graceful path needs the webview
+		// loop to return).
+		os.Exit(0)
 	}
 	close(tray.quitChan)
+}
+
+// webviewWindowHwnd is the main window handle, recorded so the post-update
+// exit can close the window even when the tray's close-to-tray handler is
+// not installed (the tray setup may have failed).
+var webviewWindowHwnd uintptr
+
+// setUpdateExitWindow records the webview window handle for the post-update
+// exit path.
+func setUpdateExitWindow(hwnd uintptr) {
+	webviewWindowHwnd = hwnd
+}
+
+// requestExitForUpdate quits the app without confirmation after an update
+// has been applied: the new binary / installer needs the process gone to
+// replace the exe. Same shutdown path as tray Exit, minus the prompt.
+func requestExitForUpdate() {
+	log.Println("[tray] exiting for update")
+	requestExitNow()
 }

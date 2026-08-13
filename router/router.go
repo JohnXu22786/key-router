@@ -40,6 +40,18 @@ func SetAutoCheckCallback(fn func(*handler.AdminHandler)) {
 	}
 }
 
+// SetUpdateExitHook wires the post-update exit trigger into the shared admin
+// handler: after a successful apply the process must exit so the new binary
+// can replace it (the handler calls it after responding to the UI).
+func SetUpdateExitHook(fn func()) {
+	sharedAdminHandler.mu.Lock()
+	h := sharedAdminHandler.h
+	sharedAdminHandler.mu.Unlock()
+	if h != nil {
+		h.ExitAfterUpdate = fn
+	}
+}
+
 // sharedAdminHandler is a package-level reference so main can inject hooks
 // after the handler is constructed inside Setup.
 var sharedAdminHandler = struct {

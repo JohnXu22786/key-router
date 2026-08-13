@@ -1,8 +1,15 @@
 package update
 
 import (
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestCompareVersions(t *testing.T) {
@@ -72,4 +79,214 @@ func TestFindAsset(t *testing.T) {
 			t.Errorf("installed mode got %q, want setup exe", a.Name)
 		}
 	})
+}
+
+// TestWindowsSwapScript guards the portable swap batch: it must wait for
+// THIS process (by PID) to exit (the exe is locked while the process
+// lives), swap the staged exe into place, relaunch, and delete itself.
+func TestWindowsSwapScript(t *testing.T) {
+	s := windowsSwapScript(
+		`D:\apps\KeyRouter\KeyRouter.exe.new`,
+		`D:\apps\KeyRouter\KeyRouter.exe`,
+		4242,
+	)
+	for _, want := range []string{
+		`PID eq 4242`,
+		`move /Y "D:\apps\KeyRouter\KeyRouter.exe.new" "D:\apps\KeyRouter\KeyRouter.exe"`,
+		`start "" "D:\apps\KeyRouter\KeyRouter.exe"`,
+		`del "%~f0"`,
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("swap script missing %q\n---\n%s", want, s)
+		}
+	}
+}
+
+// TestInstalledRelaunchScript guards the installed-mode relaunch batch: it
+// must wait for THIS process (by PID) to exit (the installer needs the exe
+// unlocked), wait for the installer process to APPEAR (ShellExecuteEx
+// returns before the UAC prompt is answered — a premature proceed would
+// delete the installer and relaunch the old app while the prompt is up),
+// wait for it to exit, start the updated copy, and delete the downloaded
+// installer plus itself.
+func TestInstalledRelaunchScript(t *testing.T) {
+	s := installedRelaunchScript(
+		`C:\Program Files\KeyRouter\KeyRouter.exe`,
+		`C:\Users\me\AppData\Local\Temp\keyrouter-update-12345.exe`,
+		4242,
+	)
+	for _, want := range []string{
+		`PID eq 4242`,
+		`:wait_installer_start`,
+		`:wait_installer_end`,
+		`IMAGENAME eq keyrouter-update-12345.exe`,
+		`start "" "C:\Program Files\KeyRouter\KeyRouter.exe"`,
+		`del /Q "C:\Users\me\AppData\Local\Temp\keyrouter-update-12345.exe"`,
+		`del "%~f0"`,
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("relaunch script missing %q\n---\n%s", want, s)
+		}
+	}
+}
+
+// tempUpdateFiles snapshots the updater's temp files (keyrouter-update-* in
+// the system temp dir).
+func tempUpdateFiles(t *testing.T) map[string]bool {
+	t.Helper()
+	matches, _ := filepath.Glob(filepath.Join(os.TempDir(), "keyrouter-update-*"))
+	m := make(map[string]bool, len(matches))
+	for _, p := range matches {
+		m[p] = true
+	}
+	return m
+}
+
+// TestApplyDownloadFailureLeavesNoTempFiles: a failed apply must clean up its
+// temp file in BOTH install modes — a leaked installer exe in installed mode
+// is exactly the kind of leftover this guards against.
+func TestApplyDownloadFailureLeavesNoTempFiles(t *testing.T) {
+	before := tempUpdateFiles(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	for _, mode := range []string{"portable", "installed"} {
+		c := NewClient("v0.1.8")
+		c.SetInstallMode(mode)
+		info := &UpdateInfo{
+			AssetName: "KeyRouter-v0.1.9-windows-amd64-setup.exe",
+			AssetURL:  srv.URL + "/asset",
+			AssetSize: 12345,
+		}
+		if err := c.Apply(info); err == nil {
+			t.Fatalf("mode %s: Apply succeeded, want download failure", mode)
+		}
+	}
+	for p := range tempUpdateFiles(t) {
+		if !before[p] {
+			t.Errorf("temp file left behind after failed apply: %s", p)
+		}
+	}
+}
+
+// TestApplyInstalledCancelCleansTemp: a declined UAC prompt must surface as
+// ErrUpdateCancelled AND not leave the downloaded installer behind.
+func TestApplyInstalledCancelCleansTemp(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("installed-mode apply is Windows-only")
+	}
+	orig := launchInstaller
+	launchInstaller = func(path, args string) error { return ErrUpdateCancelled }
+	defer func() { launchInstaller = orig }()
+
+	before := tempUpdateFiles(t)
+	body := []byte("MZ fake installer")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(body)
+	}))
+	defer srv.Close()
+
+	c := NewClient("v0.1.8")
+	c.SetInstallMode("installed")
+	info := &UpdateInfo{
+		AssetName: "KeyRouter-v0.1.9-windows-amd64-setup.exe",
+		AssetURL:  srv.URL + "/a",
+		AssetSize: int64(len(body)),
+	}
+	if err := c.Apply(info); !errors.Is(err, ErrUpdateCancelled) {
+		t.Fatalf("Apply error = %v, want ErrUpdateCancelled", err)
+	}
+	for p := range tempUpdateFiles(t) {
+		if !before[p] {
+			t.Errorf("temp file left behind after cancelled update: %s", p)
+		}
+	}
+}
+
+// TestApplyInstalledKeepsTempForInstaller: on a successful launch the temp
+// installer must survive the Apply call — the running installer reads it,
+// and the relaunch helper deletes it once the installer exits.
+func TestApplyInstalledKeepsTempForInstaller(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("installed-mode apply is Windows-only")
+	}
+	before := tempUpdateFiles(t)
+	// Clean up whatever the apply leaves behind (a kept installer or a
+	// stray helper), even when an assertion fails mid-test.
+	defer func() {
+		for p := range tempUpdateFiles(t) {
+			if !before[p] {
+				os.Remove(p)
+			}
+		}
+	}()
+
+	origInstaller := launchInstaller
+	origHelper := launchRelaunchHelper
+	launchInstaller = func(path, args string) error { return nil }
+	launchRelaunchHelper = func(content string) error { return nil }
+	defer func() {
+		launchInstaller = origInstaller
+		launchRelaunchHelper = origHelper
+	}()
+
+	body := []byte("MZ fake installer")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(body)
+	}))
+	defer srv.Close()
+
+	c := NewClient("v0.1.8")
+	c.SetInstallMode("installed")
+	info := &UpdateInfo{
+		AssetName: "KeyRouter-v0.1.9-windows-amd64-setup.exe",
+		AssetURL:  srv.URL + "/a",
+		AssetSize: int64(len(body)),
+	}
+	if err := c.Apply(info); err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
+
+	// Exactly one new temp file: the installer handed to the (fake) launch.
+	kept := 0
+	for p := range tempUpdateFiles(t) {
+		if !before[p] {
+			kept++
+		}
+	}
+	if kept != 1 {
+		t.Errorf("expected exactly one kept temp installer, found %d", kept)
+	}
+}
+
+// TestCleanupStaleDownloads: the startup cleanup removes only old updater
+// temp files — never fresh ones or unrelated files.
+func TestCleanupStaleDownloads(t *testing.T) {
+	dir := t.TempDir()
+	old := filepath.Join(dir, "keyrouter-update-1.exe")
+	fresh := filepath.Join(dir, "keyrouter-update-2.exe")
+	other := filepath.Join(dir, "unrelated.bat")
+	for _, p := range []string{old, fresh, other} {
+		if err := os.WriteFile(p, []byte("x"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldTime := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(old, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+
+	cleanupStaleDownloads(dir, 24*time.Hour)
+
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Error("stale updater temp file was not removed")
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Error("fresh updater temp file must be kept")
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Error("unrelated file must be kept")
+	}
 }

@@ -29,15 +29,29 @@ import (
 // handler package mirrors the value so /api/health reports the release version.
 var version = "0.1.0"
 
+// Updater abstracts the update client for the update endpoints: a real
+// *update.Client in production, fakes in tests.
+type Updater interface {
+	CurrentVersion() string
+	InstallMode() string
+	Check() (*update.UpdateInfo, error)
+	Apply(*update.UpdateInfo) error
+}
+
 // AdminHandler handles management API endpoints
 type AdminHandler struct {
 	Engine        *selector.Engine
 	HealthChecker *health.Checker
-	Updater       *update.Client
+	Updater       Updater
 	// AutostartEnabled reports whether launch-at-login is on (nil = unsupported).
 	AutostartEnabled func() bool
 	// AutostartSet enables/disables launch-at-login (nil = unsupported).
 	AutostartSet func(enabled bool) error
+	// ExitAfterUpdate is set by main (via router.SetUpdateExitHook). Called
+	// by ApplyUpdate AFTER the response is written: the process must exit so
+	// the new binary / installer can replace it (portable swap script,
+	// installed installer). Nil = no exit (used in tests).
+	ExitAfterUpdate func()
 	// autoCheckInfo holds the most recent auto-check result (set by
 	// AutoCheck's callback; read by GetAutoCheckState).
 	autoCheckMu   sync.Mutex
@@ -51,6 +65,14 @@ func (h *AdminHandler) SetAutoCheckInfo(info *update.UpdateInfo) {
 	h.autoCheckMu.Unlock()
 }
 
+// lastCheckInfo returns the most recent server-side check result (auto-check
+// or manual CheckUpdate), or nil before the first check.
+func (h *AdminHandler) lastCheckInfo() *update.UpdateInfo {
+	h.autoCheckMu.Lock()
+	defer h.autoCheckMu.Unlock()
+	return h.autoCheckInfo
+}
+
 // GetAutoCheckState returns the last auto-check result (checked=false when no
 // auto-check has found an update yet) plus the always-known local facts —
 // current version and install mode — so the UI can label the copy (portable
@@ -61,8 +83,8 @@ func (h *AdminHandler) GetAutoCheckState(c *gin.Context) {
 	h.autoCheckMu.Unlock()
 
 	resp := gin.H{
-		"current_version":  h.Updater.CurrentVersion,
-		"latest_version":   h.Updater.CurrentVersion,
+		"current_version":  h.Updater.CurrentVersion(),
+		"latest_version":   h.Updater.CurrentVersion(),
 		"update_available": false,
 		"install_mode":     h.Updater.InstallMode(),
 		"checked":          info != nil,
@@ -1196,24 +1218,37 @@ func (h *AdminHandler) CheckUpdate(c *gin.Context) {
 	if err != nil {
 		log.Printf("[admin] update check failed: %v", err)
 		c.JSON(http.StatusOK, gin.H{
-			"current_version":  h.Updater.CurrentVersion,
-			"latest_version":   h.Updater.CurrentVersion,
+			"current_version":  h.Updater.CurrentVersion(),
+			"latest_version":   h.Updater.CurrentVersion(),
 			"update_available": false,
 			"install_mode":     h.Updater.InstallMode(),
 			"error":            err.Error(),
 		})
 		return
 	}
+	// Cache the result so a subsequent Apply uses it without a second GitHub
+	// roundtrip (unauthenticated rate limits).
+	h.SetAutoCheckInfo(info)
 	c.JSON(http.StatusOK, info)
 }
 
-// ApplyUpdate downloads and applies the latest release (portable: replace
-// exe; installed: launch the installer). The app should exit shortly after.
+// ApplyUpdate applies the latest release (portable: replace exe; installed:
+// launch the installer). It uses the most recent server-side check result
+// (auto-check or manual CheckUpdate) and falls back to a live Check() when
+// none is cached or it is stale. The request body is IGNORED: the
+// management API is unauthenticated on localhost, so trusting a
+// client-supplied asset URL would let any local process trigger the
+// elevated launch of an arbitrary binary. The app then exits via the exit
+// hook so the new binary can replace it.
 func (h *AdminHandler) ApplyUpdate(c *gin.Context) {
-	info, err := h.Updater.Check()
-	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "update check failed: " + err.Error()})
-		return
+	info := h.lastCheckInfo()
+	if info == nil || !info.UpdateAvailable || time.Since(info.CheckedAt) > 24*time.Hour {
+		checked, err := h.Updater.Check()
+		if err != nil {
+			c.JSON(http.StatusBadGateway, gin.H{"error": "update check failed: " + err.Error()})
+			return
+		}
+		info = checked
 	}
 	if !info.UpdateAvailable {
 		c.JSON(http.StatusConflict, gin.H{"error": "no update available"})
@@ -1221,10 +1256,23 @@ func (h *AdminHandler) ApplyUpdate(c *gin.Context) {
 	}
 	if err := h.Updater.Apply(info); err != nil {
 		log.Printf("[admin] update apply failed: %v", err)
+		if errors.Is(err, update.ErrUpdateCancelled) {
+			// The user declined the UAC prompt — not a failure, and the app
+			// must NOT exit (there is no update to apply).
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "applied", "install_mode": info.InstallMode})
+	// Flush the response, then exit so the new binary / installer can
+	// replace this one (portable: the swap script relaunches the app;
+	// installed: the relaunch helper starts the updated copy).
+	c.Writer.Flush()
+	if h.ExitAfterUpdate != nil {
+		h.ExitAfterUpdate()
+	}
 }
 
 // ActivitySeriesPoint is one (time bucket, group) value for the stacked chart.

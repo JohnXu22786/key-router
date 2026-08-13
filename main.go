@@ -163,6 +163,15 @@ func main() {
 		updater.AutoCheck(h.SetAutoCheckInfo)
 	})
 
+	// After an update is applied the process must exit so the new binary can
+	// replace it (portable swap script / installed installer). The handler
+	// calls the hook after responding to the UI.
+	router.SetUpdateExitHook(requestExitForUpdate)
+
+	// Remove leftover updater temp files (interrupted downloads, cancelled
+	// installers) from previous runs. Best-effort — never fails startup.
+	update.CleanupStaleDownloads()
+
 	// Start HTTP server in background
 	app := server.New(r)
 	if err := app.StartBackground(); err != nil {
@@ -199,6 +208,9 @@ func main() {
 	// The webview library only sets the generic IDI_APPLICATION class icon,
 	// so this must be done explicitly via WM_SETICON (no-op on other OSes).
 	setWindowIcon(uintptr(w.Window()))
+	// Record the window handle for the post-update exit path (closes the
+	// window when no close-to-tray handler is installed).
+	setUpdateExitWindow(uintptr(w.Window()))
 
 	// System tray (Windows): clicking the window X hides to the tray instead
 	// of quitting; single-clicking the tray icon restores the window, the
