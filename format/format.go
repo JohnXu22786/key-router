@@ -1,10 +1,16 @@
 package format
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"mime"
+	"path"
 	"sort"
 	"strings"
+	"unicode/utf8"
+
+	"github.com/gabriel-vasile/mimetype"
 )
 
 var (
@@ -1122,12 +1128,11 @@ func convertOpenAIContentArray(content []interface{}) []interface{} {
 				continue
 			}
 			url := safeStringOrDefault(imageURL, "url", "")
-			if strings.HasPrefix(url, "data:") {
+			if isDataURI(url) {
 				// data:image/png;base64,iVBOR... → split into media_type + raw data
 				parts := strings.SplitN(url, ",", 2)
 				if len(parts) == 2 {
-					meta := strings.TrimPrefix(parts[0], "data:")
-					mediaType := strings.Split(meta, ";")[0]
+					mediaType := strings.Split(strings.TrimPrefix(strings.ToLower(parts[0]), "data:"), ";")[0]
 					if mediaType == "" {
 						mediaType = "image/png"
 					}
@@ -1150,9 +1155,246 @@ func convertOpenAIContentArray(content []interface{}) []interface{} {
 					},
 				})
 			}
+		case "file":
+			if block := openAIFilePartToAnthropic(p); block != nil {
+				anthContent = append(anthContent, block)
+			}
+		case "input_audio":
+			if block := openAIAudioPartToAnthropic(p); block != nil {
+				anthContent = append(anthContent, block)
+			}
+		case "video_url":
+			if block := openAIVideoPartToAnthropic(p); block != nil {
+				anthContent = append(anthContent, block)
+			}
 		}
 	}
 	return anthContent
+}
+
+// openAIFilePartToAnthropic converts an OpenAI {"type":"file"} content part
+// into an Anthropic document block. Returns nil when the file cannot be
+// represented — file_id-only references (they need a Files API round-trip
+// with the client's own account) and binary formats Anthropic rejects.
+func openAIFilePartToAnthropic(p map[string]interface{}) interface{} {
+	file, ok := safeMap(p["file"])
+	if !ok {
+		return nil
+	}
+	fileData := safeStringOrDefault(file, "file_data", "")
+	if fileData == "" {
+		return nil // file_id-only
+	}
+
+	doc := map[string]interface{}{
+		"type": "document",
+	}
+	if filename := cleanFileName(safeStringOrDefault(file, "filename", "")); filename != "" {
+		doc["title"] = filename
+	}
+
+	var source map[string]interface{}
+	switch {
+	case isDataURI(fileData):
+		// data:application/pdf;base64,JVBER... → media_type + raw data
+		parts := strings.SplitN(fileData, ",", 2)
+		if len(parts) != 2 {
+			return nil
+		}
+		b64 := stripBase64Newlines(parts[1])
+		if b64 == "" {
+			return nil
+		}
+		mediaType := strings.Split(strings.TrimPrefix(strings.ToLower(parts[0]), "data:"), ";")[0]
+		source = anthropicDocumentSource(mediaType, b64)
+	case isHTTPURL(fileData):
+		source = map[string]interface{}{"type": "url", "url": fileData}
+	default:
+		// Bare base64 — some SDKs omit the data: prefix. Sniff the media
+		// type from the decoded content instead of trusting the filename.
+		source = anthropicDocumentSourceFromBase64(fileData)
+	}
+	if source == nil {
+		return nil
+	}
+	doc["source"] = source
+	return doc
+}
+
+// isDataURI reports whether s starts with a data: URI scheme
+// (case-insensitive per RFC 2397).
+func isDataURI(s string) bool {
+	return len(s) >= 5 && strings.EqualFold(s[:5], "data:")
+}
+
+// isHTTPURL reports whether s starts with an http:// or https:// scheme
+// (case-insensitive per RFC 3986).
+func isHTTPURL(s string) bool {
+	if len(s) >= 7 && strings.EqualFold(s[:7], "http://") {
+		return true
+	}
+	return len(s) >= 8 && strings.EqualFold(s[:8], "https://")
+}
+
+// stripBase64Newlines removes MIME-style line wrapping from a base64
+// payload. Go's base64 decoder ignores embedded \r\n itself, but the sniff
+// prefix must be cut on data-char boundaries, so the wrapping is stripped
+// before cutting. The copy is skipped when there is nothing to strip.
+func stripBase64Newlines(b64 string) string {
+	if !strings.ContainsAny(b64, "\r\n") {
+		return b64
+	}
+	return strings.NewReplacer("\r", "", "\n", "").Replace(b64)
+}
+
+// anthropicDocumentSource builds an Anthropic document source for a known
+// media type and base64 payload. Anthropic base64 document sources only
+// accept application/pdf; text media types decode into a text source
+// (Anthropic rejects base64 document sources with any other media type).
+func anthropicDocumentSource(mediaType, b64 string) map[string]interface{} {
+	switch {
+	case mediaType == "application/pdf":
+		return map[string]interface{}{
+			"type":       "base64",
+			"media_type": "application/pdf",
+			"data":       b64,
+		}
+	case strings.HasPrefix(mediaType, "text/") || mediaType == "application/json" || mediaType == "application/xml":
+		text, err := decodeBase64String(b64)
+		if err != nil || !utf8.Valid(text) {
+			return nil
+		}
+		return map[string]interface{}{
+			"type":       "text",
+			"media_type": "text/plain",
+			"data":       string(text),
+		}
+	default:
+		return nil
+	}
+}
+
+// anthropicDocumentSourceFromBase64 sniffs the media type of a bare base64
+// payload (no data: prefix) from a small decoded prefix of its content.
+func anthropicDocumentSourceFromBase64(b64 string) map[string]interface{} {
+	b64 = stripBase64Newlines(b64)
+	prefix := b64
+	if cut := (maxSniffBytes / 3) * 4; len(prefix) > cut {
+		prefix = prefix[:cut]
+	}
+	raw, err := decodeBase64String(prefix)
+	if err != nil {
+		return nil
+	}
+	mediaType, _, err := mime.ParseMediaType(mimetype.Detect(raw).String())
+	if err != nil {
+		return nil
+	}
+	return anthropicDocumentSource(mediaType, b64)
+}
+
+// maxSniffBytes is how many decoded bytes are inspected to identify the
+// media type of a bare base64 file payload (magic bytes live at the start).
+const maxSniffBytes = 4096
+
+// decodeBase64String decodes base64 with or without padding (some SDKs send
+// bare base64 that omits the trailing '=' padding).
+func decodeBase64String(s string) ([]byte, error) {
+	if b, err := base64.StdEncoding.DecodeString(s); err == nil {
+		return b, nil
+	}
+	return base64.RawStdEncoding.DecodeString(s)
+}
+
+// openAIAudioPartToAnthropic converts an OpenAI {"type":"input_audio"} part
+// into an Anthropic audio block (Anthropic-compatible upstreams that accept
+// audio input use the image block shape with a base64 source).
+func openAIAudioPartToAnthropic(p map[string]interface{}) interface{} {
+	audio, ok := safeMap(p["input_audio"])
+	if !ok {
+		return nil
+	}
+	data := safeStringOrDefault(audio, "data", "")
+	if data == "" {
+		return nil
+	}
+	mediaType := audioFormatToMediaType(safeStringOrDefault(audio, "format", ""))
+	if mediaType == "" {
+		return nil
+	}
+	return map[string]interface{}{
+		"type": "audio",
+		"source": map[string]interface{}{
+			"type":       "base64",
+			"media_type": mediaType,
+			"data":       data,
+		},
+	}
+}
+
+// audioFormatToMediaType maps an OpenAI input_audio format to a media type.
+// Unknown codecs pass through as audio/<codec>; unparseable values return "".
+func audioFormatToMediaType(format string) string {
+	switch strings.ToLower(format) {
+	case "wav":
+		return "audio/wav"
+	case "mp3", "mpeg":
+		return "audio/mpeg"
+	}
+	if format == "" || strings.Contains(format, "/") {
+		return ""
+	}
+	return "audio/" + format
+}
+
+// openAIVideoPartToAnthropic converts an OpenAI {"type":"video_url"} content
+// part into an Anthropic video block (MiniMax M3 and other Anthropic-
+// compatible endpoints accept video blocks with url or base64 sources).
+func openAIVideoPartToAnthropic(p map[string]interface{}) interface{} {
+	vu, ok := safeMap(p["video_url"])
+	if !ok {
+		return nil
+	}
+	url := safeStringOrDefault(vu, "url", "")
+	if url == "" {
+		return nil
+	}
+	if isDataURI(url) {
+		// data:video/mp4;base64,AAAA... → media_type + raw data
+		parts := strings.SplitN(url, ",", 2)
+		if len(parts) != 2 {
+			return nil
+		}
+		data := stripBase64Newlines(parts[1])
+		if data == "" {
+			return nil
+		}
+		mediaType := strings.Split(strings.TrimPrefix(strings.ToLower(parts[0]), "data:"), ";")[0]
+		if mediaType == "" {
+			mediaType = "video/mp4"
+		}
+		return map[string]interface{}{
+			"type": "video",
+			"source": map[string]interface{}{
+				"type":       "base64",
+				"media_type": mediaType,
+				"data":       data,
+			},
+		}
+	}
+	return map[string]interface{}{
+		"type":   "video",
+		"source": map[string]interface{}{"type": "url", "url": url},
+	}
+}
+
+// cleanFileName strips directory prefixes (browser uploads report
+// "C:\fakepath\name") from a file name.
+func cleanFileName(name string) string {
+	if name == "" {
+		return ""
+	}
+	return path.Base(strings.ReplaceAll(name, "\\", "/"))
 }
 
 func convertOpenAIAssistantMessage(m map[string]interface{}) map[string]interface{} {
@@ -1232,6 +1474,21 @@ func convertOpenAIToolMessage(m map[string]interface{}) map[string]interface{} {
 	if content == nil {
 		content = ""
 	}
+	// OpenAI tool messages carry attachments as content parts (file/image
+	// parts from file-reading tools); Anthropic tool_result content accepts
+	// document/image blocks, so convert the parts instead of shipping
+	// OpenAI-shaped blocks.
+	if arr, ok := content.([]interface{}); ok {
+		converted := convertOpenAIContentArray(arr)
+		if len(converted) == 0 {
+			// Everything was dropped (e.g. file_id-only references) —
+			// Anthropic requires tool_result content to be a string or
+			// array, never null.
+			content = ""
+		} else {
+			content = converted
+		}
+	}
 	return map[string]interface{}{
 		"role": "user",
 		"content": []interface{}{
@@ -1288,13 +1545,27 @@ func splitToolResults(m map[string]interface{}) (toolParts, otherParts []interfa
 }
 
 // convertAnthropicToolResult converts an Anthropic tool_result content part
-// into an OpenAI {"role":"tool"} message.
+// into an OpenAI {"role":"tool"} message. Anthropic tool_result content may
+// be an array of text/image/document blocks (file-reading tools) — convert
+// them to OpenAI content parts instead of shipping Anthropic-shaped blocks.
 func convertAnthropicToolResult(part interface{}) map[string]interface{} {
 	p, _ := safeMap(part)
+	content := p["content"]
+	if arr, ok := content.([]interface{}); ok {
+		converted := convertAnthropicContentArray(arr, true)
+		if len(converted) == 0 {
+			// Everything was dropped (e.g. url-sourced audio) — OpenAI
+			// tool messages with null content are valid, but an empty
+			// string is unambiguous.
+			content = ""
+		} else {
+			content = converted
+		}
+	}
 	return map[string]interface{}{
 		"role":         "tool",
 		"tool_call_id": p["tool_use_id"],
-		"content":      p["content"],
+		"content":      content,
 	}
 }
 
@@ -1343,9 +1614,131 @@ func convertAnthropicContentArray(content []interface{}, skipToolResults bool) [
 					},
 				})
 			}
+		case "document":
+			if part := anthropicDocumentToOpenAI(p); part != nil {
+				oaiContent = append(oaiContent, part)
+			}
+		case "video":
+			if part := anthropicVideoToOpenAI(p); part != nil {
+				oaiContent = append(oaiContent, part)
+			}
+		case "audio":
+			if part := anthropicAudioToOpenAI(p); part != nil {
+				oaiContent = append(oaiContent, part)
+			}
 		}
 	}
 	return oaiContent
+}
+
+// anthropicDocumentToOpenAI converts an Anthropic document block into an
+// OpenAI {"type":"file"} content part (the document's title becomes the
+// file's filename).
+func anthropicDocumentToOpenAI(p map[string]interface{}) interface{} {
+	source, ok := safeMap(p["source"])
+	if !ok {
+		return nil
+	}
+	file := map[string]interface{}{}
+	if filename := cleanFileName(safeStringOrDefault(p, "title", "")); filename != "" {
+		file["filename"] = filename
+	}
+	switch safeStringOrDefault(source, "type", "") {
+	case "base64":
+		mediaType := safeStringOrDefault(source, "media_type", "application/pdf")
+		data := safeStringOrDefault(source, "data", "")
+		if data == "" {
+			return nil
+		}
+		file["file_data"] = "data:" + mediaType + ";base64," + data
+	case "text":
+		text := safeStringOrDefault(source, "data", "")
+		if text == "" {
+			return nil
+		}
+		file["file_data"] = "data:text/plain;base64," + base64.StdEncoding.EncodeToString([]byte(text))
+	case "url":
+		url := safeStringOrDefault(source, "url", "")
+		if url == "" {
+			return nil
+		}
+		// OpenAI-compatible providers accept a public URL as file_data
+		// (official OpenAI expects inline base64 or a file_id instead).
+		file["file_data"] = url
+	default:
+		// content sources embed child blocks and have no flat equivalent.
+		return nil
+	}
+	return map[string]interface{}{"type": "file", "file": file}
+}
+
+// anthropicVideoToOpenAI converts an Anthropic video block into an OpenAI
+// {"type":"video_url"} content part.
+func anthropicVideoToOpenAI(p map[string]interface{}) interface{} {
+	source, ok := safeMap(p["source"])
+	if !ok {
+		return nil
+	}
+	var url string
+	switch safeStringOrDefault(source, "type", "") {
+	case "base64":
+		mediaType := safeStringOrDefault(source, "media_type", "video/mp4")
+		data := safeStringOrDefault(source, "data", "")
+		if data == "" {
+			return nil
+		}
+		url = "data:" + mediaType + ";base64," + data
+	case "url":
+		url = safeStringOrDefault(source, "url", "")
+	default:
+		return nil
+	}
+	if url == "" {
+		return nil
+	}
+	return map[string]interface{}{
+		"type":      "video_url",
+		"video_url": map[string]interface{}{"url": url},
+	}
+}
+
+// anthropicAudioToOpenAI converts an Anthropic audio block into an OpenAI
+// {"type":"input_audio"} content part. URL-sourced audio has no OpenAI
+// equivalent (input_audio requires inline base64) and is dropped.
+func anthropicAudioToOpenAI(p map[string]interface{}) interface{} {
+	source, ok := safeMap(p["source"])
+	if !ok {
+		return nil
+	}
+	if safeStringOrDefault(source, "type", "") != "base64" {
+		return nil
+	}
+	data := safeStringOrDefault(source, "data", "")
+	if data == "" {
+		return nil
+	}
+	audioFormat := mediaTypeToAudioFormat(safeStringOrDefault(source, "media_type", ""))
+	if audioFormat == "" {
+		return nil
+	}
+	return map[string]interface{}{
+		"type":        "input_audio",
+		"input_audio": map[string]interface{}{"data": data, "format": audioFormat},
+	}
+}
+
+// mediaTypeToAudioFormat maps an audio media type to an OpenAI input_audio
+// format. OpenAI's input_audio contract accepts only "wav" and "mp3" (the
+// ogg/flac/opus list belongs to audio OUTPUT) — unsupported codecs return ""
+// and the part is dropped rather than 400-ing the whole request upstream.
+func mediaTypeToAudioFormat(mediaType string) string {
+	switch strings.ToLower(mediaType) {
+	case "audio/wav", "audio/x-wav", "audio/wave":
+		return "wav"
+	case "audio/mpeg", "audio/mp3", "audio/mpg":
+		return "mp3"
+	}
+	return ""
 }
 
 func convertAnthropicAssistantMessage(m map[string]interface{}) map[string]interface{} {
