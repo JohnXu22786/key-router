@@ -17,7 +17,9 @@ import (
 
 	"key-router/billing"
 	"key-router/db"
+	"key-router/events"
 	"key-router/health"
+	"key-router/middleware"
 	"key-router/model"
 	"key-router/selector"
 	"key-router/update"
@@ -43,6 +45,10 @@ type AdminHandler struct {
 	Engine        *selector.Engine
 	HealthChecker *health.Checker
 	Updater       Updater
+	// Events is the SSE push hub: background state changes (key status
+	// flips from the relay/health checker) are published here so connected
+	// UIs re-fetch immediately instead of waiting for their next poll.
+	Events *events.Hub
 	// AutostartEnabled reports whether launch-at-login is on (nil = unsupported).
 	AutostartEnabled func() bool
 	// AutostartSet enables/disables launch-at-login (nil = unsupported).
@@ -103,11 +109,53 @@ func (h *AdminHandler) GetAutoCheckState(c *gin.Context) {
 }
 
 // NewAdminHandler creates a new admin handler
-func NewAdminHandler(engine *selector.Engine, checker *health.Checker) *AdminHandler {
+func NewAdminHandler(engine *selector.Engine, checker *health.Checker, hub *events.Hub) *AdminHandler {
 	return &AdminHandler{
 		Engine:        engine,
 		HealthChecker: checker,
 		Updater:       update.NewClient(version),
+		Events:        hub,
+	}
+}
+
+// StreamEvents serves the SSE push channel (GET /api/events). The UI keeps
+// one connection open and re-fetches the affected resource when an event
+// arrives — the "hot reload" contract: update in place when something
+// changed, nothing when it didn't. Heartbeat comments keep the connection
+// alive through proxies and make a dead client detectable via request
+// context cancellation.
+func (h *AdminHandler) StreamEvents(c *gin.Context) {
+	ch := h.Events.Subscribe()
+	defer h.Events.Unsubscribe(ch)
+
+	c.Writer.Header().Set("Content-Type", "text/event-stream")
+	c.Writer.Header().Set("Cache-Control", "no-cache")
+	c.Writer.Header().Set("Connection", "keep-alive")
+	c.Writer.WriteHeader(http.StatusOK)
+	c.Writer.Flush()
+
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-c.Request.Context().Done():
+			return
+		case <-middleware.ShutdownSignal():
+			// App is quitting: terminate the stream so http.Server.Shutdown
+			// doesn't wait the full grace period for an immortal connection.
+			return
+		case e := <-ch:
+			data, err := json.Marshal(e)
+			if err != nil {
+				continue
+			}
+			fmt.Fprintf(c.Writer, "data: %s\n\n", data)
+			c.Writer.Flush()
+		case <-heartbeat.C:
+			fmt.Fprint(c.Writer, ": ping\n\n")
+			c.Writer.Flush()
+		}
 	}
 }
 

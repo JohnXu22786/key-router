@@ -15,11 +15,27 @@ var shutdownState = struct {
 	stopping bool
 }{}
 
-// BeginShutdown marks the server as stopping: new requests are refused.
+// shutdownSignal is closed (once) by BeginShutdown. Long-lived handlers
+// (the /api/events SSE stream) select on it so the connection terminates
+// promptly on shutdown — otherwise http.Server.Shutdown would wait the whole
+// grace period for a stream that would otherwise live forever.
+var (
+	shutdownOnce   sync.Once
+	shutdownSignal = make(chan struct{})
+)
+
+// BeginShutdown marks the server as stopping: new requests are refused and
+// long-lived connections are told to finish.
 func BeginShutdown() {
 	shutdownState.Lock()
 	shutdownState.stopping = true
 	shutdownState.Unlock()
+	shutdownOnce.Do(func() { close(shutdownSignal) })
+}
+
+// ShutdownSignal returns a channel that is closed when BeginShutdown runs.
+func ShutdownSignal() <-chan struct{} {
+	return shutdownSignal
 }
 
 // IsStopping reports whether a shutdown has begun.

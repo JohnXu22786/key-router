@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"key-router/db"
+	"key-router/events"
 	"key-router/handler"
 	"key-router/health"
 	"key-router/middleware"
@@ -74,6 +75,13 @@ func main() {
 
 	// Initialize routing engine
 	engine := selector.NewEngine()
+
+	// SSE push hub: key status flips (relay/health checker) are published
+	// here so the UI re-fetches immediately — the "hot reload" path.
+	hub := events.NewHub()
+	engine.SetOnStatusChanged(func(keyID int64, status string) {
+		hub.Publish(events.Event{Type: events.TypeKeyStatusChanged, KeyID: keyID, Status: status})
+	})
 
 	// Restore persisted rate-limit windows so long-window budgets (daily,
 	// weekly, monthly) survive restarts
@@ -149,7 +157,7 @@ func main() {
 	log.Println("[main] health checker started")
 
 	// Setup HTTP router
-	r := router.Setup(staticFS, engine, checker)
+	r := router.Setup(staticFS, engine, checker, hub)
 	// Launch-at-login (Windows only; injected after the handler is built so
 	// the router's internal handler sees the functions).
 	router.SetAutostartHooks(autostartEnabled, setAutostartEnabled)

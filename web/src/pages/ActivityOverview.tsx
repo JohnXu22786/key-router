@@ -102,8 +102,11 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
     return () => { cancelled = true; };
   }, [range]);
 
-  if (loading) return <Spin style={{ display: 'block', margin: '60px auto' }} />;
-  if (error) {
+  // Only blank on the very first load: while refreshing (the range slides
+  // every 30s) the previous charts stay visible until the new data arrives
+  // — a refresh must never flash a white page.
+  if (loading && curList.length === 0) return <Spin style={{ display: 'block', margin: '60px auto' }} />;
+  if (error && curList.length === 0) {
     return <Card><Text type="danger">Failed to load activity — check the log file.</Text></Card>;
   }
 

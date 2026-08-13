@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"key-router/db"
+	"key-router/events"
 	"key-router/health"
 	"key-router/model"
 	"key-router/router"
@@ -59,7 +60,7 @@ func bootstrapActivity(t *testing.T) *gin.Engine {
 
 	engine := selector.NewEngine()
 	checker := health.NewChecker()
-	return router.Setup(embed.FS{}, engine, checker)
+	return router.Setup(embed.FS{}, engine, checker, events.NewHub())
 }
 
 // TestActivityEdgeCases exercises GetActivity across metrics/groupings/topN

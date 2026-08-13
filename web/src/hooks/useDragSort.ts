@@ -32,6 +32,11 @@ export interface DragHandlers {
   overIndex: number | null;
   rowStyle: (index: number) => React.CSSProperties;
   dragging: boolean;
+  // draggingRef mirrors `dragging` synchronously (set inside the pointer
+  // handlers, not on a render commit) so callers can check "am I dragging
+  // right now" from event handlers and promise resolutions without waiting
+  // for React to re-render.
+  draggingRef: { current: boolean };
 }
 
 const SLIDE_MS = 150;
@@ -45,6 +50,8 @@ export function useDragSort<T>(
   const overIndexRef = useRef<number | null>(null);
   const [overIndex, setOverIndex] = useState<number | null>(null);
   const [dragging, setDragging] = useState(false);
+  // Synchronous mirror of `dragging` (see DragHandlers.draggingRef).
+  const draggingRef = useRef(false);
   // True during the drop glide: the dragged row animates into its target
   // slot before the array is spliced.
   const [settling, setSettling] = useState(false);
@@ -84,6 +91,7 @@ export function useDragSort<T>(
     overIndexRef.current = null;
     committedRef.current = false;
     activePointer.current = -1;
+    draggingRef.current = false;
     setOverIndex(null);
     setDragging(false);
     setSettling(false);
@@ -127,6 +135,7 @@ export function useDragSort<T>(
     dragIndex.current = index;
     overIndexRef.current = index;
     activePointer.current = e.pointerId;
+    draggingRef.current = true;
     setOverIndex(index);
     setDy(0);
     setSettling(false);
@@ -283,5 +292,6 @@ export function useDragSort<T>(
     overIndex,
     rowStyle,
     dragging,
+    draggingRef,
   };
 }

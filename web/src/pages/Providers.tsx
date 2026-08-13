@@ -11,6 +11,7 @@ import {
   getKeys, createKey, updateKey, deleteKey, reorderKeys, getKeyDetail, resetKeySpend,
   getRoutes, Provider, Key, Route,
 } from '../api/client';
+import { subscribeEvents, jsonEqual } from '../api/events';
 import { useDragSort } from '../hooks/useDragSort';
 
 const { Title, Text } = Typography;
@@ -64,8 +65,21 @@ const Providers: React.FC = () => {
   const [provForm] = Form.useForm();
   const [keyForm] = Form.useForm();
   const statusTouched = useRef(false);
-  // Number of drag orders committed but not yet persisted: the 10s poll
-  // must not overwrite the local order with pre-persist server state.
+  // Number of drag orders committed but not yet persisted: the background
+  // poll must not overwrite the local order with pre-persist server state.
+  // Mirror (assigned during render, Models.tsx pattern) so the SSE handler
+  // and poll — which run in []-dep effects — can read whether the detail
+  // modal is open.
+  const detailOpenRef = useRef(false);
+  detailOpenRef.current = detailOpen;
+  // Coalescing for SSE-triggered refetches: a burst of status flips must
+  // not launch N concurrent fetches whose out-of-order responses could
+  // briefly revert the table. One fetch runs at a time; events arriving in
+  // between just schedule one trailing re-run.
+  const keysRefetchingRef = useRef(false);
+  const keysRefetchAgainRef = useRef(false);
+  const detailFetchingRef = useRef(false);
+  const detailFetchAgainRef = useRef(false);
   // Captured at fetch START as well (with the persist generation), so a
   // poll that raced a commit or a persist is discarded even if the persist
   // settles before the poll response arrives.
@@ -90,8 +104,67 @@ const Providers: React.FC = () => {
 
   useEffect(() => { fetch(); }, []);
 
+  // Live push: the backend publishes key_status_changed over SSE the moment
+  // the relay/health checker flips a key, so the table turns red at the
+  // same time as the detail panel instead of waiting for the next poll.
+  // Re-fetched data is applied only when it actually changed (jsonEqual) —
+  // an unchanged response must not re-render the table.
+  useEffect(() => {
+    const refreshKeysOnly = () => {
+      // Coalesce bursts: while a refetch is in flight, further events just
+      // mark "run again at the end" — N flips must not launch N concurrent
+      // fetches whose out-of-order responses could briefly revert the table.
+      if (keysRefetchingRef.current) { keysRefetchAgainRef.current = true; return; }
+      keysRefetchingRef.current = true;
+      // Same race guards as the poll: a fetch that started while a drag
+      // commit or persist was pending (or raced one) is discarded, or the
+      // push would revert the UI to pre-persist order. The poll catches up.
+      const wasPersisting = pendingPersistsRef.current > 0;
+      const gen = persistGenRef.current;
+      getKeys().then(res => {
+        keysRefetchingRef.current = false;
+        if (keysRefetchAgainRef.current) {
+          keysRefetchAgainRef.current = false;
+          refreshKeysOnly();
+          return;
+        }
+        if (drag.draggingRef.current) return;
+        if (!wasPersisting && pendingPersistsRef.current === 0 && gen === persistGenRef.current) {
+          setKeys(prev => (jsonEqual(prev, res.data) ? prev : res.data));
+        }
+      }).catch(() => { keysRefetchingRef.current = false; });
+    };
+    // Keep an open detail modal live too: its status must never disagree
+    // with the row below it. Skipped entirely while the modal is closed.
+    // Like refreshKeysOnly, events arriving while a fetch is in flight
+    // schedule one trailing re-run so no flip is dropped.
+    const refreshDetail = (keyId: number) => {
+      if (!detailOpenRef.current) return;
+      if (detailFetchingRef.current) { detailFetchAgainRef.current = true; return; }
+      detailFetchingRef.current = true;
+      getKeyDetail(keyId).then(res => {
+        detailFetchingRef.current = false;
+        if (detailFetchAgainRef.current) {
+          detailFetchAgainRef.current = false;
+          refreshDetail(keyId);
+          return;
+        }
+        if (detailOpenRef.current) {
+          setDetailData((prev: any) => (prev?.key?.id === keyId ? res.data : prev));
+        }
+      }).catch(() => { detailFetchingRef.current = false; });
+    };
+    return subscribeEvents(evt => {
+      if (evt.type !== 'key_status_changed' || evt.key_id == null) return;
+      refreshKeysOnly();
+      refreshDetail(evt.key_id);
+    });
+  }, []);
+
   // Poll for key status changes (relay/health checker flip keys as traffic
-  // flows). Keeps expanded groups and scroll position — only row data updates.
+  // flows) as a fallback for anything a push event can miss (window usage,
+  // dropped SSE connection). Keeps expanded groups and scroll position —
+  // only row data updates, and only when it changed.
   useEffect(() => {
     const t = setInterval(() => {
       // A fetch that raced a commit or a persist may carry pre-persist data:
@@ -102,11 +175,17 @@ const Providers: React.FC = () => {
       const gen = persistGenRef.current;
       Promise.all([getProviders(), getKeys(), getRoutes()])
         .then(([p, k, r]) => {
-          setProviders(p.data); setRoutes(r.data);
-          if (!wasPersisting && pendingPersistsRef.current === 0 && gen === persistGenRef.current) setKeys(k.data);
+          setProviders(prev => (jsonEqual(prev, p.data) ? prev : p.data));
+          setRoutes(prev => (jsonEqual(prev, r.data) ? prev : r.data));
+          // Skip keys while a drag is in progress: the drag commit splices
+          // the array at pointerdown-era indices, so the array must not
+          // change underneath it (the next poll catches up).
+          if (!drag.draggingRef.current && !wasPersisting && pendingPersistsRef.current === 0 && gen === persistGenRef.current) {
+            setKeys(prev => (jsonEqual(prev, k.data) ? prev : k.data));
+          }
         })
         .catch(() => {});
-    }, 10000);
+    }, 5000);
     return () => clearInterval(t);
   }, []);
 
@@ -198,7 +277,7 @@ const Providers: React.FC = () => {
     // Persist IMMEDIATELY on drop — no debounce: an edit must be written
     // the moment it happens, so a crash or a forced kill right after a drop
     // cannot lose the new order. Each drop fires one request; the poll guard
-    // below keeps the 10s refresh from overwriting the local order while the
+    // below keeps the refresh from overwriting the local order while the
     // write is in flight.
     pendingPersistsRef.current++;
     const providerCounts: Record<number, number> = {};

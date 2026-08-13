@@ -169,8 +169,11 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range }) => {
     });
   }, [data, topN, sortKey, sortOrder]);
 
-  if (loading) return <Spin style={{ display: 'block', margin: '60px auto' }} />;
-  if (error || !data) {
+  // Only blank on the very first load: while refreshing (range slide,
+  // metric/group switch) the previous data stays visible until the new data
+  // arrives — a refresh must never flash a white page.
+  if (loading && !data) return <Spin style={{ display: 'block', margin: '60px auto' }} />;
+  if (!data) {
     return <Card><Text type="danger">Failed to load explore — check the log file.</Text></Card>;
   }
 

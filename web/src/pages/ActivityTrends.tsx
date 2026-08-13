@@ -47,13 +47,11 @@ const ActivityTrends: React.FC<TrendsProps> = ({ range }) => {
   const [cur, setCur] = useState<ActivityResponse | null>(null);
   const [prev, setPrev] = useState<ActivityResponse | null>(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
     const fetch = async () => {
       setLoading(true);
-      setError(false);
       try {
         const len = range.until.diff(range.since, 'millisecond');
         const prevSince = range.since.subtract(len, 'millisecond');
@@ -64,15 +62,18 @@ const ActivityTrends: React.FC<TrendsProps> = ({ range }) => {
         if (cancelled) return;
         setCur(curRes.data);
         setPrev(prevRes.data);
-      } catch { if (!cancelled) { setError(true); message.error('Failed to load trends'); } }
+      } catch { if (!cancelled) { message.error('Failed to load trends'); } }
       finally { if (!cancelled) setLoading(false); }
     };
     fetch();
     return () => { cancelled = true; };
   }, [range, mode, metric]);
 
-  if (loading) return <Spin style={{ display: 'block', margin: '60px auto' }} />;
-  if (error || !cur || !prev) {
+  // Only blank on the very first load: while refreshing (range slide,
+  // metric/mode switch) the previous data stays visible until the new data
+  // arrives — a refresh must never flash a white page.
+  if (loading && !cur && !prev) return <Spin style={{ display: 'block', margin: '60px auto' }} />;
+  if (!cur || !prev) {
     return <Card><Text type="danger">Failed to load trends — check the log file.</Text></Card>;
   }
 
