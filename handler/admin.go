@@ -212,10 +212,13 @@ func (h *AdminHandler) DeleteProvider(c *gin.Context) {
 	c.JSON(http.StatusNoContent, nil)
 }
 
-// GetKeys returns all keys, optionally filtered by provider
+// GetKeys returns all keys, optionally filtered by provider, ordered by
+// (provider_id, sort_order, id). sort_order is per-provider and is the call
+// order the UI arranges by dragging; without the explicit order the rows
+// come back in rowid order and the UI reverts to it on every 10s poll.
 func (h *AdminHandler) GetKeys(c *gin.Context) {
 	var keys []model.Key
-	query := db.GetDB().Preload("Provider")
+	query := db.GetDB().Preload("Provider").Order("provider_id ASC, sort_order ASC, id ASC")
 	if providerID := c.Query("provider_id"); providerID != "" {
 		query = query.Where("provider_id = ?", providerID)
 	}
@@ -318,6 +321,22 @@ func (h *AdminHandler) CreateKey(c *gin.Context) {
 	if count == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "provider not found"})
 		return
+	}
+	// A new key must not tie with existing sort_orders (drag reorder assigns
+	// 0..n-1, so a fresh 0 would silently interleave by rowid and jump the
+	// new key to the top). Place it at the end of its provider's order.
+	if k.SortOrder <= 0 {
+		var maxSort *int64
+		if err := db.GetDB().Model(&model.Key{}).
+			Where("provider_id = ?", k.ProviderID).
+			Select("COALESCE(MAX(sort_order), -1)").
+			Scan(&maxSort).Error; err != nil {
+			log.Printf("[admin] CreateKey max-sort-order query error (defaulting to 0): %v", err)
+		}
+		k.SortOrder = 0
+		if maxSort != nil && *maxSort >= 0 {
+			k.SortOrder = *maxSort + 1
+		}
 	}
 	if err := db.GetDB().Create(&k).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -559,10 +578,13 @@ func (h *AdminHandler) DeleteModelGroup(c *gin.Context) {
 	c.JSON(http.StatusNoContent, nil)
 }
 
-// GetRoutes returns all routes, ordered by priority (drag position)
+// GetRoutes returns all routes, ordered by (model_group_id, priority, id).
+// priority is per-group, so ordering by it alone would interleave groups'
+// rows (g1:0, g2:0, g1:1, ...) — the UI renders each group's rows as a
+// contiguous block and relies on that when reordering by drag.
 func (h *AdminHandler) GetRoutes(c *gin.Context) {
 	var routes []model.Route
-	query := db.GetDB().Preload("ModelGroup").Preload("Provider").Order("priority ASC")
+	query := db.GetDB().Preload("ModelGroup").Preload("Provider").Order("model_group_id ASC, priority ASC, id ASC")
 	if groupID := c.Query("model_group_id"); groupID != "" {
 		query = query.Where("model_group_id = ?", groupID)
 	}
@@ -793,9 +815,9 @@ func (h *AdminHandler) DeleteRoute(c *gin.Context) {
 }
 
 // ReorderKeys batch-updates key sort_order based on visual ordering (the
-// order the user arranged keys within a provider Ã¢â‚¬â€ sort order = call order).
-// sort_order is per-provider: the payload carries the full ordered key list
-// for one provider.
+// order the user arranged keys within a provider; sort_order = call order).
+// sort_order is per-provider: the payload carries all keys with their
+// per-provider sort_order indices (0..n-1 within each provider).
 func (h *AdminHandler) ReorderKeys(c *gin.Context) {
 	var req struct {
 		Keys []struct {

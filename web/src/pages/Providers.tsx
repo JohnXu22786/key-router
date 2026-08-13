@@ -65,6 +65,13 @@ const Providers: React.FC = () => {
   const [keyForm] = Form.useForm();
   const statusTouched = useRef(false);
   const persistTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Number of drag orders committed but not yet persisted: the 10s poll
+  // must not overwrite the local order with pre-persist server state.
+  // Captured at fetch START as well (with the persist generation), so a
+  // poll that raced a commit or a persist is discarded even if the persist
+  // settles before the poll response arrives.
+  const pendingPersistsRef = useRef(0);
+  const persistGenRef = useRef(0);
 
   // Drag-reorder with live preview animation (keys within a provider).
   const drag = useDragSort<Key>(
@@ -88,8 +95,17 @@ const Providers: React.FC = () => {
   // flows). Keeps expanded groups and scroll position — only row data updates.
   useEffect(() => {
     const t = setInterval(() => {
+      // A fetch that raced a commit or a persist may carry pre-persist data:
+      // skip keys unless no persist was pending at fetch start AND none is
+      // pending now AND the persist generation is unchanged, or the poll
+      // would revert the UI until the next one.
+      const wasPersisting = pendingPersistsRef.current > 0;
+      const gen = persistGenRef.current;
       Promise.all([getProviders(), getKeys(), getRoutes()])
-        .then(([p, k, r]) => { setProviders(p.data); setKeys(k.data); setRoutes(r.data); })
+        .then(([p, k, r]) => {
+          setProviders(p.data); setRoutes(r.data);
+          if (!wasPersisting && pendingPersistsRef.current === 0 && gen === persistGenRef.current) setKeys(k.data);
+        })
         .catch(() => {});
     }, 10000);
     return () => clearInterval(t);
@@ -180,6 +196,7 @@ const Providers: React.FC = () => {
     } catch { message.error('Failed to reset key spend'); }
   };
   const persistOrder = useCallback((ordered: Key[]) => {
+    pendingPersistsRef.current++;
     if (persistTimer.current) clearTimeout(persistTimer.current);
     persistTimer.current = setTimeout(async () => {
       const providerCounts: Record<number, number> = {};
@@ -188,14 +205,17 @@ const Providers: React.FC = () => {
         providerCounts[k.provider_id] = idx + 1;
         return { id: k.id, sort_order: idx };
       });
-      try { await reorderKeys(payload); } catch { message.error('Failed to save order'); }
+      try { await reorderKeys(payload); }
+      catch { message.error('Failed to save order'); }
+      pendingPersistsRef.current--;
+      persistGenRef.current++;
     }, 300);
   }, []);
 
   const keyColumns = [
     {
       title: '', key: 'drag', width: 40,
-      render: () => <span data-drag-handle style={{ cursor: 'grab', display: 'inline-block' }}><HolderOutlined style={{ color: '#999' }} /></span>,
+      render: () => <span data-drag-handle style={{ cursor: 'grab', display: 'inline-block', touchAction: 'none' }}><HolderOutlined style={{ color: '#999' }} /></span>,
     },
     {
       title: 'Name', dataIndex: 'name', key: 'name',
@@ -312,11 +332,11 @@ const Providers: React.FC = () => {
                   onRow={(_, index) => {
                     const globalIndex = keys.indexOf(provKeys[index!]);
                     return {
-                      'data-row-index': globalIndex,
                       style: { cursor: 'default', ...drag.rowStyle(globalIndex) },
                       onPointerDown: (e: React.PointerEvent) => drag.onPointerDown(e, globalIndex),
                       onPointerMove: drag.onPointerMove,
                       onPointerUp: drag.onPointerUp,
+                      onPointerCancel: drag.onPointerCancel,
                     };
                   }}
                 />
