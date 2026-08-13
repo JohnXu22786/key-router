@@ -187,6 +187,14 @@ func main() {
 	w.SetSize(900, 580, webview.HintNone)
 	w.Navigate(url)
 
+	// Bind the browser-opening helper for the UI's external links (project
+	// homepage, license, etc.). The webview library has no new-window
+	// handling, so target=_blank links would open a bare WebView2 popup
+	// inside the app — the UI calls this binding instead (see openurl.go).
+	if err := w.Bind("openExternal", openExternal); err != nil {
+		log.Printf("[main] failed to bind openExternal: %v", err)
+	}
+
 	// Apply the app icon to the window itself (title bar + taskbar button).
 	// The webview library only sets the generic IDI_APPLICATION class icon,
 	// so this must be done explicitly via WM_SETICON (no-op on other OSes).
