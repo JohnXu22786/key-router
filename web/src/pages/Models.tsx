@@ -11,6 +11,7 @@ import {
   getRoutes, createRoute, updateRoute, deleteRoute, reorderRoutes,
   getProviders, ModelGroup, Route, Provider,
 } from '../api/client';
+import { jsonEqual } from '../api/events';
 import JsonEditor from '../components/JsonEditor';
 import { useDragSort } from '../hooks/useDragSort';
 
@@ -33,8 +34,8 @@ const Models: React.FC = () => {
   const [extraError, setExtraError] = useState('');
   const [groupForm] = Form.useForm();
   const [routeForm] = Form.useForm();
-  // Number of drag orders committed but not yet persisted: the 10s poll
-  // must not overwrite the local order with pre-persist server state.
+  // Number of drag orders committed but not yet persisted: the background
+  // poll must not overwrite the local order with pre-persist server state.
   // Captured at fetch START as well (with the persist generation), so a
   // poll that raced a commit or a persist is discarded even if the persist
   // settles before the poll response arrives.
@@ -62,7 +63,8 @@ const Models: React.FC = () => {
   useEffect(() => { fetch(); }, []);
 
   // Poll for status changes (route/group state, key health). Keeps expanded
-  // groups and scroll position — only row data updates.
+  // groups and scroll position — only row data updates, and only when it
+  // changed (jsonEqual: an unchanged response must not re-render).
   useEffect(() => {
     const t = setInterval(() => {
       // A fetch that raced a commit or a persist may carry pre-persist data:
@@ -73,8 +75,11 @@ const Models: React.FC = () => {
       const gen = persistGenRef.current;
       Promise.all([getModelGroups(), getRoutes(), getProviders()])
         .then(([g, r, p]) => {
-          setGroups(g.data); setProviders(p.data);
-          if (!wasPersisting && pendingPersistsRef.current === 0 && gen === persistGenRef.current) setRoutes(r.data);
+          setGroups(prev => (jsonEqual(prev, g.data) ? prev : g.data));
+          setProviders(prev => (jsonEqual(prev, p.data) ? prev : p.data));
+          if (!wasPersisting && pendingPersistsRef.current === 0 && gen === persistGenRef.current) {
+            setRoutes(prev => (jsonEqual(prev, r.data) ? prev : r.data));
+          }
         })
         .catch(() => {});
     }, 10000);
@@ -122,7 +127,7 @@ const Models: React.FC = () => {
     // Persist IMMEDIATELY on drop — no debounce: an edit must be written
     // the moment it happens, so a crash or a forced kill right after a drop
     // cannot lose the new order. Each drop fires one request; the poll guard
-    // below keeps the 10s refresh from overwriting the local order while the
+    // below keeps the refresh from overwriting the local order while the
     // write is in flight.
     pendingPersistsRef.current++;
     const groupCounts: Record<number, number> = {};

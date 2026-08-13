@@ -81,3 +81,41 @@ func TestLimitedWindowsRespectsMetricType(t *testing.T) {
 		t.Errorf("LimitedWindows = %v, want %v", got, want)
 	}
 }
+
+// TestStatusChangedCallback: the UI's hot reload depends on the engine
+// notifying a subscriber whenever a key's status flips. Every status write
+// path (relay rate-limit, relay disable, health recovery) funnels through
+// updateKeyStatus, so the callback must fire exactly once per flip with the
+// new status — and not fire when nothing actually changed.
+func TestStatusChangedCallback(t *testing.T) {
+	e := newTestEngine(t)
+	key := model.Key{ProviderID: 1, Status: model.KeyStatusActive}
+	if err := db.GetDB().Create(&key).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	var got []string
+	e.SetOnStatusChanged(func(keyID int64, status string) {
+		if keyID != key.ID {
+			t.Errorf("callback keyID = %d, want %d", keyID, key.ID)
+		}
+		got = append(got, status)
+	})
+
+	// MarkKeyRateLimited with an already-expired cooldown: MarkKeyDisabled
+	// deliberately keeps rate_limited_until, and MarkKeyActive refuses to
+	// recover a key whose cooldown is still running (that guard is tested
+	// elsewhere) — so the active flip only fires once the cooldown passed.
+	e.MarkKeyRateLimited(key.ID, 0)
+	e.MarkKeyDisabled(key.ID, "auth_failed")
+	// A no-op flip (already disabled with the same reason) must NOT fire the
+	// callback: the RowsAffected==0 guard is what keeps the SSE push quiet
+	// when nothing actually changed.
+	e.MarkKeyDisabled(key.ID, "auth_failed")
+	e.MarkKeyActive(key.ID)
+
+	want := []string{model.KeyStatusRateLimited, model.KeyStatusDisabled, model.KeyStatusActive}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("status changes = %v, want %v", got, want)
+	}
+}

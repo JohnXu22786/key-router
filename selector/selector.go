@@ -24,6 +24,22 @@ type Engine struct {
 	routes    map[string][]*RouteEntry // model group ID -> routes
 	providers map[int64]*model.Provider
 	keys      map[int64][]*model.Key
+
+	// onStatusChanged, when set, is invoked after a key's status flips in
+	// the DB (rate_limited / disabled / active). The UI hot-reload path
+	// depends on it: every status write funnels through updateKeyStatus, so
+	// this single callback turns "a key changed" into an SSE push.
+	onStatusChanged func(keyID int64, status string)
+}
+
+// SetOnStatusChanged registers a callback invoked whenever a key's status
+// changes (via MarkKeyRateLimited / MarkKeyDisabled / MarkKeyActive). It is
+// called after the DB write, while the engine lock is held — keep it cheap
+// and non-blocking (e.g. publish to an event hub).
+func (e *Engine) SetOnStatusChanged(cb func(keyID int64, status string)) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.onStatusChanged = cb
 }
 
 // RouteEntry is a cached route with resolved provider and keys
@@ -370,6 +386,14 @@ func (e *Engine) updateKeyStatus(keyID int64, status string, rateLimitedUntil *t
 				}
 			}
 		}
+	}
+
+	// Notify the SSE push path. Called only from the Mark* methods after a
+	// successful DB write (RowsAffected > 0), so no event is published for
+	// a no-op change. The callback runs with the lock held: it must not
+	// block (the event hub's Publish is non-blocking).
+	if e.onStatusChanged != nil {
+		e.onStatusChanged(keyID, status)
 	}
 }
 

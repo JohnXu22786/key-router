@@ -19,11 +19,11 @@ export type TabKey = 'overview' | 'trends' | 'explore';
 const Activity: React.FC = () => {
   const [tab, setTab] = useState<TabKey>('overview');
   const [rangeIdx, setRangeIdx] = useState(4); // default 1mo like the saved page
-  const [refreshKey, setRefreshKey] = useState(0);
   const [loading, setLoading] = useState(false);
   // "now" is a state so Refresh recomputes the date window to the current
   // moment — otherwise the ranges freeze at page-load time and the data
-  // never updates.
+  // never updates. Each change slides the range and re-fetches in place
+  // (the pages below keep the previous data visible while refreshing).
   const [now, setNow] = useState(() => dayjs());
   const ranges = useMemo(() => makeRanges(now), [now]);
   const range = ranges[rangeIdx];
@@ -31,19 +31,17 @@ const Activity: React.FC = () => {
   const handleRefresh = useCallback(async () => {
     setLoading(true);
     setNow(dayjs()); // slide the window to now
-    setRefreshKey(k => k + 1);
     await new Promise(r => setTimeout(r, 50));
     setLoading(false);
   }, []);
 
-  // Keep the displayed range fresh: slide "now" every minute (the range
+  // Keep the displayed range fresh: slide "now" every 30s (the range
   // header and the queries are derived from it) and when switching tabs.
   useEffect(() => {
-    const t = setInterval(() => setNow(dayjs()), 60000);
+    const t = setInterval(() => setNow(dayjs()), 30000);
     return () => clearInterval(t);
   }, []);
   useEffect(() => { setNow(dayjs()); }, [tab]);
-  useEffect(() => { setRefreshKey(k => k + 1); }, [rangeIdx]);
 
   const onTabChange = (k: string) => setTab(k as TabKey);
 
@@ -80,9 +78,12 @@ const Activity: React.FC = () => {
 
       {loading && <Spin style={{ display: 'block', margin: '40px auto' }} />}
 
-      {tab === 'overview' && <ActivityOverview key={`ov-${refreshKey}`} range={range} />}
-      {tab === 'trends' && <ActivityTrends key={`tr-${refreshKey}`} range={range} />}
-      {tab === 'explore' && <ActivityExplore key={`ex-${refreshKey}`} range={range} />}
+      {/* No key= remount: pages re-fetch on range change and keep the
+          previous content visible while refreshing — a refresh must never
+          blank the page. */}
+      {tab === 'overview' && <ActivityOverview range={range} />}
+      {tab === 'trends' && <ActivityTrends range={range} />}
+      {tab === 'explore' && <ActivityExplore range={range} />}
     </div>
   );
 };

@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"key-router/db"
+	"key-router/events"
 	"key-router/health"
 	"key-router/model"
 	"key-router/router"
@@ -32,7 +33,7 @@ func bootstrapKeys(t *testing.T) *gin.Engine {
 	db.SetSetting(model.SettingPort, "9999")
 	engine := selector.NewEngine()
 	checker := health.NewChecker()
-	return router.Setup(embed.FS{}, engine, checker)
+	return router.Setup(embed.FS{}, engine, checker, events.NewHub())
 }
 
 func closeTestDB(t *testing.T) {

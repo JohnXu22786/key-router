@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"key-router/events"
 	"key-router/handler"
 	"key-router/health"
 	"key-router/middleware"
@@ -64,6 +65,7 @@ func Setup(
 	staticFS embed.FS,
 	engine *selector.Engine,
 	checker *health.Checker,
+	hub *events.Hub,
 ) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
@@ -77,7 +79,7 @@ func Setup(
 
 	// Create handlers
 	chatHandler := handler.NewChatHandler(engine)
-	adminHandler := handler.NewAdminHandler(engine, checker)
+	adminHandler := handler.NewAdminHandler(engine, checker, hub)
 	sharedAdminHandler.mu.Lock()
 	sharedAdminHandler.h = adminHandler
 	sharedAdminHandler.mu.Unlock()
@@ -149,6 +151,10 @@ func Setup(
 
 		// Actions
 		api.POST("/reload", adminHandler.ReloadConfig)
+
+		// SSE push channel: the UI subscribes here and re-fetches affected
+		// resources on events instead of relying on poll intervals alone.
+		api.GET("/events", adminHandler.StreamEvents)
 	}
 
 	// ===== Static files (React SPA) =====

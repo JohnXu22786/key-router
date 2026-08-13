@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"key-router/db"
+	"key-router/events"
 	"key-router/health"
 	"key-router/model"
 	"key-router/router"
@@ -66,7 +67,7 @@ func TestRelayLatencyOverhead(t *testing.T) {
 
 	engine := selector.NewEngine()
 	checker := health.NewChecker()
-	e := router.Setup(embed.FS{}, engine, checker)
+	e := router.Setup(embed.FS{}, engine, checker, events.NewHub())
 
 	do := func() (time.Duration, int) {
 		body, _ := json.Marshal(map[string]interface{}{"model": "mock-model", "messages": []map[string]string{{"role": "user", "content": "hi"}}})

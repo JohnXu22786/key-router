@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"key-router/events"
 	"key-router/handler"
 	"key-router/update"
 
@@ -21,7 +22,7 @@ import (
 // mode) even when no auto-check has run yet.
 func TestGetAutoCheckStateAlwaysReportsInstallMode(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	h := handler.NewAdminHandler(nil, nil)
+	h := handler.NewAdminHandler(nil, nil, events.NewHub())
 	// Pin the mode deterministically (skip the marker-file detection that
 	// reads os.Executable of the test runner).
 	upd := update.NewClient(h.Updater.CurrentVersion())
@@ -56,7 +57,7 @@ func TestGetAutoCheckStateAlwaysReportsInstallMode(t *testing.T) {
 // has run, its outcome is served alongside the local facts.
 func TestGetAutoCheckStateSurfacesLastResult(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	h := handler.NewAdminHandler(nil, nil)
+	h := handler.NewAdminHandler(nil, nil, events.NewHub())
 	h.SetAutoCheckInfo(&update.UpdateInfo{
 		CurrentVersion:  "0.1.8",
 		LatestVersion:   "0.1.9",
@@ -114,7 +115,7 @@ func (f *fakeUpdater) Apply(info *update.UpdateInfo) error {
 func applyContext(t *testing.T) (*handler.AdminHandler, *httptest.ResponseRecorder, *gin.Context) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
-	h := handler.NewAdminHandler(nil, nil)
+	h := handler.NewAdminHandler(nil, nil, events.NewHub())
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest("POST", "/api/updates/apply", nil)
