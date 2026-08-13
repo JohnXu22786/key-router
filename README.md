@@ -97,12 +97,14 @@ Windows are persisted to `windows.json` every 60s and on shutdown, so budgets su
 
 ## Build from source
 
-```bash
-# Backend + embedded UI (the built web/dist is committed, so this works from a fresh clone)
-go build -o keyrouter .
+Requires Go 1.26.5+ and Node 20.19+ (for the web UI build).
 
-# If you changed the web UI:
+```bash
+# Build the web UI first: web/dist is generated (not committed) and is
+# embedded into the binary via //go:embed web/dist/*.
 cd web && npm install && npm run build && cd ..
+
+# Backend + embedded UI
 go build -o keyrouter .
 ```
 

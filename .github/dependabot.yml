@@ -2,8 +2,7 @@
 #
 # Version updates are grouped so the weekly schedule produces at most one PR
 # per ecosystem (minor+patch together); breaking major bumps arrive as
-# individual PRs for manual review. The CI workflow rebuilds and commits
-# web/dist on dependabot PRs, so their checks stay green.
+# individual PRs for manual review.
 version: 2
 updates:
   - package-ecosystem: gomod
