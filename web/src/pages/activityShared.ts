@@ -1,9 +1,11 @@
 import dayjs from 'dayjs';
+import { ActivityResponse } from '../api/client';
 
-// Shared helpers for the Activity pages. Kept OUT of Activity.tsx to avoid
-// the circular import (Activity -> ActivityOverview -> Activity): a
-// circular dependency can yield undefined constants during module init and
-// crash the page.
+// Shared helpers for the Activity pages. Kept OUT of Activity.tsx so no page
+// ever imports from it (Activity -> child -> activityShared would be a
+// circular import, which can hand the children undefined constants during
+// module init and crash the page). activityShared itself only imports
+// dayjs and the API client — a leaf module.
 
 // Bucket granularity for a range. Mirrors OpenRouter's rollup ladder
 // (Hourly / Daily / Weekly / Monthly): sub-3-day windows bucket by hour,
@@ -21,6 +23,13 @@ export interface DateRange {
   since: dayjs.Dayjs;
   until: dayjs.Dayjs;
   granularity: Granularity;
+}
+
+// ExploreOpts carries Trends -> Explore navigation state (the reference
+// "Explore" links pass metric/dimension query params).
+export interface ExploreOpts {
+  metric?: string;
+  groupBy?: string;
 }
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -306,4 +315,61 @@ export function groupTotals<T extends BucketedRow>(list: T[], keyFn: (c: T) => s
     acc.set(keyFn(c), (acc.get(keyFn(c)) || 0) + valFn(c));
   }
   return [...acc.entries()].sort((a, b) => b[1] - a[1]);
+}
+
+// maskKey renders a masked key like "sk-or-v1-063...f48" (first 12 + last 3).
+// Masked unconditionally so a full key_value never reaches the UI.
+export const maskKey = (raw: string): string => {
+  if (!raw) return '';
+  return `${raw.slice(0, 12)}...${raw.slice(-3)}`;
+};
+
+// toChartData builds stacked-chart rows: bucket -> { label, [group]: value }.
+export function toChartData(resp: ActivityResponse): Array<Record<string, string | number>> {
+  const groups = Array.from(new Set(resp.series.map(s => s.group)));
+  const data: Array<Record<string, string | number>> = resp.buckets.map(b => {
+    const row: Record<string, string | number> = { label: b };
+    groups.forEach(g => { row[g] = 0; });
+    return row;
+  });
+  const bucketIdx = new Map(resp.buckets.map((b, i) => [b, i]));
+  for (const p of resp.series) {
+    const i = bucketIdx.get(p.bucket);
+    if (i !== undefined) data[i][p.group] = p.value;
+  }
+  return data;
+}
+
+// TrendingRow is one entry of the Trends "Trending" card.
+export interface TrendingRow {
+  group: string;
+  pct: number;   // relative change vs the previous period (-100.., 100 for New)
+  isNew: boolean;
+  spark: number[]; // previous-period series (flat zeros when no prior usage)
+}
+
+// computeTrending builds the "Trending" list: relative change vs the
+// previous period per entity. "Other" is an aggregation bucket, never a real
+// entity — excluded. Ranked by the absolute drop (prev − cur); entities new
+// to this period (prev = 0, cur > 0) rank by their current value. Up to 6
+// rows, like the reference page.
+export function computeTrending(cur: ActivityResponse, prev: ActivityResponse): TrendingRow[] {
+  const prevSum = new Map(prev.summary.map(s => [s.group, s.sum]));
+  const names = new Set([...cur.summary.map(s => s.group), ...prevSum.keys()]);
+  return [...names]
+    .filter(g => g !== 'Other')
+    .map(g => {
+      const c = cur.summary.find(s => s.group === g)?.sum ?? 0;
+      const p = prevSum.get(g) ?? 0;
+      if (c === 0 && p === 0) return null;
+      const isNew = p === 0 && c > 0;
+      const pct = p > 0 ? ((c - p) / p) * 100 : 100;
+      let spark = prev.series.filter(s => s.group === g).map(s => s.value);
+      if (spark.length === 0) spark = prev.buckets.map(() => 0);
+      return { group: g, pct, isNew, spark, sortVal: p > 0 ? p - c : c };
+    })
+    .filter((r): r is NonNullable<typeof r> => r !== null)
+    .sort((a, b) => b.sortVal - a.sortVal)
+    .slice(0, 6)
+    .map(({ group, pct, isNew, spark }) => ({ group, pct, isNew, spark }));
 }

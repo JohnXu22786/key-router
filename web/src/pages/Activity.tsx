@@ -5,13 +5,12 @@ import dayjs from 'dayjs';
 import ActivityOverview from './ActivityOverview';
 import ActivityTrends from './ActivityTrends';
 import ActivityExplore from './ActivityExplore';
-// Shared helpers live in activityShared.ts (NOT here) to avoid a circular
-// import: Activity -> ActivityOverview -> activityShared. A cycle can hand
-// the children undefined constants and crash the page.
-import { makeRanges, customRange, CUSTOM_KEY, CUSTOM_LABEL } from './activityShared';
+// Shared helpers live in activityShared.ts (a leaf module importing only
+// dayjs and the API client), so pages never import from Activity.tsx — a
+// cycle (Activity -> child -> Activity) can hand the children undefined
+// constants and crash the page.
+import { makeRanges, customRange, CUSTOM_KEY, CUSTOM_LABEL, ExploreOpts } from './activityShared';
 import type { DateRange } from './activityShared';
-export { fmtCompact, fmtUSD, fmtTokens, fmtPercent, GRID, AXIS, CHART_COLORS, OTHER_COLOR, fmt3sig } from './activityShared';
-export type { DateRange } from './activityShared';
 
 const { Title, Text } = Typography;
 
@@ -40,7 +39,9 @@ const Activity: React.FC = () => {
   const [rangeKey, setRangeKey] = useState('1mo'); // default like the saved page
   const [custom, setCustom] = useState<{ since: dayjs.Dayjs; until: dayjs.Dayjs } | null>(null);
   const [loading, setLoading] = useState(false);
-  // "now" is a state so Refresh recomputes the date windows to the current
+  // Trends "Explore" links hand the metric/grouping to the Explore tab.
+  const [exploreInit, setExploreInit] = useState<ExploreOpts>({});
+  // "now" is a state so Refresh recomputes the date window to the current
   // moment — otherwise the ranges freeze at page-load time and the data
   // never updates. Each change slides the range and re-fetches in place
   // (the pages below keep the previous data visible while refreshing).
@@ -67,7 +68,19 @@ const Activity: React.FC = () => {
   }, []);
   useEffect(() => { setNow(dayjs()); }, [tab]);
 
-  const onTabChange = (k: string) => setTab(k as TabKey);
+  const onTabChange = (k: string) => {
+    // A direct Explore-tab click (not a Trends "Explore" link) should start
+    // with the defaults, not stale state from an earlier link click.
+    if (k === 'explore') setExploreInit({});
+    setTab(k as TabKey);
+  };
+
+  // Trends' "Explore" links (chart + trending card headers, trending rows)
+  // switch to the Explore tab, seeding it with the section's metric/grouping.
+  const handleNavigate = useCallback((tab: TabKey, opts?: ExploreOpts) => {
+    if (opts) setExploreInit(opts);
+    setTab(tab);
+  }, []);
 
   // Picker options, in OpenRouter's order: rolling windows, calendar
   // windows, then the custom range.
@@ -153,8 +166,8 @@ const Activity: React.FC = () => {
           previous content visible while refreshing — a refresh must never
           blank the page. */}
       {tab === 'overview' && <ActivityOverview range={range} />}
-      {tab === 'trends' && <ActivityTrends range={range} />}
-      {tab === 'explore' && <ActivityExplore range={range} />}
+      {tab === 'trends' && <ActivityTrends range={range} onNavigate={handleNavigate} />}
+      {tab === 'explore' && <ActivityExplore range={range} initialMetric={exploreInit.metric} initialGroupBy={exploreInit.groupBy} />}
     </div>
   );
 };
