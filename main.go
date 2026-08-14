@@ -245,17 +245,21 @@ func main() {
 
 	// When window closes, stop server
 	log.Println("[main] window closed, shutting down...")
-	// Reject NEW requests first (in-flight SSE streams are allowed to finish
-	// in the background — the agent keeps receiving its response until it
-	// completes, then the process exits).
+	// Refuse NEW work: the shutdown middleware closes new requests'
+	// connections without a response, so clients see a connection failure
+	// and auto-retry — the one failure mode every agent retries. Health
+	// stays answerable until the listener closes.
 	middleware.BeginShutdown()
 	close(stopPersist)
 	<-persistDone
 	// Disable (not just Stop) so an in-flight async Restart from
 	// UpdateSettings can't relaunch the loop after shutdown
 	checker.Disable()
-	// Stop serving FIRST so no in-flight relay can increment windows between
-	// the save and shutdown (those increments would be lost on restart)
+	// Shutdown closes the listener (new connections get refused) and waits
+	// for in-flight requests to finish NATURALLY — no deadline: the agent
+	// keeps receiving its streaming response until it completes, however
+	// long that takes. No in-flight relay runs after this, so the window
+	// save below is consistent.
 	app.Shutdown()
 	pruneWindows()
 	if err := engine.WindowManager.SaveToFile(windowsPath); err != nil {

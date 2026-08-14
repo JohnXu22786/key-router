@@ -1245,14 +1245,15 @@ func (h *AdminHandler) ReloadConfig(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "message": "configuration reloaded"})
 }
 
-// Restart accepts a gateway restart: new requests are rejected (503) while
-// in-flight API calls drain, then the process exits and a fresh instance
-// takes over (so settings like the server port take effect). The fresh
-// instance is scheduled BEFORE the response so a scheduling failure is
-// reported as 500 (and a later attempt can succeed); the 200 is then
-// written and flushed before the quit hook runs — the process may exit as
-// soon as the drain completes, so callers must not depend on the
-// connection staying open.
+// Restart accepts a gateway restart: new requests' connections are closed
+// without a response (clients see a connection failure and auto-retry)
+// while in-flight API calls finish naturally, then the process exits and a
+// fresh instance takes over (so settings like the server port take
+// effect). The fresh instance is scheduled BEFORE the response so a
+// scheduling failure is reported as 500 (and a later attempt can succeed);
+// the 200 is then written and flushed before the quit hook runs — the
+// process may exit as soon as the drain completes, so callers must not
+// depend on the connection staying open.
 func (h *AdminHandler) Restart(c *gin.Context) {
 	if h.RestartSchedule == nil || h.RestartQuit == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "restart is not supported in this build"})
