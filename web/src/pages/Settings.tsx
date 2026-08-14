@@ -206,18 +206,7 @@ const Settings: React.FC = () => {
   return (
     <div>
       <Title level={3}>Settings</Title>
-      <Card title="Appearance" style={{ marginBottom: 16 }}>
-        <Form layout="vertical">
-          <Form.Item label="Theme Mode" tooltip="Applies immediately. 'Follow System' matches the OS theme and updates live.">
-            <Radio.Group value={themeMode} onChange={(e) => setThemeMode(e.target.value as ThemeMode)}>
-              <Radio.Button value="light"><SunOutlined /> Light</Radio.Button>
-              <Radio.Button value="dark"><MoonOutlined /> Dark</Radio.Button>
-              <Radio.Button value="system"><DesktopOutlined /> Follow System</Radio.Button>
-            </Radio.Group>
-          </Form.Item>
-        </Form>
-      </Card>
-      <Card style={{ marginTop: 16 }}>
+      <Card title="Server Settings" style={{ marginBottom: 16 }}>
         <Form form={form} layout="vertical">
           <Form.Item name="server.port" label="Server Port" tooltip="Takes effect after restarting the app.">
             <InputNumber min={1024} max={65535} style={{ width: '100%' }} />
@@ -234,6 +223,20 @@ const Settings: React.FC = () => {
           <Form.Item name="server.health_check_interval" label="Health Check Interval (seconds)">
             <InputNumber min={10} max={3600} style={{ width: '100%' }} />
           </Form.Item>
+          <Button type="primary" loading={saving} onClick={handleSave}>Save Settings</Button>
+          <Button style={{ marginLeft: 12 }} onClick={handleReload}>Reload Config</Button>
+        </Form>
+      </Card>
+
+      <Card title="App Settings" style={{ marginBottom: 16 }}>
+        <Form layout="vertical">
+          <Form.Item label="Theme Mode" tooltip="Applies immediately. 'Follow System' matches the OS theme and updates live.">
+            <Radio.Group value={themeMode} onChange={(e) => setThemeMode(e.target.value as ThemeMode)}>
+              <Radio.Button value="light"><SunOutlined /> Light</Radio.Button>
+              <Radio.Button value="dark"><MoonOutlined /> Dark</Radio.Button>
+              <Radio.Button value="system"><DesktopOutlined /> Follow System</Radio.Button>
+            </Radio.Group>
+          </Form.Item>
           {autostart && autostart.supported && (
             <Form.Item
               label={
@@ -247,22 +250,16 @@ const Settings: React.FC = () => {
               <Switch checked={autostart.enabled} loading={autostartSaving} onChange={handleAutostartChange} />
             </Form.Item>
           )}
-          <Button type="primary" loading={saving} onClick={handleSave}>Save Settings</Button>
-          <Button style={{ marginLeft: 12 }} onClick={handleReload}>Reload Config</Button>
         </Form>
-      </Card>
-
-      <Card title="Software Update" style={{ marginTop: 16 }}
-        extra={
-          <Space>
+        <Divider />
+        <Space direction="vertical" style={{ width: '100%' }}>
+          <Space wrap>
+            <Typography.Title level={5} style={{ margin: 0 }}>Software Update</Typography.Title>
             <Tag color={updateInfo?.update_available ? 'gold' : 'default'}>
               {updateInfo ? `v${updateInfo.current_version}${updateInfo.update_available ? ` → v${updateInfo.latest_version}` : ' (latest)'}` : appVersion ? `v${appVersion}` : '—'}
             </Tag>
             <Tag>{mode === 'installed' ? 'Installed' : mode === 'portable' ? 'Portable' : '—'}</Tag>
           </Space>
-        }
-      >
-        <Space direction="vertical" style={{ width: '100%' }}>
           {mode && (
             <Typography.Paragraph type="secondary" style={{ marginBottom: 8 }}>
               {mode === 'installed'
@@ -297,7 +294,7 @@ const Settings: React.FC = () => {
         </Space>
       </Card>
 
-      <Card title="About" style={{ marginTop: 16 }}>
+      <Card title="About">
         <Space direction="vertical" size="middle" style={{ width: '100%' }}>
           <Space>
             <Typography.Text strong>KeyRouter</Typography.Text>

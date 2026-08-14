@@ -32,6 +32,33 @@ export interface ExploreOpts {
   groupBy?: string;
 }
 
+// --- Activity page entity filter ------------------------------------------
+// The filter button (left of the date range) narrows every tab to a single
+// entity: one model, one API key or one app. Passed to both the activity
+// and consumptions endpoints as filter_type/filter_value so the server
+// excludes rows before aggregating (Trends' per-key breakdowns stay correct
+// under a model filter).
+export type ActivityFilterType = 'model' | 'key' | 'app';
+
+export interface ActivityFilter {
+  type: ActivityFilterType;
+  // model/app name, or the key's numeric id for type 'key'.
+  value: string;
+  // Display label for the filter button (key name / model / app name).
+  label: string;
+}
+
+export const FILTER_TYPES: { value: ActivityFilterType; label: string }[] = [
+  { value: 'model', label: 'Model' },
+  { value: 'key', label: 'API Key' },
+  { value: 'app', label: 'App' },
+];
+
+// filterKey serializes a filter for fetch keys ("model:gpt-4o", "" when
+// none) so a filter change drops stale data instead of merging it.
+export const filterKey = (f: ActivityFilter | null | undefined): string =>
+  f ? `${f.type}:${f.value}` : '';
+
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
 // Monday 00:00 of now's week (dayjs starts weeks on Sunday).
@@ -165,6 +192,18 @@ export const fmtPercent = (v: number): string => {
   if (v >= 100) return `${Math.round(v)}%`;
   if (v >= 1) return `${v.toFixed(1)}%`;
   return `${v.toFixed(2)}%`;
+};
+
+// cacheHitRate = cached / TOTAL input tokens (incl. cached), in percent.
+// The backend stores input_tokens under one convention for every provider:
+// total input including cached tokens (OpenAI's prompt_tokens includes
+// cached_tokens; Anthropic's input_tokens is folded at record time), so the
+// denominator is input alone — adding cache again would double-count it and
+// collapse high rates toward ~50%. Clamped to 100: legacy Anthropic rows
+// stored input WITHOUT cache, where cached tokens can exceed input.
+export const cacheHitRate = (input: number, cache: number): number => {
+  if (input <= 0) return 0;
+  return Math.min(100, (cache / input) * 100);
 };
 
 export const GRID = 'rgba(120,120,140,0.14)';

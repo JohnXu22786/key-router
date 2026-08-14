@@ -25,6 +25,7 @@ import (
 	"key-router/update"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 // version is injected at build time via -ldflags "-X main.version=..." Ã¢â‚¬â€ the
@@ -1173,6 +1174,13 @@ func (h *AdminHandler) GetStatsConsumptions(c *gin.Context) {
 	if keyID := c.Query("key_id"); keyID != "" {
 		query = query.Where("key_id = ?", keyID)
 	}
+	// Activity-page entity filter (Model / API Key / App).
+	filtered, err := applyActivityFilter(query, c.Query("filter_type"), c.Query("filter_value"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	query = filtered
 	if since := c.Query("since"); since != "" {
 		if t, err := time.Parse(time.RFC3339, since); err == nil {
 			// Floor to the LOCAL hour: hour_bucket holds the whole hour's
@@ -1388,8 +1396,16 @@ type ActivitySeriesPoint struct {
 	IsZero   bool    `json:"is_zero"` // explicit zero for chart stacking
 }
 
-// activityAcc accumulates one (bucket, group) cell.
-type activityAcc struct{ sum float64 }
+// activityAcc accumulates one (bucket, group) cell. sum is the selected
+// metric's value; spend/tokens/requests/cache track every metric so "rank
+// by <other metric>" can re-rank groups without re-reading the rows.
+type activityAcc struct {
+	sum      float64 // selected metric
+	spend    float64
+	tokens   float64
+	requests float64
+	cache    float64
+}
 
 // ActivityGroupSummary is one row of the Explore-style summary table.
 type ActivityGroupSummary struct {
@@ -1413,6 +1429,44 @@ type ActivityResponse struct {
 	Totals  map[string]float64     `json:"totals"`  // metric totals: spend/tokens/requests/cache
 }
 
+// applyActivityFilter constrains a consumption query by the Activity page's
+// entity filter (filter_type=model|key|app + filter_value). Shared by
+// GetActivity and GetStatsConsumptions so both endpoints see the same rows.
+// "Unknown" matches empty model/app names — the label the UI shows for rows
+// without one. filter_value for filter_type=key is the key's numeric id.
+func applyActivityFilter(q *gorm.DB, filterType, filterValue string) (*gorm.DB, error) {
+	if filterType == "" {
+		if filterValue != "" {
+			return nil, errors.New("filter_value requires filter_type")
+		}
+		return q, nil
+	}
+	if filterType != "model" && filterType != "key" && filterType != "app" {
+		return nil, errors.New("filter_type must be model|key|app")
+	}
+	if filterValue == "" {
+		return nil, fmt.Errorf("filter_value is required for filter_type=%s", filterType)
+	}
+	switch filterType {
+	case "model":
+		if filterValue == "Unknown" {
+			return q.Where("model_name = '' OR model_name IS NULL"), nil
+		}
+		return q.Where("model_name = ?", filterValue), nil
+	case "key":
+		id, err := strconv.ParseInt(filterValue, 10, 64)
+		if err != nil {
+			return nil, errors.New("filter_value must be a key id for filter_type=key")
+		}
+		return q.Where("key_id = ?", id), nil
+	default: // app
+		if filterValue == "Unknown" {
+			return q.Where("app_name = '' OR app_name IS NULL"), nil
+		}
+		return q.Where("app_name = ?", filterValue), nil
+	}
+}
+
 // GetActivity aggregates consumption for the Activity page.
 // Query params:
 //
@@ -1421,13 +1475,22 @@ type ActivityResponse struct {
 //	subgroup: model | key | app                    (optional second dimension,
 //	          must differ from group_by; splits each group's series into
 //	          per-subgroup stacks, e.g. spend by model, split by API key)
-//	rollup:   hour | day | week | month             (default day)
+//	rollup:   hour | day | week | month | total    (default day; total
+//	          collapses the whole range into a single "Total" bucket)
+//	rank_by:  current | spend | tokens | requests | cache (default current;
+//	          ranks the series Top-N (and the summary's default order) by the
+//	          given metric, which may differ from the charted one)
 //	since / until: RFC3339, inclusive range
+//	filter_type / filter_value: restrict rows to one entity before
+//	          aggregating (the Activity page's filter button). filter_type is
+//	          model|key|app; filter_value is the model/app name or a key id.
+//	          "Unknown" matches rows with an empty model/app name.
 func (h *AdminHandler) GetActivity(c *gin.Context) {
 	metric := c.DefaultQuery("metric", "spend")
 	groupBy := c.DefaultQuery("group_by", "model")
 	subgroup := c.DefaultQuery("subgroup", "")
 	rollup := c.DefaultQuery("rollup", "day")
+	rankBy := c.DefaultQuery("rank_by", "current")
 	// Top-N for the chart: series beyond this many groups are folded into an
 	// "Other" series (#94a3b8) like OpenRouter. 0 = no folding.
 	topN := 0
@@ -1454,8 +1517,12 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 			return
 		}
 	}
-	if rollup != "hour" && rollup != "day" && rollup != "week" && rollup != "month" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "rollup must be hour|day|week|month"})
+	if rollup != "hour" && rollup != "day" && rollup != "week" && rollup != "month" && rollup != "total" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "rollup must be hour|day|week|month|total"})
+		return
+	}
+	if rankBy != "current" && rankBy != "spend" && rankBy != "tokens" && rankBy != "requests" && rankBy != "cache" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "rank_by must be current|spend|tokens|requests|cache"})
 		return
 	}
 
@@ -1478,18 +1545,22 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 		}
 	}
 
-	// Load consumption in range. The window is widened to the rollup buckets
-	// CONTAINING its endpoints: hour_bucket rows are truncated to the local
-	// hour, so a range starting at 16:05 must still include the 16:00 bucket
-	// (it holds the 16:00–17:00 usage) — without the floor the 15m/30m
-	// presets show nothing for most of the hour. buildActivityAxis floors
-	// the same way, so the query and the response axis always agree.
+	// Load consumption in range, restricted by the entity filter. The window
+	// is widened to the rollup buckets CONTAINING its endpoints: hour_bucket
+	// rows are truncated to the local hour, so a range starting at 16:05 must
+	// still include the 16:00 bucket (it holds the 16:00–17:00 usage) —
+	// without the floor the 15m/30m presets show nothing for most of the
+	// hour. buildActivityAxis floors the same way, so the query and the
+	// response axis always agree.
 	from, to := activityWindow(since, until, rollup)
+	query := db.GetDB().Where("hour_bucket >= ? AND hour_bucket < ?", from, to)
+	query, err := applyActivityFilter(query, c.Query("filter_type"), c.Query("filter_value"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	var rows []model.Consumption
-	if err := db.GetDB().
-		Where("hour_bucket >= ? AND hour_bucket < ?", from, to).
-		Order("hour_bucket ASC").
-		Find(&rows).Error; err != nil {
+	if err := query.Order("hour_bucket ASC").Find(&rows).Error; err != nil {
 		log.Printf("[admin] GetActivity load error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load consumption"})
 		return
@@ -1519,7 +1590,7 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 				return n
 			}
 			return fmt.Sprintf("Key #%d", r.KeyID)
-		default: // app = the X-App request header ("" = "Unknown")
+		default: // app = the attribution-detected client app ("" = "Unknown")
 			if r.AppName != "" {
 				return r.AppName
 			}
@@ -1587,7 +1658,12 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 		if _, ok := agg[b][g]; !ok {
 			agg[b][g] = &activityAcc{}
 		}
-		agg[b][g].sum += valueOf(&rows[i])
+		a := agg[b][g]
+		a.sum += valueOf(&rows[i])
+		a.spend += rows[i].CostUSD
+		a.tokens += float64(rows[i].InputTokens + rows[i].OutputTokens)
+		a.requests += float64(rows[i].RequestCount)
+		a.cache += float64(rows[i].CacheHitTokens)
 		if !seenGroup[g] {
 			seenGroup[g] = true
 			groupOrder = append(groupOrder, g)
@@ -1643,19 +1719,41 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 		}
 	}
 
-	// Series groups are ordered by total Sum (desc) so the chart's Top-N set
-	// matches the summary table's ordering.
-	sort.Slice(groupOrder, func(i, j int) bool {
-		var si, sj float64
+	// Series groups are ordered by the rank metric (desc) so the chart's
+	// Top-N set matches the summary table's ordering. "current" means the
+	// selected chart metric (its totals live in acc.sum).
+	rankTotal := func(acc *activityAcc) float64 {
+		switch rankBy {
+		case "spend":
+			return acc.spend
+		case "tokens":
+			return acc.tokens
+		case "requests":
+			return acc.requests
+		case "cache":
+			return acc.cache
+		default:
+			return acc.sum
+		}
+	}
+	// rankTotals: per-group total of the rank metric, computed once and used
+	// by both the series ordering and the summary sort.
+	rankTotals := make(map[string]float64, len(groupOrder))
+	for _, g := range groupOrder {
+		var s float64
 		for _, b := range bucketOrder {
-			if m, ok := agg[b][groupOrder[i]]; ok {
-				si += m.sum
-			}
-			if m, ok := agg[b][groupOrder[j]]; ok {
-				sj += m.sum
+			if m, ok := agg[b][g]; ok {
+				s += rankTotal(m)
 			}
 		}
-		return si > sj
+		rankTotals[g] = s
+	}
+	sort.Slice(groupOrder, func(i, j int) bool {
+		si, sj := rankTotals[groupOrder[i]], rankTotals[groupOrder[j]]
+		if si != sj {
+			return si > sj
+		}
+		return groupOrder[i] < groupOrder[j]
 	})
 
 	// Build the response.
@@ -1790,9 +1888,14 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 			Percent: percent,
 		})
 	}
-	// Sort summary by Sum descending (OpenRouter's default rank = current metric).
+	// Sort summary by the rank metric descending (OpenRouter's "Rank by"
+	// control; "current" = the chart metric's sum).
 	sort.Slice(resp.Summary, func(i, j int) bool {
-		return resp.Summary[i].Sum > resp.Summary[j].Sum
+		si, sj := rankTotals[resp.Summary[i].Group], rankTotals[resp.Summary[j].Group]
+		if si != sj {
+			return si > sj
+		}
+		return resp.Summary[i].Group < resp.Summary[j].Group
 	})
 
 	c.JSON(http.StatusOK, resp)
@@ -1822,8 +1925,9 @@ func mondayOf(t time.Time) time.Time {
 
 // activityBucketLabel is the ONE place that maps a time to a rollup bucket
 // label (year-qualified "YYYY-MM-DD", "YYYY-MM-DD 15:00", "2006-01-02",
-// "YYYY-MM"). Both the axis builder and the row aggregation use it, so a
-// row can never be labeled off the axis and silently dropped.
+// "YYYY-MM", or "Total" for the total rollup). Both the axis builder and the
+// row aggregation use it, so a row can never be labeled off the axis and
+// silently dropped.
 func activityBucketLabel(t time.Time, rollup string) string {
 	switch rollup {
 	case "hour":
@@ -1832,6 +1936,8 @@ func activityBucketLabel(t time.Time, rollup string) string {
 		return mondayOf(t).Format("2006-01-02")
 	case "month":
 		return t.Format("2006-01")
+	case "total":
+		return "Total"
 	default:
 		return t.Format("2006-01-02")
 	}
@@ -1865,13 +1971,14 @@ func activityWindow(since, until time.Time, rollup string) (from, to time.Time) 
 }
 
 // buildActivityAxis builds a CONTINUOUS bucket axis over since..until at the
-// requested rollup (hour|day|week|month), so days/hours without traffic still
-// appear (OR renders the full range). Hour buckets are floored to the LOCAL
-// hour (billing truncates hour_bucket to the local hour too — UTC Truncate
-// would misalign in half-hour-offset zones like +05:30); day/week step
-// calendar-wise (AddDate) so a 25-hour DST fall-back day neither duplicates
-// a date label nor skips a week; the repeated wall-clock hour of a fall-back
-// keeps a single bucket (both passes aggregate into it by label).
+// requested rollup (hour|day|week|month|total), so days/hours without traffic
+// still appear (OR renders the full range). Hour buckets are floored to the
+// LOCAL hour (billing truncates hour_bucket to the local hour too — UTC
+// Truncate would misalign in half-hour-offset zones like +05:30); day/week
+// step calendar-wise (AddDate) so a 25-hour DST fall-back day neither
+// duplicates a date label nor skips a week; the repeated wall-clock hour of
+// a fall-back keeps a single bucket (both passes aggregate into it by
+// label). The total rollup collapses everything into one "Total" bucket.
 func buildActivityAxis(since, until time.Time, rollup string) []string {
 	bucketOf := func(t time.Time) string {
 		return activityBucketLabel(t, rollup)
@@ -1895,6 +2002,8 @@ func buildActivityAxis(since, until time.Time, rollup string) []string {
 		for t := mondayOf(since); !t.After(until); t = t.AddDate(0, 0, 7) {
 			bucketOrder = append(bucketOrder, bucketOf(t))
 		}
+	case "total":
+		bucketOrder = append(bucketOrder, "Total")
 	default: // month
 		start := time.Date(since.Year(), since.Month(), 1, 0, 0, 0, 0, since.Location())
 		for t := start; !t.After(until); t = t.AddDate(0, 1, 0) {

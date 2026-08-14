@@ -73,6 +73,11 @@ const Providers: React.FC = () => {
   // modal is open.
   const detailOpenRef = useRef(false);
   detailOpenRef.current = detailOpen;
+  // The key the open detail modal is showing. The 5s poll refreshes that
+  // modal so its Window Counters track the live sliding windows as the
+  // buckets rotate (see refreshDetail below).
+  const detailIdRef = useRef<number | null>(null);
+  detailIdRef.current = detailData?.key?.id ?? null;
   // Coalescing for SSE-triggered refetches: a burst of status flips must
   // not launch N concurrent fetches whose out-of-order responses could
   // briefly revert the table. One fetch runs at a time; events arriving in
@@ -105,6 +110,34 @@ const Providers: React.FC = () => {
 
   useEffect(() => { fetch(); }, []);
 
+  // Refresh the open key-detail modal. Shared by the SSE push (key status
+  // flips) and the 5s poll (window usage) — without the poll the modal's
+  // Window Counters would freeze on screen: window budgets never flip a
+  // key's status, so SSE alone never refetches them while they slide.
+  // Skipped entirely while the modal is closed. Events/polls arriving
+  // while a fetch is in flight schedule one trailing re-run, so no
+  // update is dropped.
+  const refreshDetail = useCallback((keyId: number) => {
+    if (!detailOpenRef.current) return;
+    if (detailFetchingRef.current) { detailFetchAgainRef.current = true; return; }
+    detailFetchingRef.current = true;
+    getKeyDetail(keyId).then(res => {
+      detailFetchingRef.current = false;
+      if (detailFetchAgainRef.current) {
+        detailFetchAgainRef.current = false;
+        // Re-run for the modal's CURRENT key: the call that queued this
+        // re-run may have been for a key the user already switched away
+        // from, and its response would be discarded by the id guard
+        // below. No-ops via the detailOpenRef guard when the modal closed.
+        refreshDetail(detailIdRef.current ?? keyId);
+        return;
+      }
+      if (detailOpenRef.current) {
+        setDetailData((prev: any) => (prev?.key?.id === keyId && !jsonEqual(prev, res.data) ? res.data : prev));
+      }
+    }).catch(() => { detailFetchingRef.current = false; });
+  }, []);
+
   // Live push: the backend publishes key_status_changed over SSE the moment
   // the relay/health checker flips a key, so the table turns red at the
   // same time as the detail panel instead of waiting for the next poll.
@@ -135,37 +168,19 @@ const Providers: React.FC = () => {
         }
       }).catch(() => { keysRefetchingRef.current = false; });
     };
-    // Keep an open detail modal live too: its status must never disagree
-    // with the row below it. Skipped entirely while the modal is closed.
-    // Like refreshKeysOnly, events arriving while a fetch is in flight
-    // schedule one trailing re-run so no flip is dropped.
-    const refreshDetail = (keyId: number) => {
-      if (!detailOpenRef.current) return;
-      if (detailFetchingRef.current) { detailFetchAgainRef.current = true; return; }
-      detailFetchingRef.current = true;
-      getKeyDetail(keyId).then(res => {
-        detailFetchingRef.current = false;
-        if (detailFetchAgainRef.current) {
-          detailFetchAgainRef.current = false;
-          refreshDetail(keyId);
-          return;
-        }
-        if (detailOpenRef.current) {
-          setDetailData((prev: any) => (prev?.key?.id === keyId ? res.data : prev));
-        }
-      }).catch(() => { detailFetchingRef.current = false; });
-    };
     return subscribeEvents(evt => {
       if (evt.type !== 'key_status_changed' || evt.key_id == null) return;
       refreshKeysOnly();
       refreshDetail(evt.key_id);
     });
-  }, []);
+  }, [refreshDetail]);
 
   // Poll for key status changes (relay/health checker flip keys as traffic
   // flows) as a fallback for anything a push event can miss (window usage,
   // dropped SSE connection). Keeps expanded groups and scroll position —
-  // only row data updates, and only when it changed.
+  // only row data updates, and only when it changed. The open detail modal
+  // is refreshed on the same tick so its window counters (5h/daily/weekly/
+  // monthly) keep auto-scrolling as the backend buckets rotate.
   useEffect(() => {
     const t = setInterval(() => {
       // A fetch that raced a commit or a persist may carry pre-persist data:
@@ -186,9 +201,12 @@ const Providers: React.FC = () => {
           }
         })
         .catch(() => {});
+      // No-op when the modal is closed (refreshDetail's first guard); the
+      // coalescing refs keep concurrent SSE pushes from stacking fetches.
+      if (detailIdRef.current != null) refreshDetail(detailIdRef.current);
     }, 5000);
     return () => clearInterval(t);
-  }, []);
+  }, [refreshDetail]);
 
   // ---- Provider CRUD ----
   const saveProvider = async () => {
@@ -339,17 +357,6 @@ const Providers: React.FC = () => {
       ),
     },
     { title: 'Strategy', dataIndex: 'recovery_strategy', key: 'recovery_strategy', width: 90 },
-    {
-      title: 'Rate Limits', key: 'limits',
-      render: (_: unknown, r: Key) => (
-        <Space size={4} wrap>
-          {r.rpm_limit > 0 && <Tag>{r.rpm_limit} rpm</Tag>}
-          {r.tpm_limit > 0 && <Tag>{r.tpm_limit} tpm</Tag>}
-          {r.rpd_limit > 0 && <Tag>{r.rpd_metric === 'cost' ? `$${(r.rpd_limit / 1e6).toFixed(2)}/d` : `${r.rpd_limit}/d`}</Tag>}
-          {r.total_spend_limit > 0 && <Tag>${microUsdToUsd(r.total_spend_limit).toFixed(2)} budget</Tag>}
-        </Space>
-      ),
-    },
     {
       title: 'Actions', key: 'actions', width: 120,
       render: (_: unknown, r: Key) => (

@@ -62,6 +62,12 @@ func Init(dataDir string) error {
 		return err
 	}
 
+	// Fold cached tokens into input_tokens for legacy Anthropic consumption
+	// rows (one-time; see migrateAnthropicInputTokensOnce).
+	if err := migrateAnthropicInputTokensOnce(db); err != nil {
+		return err
+	}
+
 	// Seed default settings if not exist
 	seedDefaults(db)
 
@@ -140,6 +146,57 @@ func migratePricingPer1KToPer1M(db *gorm.DB) error {
 // GetDB returns the database instance
 func GetDB() *gorm.DB {
 	return DB
+}
+
+// migrationInputTokensInclCache is the settings flag that gates
+// migrateAnthropicInputTokensOnce: it must run exactly once, because rows
+// recorded after this build already include cached tokens in input_tokens
+// (RecordConsumption folds them) and a second pass would double-count.
+const migrationInputTokensInclCache = "migration.input_tokens_incl_cache"
+
+// migrateAnthropicInputTokensOnce brings legacy consumption rows in line
+// with the uniform "input_tokens includes cached tokens" convention
+// (RecordConsumption folds cache reads + writes for anthropic-format usage).
+// Rows recorded by older builds under anthropic-type providers stored input
+// EXCLUDING cached tokens, which made the UI cache-hit rate
+// (cached / input_tokens) read 0% for fully-cached requests and over 100%
+// otherwise. The fold adds cache_hit + cache_write for those rows exactly
+// once; rows under openai-type providers already include cached tokens and
+// are left untouched. Runs at startup inside a transaction, before any
+// request is served; no-op once the flag is set.
+//
+// Keyed by each key's CURRENT provider type: consumption rows store no
+// usage format, so rows recorded before a provider was re-typed (or a key
+// moved between providers) are indistinguishable from new ones — skipped
+// rows then read above 100% (the frontend rate clamps to 100) and
+// over-folded rows read low. Rows whose key or provider was deleted since
+// are skipped too.
+func migrateAnthropicInputTokensOnce(db *gorm.DB) error {
+	var n int64
+	if err := db.Model(&model.Setting{}).Where("key = ? AND value = '1'", migrationInputTokensInclCache).Count(&n).Error; err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+
+	log.Println("[db] folding cached tokens into input_tokens for legacy Anthropic consumption rows")
+	// Fold and flag write are ONE transaction: a crash or error mid-way
+	// leaves the flag unset, so the next launch retries WITHOUT having
+	// double-counted any rows.
+	err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec(`
+			UPDATE consumptions
+			SET input_tokens = input_tokens + cache_hit_tokens + cache_write_tokens
+			WHERE key_id IN (
+				SELECT k.id FROM keys k JOIN providers p ON p.id = k.provider_id
+				WHERE p.type = 'anthropic'
+			)`).Error; err != nil {
+			return err
+		}
+		return tx.Create(&model.Setting{Key: migrationInputTokensInclCache, Value: "1"}).Error
+	})
+	return err
 }
 
 // seedDefaults inserts default settings if they don't exist

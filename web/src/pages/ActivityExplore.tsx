@@ -12,14 +12,16 @@ import {
 } from '@ant-design/icons';
 import { getActivity, ActivityResponse, ActivityGroupSummary } from '../api/client';
 import {
-  DateRange, fmtUSDInt, fmtTokens, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS,
+  DateRange, ActivityFilter, filterKey, fmtUSDInt, fmtTokens, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS,
   fmtPercent, fmt3sig, fmtTick, fmtBucket, modelFavicon, Granularity,
 } from './activityShared';
+import './explore.css';
 
 const { Text } = Typography;
 
 interface ExploreProps {
   range: DateRange;
+  filter?: ActivityFilter | null;
   // Seeded by the Trends "Explore" links (metric/grouping of the section).
   initialMetric?: string;
   initialGroupBy?: string;
@@ -39,8 +41,21 @@ const GROUP_BY = [
 ];
 
 const ROLLUP = [
-  { value: 'day', label: 'Daily' },
   { value: 'hour', label: 'Hourly' },
+  { value: 'day', label: 'Daily' },
+  { value: 'week', label: 'Weekly' },
+  { value: 'month', label: 'Monthly' },
+  { value: 'total', label: 'Total' },
+];
+
+// RANK_BY mirrors OpenRouter's "Rank by" dropdown: rank the Top-N (and the
+// table's default order) by the current metric or by another metric.
+const RANK_BY = [
+  { value: 'current', label: 'Current metric' },
+  { value: 'spend', label: 'Total Usage ($)' },
+  { value: 'tokens', label: 'Total Tokens' },
+  { value: 'requests', label: 'Request Count' },
+  { value: 'cache', label: 'Cache Hits' },
 ];
 
 const TOPS = [5, 10, 15, 20];
@@ -64,7 +79,10 @@ const SEP = '\u0001';
 const keyFor = (g: string, sg: string) => (sg ? g + SEP + sg : g);
 const displayFor = (g: string, sg: string) => (sg ? `${g} · ${sg}` : g);
 
-// rollupGran maps the API rollup value to a chart-label granularity.
+// rollupGran maps the API rollup value to a chart-label granularity. The
+// "total" rollup renders one bucket labeled "Total": 'day' is safe because
+// fmtTick/fmtBucket pass non-date labels through unchanged (they only
+// reformat strings shaped like dates).
 const rollupGran = (rollup: string): Granularity =>
   rollup === 'hour' ? 'hour' : rollup === 'month' ? 'month' : 'day';
 
@@ -80,7 +98,7 @@ const NUM_COLS: { key: keyof ActivityGroupSummary; label: string }[] = [
   { key: 'value', label: 'Value' },
 ];
 
-const ActivityExplore: React.FC<ExploreProps> = ({ range, initialMetric, initialGroupBy }) => {
+const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric, initialGroupBy }) => {
   // Hand-drawn control chips ("by", "Top") must follow the theme too.
   const { token } = theme.useToken();
   const [metric, setMetric] = useState(initialMetric ?? 'spend');
@@ -88,22 +106,26 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, initialMetric, initial
   const [subgroup, setSubgroup] = useState('');
   const [rollup, setRollup] = useState('day');
   const [topN, setTopN] = useState(10);
+  // Backend rank: 'current' = the chart metric's total; other values rank
+  // the Top-N (and the table's default order) by a different metric.
+  const [rankBy, setRankBy] = useState('current');
   const [chartType, setChartType] = useState<'bar' | 'area' | 'line'>('bar');
   const [legendPos, setLegendPos] = useState<'bottom' | 'right'>('bottom');
   const [expanded, setExpanded] = useState(false);
   const [hidden, setHidden] = useState<Set<string>>(new Set());
-  // Table sort: null = backend order (sum desc, "Rank by: Current metric").
+  // Table sort: null = backend order, i.e. the "Rank by" selection (the
+  // chart metric's total by default). Clicking a header re-sorts client-side.
   const [sortKey, setSortKey] = useState<keyof ActivityGroupSummary | 'group' | null>(null);
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('asc');
   const [data, setData] = useState<ActivityResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
   const [loadMs, setLoadMs] = useState(0);
-  // A preset/control switch drops the stale response (spinner); the 60s
-  // range slide (same fetch key) keeps the previous chart while refetching.
-  // Compared inside the effect: render-time ref writes would be defeated by
-  // StrictMode's double render.
-  const fetchKey = `${range.key}|${metric}|${groupBy}|${subgroup}|${rollup}|${topN}`;
+  // A preset/control/filter switch drops the stale response (spinner); the
+  // 60s range slide (same fetch key) keeps the previous chart while
+  // refetching. Compared inside the effect: render-time ref writes would be
+  // defeated by StrictMode's double render.
+  const fetchKey = `${range.key}|${metric}|${groupBy}|${subgroup}|${rollup}|${topN}|${rankBy}|${filterKey(filter)}`;
   const prevKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -121,9 +143,12 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, initialMetric, initial
           group_by: groupBy,
           subgroup: subgroup || undefined,
           rollup,
+          rank_by: rankBy,
           top: topN,
           since: range.since.toISOString(),
           until: range.until.toISOString(),
+          filter_type: filter?.type,
+          filter_value: filter?.value,
         });
         if (cancelled) return;
         setData(res.data);
@@ -133,10 +158,11 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, initialMetric, initial
     };
     fetch();
     return () => { cancelled = true; };
-  }, [range, metric, groupBy, subgroup, rollup, topN]);
+  }, [range, metric, groupBy, subgroup, rollup, topN, rankBy, filter]);
 
   // Ordered list of chart series (group, subgroup) as they appear in the
-  // backend response (sum desc; per-group subgroups when set).
+  // backend response (rank-metric desc — "Rank by"; per-group subgroups
+  // when set).
   const seriesKeys = useMemo(() => {
     const out: { key: string; group: string; subgroup: string }[] = [];
     const seen = new Set<string>();
@@ -277,8 +303,8 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, initialMetric, initial
     <ResponsiveContainer width="100%" height={chartHeight}>
       {chartType === 'bar' && (
         <BarChart data={chartData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-          <CartesianGrid strokeDasharray="3 3" stroke={GRID} vertical={false} />
-          <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={28} tickFormatter={(v) => fmtTick(rollupGran(rollup), String(v))} />
+          <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
+          <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={48} tickFormatter={(v) => fmtTick(rollupGran(rollup), String(v))} />
           <YAxis tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} width={60} tickFormatter={fmtAxis} />
           <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(rollupGran(rollup), String(l))} />
           {/* dataKey is a function accessor: recharts resolves string keys via
@@ -290,8 +316,8 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, initialMetric, initial
       )}
       {chartType === 'area' && (
         <AreaChart data={chartData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-          <CartesianGrid strokeDasharray="3 3" stroke={GRID} vertical={false} />
-          <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={28} tickFormatter={(v) => fmtTick(rollupGran(rollup), String(v))} />
+          <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
+          <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={48} tickFormatter={(v) => fmtTick(rollupGran(rollup), String(v))} />
           <YAxis tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} width={60} tickFormatter={fmtAxis} />
           <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(rollupGran(rollup), String(l))} />
           {seriesKeys.map((sk, i) => (
@@ -301,8 +327,8 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, initialMetric, initial
       )}
       {chartType === 'line' && (
         <LineChart data={chartData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-          <CartesianGrid strokeDasharray="3 3" stroke={GRID} vertical={false} />
-          <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={28} tickFormatter={(v) => fmtTick(rollupGran(rollup), String(v))} />
+          <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
+          <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={48} tickFormatter={(v) => fmtTick(rollupGran(rollup), String(v))} />
           <YAxis tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} width={60} tickFormatter={fmtAxis} />
           <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(rollupGran(rollup), String(l))} />
           {seriesKeys.map((sk, i) => (
@@ -317,7 +343,7 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, initialMetric, initial
     const isHidden = hidden.has(sk.key);
     const display = displayFor(sk.group, sk.subgroup);
     return (
-      <span key={sk.key} style={{ display: 'inline-flex', alignItems: 'center', borderRadius: 4, fontSize: 12, color: 'inherit', opacity: isHidden ? 0.4 : 1, transition: 'opacity .15s' }}>
+      <span key={sk.key} className="explore-legend-item" style={{ display: 'inline-flex', alignItems: 'center', borderRadius: 4, fontSize: 12, color: 'inherit', opacity: isHidden ? 0.4 : 1, transition: 'opacity .15s, background-color .15s' }}>
         <Tooltip title={isHidden ? `Show ${display}` : `Hide ${display}`}>
           <button onClick={() => toggleHidden(sk.key)} style={{ border: 'none', background: 'none', cursor: 'pointer', padding: '2px 4px' }}>
             <span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: 2, background: seriesColor(i, sk.group) }} />
@@ -366,13 +392,25 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, initialMetric, initial
         )}
         <span style={{ width: 1, height: 16, background: GRID, margin: '0 2px' }} />
         <Select size="small" value={rollup} onChange={(v: string) => setRollup(v)} style={{ minWidth: 130 }}
-          options={ROLLUP.map(r => ({ value: r.value, label: `Rollup: ${r.label}` }))} />
+          options={ROLLUP.map(r => ({ value: r.value, label: r.label }))}
+          labelRender={() => (
+            <span><span style={{ color: AXIS, marginRight: 4 }}>Rollup:</span>{ROLLUP.find(r => r.value === rollup)!.label}</span>
+          )} />
         <span style={{ width: 1, height: 16, background: GRID, margin: '0 2px' }} />
-        <span style={{ height: 24, display: 'inline-flex', alignItems: 'center', padding: '0 8px', borderRadius: 6, border: '1px solid ' + GRID, background: token.colorBgContainer, fontSize: 12, color: token.colorText }}>Top</span>
-        <Select size="small" value={topN} onChange={(v: number) => setTopN(v)} style={{ minWidth: 55 }}
-          options={TOPS.map(n => ({ value: n, label: String(n) }))} />
-        <Select size="small" value="current" style={{ minWidth: 155 }}
-          options={[{ value: 'current', label: 'Rank by: Current metric' }]} />
+        {/* OR joins Top / N / Rank by into one segmented group */}
+        <Space.Compact>
+          <Select size="small" value="top" style={{ minWidth: 50 }}
+            options={[{ value: 'top', label: 'Top' }]} />
+          <Select size="small" value={topN} onChange={(v: number) => setTopN(v)} style={{ minWidth: 55 }}
+            options={TOPS.map(n => ({ value: n, label: String(n) }))} />
+          <Select size="small" value={rankBy}
+            onChange={(v: string) => { setRankBy(v); setSortKey(null); setHidden(new Set()); }}
+            style={{ minWidth: 168 }}
+            options={RANK_BY.map(r => ({ value: r.value, label: r.label }))}
+            labelRender={() => (
+              <span><span style={{ color: AXIS, marginRight: 4 }}>Rank by:</span>{RANK_BY.find(r => r.value === rankBy)!.label}</span>
+            )} />
+        </Space.Compact>
         <div style={{ marginLeft: 'auto', display: 'flex' }}>
           <Space.Compact>
             <Dropdown menu={{ items: chartTypeItems, onClick: ({ key }) => setChartType(key as 'bar' | 'area' | 'line') }}>

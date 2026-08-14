@@ -55,10 +55,12 @@ func bootstrapActivity(t *testing.T) *gin.Engine {
 	db.GetDB().Create(&model.Consumption{KeyID: key.ID, HourBucket: day1late, ModelName: "", RequestCount: 1, InputTokens: 10, OutputTokens: 0, CostUSD: 0})
 
 	// Second key with its own spend on g1 so subgroup=key splits a group.
+	// It also carries an app name so app filters discriminate against the
+	// empty-app_name rows.
 	db.GetDB().Create(&model.Key{ProviderID: prov.ID, KeyValue: "k2", Name: "k2"})
 	var key2 model.Key
 	db.GetDB().Where("name = ?", "k2").First(&key2)
-	db.GetDB().Create(&model.Consumption{KeyID: key2.ID, HourBucket: day1, ModelName: "g1", RequestCount: 7, InputTokens: 200, OutputTokens: 40, CacheHitTokens: 20, CostUSD: 0.02})
+	db.GetDB().Create(&model.Consumption{KeyID: key2.ID, HourBucket: day1, ModelName: "g1", AppName: "testapp", RequestCount: 7, InputTokens: 200, OutputTokens: 40, CacheHitTokens: 20, CostUSD: 0.02})
 
 	engine := selector.NewEngine()
 	checker := health.NewChecker()
@@ -89,11 +91,17 @@ func TestActivityEdgeCases(t *testing.T) {
 		{"cache daily", "metric=cache&group_by=model&rollup=day", 200},
 		{"model weekly spend", "metric=spend&group_by=model&rollup=week", 200},
 		{"model monthly spend", "metric=spend&group_by=model&rollup=month", 200},
+		{"model total spend", "metric=spend&group_by=model&rollup=total", 200},
+		{"rank by requests", "metric=spend&group_by=model&rollup=day&rank_by=requests", 200},
+		{"rank by cache", "metric=spend&group_by=model&rollup=day&rank_by=cache", 200},
+		{"total rollup with rank_by", "metric=spend&group_by=model&rollup=total&rank_by=tokens", 200},
+		{"total rollup with subgroup", "metric=spend&group_by=model&rollup=total&subgroup=key", 200},
 		{"bad metric", "metric=bogus", 400},
 		{"bad group_by", "metric=spend&group_by=nope", 400},
 		{"bad subgroup", "metric=spend&subgroup=bogus", 400},
 		{"subgroup same as group_by", "metric=spend&group_by=model&subgroup=model", 400},
 		{"bad rollup", "metric=spend&rollup=minute", 400},
+		{"bad rank_by", "metric=spend&rank_by=bogus", 400},
 		{"bad since", "metric=spend&since=notadate", 400},
 	}
 	for _, c := range cases {
@@ -231,6 +239,233 @@ func TestActivitySubgroup(t *testing.T) {
 	}
 }
 
+// TestActivityTotalRollup pins the rollup=total behavior: the whole range
+// collapses into a single "Total" bucket, every group's series value equals
+// its range total, and the summary's Value (last bucket) equals its Sum.
+// since/until are pinned so the fixture rows (yesterday + today noon) are
+// always in range regardless of the wall-clock time the test runs at.
+func TestActivityTotalRollup(t *testing.T) {
+	e := bootstrapActivity(t)
+	t.Cleanup(func() {
+		if sqlDB, err := db.GetDB().DB(); err == nil {
+			sqlDB.Close()
+		}
+	})
+	qs := "metric=spend&group_by=model&rollup=total&" + rangeQuery(t)
+
+	req := httptest.NewRequest("GET", "/api/stats/activity?"+qs, nil)
+	req.Host = "localhost:9999"
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Buckets []string `json:"buckets"`
+		Series  []struct {
+			Bucket string  `json:"bucket"`
+			Group  string  `json:"group"`
+			Value  float64 `json:"value"`
+		} `json:"series"`
+		Summary []summaryRow `json:"summary"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("bad json: %v\n%s", err, rec.Body.String())
+	}
+	if len(out.Buckets) != 1 || out.Buckets[0] != "Total" {
+		t.Fatalf("buckets = %v, want [Total]", out.Buckets)
+	}
+	got := map[string]float64{}
+	for _, s := range out.Series {
+		if s.Bucket != "Total" {
+			t.Fatalf("series bucket = %q, want Total", s.Bucket)
+		}
+		got[s.Group] += s.Value
+	}
+	if got["g1"] != 0.03 || got["g2"] != 0.005 || got["Unknown"] != 0 {
+		t.Fatalf("total-bucket series values = %v, want g1=0.03 g2=0.005 Unknown=0", got)
+	}
+	for _, s := range out.Summary {
+		if s.Value != s.Sum {
+			t.Fatalf("group %s: Value %v != Sum %v (single bucket)", s.Group, s.Value, s.Sum)
+		}
+	}
+
+	// With top=1 the runner-up groups fold into Other (single bucket).
+	req2 := httptest.NewRequest("GET", "/api/stats/activity?metric=spend&group_by=model&rollup=total&top=1&"+rangeQuery(t), nil)
+	req2.Host = "localhost:9999"
+	rec2 := httptest.NewRecorder()
+	e.ServeHTTP(rec2, req2)
+	if rec2.Code != 200 {
+		t.Fatalf("top=1 status = %d: %s", rec2.Code, rec2.Body.String())
+	}
+	var out2 struct {
+		Series []struct {
+			Group  string  `json:"group"`
+			Bucket string  `json:"bucket"`
+			Value  float64 `json:"value"`
+		} `json:"series"`
+	}
+	if err := json.Unmarshal(rec2.Body.Bytes(), &out2); err != nil {
+		t.Fatalf("bad json: %v\n%s", err, rec2.Body.String())
+	}
+	other := 0.0
+	topSeen := ""
+	for _, s := range out2.Series {
+		if s.Bucket != "Total" {
+			t.Fatalf("series bucket = %q, want Total", s.Bucket)
+		}
+		if s.Group == "Other" {
+			other += s.Value
+		} else if topSeen == "" {
+			topSeen = s.Group
+		}
+	}
+	if topSeen != "g1" {
+		t.Fatalf("top group = %q, want g1 (spend rank)", topSeen)
+	}
+	if other != 0.005 {
+		t.Fatalf("Other value = %v, want 0.005 (g2 + Unknown)", other)
+	}
+}
+
+// TestActivityRankBy pins the rank_by param: series (top-N + Other folding)
+// and the summary's default order are ranked by the requested METRIC, which
+// may differ from the charted metric. An extra high-request/low-spend g2 row
+// makes the metric ranks diverge from the spend rank.
+func TestActivityRankBy(t *testing.T) {
+	e := bootstrapActivity(t)
+	t.Cleanup(func() {
+		if sqlDB, err := db.GetDB().DB(); err == nil {
+			sqlDB.Close()
+		}
+	})
+
+	// g2 gains 100 requests at negligible cost on day1 (a distinct hour so
+	// the (key_id, hour_bucket) unique constraint is satisfied), so request
+	// rank (g2 >= 100 > g1 12) opposes spend rank (g1 0.03 > g2 ~0.0051).
+	var k1 model.Key
+	db.GetDB().Where("name = ?", "k1").First(&k1)
+	now := time.Now()
+	day1 := time.Date(now.Year(), now.Month(), now.Day()-1, 12, 0, 0, 0, now.Location())
+	db.GetDB().Create(&model.Consumption{KeyID: k1.ID, HourBucket: day1.Add(2 * time.Hour), ModelName: "g2", RequestCount: 100, InputTokens: 0, OutputTokens: 0, CostUSD: 0.0001})
+
+	req := httptest.NewRequest("GET", "/api/stats/activity?metric=spend&group_by=model&rollup=day&rank_by=requests&top=1&"+rangeQuery(t), nil)
+	req.Host = "localhost:9999"
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Summary []summaryRow `json:"summary"`
+		Series  []struct {
+			Group string  `json:"group"`
+			Value float64 `json:"value"`
+		} `json:"series"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("bad json: %v\n%s", err, rec.Body.String())
+	}
+	if len(out.Summary) != 3 || out.Summary[0].Group != "g2" || out.Summary[1].Group != "g1" {
+		t.Fatalf("summary order = %v, want [g2 g1 Unknown] (request rank)", summaryGroups(out.Summary))
+	}
+	// The chart metric is still spend: series values must be spend sums.
+	// The top group's series value must equal its summary Sum (checked
+	// self-consistently, no float-literal trap).
+	var g2Series, g2Sum float64
+	firstGroup := out.Series[0].Group
+	for _, s := range out.Series {
+		if s.Group == firstGroup {
+			g2Series += s.Value
+		}
+	}
+	for _, s := range out.Summary {
+		if s.Group == firstGroup {
+			g2Sum = s.Sum
+		}
+	}
+	if g2Series != g2Sum {
+		t.Fatalf("top series %q value %v != its summary Sum %v (series must carry the chart metric)", firstGroup, g2Series, g2Sum)
+	}
+	otherSum := 0.0
+	for _, s := range out.Series {
+		if s.Group == "Other" {
+			otherSum += s.Value
+		}
+	}
+	if firstGroup != "g2" {
+		t.Fatalf("first series group = %q, want g2 (top-1 by requests)", firstGroup)
+	}
+	if otherSum != 0.03 {
+		t.Fatalf("Other spend = %v, want 0.03 (g1 + Unknown folded)", otherSum)
+	}
+
+	// Without rank_by the default stays the chart metric's sum (g1 first).
+	req2 := httptest.NewRequest("GET", "/api/stats/activity?metric=spend&group_by=model&rollup=day&"+rangeQuery(t), nil)
+	req2.Host = "localhost:9999"
+	rec2 := httptest.NewRecorder()
+	e.ServeHTTP(rec2, req2)
+	if rec2.Code != 200 {
+		t.Fatalf("status = %d: %s", rec2.Code, rec2.Body.String())
+	}
+	var out2 struct {
+		Summary []summaryRow `json:"summary"`
+	}
+	if err := json.Unmarshal(rec2.Body.Bytes(), &out2); err != nil {
+		t.Fatalf("bad json: %v\n%s", err, rec2.Body.String())
+	}
+	if out2.Summary[0].Group != "g1" {
+		t.Fatalf("default summary order starts with %q, want g1 (spend sum)", out2.Summary[0].Group)
+	}
+
+	// rank_by=tokens with the same fixture ranks by token totals (g1 first).
+	req3 := httptest.NewRequest("GET", "/api/stats/activity?metric=spend&group_by=model&rollup=day&rank_by=tokens&"+rangeQuery(t), nil)
+	req3.Host = "localhost:9999"
+	rec3 := httptest.NewRecorder()
+	e.ServeHTTP(rec3, req3)
+	if rec3.Code != 200 {
+		t.Fatalf("status = %d: %s", rec3.Code, rec3.Body.String())
+	}
+	var out3 struct {
+		Summary []summaryRow `json:"summary"`
+	}
+	if err := json.Unmarshal(rec3.Body.Bytes(), &out3); err != nil {
+		t.Fatalf("bad json: %v\n%s", err, rec3.Body.String())
+	}
+	if out3.Summary[0].Group != "g1" || out3.Summary[1].Group != "g2" {
+		t.Fatalf("rank_by=tokens order = %v, want [g1 g2 Unknown]", summaryGroups(out3.Summary))
+	}
+}
+
+// summaryRow is the summary slice shape the activity endpoint returns.
+type summaryRow struct {
+	Group   string  `json:"group"`
+	Sum     float64 `json:"sum"`
+	Value   float64 `json:"value"`
+	Percent float64 `json:"percent"`
+}
+
+func summaryGroups(s []summaryRow) []string {
+	out := make([]string, len(s))
+	for i := range s {
+		out[i] = s[i].Group
+	}
+	return out
+}
+
+// rangeQuery pins since/until to the last two days (start of day minus one
+// day through end of today), so the fixture's yesterday-noon and today-noon
+// rows are always in range no matter what wall-clock time the suite runs at.
+func rangeQuery(t *testing.T) string {
+	t.Helper()
+	now := time.Now()
+	since := time.Date(now.Year(), now.Month(), now.Day()-1, 0, 0, 0, 0, now.Location())
+	until := time.Date(now.Year(), now.Month(), now.Day(), 23, 59, 59, 0, now.Location())
+	return fmt.Sprintf("since=%s&until=%s",
+		url.QueryEscape(since.Format(time.RFC3339)), url.QueryEscape(until.Format(time.RFC3339)))
+}
+
 // TestActivityWeekRollupMondayAlignment pins the week-rollup edge case: a
 // range starting on a Sunday must open on the PREVIOUS Monday (week buckets
 // are labeled by their Monday start date).
@@ -262,5 +497,184 @@ func TestActivityWeekRollupMondayAlignment(t *testing.T) {
 	}
 	if len(out.Buckets) == 0 || out.Buckets[0] != "2026-08-10" {
 		t.Fatalf("first week bucket = %v, want 2026-08-10 (Monday of the Sunday's week)", out.Buckets)
+	}
+}
+
+// activityGet issues an activity request and decodes totals + summary rows.
+func activityGet(t *testing.T, e *gin.Engine, qs string) (int, map[string]float64, []struct {
+	Group string  `json:"group"`
+	Sum   float64 `json:"sum"`
+}) {
+	t.Helper()
+	req := httptest.NewRequest("GET", "/api/stats/activity?"+qs, nil)
+	req.Host = "localhost:9999"
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		return rec.Code, nil, nil
+	}
+	var out struct {
+		Totals  map[string]float64 `json:"totals"`
+		Summary []struct {
+			Group string  `json:"group"`
+			Sum   float64 `json:"sum"`
+		} `json:"summary"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("bad json: %v\n%s", err, rec.Body.String())
+	}
+	return rec.Code, out.Totals, out.Summary
+}
+
+// summarySumOf returns a summary row's Sum by group name (0 when absent).
+func summarySumOf(rows []struct {
+	Group string  `json:"group"`
+	Sum   float64 `json:"sum"`
+}, group string) float64 {
+	for _, r := range rows {
+		if r.Group == group {
+			return r.Sum
+		}
+	}
+	return 0
+}
+
+// TestActivityFilter exercises the entity filter (filter_type/filter_value)
+// on the activity endpoint: rows outside the filter must not contribute to
+// totals or summary, and "Unknown" matches rows with an empty name.
+// Fixture (bootstrapActivity): g1 spend $0.03 via k1 ($0.01) + k2 ($0.02,
+// app "testapp"); g2 spend $0.005 via k1; one empty-model_name row ($0).
+func TestActivityFilter(t *testing.T) {
+	e := bootstrapActivity(t)
+	t.Cleanup(func() {
+		if sqlDB, err := db.GetDB().DB(); err == nil {
+			sqlDB.Close()
+		}
+	})
+
+	var key2 model.Key
+	if err := db.GetDB().Where("name = ?", "k2").First(&key2).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	// Explicit range covering the fixture rows (yesterday + today noon): the
+	// default since..until window ("now-7d .. now") would drop today's row
+	// when the suite runs before noon.
+	now := time.Now()
+	since := time.Date(now.Year(), now.Month(), now.Day()-1, 0, 0, 0, 0, now.Location())
+	until := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
+	rangeQS := fmt.Sprintf("since=%s&until=%s",
+		url.QueryEscape(since.Format(time.RFC3339)), url.QueryEscape(until.Format(time.RFC3339)))
+
+	// filter_type=model&filter_value=g1 -> only the two g1 rows ($0.01 + $0.02).
+	code, totals, rows := activityGet(t, e, "metric=spend&group_by=key&rollup=day&filter_type=model&filter_value=g1&"+rangeQS)
+	if code != 200 {
+		t.Fatalf("model filter status = %d", code)
+	}
+	if totals["spend"] != 0.03 {
+		t.Fatalf("model=g1 totals.spend = %v, want 0.03", totals["spend"])
+	}
+	if len(rows) != 2 || summarySumOf(rows, "k1") != 0.01 || summarySumOf(rows, "k2") != 0.02 {
+		t.Fatalf("model=g1 summary = %+v, want k1 0.01 + k2 0.02 only", rows)
+	}
+
+	// filter_type=key&filter_value=<k2 id> -> only k2's row ($0.02).
+	code, totals, rows = activityGet(t, e, fmt.Sprintf("metric=spend&group_by=model&rollup=day&filter_type=key&filter_value=%d&%s", key2.ID, rangeQS))
+	if code != 200 {
+		t.Fatalf("key filter status = %d", code)
+	}
+	if totals["spend"] != 0.02 || summarySumOf(rows, "g1") != 0.02 {
+		t.Fatalf("key=k2 totals=%v rows=%+v, want spend 0.02 on g1 only", totals, rows)
+	}
+
+	// filter_type=app&filter_value=testapp -> only k2's row.
+	code, totals, rows = activityGet(t, e, "metric=spend&group_by=model&rollup=day&filter_type=app&filter_value=testapp&"+rangeQS)
+	if code != 200 {
+		t.Fatalf("app filter status = %d", code)
+	}
+	if totals["spend"] != 0.02 || len(rows) != 1 || rows[0].Group != "g1" {
+		t.Fatalf("app=testapp totals=%v rows=%+v, want the k2 row only", totals, rows)
+	}
+
+	// filter_type=app&filter_value=Unknown -> all rows with an EMPTY app name
+	// (k1's g1 row + the g2 row + the empty-model row): 5+3+1 = 9 requests.
+	code, totals, rows = activityGet(t, e, "metric=requests&group_by=model&rollup=day&filter_type=app&filter_value=Unknown&"+rangeQS)
+	if code != 200 {
+		t.Fatalf("app=Unknown status = %d", code)
+	}
+	if totals["requests"] != 9 {
+		t.Fatalf("app=Unknown totals.requests = %v, want 9 (empty app_name rows only)", totals["requests"])
+	}
+	if summarySumOf(rows, "Unknown") != 1 || summarySumOf(rows, "g2") != 3 {
+		t.Fatalf("app=Unknown summary = %+v, want g2 3 + Unknown 1", rows)
+	}
+
+	// filter_type=model&filter_value=Unknown -> the empty-model_name row only.
+	code, totals, rows = activityGet(t, e, "metric=requests&group_by=model&rollup=day&filter_type=model&filter_value=Unknown&"+rangeQS)
+	if code != 200 {
+		t.Fatalf("model=Unknown status = %d", code)
+	}
+	if totals["requests"] != 1 || len(rows) != 1 || rows[0].Group != "Unknown" {
+		t.Fatalf("model=Unknown totals=%v rows=%+v, want the empty-model_name row only", totals, rows)
+	}
+
+	// Bad filters -> 400.
+	for _, qs := range []string{
+		"metric=spend&filter_type=bogus&filter_value=x",
+		"metric=spend&filter_type=model",
+		"metric=spend&filter_type=model&filter_value=",
+		"metric=spend&filter_type=key&filter_value=abc",
+		"metric=spend&filter_value=x",
+	} {
+		if code, _, _ := activityGet(t, e, qs); code != 400 {
+			t.Fatalf("qs %q status = %d, want 400", qs, code)
+		}
+	}
+}
+
+// TestConsumptionsFilter pins the same filter on the raw-consumption
+// endpoint (the Overview tab's data source).
+func TestConsumptionsFilter(t *testing.T) {
+	e := bootstrapActivity(t)
+	t.Cleanup(func() {
+		if sqlDB, err := db.GetDB().DB(); err == nil {
+			sqlDB.Close()
+		}
+	})
+
+	get := func(qs string) (int, []model.Consumption) {
+		t.Helper()
+		req := httptest.NewRequest("GET", "/api/stats/consumptions?"+qs, nil)
+		req.Host = "localhost:9999"
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			return rec.Code, nil
+		}
+		var rows []model.Consumption
+		if err := json.Unmarshal(rec.Body.Bytes(), &rows); err != nil {
+			t.Fatalf("bad json: %v\n%s", err, rec.Body.String())
+		}
+		return rec.Code, rows
+	}
+
+	// Explicit range covering the fixture rows (see TestActivityFilter): the
+	// default since..until window drops today's noon row before noon.
+	now := time.Now()
+	since := time.Date(now.Year(), now.Month(), now.Day()-1, 0, 0, 0, 0, now.Location())
+	until := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
+	rangeQS := fmt.Sprintf("since=%s&until=%s",
+		url.QueryEscape(since.Format(time.RFC3339)), url.QueryEscape(until.Format(time.RFC3339)))
+
+	code, rows := get("filter_type=model&filter_value=g2&" + rangeQS)
+	if code != 200 || len(rows) != 1 || rows[0].ModelName != "g2" {
+		t.Fatalf("model=g2: code=%d rows=%d, want exactly the g2 row", code, len(rows))
+	}
+	code, rows = get("filter_type=app&filter_value=testapp&" + rangeQS)
+	if code != 200 || len(rows) != 1 || rows[0].ModelName != "g1" {
+		t.Fatalf("app=testapp: code=%d rows=%d, want exactly the k2 g1 row", code, len(rows))
+	}
+	if code, _ := get("filter_type=nope"); code != 400 {
+		t.Fatalf("bad filter_type status = %d, want 400", code)
 	}
 }
