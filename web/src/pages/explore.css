@@ -1,0 +1,7 @@
+/* Explore-page legend entries hover like the OpenRouter reference
+   (hover:bg-slate-4): a soft slate background while hovering the
+   hide/show-only chip. The inline styles keep the layout; only the
+   :hover background needs real CSS. */
+.explore-legend-item:hover {
+  background: rgba(120, 120, 140, 0.14);
+}
