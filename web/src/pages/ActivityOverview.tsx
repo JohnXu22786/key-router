@@ -1,16 +1,24 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Card, Row, Col, Typography, Spin, message, Space, theme } from 'antd';
+import { Card, Row, Col, Typography, Spin, message, theme } from 'antd';
+import { RightOutlined, PicRightOutlined, PicLeftOutlined } from '@ant-design/icons';
 import {
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
-  BarChart, Bar, Legend, LineChart, Line,
+  BarChart, Bar, LineChart, Line,
 } from 'recharts';
 import { getConsumptions, getKeys, Consumption, Key } from '../api/client';
-import { DateRange, ActivityFilter, filterKey, fmtUSD, fmtTokens, fmtCompact, fmtTokensBare, fmtUSDInt, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtPercent, fmtTick, fmtBucket, series, stackedData, groupTotals, Granularity, maskKey } from './activityShared';
+import { DateRange, ActivityFilter, filterKey, ExploreOpts, fmtUSD, fmtTokens, fmtCompact, fmtTokensBare, fmtUSDInt, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtPercent, fmtTick, fmtBucket, series, stackedData, groupTotals, Granularity, maskKey } from './activityShared';
 import dayjs from 'dayjs';
 
 const { Text } = Typography;
 
-interface OverviewProps { range: DateRange; filter?: ActivityFilter | null; }
+interface OverviewProps {
+  range: DateRange;
+  filter?: ActivityFilter | null;
+  // Overview "Explore" links switch to the Explore tab, seeding it with the
+  // section's metric/grouping (reference: every card links to
+  // /activity/explore?metric=...&dimension=...).
+  onNavigate?: (tab: 'explore', opts?: ExploreOpts) => void;
+}
 
 // keyValueFor is bound inside the component to the loaded keys.
 function keyValueFor(name: string): string {
@@ -21,7 +29,110 @@ let keysRefForOverview = new Map<string, string>();
 const deltaPct = (cur: number, prev: number) =>
   prev > 0 ? ((cur - prev) / prev) * 100 : (cur > 0 ? 100 : 0);
 
-const ActivityOverview: React.FC<OverviewProps> = ({ range, filter }) => {
+// ExploreLink: the card-header "Explore ›" link, like the reference page's
+// underlined Explore anchor on every chart/card header.
+const ExploreLink: React.FC<{ onClick: () => void }> = ({ onClick }) => (
+  <span
+    role="link"
+    tabIndex={0}
+    onClick={onClick}
+    onKeyDown={(e) => { if (e.key === 'Enter') onClick(); }}
+    style={{ fontSize: 12, textDecoration: 'underline', textUnderlineOffset: 2, cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 2 }}
+  >
+    Explore<RightOutlined style={{ fontSize: 10 }} />
+  </span>
+);
+
+interface LegendGroup { name: string; color: string; }
+
+// ChartCard: a chart card with the reference's custom legend — the color
+// swatch toggles a series hidden, clicking the name shows only it, and the
+// move-right button relocates the legend next to the chart. Each card keeps
+// its own legend state (hide/show-only/move-right), like the reference.
+const ChartCard: React.FC<{
+  title: string;
+  extra?: React.ReactNode;
+  groups: LegendGroup[];
+  renderChart: (visibleGroups: string[]) => React.ReactNode;
+}> = ({ title, extra, groups, renderChart }) => {
+  const [hidden, setHidden] = useState<Set<string>>(new Set());
+  const [legendRight, setLegendRight] = useState(false);
+
+  const toggleHidden = (g: string) => {
+    setHidden(h => {
+      const n = new Set(h);
+      if (n.has(g)) n.delete(g); else n.add(g);
+      return n;
+    });
+  };
+
+  const showOnly = (g: string) => {
+    const onlyThis = groups.every(x => (x.name === g) === !hidden.has(x.name));
+    if (onlyThis) setHidden(new Set());
+    else setHidden(new Set(groups.filter(x => x.name !== g).map(x => x.name)));
+  };
+
+  const visibleGroups = groups.filter(g => !hidden.has(g.name)).map(g => g.name);
+
+  const chips = (right: boolean) => (
+    <div style={{
+      display: 'flex', flexDirection: right ? 'column' : 'row', flexWrap: right ? 'nowrap' : 'wrap',
+      alignItems: right ? 'flex-start' : 'center', gap: 4,
+      borderTop: right ? 'none' : `1px solid ${GRID}`, paddingTop: right ? 0 : 12,
+    }}>
+      {groups.map(g => {
+        const isHidden = hidden.has(g.name);
+        // True when g is the only visible series — the button then restores all.
+        const isOnlyX = groups.every(x => (x.name === g.name) === !hidden.has(x.name));
+        return (
+          <span key={g.name} role="group" aria-label={g.name}
+            style={{ display: 'inline-flex', alignItems: 'center', borderRadius: 3, opacity: isHidden ? 0.45 : 1, transition: 'opacity .15s' }}>
+            <button type="button" title={isHidden ? `Show ${g.name}` : `Hide ${g.name}`} aria-pressed={!isHidden} onClick={() => toggleHidden(g.name)}
+              style={{ background: 'none', border: 'none', cursor: 'pointer', padding: '3px 4px' }}>
+              <span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: 2, background: g.color, flexShrink: 0 }} />
+            </button>
+            <button type="button"
+              title={isOnlyX ? 'Show all' : `Show only ${g.name}`}
+              onClick={() => showOnly(g.name)}
+              style={{ background: 'none', border: 'none', cursor: 'pointer', padding: '3px 4px', color: 'inherit', fontSize: 12, fontFamily: 'inherit' }}>
+              <span style={{ maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'inline-block' }}>{g.name}</span>
+            </button>
+          </span>
+        );
+      })}
+      <span style={{ marginLeft: right ? 0 : 'auto', display: 'inline-flex', alignItems: 'center', marginTop: right ? 8 : 0 }}>
+        <button type="button" title={legendRight ? 'Move legend to bottom' : 'Move legend to right'}
+          onClick={() => setLegendRight(v => !v)} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 4, color: 'inherit' }}>
+          {legendRight ? <PicLeftOutlined style={{ fontSize: 14 }} /> : <PicRightOutlined style={{ fontSize: 14 }} />}
+        </button>
+      </span>
+    </div>
+  );
+
+  return (
+    <Card style={{ borderRadius: 12 }} title={title} extra={extra}>
+      {legendRight ? (
+        <div style={{ display: 'flex', gap: 12 }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            {visibleGroups.length === 0
+              ? <Text type="secondary">No usage in this period.</Text>
+              : renderChart(visibleGroups)}
+          </div>
+          <div style={{ width: 190, flexShrink: 0 }}>{chips(true)}</div>
+        </div>
+      ) : (
+        <>
+          {visibleGroups.length === 0
+            ? <div style={{ padding: '12px 0' }}><Text type="secondary">No usage in this period.</Text></div>
+            : renderChart(visibleGroups)}
+          {chips(false)}
+        </>
+      )}
+    </Card>
+  );
+};
+
+const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }) => {
   // Recharts tooltips default to a white card; paint them with theme tokens
   // so they match light/dark.
   const { token } = theme.useToken();
@@ -121,14 +232,20 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter }) => {
   }));
   const rateSeries = series(curList, c => (c.cache_hit_tokens / Math.max(1, c.input_tokens + c.cache_hit_tokens)) * 100, axSince, axUntil, gran);
 
+  // goExplore opens the Explore tab seeded with a metric/grouping. The
+  // reference KPI cards and section headers link to /activity/explore with
+  // the matching query params; our Explore tab supports spend/tokens/
+  // requests/cache × model/key/app, so each link maps to the closest one.
+  const goExplore = (opts?: ExploreOpts) => onNavigate?.('explore', opts);
+
   // deltaFor: for the Blended $/1M KPI a RISE is negative (cost per token up
   // = bad), so the "bad" flag inverts the color.
   const kpis = [
-    { label: 'Total spend', value: fmtUSD(cur.spend), delta: deltaPct(cur.spend, prev.spend), badUp: false, series: costSeries },
-    { label: 'Requests', value: fmtCompact(cur.requests), delta: deltaPct(cur.requests, prev.requests), badUp: false, series: reqSeries },
-    { label: 'Token volume', value: fmtTokensBare(cur.tokens), delta: deltaPct(cur.tokens, prev.tokens), badUp: false, series: tokenSeries },
-    { label: 'Cache hit rate', value: fmtPercent(curRate), delta: deltaPct(curRate, prevRate), badUp: false, series: rateSeries },
-    { label: 'Blended $/1M', value: `$${blended.toFixed(2)}`, delta: deltaPct(blended, blendedPrev), badUp: true, series: blendedSeries },
+    { label: 'Total spend', value: fmtUSD(cur.spend), delta: deltaPct(cur.spend, prev.spend), badUp: false, series: costSeries, explore: { metric: 'spend' } },
+    { label: 'Requests', value: fmtCompact(cur.requests), delta: deltaPct(cur.requests, prev.requests), badUp: false, series: reqSeries, explore: { metric: 'requests' } },
+    { label: 'Token volume', value: fmtTokensBare(cur.tokens), delta: deltaPct(cur.tokens, prev.tokens), badUp: false, series: tokenSeries, explore: { metric: 'tokens' } },
+    { label: 'Cache hit rate', value: fmtPercent(curRate), delta: deltaPct(curRate, prevRate), badUp: false, series: rateSeries, explore: { metric: 'cache' } },
+    { label: 'Blended $/1M', value: `$${blended.toFixed(2)}`, delta: deltaPct(blended, blendedPrev), badUp: true, series: blendedSeries, explore: { metric: 'spend' } },
   ];
 
   // --- Charts ---
@@ -139,13 +256,18 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter }) => {
   // Fold everything below top-5 into "Other" per bucket.
   const otherModelSet = new Set(modelSpend.slice(5).map(([m]) => m));
   usageByModel.forEach(row => {
-    const other = otherModelSet;
     let sum = 0;
     for (const [g, v] of Object.entries(row)) {
-      if (g !== 'label' && g !== 'Other' && other.has(g)) { sum += (v as number); delete (row as any)[g]; }
+      if (g !== 'label' && g !== 'Other' && otherModelSet.has(g)) { sum += (v as number); delete (row as any)[g]; }
     }
     (row as any).Other = sum;
   });
+  const modelGroups: LegendGroup[] = [...topModels, 'Other'].map((m, i) => ({
+    name: m,
+    color: m === 'Other' ? OTHER_COLOR : CHART_COLORS[i % CHART_COLORS.length],
+  }));
+  // Colors keyed by name so bars keep their color while other series hide.
+  const modelColor = new Map(modelGroups.map(g => [g.name, g.color]));
 
   // Request volume by model (stacked bars, top-5 + Other)
   const modelReqs = groupTotals(curList, c => c.model_name || 'Unknown', c => c.request_count);
@@ -159,6 +281,11 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter }) => {
     }
     (row as any).Other = sum;
   });
+  const reqGroups: LegendGroup[] = [...topReqModels, 'Other'].map((m, i) => ({
+    name: m,
+    color: m === 'Other' ? OTHER_COLOR : CHART_COLORS[i % CHART_COLORS.length],
+  }));
+  const reqColor = new Map(reqGroups.map(g => [g.name, g.color]));
 
   // Usage type: total spend only.
   const usageType = costSeries.map(d => ({ ...d, Spend: d.value }));
@@ -196,7 +323,8 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter }) => {
 
   return (
     <div>
-      {/* KPI cards with vs-prev chips + sparkline (OR: all sparklines #FF2D55) */}
+      {/* KPI cards with vs-prev chips + sparkline (OR: all sparklines #FF2D55).
+          The whole card is a link to Explore, like the reference. */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 12, marginBottom: 16 }}>
         {kpis.map((k, i) => {
           // Blended $/1M: a rise is bad (cost per token up), so positive
@@ -204,28 +332,40 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter }) => {
           const rising = k.delta >= 0;
           const negative = k.badUp ? rising : !rising;
           return (
-            <Card key={k.label} size="small" style={{ borderRadius: 12 }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 }}>
-                <div>
-                  <Text type="secondary" style={{ fontSize: 12 }}>{k.label}</Text>
-                  <div style={{ fontSize: 20, fontWeight: 700, margin: '2px 0', fontVariantNumeric: 'tabular-nums' }}>{k.value}</div>
-                  <span style={{ fontSize: 12, color: negative ? token.colorError : token.colorSuccess, display: 'inline-flex', alignItems: 'center', gap: 2 }}>
-                    {rising
-                      ? <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M7 17L17 7M17 7H7M17 7V17" /></svg>
-                      : <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M7 7l10 10M17 17H7M17 7v10" /></svg>}
-                    <span className="tabular-nums">{Math.abs(k.delta).toFixed(1)}%</span>
-                    <span style={{ color: '#6b7280', marginLeft: 2 }}>vs prev period</span>
-                  </span>
+            <div
+              key={k.label}
+              role="link"
+              tabIndex={0}
+              title={`Explore ${k.label}`}
+              onClick={() => goExplore(k.explore)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); goExplore(k.explore); }
+              }}
+              style={{ cursor: 'pointer' }}
+            >
+              <Card size="small" hoverable style={{ borderRadius: 12 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 }}>
+                  <div>
+                    <Text type="secondary" style={{ fontSize: 12 }}>{k.label}</Text>
+                    <div style={{ fontSize: 20, fontWeight: 700, margin: '2px 0', fontVariantNumeric: 'tabular-nums' }}>{k.value}</div>
+                    <span style={{ fontSize: 12, color: negative ? token.colorError : token.colorSuccess, display: 'inline-flex', alignItems: 'center', gap: 2 }}>
+                      {rising
+                        ? <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M7 17L17 7M17 7H7M17 7V17" /></svg>
+                        : <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M7 7l10 10M17 17H7M17 7v10" /></svg>}
+                      <span className="tabular-nums">{Math.abs(k.delta).toFixed(1)}%</span>
+                      <span style={{ color: '#6b7280', marginLeft: 2 }}>vs prev period</span>
+                    </span>
+                  </div>
+                  <div style={{ width: 84, height: 40 }}>
+                    <ResponsiveContainer width="100%" height="100%">
+                      <LineChart data={k.series} margin={{ top: 3, right: 0, bottom: 0, left: 0 }}>
+                        <Line type="monotone" dataKey="value" stroke={kpiColors[i]} strokeWidth={1.5} dot={false} isAnimationActive={false} />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
                 </div>
-                <div style={{ width: 84, height: 40 }}>
-                  <ResponsiveContainer width="100%" height="100%">
-                    <LineChart data={k.series} margin={{ top: 3, right: 0, bottom: 0, left: 0 }}>
-                      <Line type="monotone" dataKey="value" stroke={kpiColors[i]} strokeWidth={1.5} dot={false} isAnimationActive={false} />
-                    </LineChart>
-                  </ResponsiveContainer>
-                </div>
-              </div>
-            </Card>
+              </Card>
+            </div>
           );
         })}
       </div>
@@ -233,7 +373,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter }) => {
       {/* Top API Keys + Top Apps — side by side like OR */}
       <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
         <Col xs={24} lg={12}>
-          <Card style={{ borderRadius: 12 }} title="Top API Keys" extra={<Text type="secondary" style={{ fontSize: 12 }}>by tokens</Text>}>
+          <Card style={{ borderRadius: 12 }} title="Top API Keys" extra={<ExploreLink onClick={() => goExplore({ metric: 'tokens', groupBy: 'key' })} />}>
             {topKeys.length === 0 && <Text type="secondary">No usage in this period.</Text>}
             {topKeys.map(([name, val], idx) => (
               <div key={name} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '6px 0' }}>
@@ -249,7 +389,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter }) => {
           </Card>
         </Col>
         <Col xs={24} lg={12}>
-          <Card style={{ borderRadius: 12 }} title="Top Apps" extra={<Text type="secondary" style={{ fontSize: 12 }}>by tokens · X-OpenRouter-Title / Referer / UA</Text>}>
+          <Card style={{ borderRadius: 12 }} title="Top Apps" extra={<ExploreLink onClick={() => goExplore({ metric: 'tokens', groupBy: 'app' })} />}>
             {topApps.length === 0 && <Text type="secondary">No usage in this period.</Text>}
             {topApps.map(([name, val], idx) => (
               <div key={name} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '6px 0' }}>
@@ -266,52 +406,67 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter }) => {
       </Row>
 
       {/* Usage by model — stacked bars */}
-      <Card style={{ borderRadius: 12, marginBottom: 16 }} title="Usage by model">
-        <ResponsiveContainer width="100%" height={260}>
-          <BarChart data={usageByModel} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
-            <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={(v) => fmtTick(gran, String(v))} />
-            <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => fmtUSDInt(Number(v))} />
-            <Tooltip formatter={(v: any, name: any) => [fmtUSD(Number(v)), String(name)]} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
-            <Legend wrapperStyle={{ fontSize: 12 }} />
-            {topModels.map((m, i) => (
-              <Bar key={m} dataKey={m} stackId="a" fill={m === 'Other' ? OTHER_COLOR : CHART_COLORS[i % CHART_COLORS.length]} maxBarSize={22} radius={i === topModels.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]} />
-            ))}
-          </BarChart>
-        </ResponsiveContainer>
-      </Card>
+      <div style={{ marginBottom: 16 }}>
+        <ChartCard
+          title="Usage by model"
+          extra={<ExploreLink onClick={() => goExplore({ metric: 'spend', groupBy: 'model' })} />}
+          groups={modelGroups}
+          renderChart={(vis) => (
+            <ResponsiveContainer width="100%" height={260}>
+              <BarChart data={usageByModel} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
+                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={(v) => fmtTick(gran, String(v))} />
+                <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => fmtUSDInt(Number(v))} />
+                <Tooltip formatter={(v: any, name: any) => [fmtUSD(Number(v)), String(name)]} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
+                {vis.map((m, i) => (
+                  <Bar key={m} dataKey={m} stackId="a" fill={modelColor.get(m)} maxBarSize={22} radius={i === vis.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]} />
+                ))}
+              </BarChart>
+            </ResponsiveContainer>
+          )}
+        />
+      </div>
 
       <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
         {/* Usage type — stacked area */}
         <Col xs={24} lg={12}>
-          <Card style={{ borderRadius: 12 }} title="Usage type">
-            <ResponsiveContainer width="100%" height={260}>
-              <AreaChart data={usageType} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
-                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={(v) => fmtTick(gran, String(v))} />
-                <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => fmtUSDInt(Number(v))} />
-                <Tooltip formatter={(v: any) => [fmtUSD(Number(v)), 'Spend']} contentStyle={{ borderRadius: 8, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
-                <Area type="monotone" dataKey="Spend" stroke="#8b5cf6" strokeWidth={2} fill="#8b5cf6" fillOpacity={0.4} dot={false} />
-              </AreaChart>
-            </ResponsiveContainer>
-          </Card>
+          <ChartCard
+            title="Usage type"
+            extra={<ExploreLink onClick={() => goExplore({ metric: 'spend' })} />}
+            groups={[{ name: 'Spend', color: '#8b5cf6' }]}
+            renderChart={(vis) => (
+              <ResponsiveContainer width="100%" height={260}>
+                <AreaChart data={usageType} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
+                  <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={(v) => fmtTick(gran, String(v))} />
+                  <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => fmtUSDInt(Number(v))} />
+                  <Tooltip formatter={(v: any) => [fmtUSD(Number(v)), 'Spend']} contentStyle={{ borderRadius: 8, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
+                  {vis.includes('Spend') && <Area type="monotone" dataKey="Spend" stroke="#8b5cf6" strokeWidth={2} fill="#8b5cf6" fillOpacity={0.4} dot={false} />}
+                </AreaChart>
+              </ResponsiveContainer>
+            )}
+          />
         </Col>
         {/* Request volume by model — stacked bars */}
         <Col xs={24} lg={12}>
-          <Card style={{ borderRadius: 12 }} title="Request volume by model">
-            <ResponsiveContainer width="100%" height={260}>
-              <BarChart data={reqByModel} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
-                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={(v) => fmtTick(gran, String(v))} />
-                <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={50} tickFormatter={(v) => fmtCompact(Number(v))} />
-                <Tooltip formatter={(v: any, name: any) => [fmtCompact(Number(v)), String(name)]} contentStyle={{ borderRadius: 8, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
-                <Legend wrapperStyle={{ fontSize: 12 }} />
-                {topReqModels.map((m, i) => (
-                  <Bar key={m} dataKey={m} stackId="a" fill={m === 'Other' ? OTHER_COLOR : CHART_COLORS[i % CHART_COLORS.length]} maxBarSize={14} radius={i === topReqModels.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]} />
-                ))}
-              </BarChart>
-            </ResponsiveContainer>
-          </Card>
+          <ChartCard
+            title="Request volume by model"
+            extra={<ExploreLink onClick={() => goExplore({ metric: 'requests', groupBy: 'model' })} />}
+            groups={reqGroups}
+            renderChart={(vis) => (
+              <ResponsiveContainer width="100%" height={260}>
+                <BarChart data={reqByModel} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
+                  <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={(v) => fmtTick(gran, String(v))} />
+                  <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={50} tickFormatter={(v) => fmtCompact(Number(v))} />
+                  <Tooltip formatter={(v: any, name: any) => [fmtCompact(Number(v)), String(name)]} contentStyle={{ borderRadius: 8, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
+                  {vis.map((m, i) => (
+                    <Bar key={m} dataKey={m} stackId="a" fill={reqColor.get(m)} maxBarSize={14} radius={i === vis.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]} />
+                  ))}
+                </BarChart>
+              </ResponsiveContainer>
+            )}
+          />
         </Col>
       </Row>
 
@@ -320,35 +475,45 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter }) => {
             reasoning field in the data model, and no Cached here to avoid
             double-counting cached tokens into the prompt bucket) */}
         <Col xs={24} lg={12}>
-          <Card style={{ borderRadius: 12 }} title="Token breakdown">
-            <ResponsiveContainer width="100%" height={260}>
-              <BarChart data={tokenBreakdown} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
-                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={(v) => fmtTick(gran, String(v))} />
-                <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => fmtCompact(Number(v))} />
-                <Tooltip formatter={(v: any, name: any) => [fmtTokens(Number(v)), String(name)]} contentStyle={{ borderRadius: 8, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
-                <Legend wrapperStyle={{ fontSize: 12 }} />
-                <Bar dataKey="Completion" stackId="a" fill="#a855f7" maxBarSize={14} />
-                <Bar dataKey="Prompt" stackId="a" fill="#3b82f6" maxBarSize={14} radius={[2, 2, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          </Card>
+          <ChartCard
+            title="Token breakdown"
+            extra={<ExploreLink onClick={() => goExplore({ metric: 'tokens' })} />}
+            groups={[{ name: 'Completion', color: '#a855f7' }, { name: 'Prompt', color: '#3b82f6' }]}
+            renderChart={(vis) => (
+              <ResponsiveContainer width="100%" height={260}>
+                <BarChart data={tokenBreakdown} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
+                  <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={(v) => fmtTick(gran, String(v))} />
+                  <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => fmtCompact(Number(v))} />
+                  <Tooltip formatter={(v: any, name: any) => [fmtTokens(Number(v)), String(name)]} contentStyle={{ borderRadius: 8, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
+                  {vis.map((g, i) => (
+                    <Bar key={g} dataKey={g} stackId="a" fill={g === 'Prompt' ? '#3b82f6' : '#a855f7'} maxBarSize={14} radius={i === vis.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]} />
+                  ))}
+                </BarChart>
+              </ResponsiveContainer>
+            )}
+          />
         </Col>
         {/* Prompt token caching — stacked bars */}
         <Col xs={24} lg={12}>
-          <Card style={{ borderRadius: 12 }} title="Prompt token caching">
-            <ResponsiveContainer width="100%" height={260}>
-              <BarChart data={caching} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
-                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={(v) => fmtTick(gran, String(v))} />
-                <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => fmtCompact(Number(v))} />
-                <Tooltip formatter={(v: any, name: any) => [fmtTokens(Number(v)), String(name)]} contentStyle={{ borderRadius: 8, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
-                <Legend wrapperStyle={{ fontSize: 12 }} />
-                <Bar dataKey="Uncached" stackId="a" fill="#94a3b8" maxBarSize={14} />
-                <Bar dataKey="Cached" stackId="a" fill="#f59e0b" maxBarSize={14} radius={[2, 2, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          </Card>
+          <ChartCard
+            title="Prompt token caching"
+            extra={<ExploreLink onClick={() => goExplore({ metric: 'tokens' })} />}
+            groups={[{ name: 'Uncached', color: '#94a3b8' }, { name: 'Cached', color: '#f59e0b' }]}
+            renderChart={(vis) => (
+              <ResponsiveContainer width="100%" height={260}>
+                <BarChart data={caching} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
+                  <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={(v) => fmtTick(gran, String(v))} />
+                  <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => fmtCompact(Number(v))} />
+                  <Tooltip formatter={(v: any, name: any) => [fmtTokens(Number(v)), String(name)]} contentStyle={{ borderRadius: 8, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
+                  {vis.map((g, i) => (
+                    <Bar key={g} dataKey={g} stackId="a" fill={g === 'Cached' ? '#f59e0b' : '#94a3b8'} maxBarSize={14} radius={i === vis.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]} />
+                  ))}
+                </BarChart>
+              </ResponsiveContainer>
+            )}
+          />
         </Col>
       </Row>
     </div>

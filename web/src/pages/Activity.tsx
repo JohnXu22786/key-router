@@ -366,7 +366,7 @@ const Activity: React.FC = () => {
       {/* No key= remount: pages re-fetch on range change and keep the
           previous content visible while refreshing — a refresh must never
           blank the page. */}
-      {tab === 'overview' && <ActivityOverview range={range} filter={filter} />}
+      {tab === 'overview' && <ActivityOverview range={range} filter={filter} onNavigate={handleNavigate} />}
       {tab === 'trends' && <ActivityTrends range={range} filter={filter} onNavigate={handleNavigate} />}
       {tab === 'explore' && <ActivityExplore range={range} filter={filter} initialMetric={exploreInit.metric} initialGroupBy={exploreInit.groupBy} />}
     </div>
