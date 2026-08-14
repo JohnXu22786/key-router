@@ -5,7 +5,7 @@ import {
   BarChart, Bar, Legend, LineChart, Line,
 } from 'recharts';
 import { getConsumptions, getKeys, Consumption, Key } from '../api/client';
-import { DateRange, fmtUSD, fmtTokens, fmtCompact, fmtTokensBare, fmtUSDInt, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtPercent, fmtTick, fmtBucket, series, stackedData, groupTotals, Granularity, maskKey } from './activityShared';
+import { DateRange, fmtUSD, fmtTokens, fmtCompact, fmtTokensBare, fmtUSDInt, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtPercent, fmtTick, fmtBucket, series, stackedData, groupTotals, Granularity, maskKey, cacheHitRate } from './activityShared';
 import dayjs from 'dayjs';
 
 const { Text } = Typography;
@@ -96,8 +96,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
   // consistent formula for both the KPI value and the sparkline.
   const rateFor = (l: Consumption[]) => {
     const s = sum(l);
-    const tot = s.input + s.cache;
-    return tot > 0 ? (s.cache / tot) * 100 : 0;
+    return cacheHitRate(s.input, s.cache);
   };
   const curRate = rateFor(curList);
   const prevRate = rateFor(prevList);
@@ -114,12 +113,22 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
   const costSeries = series(curList, c => c.cost_usd, axSince, axUntil, gran);
   const tokenSeries = series(curList, c => c.input_tokens + c.output_tokens, axSince, axUntil, gran);
   const reqSeries = series(curList, c => c.request_count, axSince, axUntil, gran);
+  // Prompt caching per bucket (token sums, shared by the Cached/Uncached
+  // chart and the rate sparkline below).
+  const inSeries = series(curList, c => c.input_tokens, axSince, axUntil, gran);
+  const cacheSeries = series(curList, c => c.cache_hit_tokens, axSince, axUntil, gran);
   // Blended $/1M per bucket (cost / tokens in the SAME bucket).
   const blendedSeries = costSeries.map((d, i) => ({
     label: d.label,
     value: (tokenSeries[i]?.value || 0) > 0 ? (d.value / (tokenSeries[i]?.value || 0)) * 1e6 : 0,
   }));
-  const rateSeries = series(curList, c => (c.cache_hit_tokens / Math.max(1, c.input_tokens + c.cache_hit_tokens)) * 100, axSince, axUntil, gran);
+  // Cache-hit rate sparkline: divide the bucket's cached by the bucket's
+  // input (token-weighted, like the KPI) — summing per-row rates would
+  // over-read with several keys in one bucket.
+  const rateSeries = inSeries.map((d, i) => ({
+    label: d.label,
+    value: cacheHitRate(d.value, cacheSeries[i]?.value || 0),
+  }));
 
   // deltaFor: for the Blended $/1M KPI a RISE is negative (cost per token up
   // = bad), so the "bad" flag inverts the color.
@@ -174,8 +183,6 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range }) => {
   }));
 
   // Prompt caching: Cached vs Uncached (per bucket)
-  const inSeries = series(curList, c => c.input_tokens, axSince, axUntil, gran);
-  const cacheSeries = series(curList, c => c.cache_hit_tokens, axSince, axUntil, gran);
   const caching = cacheSeries.map((d, i) => ({
     label: d.label,
     Cached: d.value,
