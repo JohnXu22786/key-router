@@ -1138,6 +1138,11 @@ func ConvertAnthropicResponseToOpenAI(body []byte, model string) ([]byte, error)
 	if toolCalls := extractAnthropicToolCalls(anthResp); len(toolCalls) > 0 {
 		msg["tool_calls"] = toolCalls
 	}
+	// thinking blocks (extended thinking) → reasoning_content so OpenAI
+	// clients (opencode, DeepSeek-style gateways) keep the reasoning chain
+	if rc := extractAnthropicThinking(anthResp); rc != "" {
+		msg["reasoning_content"] = rc
+	}
 
 	oaiResp := map[string]interface{}{
 		"id":      anthResp["id"],
@@ -1216,12 +1221,58 @@ func ConvertOpenAIResponseToAnthropic(body []byte) ([]byte, error) {
 		}
 		msg, _ := choice["message"].(map[string]interface{})
 
+		// DeepSeek-style reasoning_content → thinking block (empty
+		// signature: it is cryptographically bound to the original turn and
+		// cannot be fabricated; compatible gateways accept it).
+		var thinkingParts []string
+		if rc, ok := msg["reasoning_content"].(string); ok && rc != "" {
+			thinkingParts = append(thinkingParts, rc)
+		}
+
 		content := []interface{}{}
-		if text, ok := msg["content"].(string); ok && text != "" {
-			content = append(content, map[string]interface{}{
-				"type": "text",
-				"text": text,
-			})
+		switch c := msg["content"].(type) {
+		case string:
+			if c != "" {
+				content = append(content, map[string]interface{}{
+					"type": "text",
+					"text": c,
+				})
+			}
+		case []interface{}:
+			// Some OpenAI-compatible gateways return content as parts;
+			// text parts become text blocks, reasoning parts (o-series
+			// style) become a thinking block.
+			var texts []string
+			for _, part := range c {
+				p, ok := part.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				switch p["type"] {
+				case "text":
+					if t, ok := p["text"].(string); ok {
+						texts = append(texts, t)
+					}
+				case "reasoning":
+					if t := format.ReasoningSummaryText(p); t != "" {
+						thinkingParts = append(thinkingParts, t)
+					}
+				}
+			}
+			if t := strings.Join(texts, ""); t != "" {
+				content = append(content, map[string]interface{}{
+					"type": "text",
+					"text": t,
+				})
+			}
+		}
+		if len(thinkingParts) > 0 {
+			// thinking precedes text in Anthropic responses
+			content = append([]interface{}{map[string]interface{}{
+				"type":      "thinking",
+				"thinking":  strings.Join(thinkingParts, "\n"),
+				"signature": "",
+			}}, content...)
 		}
 		// tool_calls → tool_use content blocks (arguments string → object)
 		if toolCalls, ok := msg["tool_calls"].([]interface{}); ok {
@@ -1364,6 +1415,27 @@ func extractAnthropicContent(anthResp map[string]interface{}) string {
 		}
 	}
 	return strings.Join(texts, "")
+}
+
+// extractAnthropicThinking collects the text of an Anthropic response's
+// thinking blocks (extended thinking) so it can be reported as OpenAI
+// reasoning_content. redacted_thinking blocks have no text and are skipped.
+// Multiple blocks are joined with "\n" (like the request-direction
+// conversion) so block boundaries never merge words.
+func extractAnthropicThinking(anthResp map[string]interface{}) string {
+	content, ok := anthResp["content"].([]interface{})
+	if !ok {
+		return ""
+	}
+	var texts []string
+	for _, c := range content {
+		if block, ok := c.(map[string]interface{}); ok && block["type"] == "thinking" {
+			if t, ok := block["thinking"].(string); ok && t != "" {
+				texts = append(texts, t)
+			}
+		}
+	}
+	return strings.Join(texts, "\n")
 }
 
 // parseTokenUsage extracts token usage from a response body
