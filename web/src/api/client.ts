@@ -175,7 +175,7 @@ export interface ActivityResponse {
   buckets: string[];
   totals: { spend: number; tokens: number; requests: number; cache: number };
 }
-export const getActivity = (params: { metric?: string; group_by?: string; subgroup?: string; rollup?: string; top?: number; since?: string; until?: string }) =>
+export const getActivity = (params: { metric?: string; group_by?: string; subgroup?: string; rollup?: string; rank_by?: string; top?: number; since?: string; until?: string }) =>
   api.get<ActivityResponse>('/stats/activity', { params });
 
 // Actions
