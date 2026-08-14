@@ -197,8 +197,13 @@ func RecordConsumption(keyID int64, modelName, appName string, usage *model.Toke
 // GetConsumptionSummary returns consumption statistics for a time range
 func GetConsumptionSummary(keyID int64, since, until time.Time) ([]model.Consumption, error) {
 	var consumptions []model.Consumption
+	// Floor since to the LOCAL hour: hour_bucket rows are hour-truncated, so
+	// a mid-hour since (e.g. a 1h window at 16:20 -> since 15:20) must still
+	// match the 15:00 bucket or the window's first hour (the bucket
+	// containing its start) silently disappears from the query.
+	floor := time.Date(since.Year(), since.Month(), since.Day(), since.Hour(), 0, 0, 0, since.Location())
 	err := db.GetDB().Where("key_id = ? AND hour_bucket >= ? AND hour_bucket <= ?",
-		keyID, since, until).Order("hour_bucket DESC").Find(&consumptions).Error
+		keyID, floor, until).Order("hour_bucket DESC").Find(&consumptions).Error
 	return consumptions, err
 }
 
