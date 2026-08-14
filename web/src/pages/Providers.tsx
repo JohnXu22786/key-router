@@ -340,17 +340,6 @@ const Providers: React.FC = () => {
     },
     { title: 'Strategy', dataIndex: 'recovery_strategy', key: 'recovery_strategy', width: 90 },
     {
-      title: 'Rate Limits', key: 'limits',
-      render: (_: unknown, r: Key) => (
-        <Space size={4} wrap>
-          {r.rpm_limit > 0 && <Tag>{r.rpm_limit} rpm</Tag>}
-          {r.tpm_limit > 0 && <Tag>{r.tpm_limit} tpm</Tag>}
-          {r.rpd_limit > 0 && <Tag>{r.rpd_metric === 'cost' ? `$${(r.rpd_limit / 1e6).toFixed(2)}/d` : `${r.rpd_limit}/d`}</Tag>}
-          {r.total_spend_limit > 0 && <Tag>${microUsdToUsd(r.total_spend_limit).toFixed(2)} budget</Tag>}
-        </Space>
-      ),
-    },
-    {
       title: 'Actions', key: 'actions', width: 120,
       render: (_: unknown, r: Key) => (
         <Space>
