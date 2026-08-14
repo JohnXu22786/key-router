@@ -504,6 +504,13 @@ type AnthropicStreamConverter struct {
 	// emitting it early would skip a lower index).
 	textPending bool
 	textDeltas  [][]byte // buffered text deltas while the text start is held
+	// DeepSeek-style reasoning_content deltas map to an Anthropic thinking
+	// block; the same hold-until-ascending rule applies (a thinking block
+	// may arrive before a deferred tool's start resolves).
+	thinkingOpened   bool
+	thinkingBlockIdx int
+	thinkingPending  bool
+	thinkingDeltas   [][]byte
 	// Some gateways delay a tool call's id/name to a later fragment. The
 	// content_block_start (which must carry both) is held back until they
 	// are known, buffering argument deltas in the meantime; pendingStarts
@@ -569,30 +576,51 @@ func (c *AnthropicStreamConverter) flushPendingStart(ti int) [][]byte {
 }
 
 // flushAllPendingStarts emits every deferred start (deferred tools plus a
-// held text block) in block-index order (used at stream end, or when all
-// deferred tools become resolvable — strict Anthropic validators require
-// ascending block indexes). A tool whose name never arrived is dropped
-// entirely — Anthropic rejects a nameless tool_use block, and an unusable
-// tool call must not 400 the whole stream.
+// held text/thinking block) in block-index order (used at stream end, or
+// when all deferred tools become resolvable — strict Anthropic validators
+// require ascending block indexes). A tool whose name never arrived is
+// dropped entirely — Anthropic rejects a nameless tool_use block, and an
+// unusable tool call must not 400 the whole stream.
 func (c *AnthropicStreamConverter) flushAllPendingStarts() [][]byte {
 	type entry struct {
-		ti     int // -1 for the text block
+		ti     int // >=0 tool call index; -1 text block; -2 thinking block
 		block  int
 		id     string
 		name   string
 		deltas [][]byte
 	}
-	entries := make([]entry, 0, len(c.pendingStarts)+1)
+	entries := make([]entry, 0, len(c.pendingStarts)+2)
 	for ti, ps := range c.pendingStarts {
 		entries = append(entries, entry{ti, ps.blockIdx, ps.id, ps.name, ps.deltas})
 	}
 	if c.textPending {
 		entries = append(entries, entry{ti: -1, block: c.textBlockIdx})
 	}
+	if c.thinkingPending {
+		entries = append(entries, entry{ti: -2, block: c.thinkingBlockIdx})
+	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].block < entries[j].block })
 	var events [][]byte
 	for _, e := range entries {
 		if e.ti < 0 {
+			if e.ti == -2 {
+				// held thinking block: emit its start, then the buffered deltas
+				c.thinkingPending = false
+				c.thinkingOpened = true
+				startEv, _ := json.Marshal(map[string]interface{}{
+					"type":  "content_block_start",
+					"index": e.block,
+					"content_block": map[string]interface{}{
+						"type":      "thinking",
+						"thinking":  "",
+						"signature": "",
+					},
+				})
+				events = append(events, startEv)
+				events = append(events, c.thinkingDeltas...)
+				c.thinkingDeltas = nil
+				continue
+			}
 			// held text block: emit its start, then the buffered deltas
 			c.textPending = false
 			c.textOpened = true
@@ -722,6 +750,47 @@ func (c *AnthropicStreamConverter) Convert(chunk []byte, modelName string) ([][]
 	// upstreams (vLLM, llama.cpp, Ollama) send the last fragment together
 	// with finish_reason — dropping it would truncate the final token.
 	if delta, ok := safeMap(choice["delta"]); ok {
+		// Reasoning delta (DeepSeek/opencode-style reasoning_content). Maps
+		// to an Anthropic thinking block; processed first so it takes a
+		// lower block index than text/tools (Anthropic emits thinking
+		// before the answer).
+		if rc, ok := safeString(delta, "reasoning_content"); ok && rc != "" {
+			if !c.thinkingOpened && !c.thinkingPending {
+				c.thinkingBlockIdx = c.nextBlockIdx
+				c.nextBlockIdx++
+				if len(c.pendingStarts) > 0 || c.textPending {
+					// Tool/text starts are held — hold the thinking start
+					// too so every start flushes in ascending block order.
+					c.thinkingPending = true
+				} else {
+					c.thinkingOpened = true
+					startEv, _ := json.Marshal(map[string]interface{}{
+						"type":  "content_block_start",
+						"index": c.thinkingBlockIdx,
+						"content_block": map[string]interface{}{
+							"type":      "thinking",
+							"thinking":  "",
+							"signature": "",
+						},
+					})
+					events = append(events, startEv)
+				}
+			}
+			ev, _ := json.Marshal(map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": c.thinkingBlockIdx,
+				"delta": map[string]interface{}{
+					"type":     "thinking_delta",
+					"thinking": rc,
+				},
+			})
+			if c.thinkingPending {
+				c.thinkingDeltas = append(c.thinkingDeltas, ev)
+			} else {
+				events = append(events, ev)
+			}
+		}
+
 		// Content delta (text). Emit content_block_start before the first
 		// text delta so strict clients have an open block. The text block
 		// takes the next free index (0 unless a tool block opened first).
@@ -729,9 +798,9 @@ func (c *AnthropicStreamConverter) Convert(chunk []byte, modelName string) ([][]
 			if !c.textOpened {
 				c.textBlockIdx = c.nextBlockIdx
 				c.nextBlockIdx++
-				if len(c.pendingStarts) > 0 {
-					// Tool starts are held — hold the text start too so
-					// every start flushes in ascending block order.
+				if len(c.pendingStarts) > 0 || c.thinkingPending {
+					// Tool/thinking starts are held — hold the text start
+					// too so every start flushes in ascending block order.
 					c.textPending = true
 				} else {
 					c.textOpened = true
@@ -891,14 +960,17 @@ func (c *AnthropicStreamConverter) Convert(chunk []byte, modelName string) ([][]
 		// content_block_stop events.
 		events = append(events, c.flushAllPendingStarts()...)
 
-		// Close all open blocks in ascending index order (text block and any
-		// tool blocks)
-		closeIdx := make([]int, 0, len(c.toolBlocks)+1)
+		// Close all open blocks in ascending index order (text/thinking
+		// block and any tool blocks)
+		closeIdx := make([]int, 0, len(c.toolBlocks)+2)
 		for _, blockIdx := range c.toolBlocks {
 			closeIdx = append(closeIdx, blockIdx)
 		}
 		if c.textOpened {
 			closeIdx = append(closeIdx, c.textBlockIdx)
+		}
+		if c.thinkingOpened {
+			closeIdx = append(closeIdx, c.thinkingBlockIdx)
 		}
 		sort.Ints(closeIdx)
 		for _, blockIdx := range closeIdx {
@@ -973,12 +1045,15 @@ func (c *AnthropicStreamConverter) CloseStream() [][]byte {
 	// Flush any deferred tool starts, then close open blocks.
 	var events [][]byte
 	events = append(events, c.flushAllPendingStarts()...)
-	closeIdx := make([]int, 0, len(c.toolBlocks)+1)
+	closeIdx := make([]int, 0, len(c.toolBlocks)+2)
 	for _, blockIdx := range c.toolBlocks {
 		closeIdx = append(closeIdx, blockIdx)
 	}
 	if c.textOpened {
 		closeIdx = append(closeIdx, c.textBlockIdx)
+	}
+	if c.thinkingOpened {
+		closeIdx = append(closeIdx, c.thinkingBlockIdx)
 	}
 	sort.Ints(closeIdx)
 
@@ -1612,16 +1687,31 @@ func convertOpenAIAssistantMessage(m map[string]interface{}) map[string]interfac
 	}
 
 	// Content may be a string OR an array of parts (audio/video modalities,
-	// refusal parts, some OpenAI-compatible gateways) — extract the text.
+	// refusal parts, some OpenAI-compatible gateways) — extract the text and
+	// any reasoning parts (o-series style {"type":"reasoning","summary":...}).
 	var content string
+	var thinkingParts []string
+	// DeepSeek-style reasoning_content field → Anthropic thinking block
+	if rc, ok := safeString(m, "reasoning_content"); ok && rc != "" {
+		thinkingParts = append(thinkingParts, rc)
+	}
 	if s, ok := safeString(m, "content"); ok {
 		content = s
 	} else if parts, ok := safeArr(m, "content"); ok {
 		var texts []string
 		for _, part := range parts {
-			if p, ok := safeMap(part); ok && safeStringOrDefault(p, "type", "") == "text" {
+			p, ok := safeMap(part)
+			if !ok {
+				continue
+			}
+			switch safeStringOrDefault(p, "type", "") {
+			case "text":
 				if t, ok := safeString(p, "text"); ok {
 					texts = append(texts, t)
+				}
+			case "reasoning":
+				if t := ReasoningSummaryText(p); t != "" {
+					thinkingParts = append(thinkingParts, t)
 				}
 			}
 		}
@@ -1629,6 +1719,16 @@ func convertOpenAIAssistantMessage(m map[string]interface{}) map[string]interfac
 	}
 
 	var anthContent []interface{}
+	if len(thinkingParts) > 0 {
+		// The signature cannot be fabricated (it is cryptographically bound
+		// to the original turn); an empty one keeps the block well-formed
+		// for Anthropic-compatible gateways that accept thinking blocks.
+		anthContent = append(anthContent, map[string]interface{}{
+			"type":      "thinking",
+			"thinking":  strings.Join(thinkingParts, "\n"),
+			"signature": "",
+		})
+	}
 	if content != "" {
 		anthContent = append(anthContent, map[string]interface{}{
 			"type": "text",
@@ -1684,6 +1784,26 @@ func parseArgumentsObject(arguments interface{}) map[string]interface{} {
 	return obj
 }
 
+// ReasoningSummaryText extracts the plain text of an OpenAI content part of
+// type "reasoning" (o-series shape: {"type":"reasoning","summary":[
+// {"type":"summary_text","text":...}]}). Returns "" when absent. Exported
+// because the relay's response conversion needs the same extraction.
+func ReasoningSummaryText(p map[string]interface{}) string {
+	summary, ok := safeArr(p, "summary")
+	if !ok {
+		return ""
+	}
+	var texts []string
+	for _, s := range summary {
+		if part, ok := safeMap(s); ok && safeStringOrDefault(part, "type", "") == "summary_text" {
+			if t, ok := safeString(part, "text"); ok {
+				texts = append(texts, t)
+			}
+		}
+	}
+	return strings.Join(texts, "")
+}
+
 func convertOpenAIToolMessage(m map[string]interface{}) map[string]interface{} {
 	// Anthropic tool_result.content must be a string or array — OpenAI may
 	// legally send null content (a tool that returned nothing)
@@ -1729,10 +1849,16 @@ func convertOpenAITools(tools []interface{}) []interface{} {
 		if !ok {
 			continue
 		}
+		// Anthropic input_schema is REQUIRED and must be an object;
+		// OpenAI-compatible gateways sometimes omit "parameters".
+		schema := fn["parameters"]
+		if schema == nil {
+			schema = map[string]interface{}{"type": "object"}
+		}
 		anthTools = append(anthTools, map[string]interface{}{
 			"name":         fn["name"],
 			"description":  fn["description"],
-			"input_schema": fn["parameters"],
+			"input_schema": schema,
 			"type":         "custom",
 		})
 	}
@@ -1969,6 +2095,7 @@ func convertAnthropicAssistantMessage(m map[string]interface{}) map[string]inter
 	}
 
 	var textParts []string
+	var thinkingParts []string
 	var toolCalls []interface{}
 
 	for _, part := range content {
@@ -1982,6 +2109,13 @@ func convertAnthropicAssistantMessage(m map[string]interface{}) map[string]inter
 		case "text":
 			if t, ok := safeString(p, "text"); ok {
 				textParts = append(textParts, t)
+			}
+		case "thinking":
+			// Extended-thinking blocks → reasoning_content so OpenAI-format
+			// clients (opencode, DeepSeek-style gateways) keep the chain.
+			// redacted_thinking blocks have no text and are skipped.
+			if t, ok := safeString(p, "thinking"); ok && t != "" {
+				thinkingParts = append(thinkingParts, t)
 			}
 		case "tool_use":
 			// Anthropic input is a JSON object; OpenAI requires a
@@ -2004,6 +2138,9 @@ func convertAnthropicAssistantMessage(m map[string]interface{}) map[string]inter
 	}
 
 	result["content"] = strings.Join(textParts, "")
+	if len(thinkingParts) > 0 {
+		result["reasoning_content"] = strings.Join(thinkingParts, "\n")
+	}
 	if len(toolCalls) > 0 {
 		result["tool_calls"] = toolCalls
 	}
@@ -2018,12 +2155,18 @@ func convertAnthropicTools(tools []interface{}) []interface{} {
 		if !ok {
 			continue
 		}
+		// Symmetric guard: a non-conformant gateway may omit input_schema —
+		// OpenAI function tools must carry a parameters object.
+		params := t["input_schema"]
+		if params == nil {
+			params = map[string]interface{}{"type": "object"}
+		}
 		oaiTools = append(oaiTools, map[string]interface{}{
 			"type": "function",
 			"function": map[string]interface{}{
 				"name":        t["name"],
 				"description": t["description"],
-				"parameters":  t["input_schema"],
+				"parameters":  params,
 			},
 		})
 	}
