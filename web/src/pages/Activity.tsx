@@ -1,6 +1,6 @@
-import React, { useEffect, useState, useCallback, useMemo } from 'react';
-import { Typography, Space, Button, Spin, Select, DatePicker, Segmented } from 'antd';
-import { ReloadOutlined, CalendarOutlined } from '@ant-design/icons';
+import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
+import { Typography, Space, Button, Spin, Popover, Segmented, Select, DatePicker, theme, message } from 'antd';
+import { ReloadOutlined, CalendarOutlined, FilterOutlined, DownOutlined } from '@ant-design/icons';
 import dayjs from 'dayjs';
 import ActivityOverview from './ActivityOverview';
 import ActivityTrends from './ActivityTrends';
@@ -9,8 +9,12 @@ import ActivityExplore from './ActivityExplore';
 // dayjs and the API client), so pages never import from Activity.tsx — a
 // cycle (Activity -> child -> Activity) can hand the children undefined
 // constants and crash the page.
-import { makeRanges, customRange, CUSTOM_KEY, CUSTOM_LABEL, ExploreOpts } from './activityShared';
+import {
+  makeRanges, customRange, CUSTOM_KEY, CUSTOM_LABEL, ExploreOpts,
+  ActivityFilter, ActivityFilterType, FILTER_TYPES, modelFavicon, maskKey,
+} from './activityShared';
 import type { DateRange } from './activityShared';
+import { getConsumptions, getKeys, Key } from '../api/client';
 
 const { Title, Text } = Typography;
 
@@ -23,7 +27,7 @@ const Chip: React.FC<{ children: React.ReactNode }> = ({ children }) => (
     display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
     minWidth: 34, padding: '0 6px', height: 18, borderRadius: 6,
     background: 'rgba(120,120,140,0.12)', color: 'rgba(120,120,140,0.9)',
-    fontSize: 11, fontWeight: 500, fontVariantNumeric: 'tabular-nums', marginRight: 8,
+    fontSize: 11, fontWeight: 500, fontVariantNumeric: 'tabular-nums',
   }}>
     {children}
   </span>
@@ -32,11 +36,25 @@ const Chip: React.FC<{ children: React.ReactNode }> = ({ children }) => (
 const rangeText = (r: DateRange): string =>
   `${r.since.format('MMM D, h:mm a')} – ${r.until.format('MMM D, h:mm a')}`;
 
-interface OptionType { value: string; label: React.ReactNode; disabled?: boolean; isHeader?: boolean; }
+// EntityIcon renders a model's vendor favicon (or a letter avatar fallback)
+// in the filter panel's option list, matching the Explore/Trends rows.
+const EntityIcon: React.FC<{ name: string }> = ({ name }) => {
+  const fav = modelFavicon(name);
+  if (fav.url) {
+    return <img src={fav.url} alt="" width={14} height={14} style={{ borderRadius: 3, flexShrink: 0 }} />;
+  }
+  return (
+    <span style={{ width: 14, height: 14, borderRadius: 3, background: fav.color, color: '#fff', fontSize: 9, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, fontWeight: 600 }}>
+      {fav.letter}
+    </span>
+  );
+};
 
 const Activity: React.FC = () => {
+  const { token } = theme.useToken();
   const [tab, setTab] = useState<TabKey>('overview');
-  const [rangeKey, setRangeKey] = useState('1mo'); // default like the saved page
+  // Default: Past 24 Hours — the window most users care about first.
+  const [rangeKey, setRangeKey] = useState('1d');
   const [custom, setCustom] = useState<{ since: dayjs.Dayjs; until: dayjs.Dayjs } | null>(null);
   const [loading, setLoading] = useState(false);
   // Trends "Explore" links hand the metric/grouping to the Explore tab.
@@ -48,9 +66,21 @@ const Activity: React.FC = () => {
   const [now, setNow] = useState(() => dayjs());
   const ranges = useMemo(() => makeRanges(now), [now]);
 
+  // Global entity filter (Model / API Key / App), applied to every tab via
+  // filter_type/filter_value on the activity + consumptions requests.
+  const [filter, setFilter] = useState<ActivityFilter | null>(null);
+  const [filterOpen, setFilterOpen] = useState(false);
+  const [filterMode, setFilterMode] = useState<ActivityFilterType>('model');
+  // Option lists: models/apps seen in the current window, plus all keys.
+  // Loaded lazily when the panel opens so the 30s range slide doesn't
+  // refetch them constantly.
+  const [filterOpts, setFilterOpts] = useState<{ models: string[]; apps: string[]; keys: Key[] } | null>(null);
+  const [filterOptsLoading, setFilterOptsLoading] = useState(false);
+  const [rangeOpen, setRangeOpen] = useState(false);
+
   const range = useMemo<DateRange>(() => {
     if (rangeKey === CUSTOM_KEY && custom) return customRange(custom.since, custom.until);
-    return ranges.find(r => r.key === rangeKey) ?? ranges[7]; // fallback 1mo
+    return ranges.find(r => r.key === rangeKey) ?? ranges.find(r => r.key === '1d') ?? ranges[0];
   }, [rangeKey, custom, ranges]);
 
   const handleRefresh = useCallback(async () => {
@@ -82,15 +112,195 @@ const Activity: React.FC = () => {
     setTab(tab);
   }, []);
 
-  // Picker options, in OpenRouter's order: rolling windows, calendar
-  // windows, then the custom range.
-  const options: OptionType[] = useMemo(() => [
-    { value: '__grp_rolling', label: 'Rolling', isHeader: true, disabled: true },
-    ...ranges.slice(0, 9).map(r => ({ value: r.key, label: <span style={{ display: 'inline-flex', alignItems: 'center' }}><Chip>{r.badge}</Chip>{r.label}</span> })),
-    { value: '__grp_calendar', label: 'Calendar', isHeader: true, disabled: true },
-    ...ranges.slice(9).map(r => ({ value: r.key, label: <span style={{ display: 'inline-flex', alignItems: 'center' }}><Chip>{r.badge}</Chip>{r.label}</span> })),
-    { value: CUSTOM_KEY, label: <span style={{ display: 'inline-flex', alignItems: 'center' }}><Chip><CalendarOutlined style={{ fontSize: 11 }} /></Chip>{CUSTOM_LABEL}…</span> },
-  ], [ranges]);
+  // --- Filter panel --------------------------------------------------------
+
+  // Fetch the entity options when the panel opens: models/apps are derived
+  // from the consumption rows of the CURRENT window (only entities with
+  // usage can be filtered), keys from the key table. The window is captured
+  // at open time — `range` stays OUT of the deps so the 30s slide doesn't
+  // refetch (and flicker the spinner) while the panel stays open.
+  const rangeRef = useRef(range);
+  rangeRef.current = range;
+  useEffect(() => {
+    if (!filterOpen) return;
+    let cancelled = false;
+    setFilterOptsLoading(true);
+    Promise.all([
+      getConsumptions({ since: rangeRef.current.since.toISOString(), until: rangeRef.current.until.toISOString() }),
+      getKeys(),
+    ])
+      .then(([c, k]) => {
+        if (cancelled) return;
+        const cmp = (a: string, b: string) => a.localeCompare(b);
+        const models = [...new Set(c.data.map(x => x.model_name || 'Unknown'))].sort(cmp);
+        const apps = [...new Set(c.data.map(x => x.app_name || 'Unknown'))].sort(cmp);
+        const keys = [...k.data].sort((a, b) =>
+          (a.name || `Key #${a.id}`).localeCompare(b.name || `Key #${b.id}`));
+        setFilterOpts({ models, apps, keys });
+      })
+      .catch(() => { if (!cancelled) message.error('Failed to load filter options'); })
+      .finally(() => { if (!cancelled) setFilterOptsLoading(false); });
+    return () => { cancelled = true; };
+  }, [filterOpen]);
+
+  const onFilterOpenChange = (open: boolean) => {
+    setFilterOpen(open);
+    // Reopening with an active filter shows the dimension it lives in.
+    if (open && filter) setFilterMode(filter.type);
+  };
+
+  const applyFilter = (value: string, label: string) => {
+    setFilter({ type: filterMode, value, label });
+    setFilterOpen(false);
+  };
+
+  const clearFilter = () => setFilter(null);
+
+  const keyNameById = useMemo(
+    () => new Map((filterOpts?.keys ?? []).map(k => [String(k.id), k.name || `Key #${k.id}`])),
+    [filterOpts],
+  );
+
+  // Select options for the current dimension. searchText backs the client
+  // filter so ReactNode labels don't break optionFilterProp.
+  const filterOptions = useMemo(() => {
+    const opts = filterOpts ?? { models: [], apps: [], keys: [] };
+    if (filterMode === 'model') {
+      return opts.models.map(m => ({
+        value: m,
+        searchText: m,
+        label: (
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+            <EntityIcon name={m} />
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m}</span>
+          </span>
+        ),
+      }));
+    }
+    if (filterMode === 'key') {
+      return opts.keys.map(k => {
+        const name = k.name || `Key #${k.id}`;
+        return {
+          value: String(k.id),
+          searchText: `${name} ${maskKey(k.key_value)}`,
+          label: (
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+              <span style={{ width: 8, height: 8, borderRadius: '50%', background: token.colorPrimary, flexShrink: 0 }} />
+              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</span>
+              <Text type="secondary" style={{ fontSize: 11, marginLeft: 'auto', flexShrink: 0 }}>{maskKey(k.key_value)}</Text>
+            </span>
+          ),
+        };
+      });
+    }
+    return opts.apps.map(a => ({
+      value: a,
+      searchText: a,
+      label: (
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+          <span style={{ width: 8, height: 8, borderRadius: 2, background: '#94a3b8', flexShrink: 0 }} />
+          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{a}</span>
+        </span>
+      ),
+    }));
+  }, [filterMode, filterOpts, token.colorPrimary]);
+
+  const filterPanel = (
+    <div style={{ width: 300 }}>
+      <div style={{ fontSize: 11, color: 'rgba(120,120,140,0.75)', textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 8 }}>
+        Filter by
+      </div>
+      <Segmented
+        block
+        size="small"
+        value={filterMode}
+        onChange={(v) => setFilterMode(v as ActivityFilterType)}
+        options={FILTER_TYPES.map(t => ({ value: t.value, label: t.label }))}
+      />
+      <Select
+        style={{ width: '100%', marginTop: 10 }}
+        placeholder={filterMode === 'model' ? 'Select a model…' : filterMode === 'key' ? 'Select an API key…' : 'Select an app…'}
+        showSearch
+        loading={filterOptsLoading}
+        value={filter && filter.type === filterMode ? filter.value : undefined}
+        options={filterOptions}
+        optionFilterProp="searchText"
+        onChange={(v: string) => {
+          const label = filterMode === 'key' ? keyNameById.get(v) ?? v : v;
+          applyFilter(v, label);
+        }}
+      />
+      {filter && (
+        <div style={{ marginTop: 12, paddingTop: 10, borderTop: `1px solid rgba(120,120,140,0.14)`, display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ width: 8, height: 8, borderRadius: '50%', background: token.colorPrimary, flexShrink: 0 }} />
+          <Text style={{ fontSize: 12, flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {FILTER_TYPES.find(t => t.value === filter.type)?.label}: {filter.label}
+          </Text>
+          <Button size="small" onClick={clearFilter}>Clear</Button>
+        </div>
+      )}
+    </div>
+  );
+
+  // --- Date range panel ----------------------------------------------------
+
+  const onPresetClick = (key: string) => {
+    if (key === CUSTOM_KEY) {
+      // Entering custom mode immediately applies a default window
+      // (last month) so the charts and the trigger stay consistent
+      // until the user picks their own dates.
+      setCustom(custom ?? { since: now.subtract(1, 'month'), until: now });
+    }
+    setRangeKey(key);
+    setRangeOpen(false);
+  };
+
+  const rangeCell = (r: DateRange, active: boolean) => (
+    <button
+      key={r.key}
+      type="button"
+      onClick={() => onPresetClick(r.key)}
+      style={{
+        display: 'flex', alignItems: 'center', gap: 6, padding: '5px 6px', borderRadius: 8, cursor: 'pointer',
+        border: active ? `1px solid ${token.colorPrimary}` : '1px solid transparent',
+        background: active ? token.colorPrimaryBg : 'transparent',
+        color: 'inherit', fontFamily: 'inherit', fontSize: 12, textAlign: 'left', minWidth: 0,
+      }}
+    >
+      <Chip>{r.badge}</Chip>
+      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.label}</span>
+    </button>
+  );
+
+  const rangePanel = (
+    <div style={{ width: 344 }}>
+      <div style={{ fontSize: 11, color: 'rgba(120,120,140,0.75)', textTransform: 'uppercase', letterSpacing: '0.04em', padding: '2px 2px 6px' }}>
+        Rolling
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 4 }}>
+        {ranges.slice(0, 9).map(r => rangeCell(r, rangeKey === r.key))}
+      </div>
+      <div style={{ fontSize: 11, color: 'rgba(120,120,140,0.75)', textTransform: 'uppercase', letterSpacing: '0.04em', padding: '10px 2px 6px' }}>
+        Calendar
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 4 }}>
+        {ranges.slice(9).map(r => rangeCell(r, rangeKey === r.key))}
+      </div>
+      <button
+        type="button"
+        onClick={() => onPresetClick(CUSTOM_KEY)}
+        style={{
+          width: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '7px 8px', marginTop: 10,
+          borderRadius: 8, cursor: 'pointer', fontFamily: 'inherit', fontSize: 12, textAlign: 'left', color: 'inherit',
+          border: rangeKey === CUSTOM_KEY ? `1px solid ${token.colorPrimary}` : '1px solid transparent',
+          background: rangeKey === CUSTOM_KEY ? token.colorPrimaryBg : token.colorFillTertiary,
+        }}
+      >
+        <CalendarOutlined style={{ fontSize: 13, opacity: 0.7 }} />
+        {CUSTOM_LABEL}…
+      </button>
+    </div>
+  );
 
   return (
     <div>
@@ -102,38 +312,29 @@ const Activity: React.FC = () => {
           </Text>
         </div>
         <Space wrap>
-          <Select
-            value={rangeKey}
-            onChange={(v: string) => {
-              if (v === CUSTOM_KEY) {
-                // Entering custom mode immediately applies a default window
-                // (last month) so the charts and the trigger stay consistent
-                // until the user picks their own dates.
-                setCustom(custom ?? { since: now.subtract(1, 'month'), until: now });
-              }
-              setRangeKey(v);
-            }}
-            style={{ minWidth: 300 }}
-            popupMatchSelectWidth={false}
-            options={options}
-            optionRender={(option) => {
-              // rc-select's optionRender receives { data, label, value, ... } —
-              // custom props live on option.data, not on the wrapper.
-              const o = ((option as any).data ?? option) as OptionType;
-              if (o.isHeader) {
-                return <div style={{ fontSize: 11, color: 'rgba(120,120,140,0.75)', padding: '4px 12px 2px', textTransform: 'uppercase', letterSpacing: '0.04em' }}>{o.label}</div>;
-              }
-              return o.label as React.ReactNode;
-            }}
-            labelRender={() => (
-              <span style={{ display: 'inline-flex', alignItems: 'center' }}>
+          {/* Filter button: narrows every tab to one model / API key / app. */}
+          <Popover trigger="click" open={filterOpen} onOpenChange={onFilterOpenChange} placement="bottomLeft" content={filterPanel}>
+            <Button style={filter ? { borderColor: token.colorPrimary, color: token.colorPrimary } : undefined}>
+              <FilterOutlined />
+              {filter ? (
+                <span style={{ maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'inline-block', verticalAlign: 'middle' }}>
+                  {FILTER_TYPES.find(t => t.value === filter.type)?.label}: {filter.label}
+                </span>
+              ) : 'Filter'}
+            </Button>
+          </Popover>
+          {/* Date range: a panel with the Rolling / Calendar presets. */}
+          <Popover trigger="click" open={rangeOpen} onOpenChange={setRangeOpen} placement="bottomLeft" content={rangePanel}>
+            <Button style={{ minWidth: 320, display: 'inline-flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, overflow: 'hidden', minWidth: 0 }}>
                 {rangeKey === CUSTOM_KEY
                   ? <Chip><CalendarOutlined style={{ fontSize: 11 }} /></Chip>
                   : <Chip>{range.badge}</Chip>}
-                <span className="tabular-nums">{rangeText(range)}</span>
+                <span className="tabular-nums" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{rangeText(range)}</span>
               </span>
-            )}
-          />
+              <DownOutlined style={{ fontSize: 10, opacity: 0.6, flexShrink: 0 }} />
+            </Button>
+          </Popover>
           {rangeKey === CUSTOM_KEY && (
             <DatePicker.RangePicker
               showTime
@@ -165,9 +366,9 @@ const Activity: React.FC = () => {
       {/* No key= remount: pages re-fetch on range change and keep the
           previous content visible while refreshing — a refresh must never
           blank the page. */}
-      {tab === 'overview' && <ActivityOverview range={range} />}
-      {tab === 'trends' && <ActivityTrends range={range} onNavigate={handleNavigate} />}
-      {tab === 'explore' && <ActivityExplore range={range} initialMetric={exploreInit.metric} initialGroupBy={exploreInit.groupBy} />}
+      {tab === 'overview' && <ActivityOverview range={range} filter={filter} />}
+      {tab === 'trends' && <ActivityTrends range={range} filter={filter} onNavigate={handleNavigate} />}
+      {tab === 'explore' && <ActivityExplore range={range} filter={filter} initialMetric={exploreInit.metric} initialGroupBy={exploreInit.groupBy} />}
     </div>
   );
 };

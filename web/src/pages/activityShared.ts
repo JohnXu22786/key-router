@@ -32,6 +32,33 @@ export interface ExploreOpts {
   groupBy?: string;
 }
 
+// --- Activity page entity filter ------------------------------------------
+// The filter button (left of the date range) narrows every tab to a single
+// entity: one model, one API key or one app. Passed to both the activity
+// and consumptions endpoints as filter_type/filter_value so the server
+// excludes rows before aggregating (Trends' per-key breakdowns stay correct
+// under a model filter).
+export type ActivityFilterType = 'model' | 'key' | 'app';
+
+export interface ActivityFilter {
+  type: ActivityFilterType;
+  // model/app name, or the key's numeric id for type 'key'.
+  value: string;
+  // Display label for the filter button (key name / model / app name).
+  label: string;
+}
+
+export const FILTER_TYPES: { value: ActivityFilterType; label: string }[] = [
+  { value: 'model', label: 'Model' },
+  { value: 'key', label: 'API Key' },
+  { value: 'app', label: 'App' },
+];
+
+// filterKey serializes a filter for fetch keys ("model:gpt-4o", "" when
+// none) so a filter change drops stale data instead of merging it.
+export const filterKey = (f: ActivityFilter | null | undefined): string =>
+  f ? `${f.type}:${f.value}` : '';
+
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
 // Monday 00:00 of now's week (dayjs starts weeks on Sunday).

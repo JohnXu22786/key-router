@@ -12,7 +12,7 @@ import {
 } from '@ant-design/icons';
 import { getActivity, ActivityResponse, ActivityGroupSummary } from '../api/client';
 import {
-  DateRange, fmtUSDInt, fmtTokens, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS,
+  DateRange, ActivityFilter, filterKey, fmtUSDInt, fmtTokens, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS,
   fmtPercent, fmt3sig, fmtTick, fmtBucket, modelFavicon, Granularity,
 } from './activityShared';
 
@@ -20,6 +20,7 @@ const { Text } = Typography;
 
 interface ExploreProps {
   range: DateRange;
+  filter?: ActivityFilter | null;
   // Seeded by the Trends "Explore" links (metric/grouping of the section).
   initialMetric?: string;
   initialGroupBy?: string;
@@ -80,7 +81,7 @@ const NUM_COLS: { key: keyof ActivityGroupSummary; label: string }[] = [
   { key: 'value', label: 'Value' },
 ];
 
-const ActivityExplore: React.FC<ExploreProps> = ({ range, initialMetric, initialGroupBy }) => {
+const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric, initialGroupBy }) => {
   // Hand-drawn control chips ("by", "Top") must follow the theme too.
   const { token } = theme.useToken();
   const [metric, setMetric] = useState(initialMetric ?? 'spend');
@@ -99,11 +100,11 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, initialMetric, initial
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
   const [loadMs, setLoadMs] = useState(0);
-  // A preset/control switch drops the stale response (spinner); the 60s
-  // range slide (same fetch key) keeps the previous chart while refetching.
-  // Compared inside the effect: render-time ref writes would be defeated by
-  // StrictMode's double render.
-  const fetchKey = `${range.key}|${metric}|${groupBy}|${subgroup}|${rollup}|${topN}`;
+  // A preset/control/filter switch drops the stale response (spinner); the
+  // 60s range slide (same fetch key) keeps the previous chart while
+  // refetching. Compared inside the effect: render-time ref writes would be
+  // defeated by StrictMode's double render.
+  const fetchKey = `${range.key}|${metric}|${groupBy}|${subgroup}|${rollup}|${topN}|${filterKey(filter)}`;
   const prevKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -124,6 +125,8 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, initialMetric, initial
           top: topN,
           since: range.since.toISOString(),
           until: range.until.toISOString(),
+          filter_type: filter?.type,
+          filter_value: filter?.value,
         });
         if (cancelled) return;
         setData(res.data);
@@ -133,7 +136,7 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, initialMetric, initial
     };
     fetch();
     return () => { cancelled = true; };
-  }, [range, metric, groupBy, subgroup, rollup, topN]);
+  }, [range, metric, groupBy, subgroup, rollup, topN, filter]);
 
   // Ordered list of chart series (group, subgroup) as they appear in the
   // backend response (sum desc; per-group subgroups when set).

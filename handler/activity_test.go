@@ -55,10 +55,12 @@ func bootstrapActivity(t *testing.T) *gin.Engine {
 	db.GetDB().Create(&model.Consumption{KeyID: key.ID, HourBucket: day1late, ModelName: "", RequestCount: 1, InputTokens: 10, OutputTokens: 0, CostUSD: 0})
 
 	// Second key with its own spend on g1 so subgroup=key splits a group.
+	// It also carries an app name so app filters discriminate against the
+	// empty-app_name rows.
 	db.GetDB().Create(&model.Key{ProviderID: prov.ID, KeyValue: "k2", Name: "k2"})
 	var key2 model.Key
 	db.GetDB().Where("name = ?", "k2").First(&key2)
-	db.GetDB().Create(&model.Consumption{KeyID: key2.ID, HourBucket: day1, ModelName: "g1", RequestCount: 7, InputTokens: 200, OutputTokens: 40, CacheHitTokens: 20, CostUSD: 0.02})
+	db.GetDB().Create(&model.Consumption{KeyID: key2.ID, HourBucket: day1, ModelName: "g1", AppName: "testapp", RequestCount: 7, InputTokens: 200, OutputTokens: 40, CacheHitTokens: 20, CostUSD: 0.02})
 
 	engine := selector.NewEngine()
 	checker := health.NewChecker()
@@ -262,5 +264,167 @@ func TestActivityWeekRollupMondayAlignment(t *testing.T) {
 	}
 	if len(out.Buckets) == 0 || out.Buckets[0] != "2026-08-10" {
 		t.Fatalf("first week bucket = %v, want 2026-08-10 (Monday of the Sunday's week)", out.Buckets)
+	}
+}
+
+// activityGet issues an activity request and decodes totals + summary rows.
+func activityGet(t *testing.T, e *gin.Engine, qs string) (int, map[string]float64, []struct {
+	Group string  `json:"group"`
+	Sum   float64 `json:"sum"`
+}) {
+	t.Helper()
+	req := httptest.NewRequest("GET", "/api/stats/activity?"+qs, nil)
+	req.Host = "localhost:9999"
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		return rec.Code, nil, nil
+	}
+	var out struct {
+		Totals  map[string]float64 `json:"totals"`
+		Summary []struct {
+			Group string  `json:"group"`
+			Sum   float64 `json:"sum"`
+		} `json:"summary"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("bad json: %v\n%s", err, rec.Body.String())
+	}
+	return rec.Code, out.Totals, out.Summary
+}
+
+// summarySumOf returns a summary row's Sum by group name (0 when absent).
+func summarySumOf(rows []struct {
+	Group string  `json:"group"`
+	Sum   float64 `json:"sum"`
+}, group string) float64 {
+	for _, r := range rows {
+		if r.Group == group {
+			return r.Sum
+		}
+	}
+	return 0
+}
+
+// TestActivityFilter exercises the entity filter (filter_type/filter_value)
+// on the activity endpoint: rows outside the filter must not contribute to
+// totals or summary, and "Unknown" matches rows with an empty name.
+// Fixture (bootstrapActivity): g1 spend $0.03 via k1 ($0.01) + k2 ($0.02,
+// app "testapp"); g2 spend $0.005 via k1; one empty-model_name row ($0).
+func TestActivityFilter(t *testing.T) {
+	e := bootstrapActivity(t)
+	t.Cleanup(func() {
+		if sqlDB, err := db.GetDB().DB(); err == nil {
+			sqlDB.Close()
+		}
+	})
+
+	var key2 model.Key
+	if err := db.GetDB().Where("name = ?", "k2").First(&key2).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	// filter_type=model&filter_value=g1 -> only the two g1 rows ($0.01 + $0.02).
+	code, totals, rows := activityGet(t, e, "metric=spend&group_by=key&rollup=day&filter_type=model&filter_value=g1")
+	if code != 200 {
+		t.Fatalf("model filter status = %d", code)
+	}
+	if totals["spend"] != 0.03 {
+		t.Fatalf("model=g1 totals.spend = %v, want 0.03", totals["spend"])
+	}
+	if len(rows) != 2 || summarySumOf(rows, "k1") != 0.01 || summarySumOf(rows, "k2") != 0.02 {
+		t.Fatalf("model=g1 summary = %+v, want k1 0.01 + k2 0.02 only", rows)
+	}
+
+	// filter_type=key&filter_value=<k2 id> -> only k2's row ($0.02).
+	code, totals, rows = activityGet(t, e, fmt.Sprintf("metric=spend&group_by=model&rollup=day&filter_type=key&filter_value=%d", key2.ID))
+	if code != 200 {
+		t.Fatalf("key filter status = %d", code)
+	}
+	if totals["spend"] != 0.02 || summarySumOf(rows, "g1") != 0.02 {
+		t.Fatalf("key=k2 totals=%v rows=%+v, want spend 0.02 on g1 only", totals, rows)
+	}
+
+	// filter_type=app&filter_value=testapp -> only k2's row.
+	code, totals, rows = activityGet(t, e, "metric=spend&group_by=model&rollup=day&filter_type=app&filter_value=testapp")
+	if code != 200 {
+		t.Fatalf("app filter status = %d", code)
+	}
+	if totals["spend"] != 0.02 || len(rows) != 1 || rows[0].Group != "g1" {
+		t.Fatalf("app=testapp totals=%v rows=%+v, want the k2 row only", totals, rows)
+	}
+
+	// filter_type=app&filter_value=Unknown -> all rows with an EMPTY app name
+	// (k1's g1 row + the g2 row + the empty-model row): 5+3+1 = 9 requests.
+	code, totals, rows = activityGet(t, e, "metric=requests&group_by=model&rollup=day&filter_type=app&filter_value=Unknown")
+	if code != 200 {
+		t.Fatalf("app=Unknown status = %d", code)
+	}
+	if totals["requests"] != 9 {
+		t.Fatalf("app=Unknown totals.requests = %v, want 9 (empty app_name rows only)", totals["requests"])
+	}
+	if summarySumOf(rows, "Unknown") != 1 || summarySumOf(rows, "g2") != 3 {
+		t.Fatalf("app=Unknown summary = %+v, want g2 3 + Unknown 1", rows)
+	}
+
+	// filter_type=model&filter_value=Unknown -> the empty-model_name row only.
+	code, totals, rows = activityGet(t, e, "metric=requests&group_by=model&rollup=day&filter_type=model&filter_value=Unknown")
+	if code != 200 {
+		t.Fatalf("model=Unknown status = %d", code)
+	}
+	if totals["requests"] != 1 || len(rows) != 1 || rows[0].Group != "Unknown" {
+		t.Fatalf("model=Unknown totals=%v rows=%+v, want the empty-model_name row only", totals, rows)
+	}
+
+	// Bad filters -> 400.
+	for _, qs := range []string{
+		"metric=spend&filter_type=bogus&filter_value=x",
+		"metric=spend&filter_type=model",
+		"metric=spend&filter_type=model&filter_value=",
+		"metric=spend&filter_type=key&filter_value=abc",
+		"metric=spend&filter_value=x",
+	} {
+		if code, _, _ := activityGet(t, e, qs); code != 400 {
+			t.Fatalf("qs %q status = %d, want 400", qs, code)
+		}
+	}
+}
+
+// TestConsumptionsFilter pins the same filter on the raw-consumption
+// endpoint (the Overview tab's data source).
+func TestConsumptionsFilter(t *testing.T) {
+	e := bootstrapActivity(t)
+	t.Cleanup(func() {
+		if sqlDB, err := db.GetDB().DB(); err == nil {
+			sqlDB.Close()
+		}
+	})
+
+	get := func(qs string) (int, []model.Consumption) {
+		t.Helper()
+		req := httptest.NewRequest("GET", "/api/stats/consumptions?"+qs, nil)
+		req.Host = "localhost:9999"
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			return rec.Code, nil
+		}
+		var rows []model.Consumption
+		if err := json.Unmarshal(rec.Body.Bytes(), &rows); err != nil {
+			t.Fatalf("bad json: %v\n%s", err, rec.Body.String())
+		}
+		return rec.Code, rows
+	}
+
+	code, rows := get("filter_type=model&filter_value=g2")
+	if code != 200 || len(rows) != 1 || rows[0].ModelName != "g2" {
+		t.Fatalf("model=g2: code=%d rows=%d, want exactly the g2 row", code, len(rows))
+	}
+	code, rows = get("filter_type=app&filter_value=testapp")
+	if code != 200 || len(rows) != 1 || rows[0].ModelName != "g1" {
+		t.Fatalf("app=testapp: code=%d rows=%d, want exactly the k2 g1 row", code, len(rows))
+	}
+	if code, _ := get("filter_type=nope"); code != 400 {
+		t.Fatalf("bad filter_type status = %d, want 400", code)
 	}
 }
