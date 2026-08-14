@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Card, Row, Col, Typography, Spin, message, Space, theme } from 'antd';
 import {
-  AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
+  XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   BarChart, Bar, Legend, LineChart, Line,
 } from 'recharts';
 import { getConsumptions, getKeys, Consumption, Key } from '../api/client';
@@ -169,9 +169,6 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter }) => {
     (row as any).Other = sum;
   });
 
-  // Usage type: total spend only.
-  const usageType = costSeries.map(d => ({ ...d, Spend: d.value }));
-
   // Token breakdown: Prompt / Completion (no reasoning field in the model;
   // cached tokens stay in Prompt so nothing is double-counted).
   const promptSeries = series(curList, c => c.input_tokens, axSince, axUntil, gran);
@@ -289,22 +286,8 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter }) => {
       </Card>
 
       <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
-        {/* Usage type — stacked area */}
-        <Col xs={24} lg={12}>
-          <Card style={{ borderRadius: 12 }} title="Usage type">
-            <ResponsiveContainer width="100%" height={260}>
-              <AreaChart data={usageType} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
-                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={(v) => fmtTick(gran, String(v))} />
-                <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => fmtUSDInt(Number(v))} />
-                <Tooltip formatter={(v: any) => [fmtUSD(Number(v)), 'Spend']} contentStyle={{ borderRadius: 8, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
-                <Area type="monotone" dataKey="Spend" stroke="#8b5cf6" strokeWidth={2} fill="#8b5cf6" fillOpacity={0.4} dot={false} />
-              </AreaChart>
-            </ResponsiveContainer>
-          </Card>
-        </Col>
         {/* Request volume by model — stacked bars */}
-        <Col xs={24} lg={12}>
+        <Col xs={24} lg={24}>
           <Card style={{ borderRadius: 12 }} title="Request volume by model">
             <ResponsiveContainer width="100%" height={260}>
               <BarChart data={reqByModel} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
