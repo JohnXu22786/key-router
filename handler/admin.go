@@ -1183,7 +1183,12 @@ func (h *AdminHandler) GetStatsConsumptions(c *gin.Context) {
 	query = filtered
 	if since := c.Query("since"); since != "" {
 		if t, err := time.Parse(time.RFC3339, since); err == nil {
-			query = query.Where("hour_bucket >= ?", t.Local())
+			// Floor to the LOCAL hour: hour_bucket holds the whole hour's
+			// usage, so a 15m/30m window starting at 16:05 must still match
+			// the 16:00 bucket — otherwise those presets show nothing for
+			// most of the hour (the chart axis floors the same way).
+			l := t.Local()
+			query = query.Where("hour_bucket >= ?", time.Date(l.Year(), l.Month(), l.Day(), l.Hour(), 0, 0, 0, l.Location()))
 		} else {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid since parameter"})
 			return
@@ -1540,14 +1545,21 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 		}
 	}
 
-	// Load consumption in range, restricted by the entity filter.
-	var rows []model.Consumption
-	query := db.GetDB().Where("hour_bucket >= ? AND hour_bucket <= ?", since, until)
+	// Load consumption in range, restricted by the entity filter. The window
+	// is widened to the rollup buckets CONTAINING its endpoints: hour_bucket
+	// rows are truncated to the local hour, so a range starting at 16:05 must
+	// still include the 16:00 bucket (it holds the 16:00–17:00 usage) —
+	// without the floor the 15m/30m presets show nothing for most of the
+	// hour. buildActivityAxis floors the same way, so the query and the
+	// response axis always agree.
+	from, to := activityWindow(since, until, rollup)
+	query := db.GetDB().Where("hour_bucket >= ? AND hour_bucket < ?", from, to)
 	query, err := applyActivityFilter(query, c.Query("filter_type"), c.Query("filter_value"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	var rows []model.Consumption
 	if err := query.Order("hour_bucket ASC").Find(&rows).Error; err != nil {
 		log.Printf("[admin] GetActivity load error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load consumption"})
@@ -1929,6 +1941,33 @@ func activityBucketLabel(t time.Time, rollup string) string {
 	default:
 		return t.Format("2006-01-02")
 	}
+}
+
+// activityWindow widens a query range to the rollup buckets CONTAINING its
+// endpoints. hour_bucket rows are truncated to the LOCAL hour, so a window
+// starting at 16:05 must still match the 16:00 bucket (it holds the
+// 16:00–17:00 usage) — without the floor, short presets (15m/30m) return
+// nothing for most of the hour. `from` is the bucket start of since; `to`
+// is the first bucket start AFTER until, so the bucket containing until is
+// complete. Matches buildActivityAxis (same floor and step), so the query
+// and the response axis always agree.
+func activityWindow(since, until time.Time, rollup string) (from, to time.Time) {
+	loc := since.Location()
+	switch rollup {
+	case "hour":
+		from = time.Date(since.Year(), since.Month(), since.Day(), since.Hour(), 0, 0, 0, loc)
+		to = time.Date(until.Year(), until.Month(), until.Day(), until.Hour(), 0, 0, 0, loc).Add(time.Hour)
+	case "day":
+		from = time.Date(since.Year(), since.Month(), since.Day(), 0, 0, 0, 0, loc)
+		to = time.Date(until.Year(), until.Month(), until.Day(), 0, 0, 0, 0, loc).AddDate(0, 0, 1)
+	case "week":
+		from = mondayOf(since)
+		to = mondayOf(until).AddDate(0, 0, 7)
+	default: // month
+		from = time.Date(since.Year(), since.Month(), 1, 0, 0, 0, 0, loc)
+		to = time.Date(until.Year(), until.Month(), 1, 0, 0, 0, 0, loc).AddDate(0, 1, 0)
+	}
+	return from, to
 }
 
 // buildActivityAxis builds a CONTINUOUS bucket axis over since..until at the
