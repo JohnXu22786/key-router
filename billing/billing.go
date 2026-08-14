@@ -168,7 +168,20 @@ func RecordConsumption(keyID int64, modelName, appName string, usage *model.Toke
 		CostUSD:      cost,
 	}
 	if usage != nil {
-		consumption.InputTokens = usage.PromptTokens
+		// Store input_tokens under ONE convention for every provider: total
+		// input INCLUDING cached tokens. OpenAI's prompt_tokens already
+		// includes cached_tokens; Anthropic's input_tokens excludes them, so
+		// fold cache reads + writes in (same conversion the relay applies to
+		// the Responses API). The UI cache-hit rate then divides by
+		// input_tokens alone — storing the raw values mixed semantics and
+		// double-counted OpenAI cache tokens (~98% real hit rate read ~50%).
+		// Legacy rows recorded before this build are folded once at startup
+		// by db.migrateAnthropicInputTokensOnce.
+		inputTokens := usage.PromptTokens
+		if usage.Format == "anthropic" {
+			inputTokens = usage.PromptTokens + usage.CacheHitTokens + usage.CacheWriteTokens
+		}
+		consumption.InputTokens = inputTokens
 		consumption.OutputTokens = usage.CompletionTokens
 		consumption.CacheHitTokens = usage.CacheHitTokens
 		consumption.CacheWriteTokens = usage.CacheWriteTokens

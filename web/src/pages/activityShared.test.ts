@@ -3,6 +3,7 @@ import dayjs from 'dayjs';
 import {
   makeRanges, customRange, granularityFor, series, stackedData, bucketAxis,
   fmtTick, fmtBucket, fmtDayLabel, CUSTOM_KEY, computeTrending, toChartData,
+  cacheHitRate,
 } from './activityShared';
 import type { ActivityResponse } from '../api/client';
 
@@ -269,6 +270,36 @@ describe('computeTrending', () => {
     const rows = computeTrending(cur, prev);
     expect(rows.find(r => r.group === 'a')!.spark).toEqual([2, 8]);
     expect(rows.find(r => r.group === 'b')!.spark).toEqual([0, 0]);
+  });
+});
+
+describe('cacheHitRate', () => {
+  // The backend stores input_tokens as TOTAL input incl. cached for every
+  // provider (OpenAI's prompt_tokens already includes cached tokens;
+  // Anthropic's input_tokens is folded at record time), so the rate is
+  // cache / input. Adding cache to the denominator again — the old buggy
+  // cache / (input + cache) — double-counts OpenAI cache tokens and halves
+  // high rates.
+  it('returns the real hit rate when input already includes cached tokens', () => {
+    // 2450 of 2500 prompt tokens cached = 98%. The old formula produced
+    // 2450 / (2500 + 2450) = 49.5% — the stuck ~49.6% the user saw.
+    expect(cacheHitRate(2500, 2450)).toBeCloseTo(98.0, 5);
+  });
+
+  it('reports 100% when every input token is cached', () => {
+    expect(cacheHitRate(100, 100)).toBe(100);
+  });
+
+  it('reports 0 with no input', () => {
+    expect(cacheHitRate(0, 0)).toBe(0);
+    expect(cacheHitRate(0, 5)).toBe(0);
+  });
+
+  it('clamps to 100 for legacy Anthropic rows whose input excluded cache', () => {
+    // Old Anthropic-native rows stored input WITHOUT cache, so cache can
+    // exceed input there (98 reads vs 2 uncached). Must clamp, not print
+    // 4900%.
+    expect(cacheHitRate(2, 98)).toBe(100);
   });
 });
 
