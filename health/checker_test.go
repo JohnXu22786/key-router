@@ -182,6 +182,209 @@ func TestCheckKeyRecoversAuthFailedKeyWhenUsable(t *testing.T) {
 	}
 }
 
+// TestCheckKeyDoesNotRecoverSpendLimitExhausted guards the lifetime spend
+// cap: the budget is an administrative limit, not an upstream health
+// condition, so a successful probe must NOT resurrect a key whose budget is
+// exhausted — it stays disabled until an admin resets the spend
+// (POST /api/keys/:id/reset-spend). Without this guard the checker
+// re-enables the key on the next pass and traffic keeps overspending the
+// budget. The key must not even be probed (each probe is a billable chat
+// completion), so the upstream handler must see zero requests.
+func TestCheckKeyDoesNotRecoverSpendLimitExhausted(t *testing.T) {
+	hits := 0
+	c, k := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		okUpstream(w, r)
+	})
+	db.GetDB().Model(&model.Key{}).Where("id = ?", k.ID).Updates(map[string]interface{}{
+		"status":            model.KeyStatusDisabled,
+		"disabled_reason":   model.KeyDisabledReasonSpendLimit,
+		"total_spend_limit": 1000,
+		"total_spent":       1000,
+	})
+	db.GetDB().First(k)
+
+	if c.shouldProbeKey(k) {
+		t.Error("shouldProbeKey returned true for a spend-capped key (it would be probed every pass)")
+	}
+
+	recovered := false
+	c.SetOnKeyRecovered(func(keyID int64) { recovered = true })
+
+	c.checkKey(k)
+
+	var after model.Key
+	db.GetDB().First(&after, k.ID)
+	if after.Status != model.KeyStatusDisabled {
+		t.Errorf("status = %q, want disabled (budget exhausted must not auto-recover)", after.Status)
+	}
+	if after.DisabledReason != model.KeyDisabledReasonSpendLimit {
+		t.Errorf("disabled_reason = %q, want spend_limit_exhausted", after.DisabledReason)
+	}
+	if recovered {
+		t.Error("onRecovered fired for a key whose budget is exhausted")
+	}
+	if hits != 0 {
+		t.Errorf("upstream probed %d time(s), want 0 (spend-capped keys must not be probed)", hits)
+	}
+}
+
+// TestCheckKeyDoesNotRecoverSpendLimitSetMidProbe covers the race the
+// pre-pass guard can't see: the pass loads a healthy-looking key, and while
+// the probe is in flight the relay crosses the budget and disables it with
+// spend_limit_exhausted. A successful probe must still not revive it (the
+// mid-probe DB re-check and the guarded recovery update).
+func TestCheckKeyDoesNotRecoverSpendLimitSetMidProbe(t *testing.T) {
+	// The handler runs during the probe, after newTestEnv returns — bind the
+	// key id through a variable in the closure's scope instead of k itself.
+	var keyID int64
+	c, k := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		// Simulate the relay's applySpendLimit landing while the probe is in
+		// flight: the key's budget crosses the limit and it is disabled.
+		db.GetDB().Model(&model.Key{}).Where("id = ?", keyID).Updates(map[string]interface{}{
+			"status":          model.KeyStatusDisabled,
+			"disabled_reason": model.KeyDisabledReasonSpendLimit,
+			"total_spent":     1000,
+		})
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{}`))
+	})
+	keyID = k.ID
+	// The key starts selectable (rate-limited with an expired cooldown) so
+	// the probe actually runs, and it has a budget for the cap to trip.
+	db.GetDB().Model(&model.Key{}).Where("id = ?", k.ID).Updates(map[string]interface{}{
+		"status":             model.KeyStatusRateLimited,
+		"rate_limited_until": time.Now().Add(-1 * time.Minute),
+		"total_spend_limit":  1000,
+		"total_spent":        0,
+		"disabled_reason":    "",
+	})
+	db.GetDB().First(k)
+
+	recovered := false
+	c.SetOnKeyRecovered(func(keyID int64) { recovered = true })
+
+	c.checkKey(k)
+
+	var after model.Key
+	db.GetDB().First(&after, k.ID)
+	if after.Status != model.KeyStatusDisabled {
+		t.Errorf("status = %q, want disabled (budget crossed mid-probe must not auto-recover)", after.Status)
+	}
+	if after.DisabledReason != model.KeyDisabledReasonSpendLimit {
+		t.Errorf("disabled_reason = %q, want spend_limit_exhausted", after.DisabledReason)
+	}
+	if recovered {
+		t.Error("onRecovered fired for a key whose budget was exhausted mid-probe")
+	}
+}
+
+// TestCheckKeyDoesNotOverwriteSpendLimitReasonMidProbe: when the probe
+// FAILS after the relay disabled the key for an exhausted budget, the
+// failure reason must not clobber spend_limit_exhausted — otherwise the
+// next pass would probe the key again (its reason no longer matches the
+// cap) and a later success could revive it.
+func TestCheckKeyDoesNotOverwriteSpendLimitReasonMidProbe(t *testing.T) {
+	var keyID int64
+	c, k := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		db.GetDB().Model(&model.Key{}).Where("id = ?", keyID).Updates(map[string]interface{}{
+			"status":          model.KeyStatusDisabled,
+			"disabled_reason": model.KeyDisabledReasonSpendLimit,
+			"total_spent":     1000,
+		})
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	keyID = k.ID
+	db.GetDB().Model(&model.Key{}).Where("id = ?", k.ID).Updates(map[string]interface{}{
+		"status":             model.KeyStatusRateLimited,
+		"rate_limited_until": time.Now().Add(-1 * time.Minute),
+		"total_spend_limit":  1000,
+		"total_spent":        0,
+		"disabled_reason":    "",
+	})
+	db.GetDB().First(k)
+
+	c.checkKey(k)
+
+	var after model.Key
+	db.GetDB().First(&after, k.ID)
+	if after.DisabledReason != model.KeyDisabledReasonSpendLimit {
+		t.Errorf("disabled_reason = %q, want spend_limit_exhausted (failure reason must not clobber the cap)", after.DisabledReason)
+	}
+	if after.Status != model.KeyStatusDisabled {
+		t.Errorf("status = %q, want disabled", after.Status)
+	}
+}
+
+// TestCheckKeyStaleSnapshotBudgetExhausted pins the entry re-read: the pass
+// loaded the key BEFORE the budget was exhausted, so checkKey's stale copy
+// looks healthy. The fresh DB state must stop the probe before it fires —
+// otherwise a billable chat completion runs on a capped key.
+func TestCheckKeyStaleSnapshotBudgetExhausted(t *testing.T) {
+	hits := 0
+	c, k := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		okUpstream(w, r)
+	})
+	// Exhaust the budget in the DB but deliberately do NOT reload k: k is
+	// the stale pass snapshot (status active, spent 0).
+	db.GetDB().Model(&model.Key{}).Where("id = ?", k.ID).Updates(map[string]interface{}{
+		"total_spend_limit": 1000,
+		"total_spent":       1000,
+	})
+
+	c.checkKey(k)
+
+	if hits != 0 {
+		t.Errorf("upstream probed %d time(s), want 0 (stale snapshot must be re-checked against the DB)", hits)
+	}
+	var after model.Key
+	db.GetDB().First(&after, k.ID)
+	if after.Status != model.KeyStatusActive {
+		t.Errorf("status = %q, want active (no probe ran, state untouched)", after.Status)
+	}
+}
+
+// TestCheckKeyActiveStartBudgetCrossedMidProbe pins the ACTIVE-key success
+// path: an active key whose budget is exhausted while its probe is in flight
+// must stay disabled in the DB — the active branch never writes status, so
+// the relay's spend-limit disable must survive untouched.
+func TestCheckKeyActiveStartBudgetCrossedMidProbe(t *testing.T) {
+	var keyID int64
+	c, k := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		db.GetDB().Model(&model.Key{}).Where("id = ?", keyID).Updates(map[string]interface{}{
+			"status":          model.KeyStatusDisabled,
+			"disabled_reason": model.KeyDisabledReasonSpendLimit,
+			"total_spent":     1000,
+		})
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{}`))
+	})
+	keyID = k.ID
+	db.GetDB().Model(&model.Key{}).Where("id = ?", k.ID).Updates(map[string]interface{}{
+		"total_spend_limit": 1000,
+		"total_spent":       0,
+	})
+	db.GetDB().First(k)
+
+	recovered := false
+	c.SetOnKeyRecovered(func(keyID int64) { recovered = true })
+
+	c.checkKey(k)
+
+	var after model.Key
+	db.GetDB().First(&after, k.ID)
+	if after.Status != model.KeyStatusDisabled {
+		t.Errorf("status = %q, want disabled (active-key probe must not wipe the relay's spend disable)", after.Status)
+	}
+	if after.DisabledReason != model.KeyDisabledReasonSpendLimit {
+		t.Errorf("disabled_reason = %q, want spend_limit_exhausted", after.DisabledReason)
+	}
+	if recovered {
+		t.Error("onRecovered fired for an active key whose budget was exhausted mid-probe")
+	}
+}
+
 // TestOpenAIProbeUsesChatCompletions pins the OpenAI health probe to a real
 // authenticated chat-completion request. A GET /v1/models probe returns 200
 // even for an invalid key on many gateways and would recover disabled

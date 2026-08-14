@@ -31,6 +31,13 @@ const (
 	KeyStatusTesting     = "testing"
 )
 
+// KeyDisabledReasonSpendLimit is the disabled_reason set when a key's
+// lifetime spend budget is exhausted (see Key.TotalSpendLimit). The key
+// stays disabled until an admin resets the spend; the health checker must
+// never revive it (the cap is an administrative limit, not an upstream
+// health condition).
+const KeyDisabledReasonSpendLimit = "spend_limit_exhausted"
+
 // RecoveryStrategy constants
 const (
 	RecoveryImmediate = "immediate"
