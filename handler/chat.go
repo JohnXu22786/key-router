@@ -16,6 +16,7 @@ import (
 	"key-router/billing"
 	"key-router/db"
 	"key-router/format"
+	"key-router/health"
 	"key-router/model"
 	"key-router/relay"
 	"key-router/selector"
@@ -292,9 +293,24 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			continue
 		}
 		if resp.StatusCode == http.StatusUnauthorized {
+			// A 401 usually means the key is invalid, but many gateways also
+			// answer 401 for an unknown / not-entitled MODEL. The health
+			// probe classifies such bodies as alive (the key authenticated;
+			// only the probe's model choice was wrong) — the relay must use
+			// the SAME classification, or a model-problem 401 disables the
+			// key here while the next probe pass recovers it (the disable →
+			// active → disable flap). Model/access problems cool the key
+			// down like the 403 path; genuine key-invalidity 401s disable.
+			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+			resp.Body.Close()
+			if health.ModelProblemInBody(errBody) {
+				h.Engine.MarkKeyRateLimited(key.ID, 30*time.Second)
+				log.Printf("[relay] key %d unauthorized for the requested model (401, cooling 30s, attempt %d/%d)", key.ID, attempt+1, maxRetries+1)
+				attempt++
+				continue
+			}
 			h.Engine.MarkKeyDisabled(key.ID, "auth_failed")
 			log.Printf("[relay] key %d disabled (auth failed, attempt %d/%d)", key.ID, attempt+1, maxRetries+1)
-			drainClose(resp)
 			attempt++
 			continue
 		}
@@ -877,7 +893,11 @@ func extractUpstreamError(body []byte, statusCode int) string {
 // OpenAI-compatible APIs return 429 with error.code "insufficient_quota" or
 // "billing_hard_limit_reached"; Anthropic uses 402 Payment Required (handled
 // separately by status code) and some gateways return the code as a string
-// or in "error.type".
+// or in "error.type". "quota_exceeded" is deliberately NOT matched: gateways
+// use it for request/model rate-limit throttles as well as billing
+// exhaustion, and the cost of a wrong disable (a healthy key taken out of
+// rotation) outweighs the cost of a wrong cool-down — so it cools the key
+// down instead of disabling it.
 func isQuotaExhaustedError(body []byte) bool {
 	var payload struct {
 		Error json.RawMessage `json:"error"`
@@ -893,7 +913,7 @@ func isQuotaExhaustedError(body []byte) bool {
 		return false
 	}
 	switch inner.Code {
-	case "insufficient_quota", "billing_hard_limit_reached", "billing_not_active", "card_declined", "quota_exceeded":
+	case "insufficient_quota", "billing_hard_limit_reached", "billing_not_active", "card_declined":
 		return true
 	}
 	switch inner.Type {

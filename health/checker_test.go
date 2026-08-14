@@ -1,6 +1,7 @@
 package health
 
 import (
+	"bytes"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -370,6 +371,269 @@ func TestRecordFailureMixedFailureSequence(t *testing.T) {
 	c.recordFailure(k, "auth_failed") // second auth failure — disable
 	if len(failed) != 1 || failed[0] != "auth_failed" {
 		t.Fatalf("onFailed = %v, want [auth_failed] after repeated auth failures", failed)
+	}
+}
+
+// TestClassifyOpenAIProbe401ModelProblemIsAlive: many OpenAI-compatible
+// gateways answer a request for an UNKNOWN or NOT-ENTITLED model with 401
+// (not 400/404), even though the key itself is perfectly valid. The health
+// probe uses a hardcoded model (gpt-4o-mini), so a 401 whose body names a
+// model/access problem must classify the key as ALIVE — the key
+// authenticated; only the probe's model choice is wrong. Disabling on this
+// takes every usable key out of rotation (the regression users saw after
+// the probe switched to chat completions).
+func TestClassifyOpenAIProbe401ModelProblemIsAlive(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusUnauthorized,
+		Body: io.NopCloser(strings.NewReader(
+			`{"error":{"message":"The model 'gpt-4o-mini' does not exist or you do not have access to it","code":"model_not_found"}}`)),
+	}
+	result := classifyOpenAIProbe(resp)
+	if !result.Alive {
+		t.Errorf("401 + model-not-found body = %+v, want alive (key authenticated, probe model unavailable)", result)
+	}
+}
+
+// TestClassifyOpenAIProbe401NotEntitledModelIsAlive: same as above for a
+// gateway that returns 401 with a permission-flavored message when the key
+// is not entitled to the probe's model.
+func TestClassifyOpenAIProbe401NotEntitledModelIsAlive(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusUnauthorized,
+		Body: io.NopCloser(strings.NewReader(
+			`{"error":{"message":"Your API key does not have access to the model gpt-4o-mini","type":"access_denied_error"}}`)),
+	}
+	result := classifyOpenAIProbe(resp)
+	if !result.Alive {
+		t.Errorf("401 + not-entitled body = %+v, want alive (key authenticated, model denied)", result)
+	}
+}
+
+// TestClassifyOpenAIProbe401InvalidKeyIsAuthFailed: a 401 whose body clearly
+// says the KEY is invalid (invalid api key / authentication error) must
+// still classify as auth_failed — this is the exact case the chat-probe
+// switch (health #69) exists to catch.
+func TestClassifyOpenAIProbe401InvalidKeyIsAuthFailed(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusUnauthorized,
+		Body: io.NopCloser(strings.NewReader(
+			`{"error":{"message":"Incorrect API key provided: sk-***.","type":"invalid_request_error","code":"invalid_api_key"}}`)),
+	}
+	result := classifyOpenAIProbe(resp)
+	if result.Alive || result.Reason != "auth_failed" {
+		t.Errorf("401 + invalid-api-key body = %+v, want {alive:false reason:auth_failed}", result)
+	}
+}
+
+// TestClassifyOpenAIProbe401EmptyBodyIsAuthFailed: a bare 401 (no body, or
+// an unparseable body) stays fail-closed: an ambiguous 401 is treated as an
+// auth failure, since a gateway with a real model problem normally includes
+// an error body naming the model.
+func TestClassifyOpenAIProbe401EmptyBodyIsAuthFailed(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusUnauthorized,
+		Body:       io.NopCloser(strings.NewReader(``)),
+	}
+	result := classifyOpenAIProbe(resp)
+	if result.Alive || result.Reason != "auth_failed" {
+		t.Errorf("bare 401 = %+v, want {alive:false reason:auth_failed}", result)
+	}
+}
+
+// TestClassifyOpenAIProbe429QuotaExceededIsRateLimited: "quota_exceeded" is
+// a RATE-LIMIT signal on many gateways (e.g. OpenRouter's "you've made too
+// many requests to this model"), NOT a billing/quota exhaustion. Classifying
+// it as insufficient_quota disables a healthy key on a transient throttle.
+// It must classify as rate_limited (cooldown, no disable).
+func TestClassifyOpenAIProbe429QuotaExceededIsRateLimited(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Body: io.NopCloser(strings.NewReader(
+			`{"error":{"code":"quota_exceeded","message":"You've made too many requests to this model within a short time window."}}`)),
+	}
+	result := classifyOpenAIProbe(resp)
+	if result.Alive || result.Reason != "rate_limited" {
+		t.Errorf("429 + quota_exceeded = %+v, want {alive:false reason:rate_limited}", result)
+	}
+}
+
+// TestQuotaErrorInBodyKeepsBillingCodes: quotaErrorInBody must still report
+// genuine billing-exhaustion codes as quota errors (insufficient_quota /
+// billing_hard_limit_reached), while excluding the rate-limit code
+// quota_exceeded.
+func TestQuotaErrorInBodyKeepsBillingCodes(t *testing.T) {
+	if !quotaErrorInBody([]byte(`{"error":{"code":"insufficient_quota"}}`)) {
+		t.Error("insufficient_quota must be a quota error")
+	}
+	if !quotaErrorInBody([]byte(`{"error":{"type":"billing_error"}}`)) {
+		t.Error("billing_error must be a quota error")
+	}
+	if quotaErrorInBody([]byte(`{"error":{"code":"quota_exceeded"}}`)) {
+		t.Error("quota_exceeded is a rate-limit code, must NOT be a quota error")
+	}
+}
+
+// TestCheckKeyKeepsActiveKeyOnModelProblem401 is the end-to-end regression:
+// an ACTIVE key whose probe comes back 401 + model-not-found (the probe's
+// hardcoded model is unavailable on this gateway) must survive repeated
+// probe passes WITHOUT being disabled. Before the fix, two consecutive
+// probes classified the key auth_failed and yanked it out of rotation.
+func TestCheckKeyKeepsActiveKeyOnModelProblem401(t *testing.T) {
+	c, k := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":{"message":"The model 'gpt-4o-mini' does not exist","code":"model_not_found"}}`))
+	})
+
+	failed := false
+	c.SetOnKeyFailed(func(keyID int64, reason string) { failed = true })
+
+	c.checkKey(k)
+	c.checkKey(k) // second consecutive probe must not disable either
+
+	var after model.Key
+	db.GetDB().First(&after, k.ID)
+	if after.Status != model.KeyStatusActive {
+		t.Errorf("status = %q, want active (model-problem 401 must not disable the key)", after.Status)
+	}
+	if failed {
+		t.Error("onFailed fired for a key whose only problem is the probe's model choice")
+	}
+}
+
+// TestModelProblemInBodyKeySignalWins: when the body blames BOTH the key
+// and the model (e.g. "api key not found for model gpt-4o-mini"), the key
+// signal must win — fail-closed, the key is invalid. The "key not found"
+// signal closes the hole where a body naming both would otherwise classify
+// as a model problem and wrongly keep (or recover) a dead key.
+func TestModelProblemInBodyKeySignalWins(t *testing.T) {
+	body := []byte(`{"error":{"message":"api key not found for model gpt-4o-mini"}}`)
+	if ModelProblemInBody(body) {
+		t.Errorf("body %q = model problem, want false (key signal wins)", body)
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusUnauthorized,
+		Body:       io.NopCloser(bytes.NewReader(body)),
+	}
+	result := classifyOpenAIProbe(resp)
+	if result.Alive || result.Reason != "auth_failed" {
+		t.Errorf("401 + key-not-found-for-model body = %+v, want {alive:false reason:auth_failed}", result)
+	}
+}
+
+// TestModelProblemInBodyKeyScopedDenialWins covers the other key-blaming
+// phrasings that mention a model in the same body: "the key does not exist
+// for model gpt-4o-mini", "your api key is disabled and the model
+// gpt-4o-mini is unavailable", "you have access to the model gpt-4o-mini
+// but the api key is invalid" — a genuinely dead key must NEVER be
+// classified as a model problem just because the word "model" appears.
+// Interposed words (an echoed key ID like "sk-123", qualifiers) must not
+// defeat the key signal either: "The api key sk-123 is invalid. Model
+// gpt-4o-mini is not available." still blames the KEY.
+func TestModelProblemInBodyKeyScopedDenialWins(t *testing.T) {
+	for _, body := range []string{
+		`{"error":{"message":"the key does not exist for model gpt-4o-mini"}}`,
+		`{"error":{"message":"your api key is disabled and the model gpt-4o-mini is unavailable"}}`,
+		`{"error":{"message":"you have access to the model gpt-4o-mini but the api key is invalid"}}`,
+		`{"error":{"message":"The api key sk-123 is invalid. Model gpt-4o-mini is not available."}}`,
+		`{"error":{"message":"The key you provided is invalid. Model gpt-4o-mini does not exist."}}`,
+		`{"error":{"message":"key abc is not found. model gpt-4o-mini is not found."}}`,
+		`{"error":{"message":"the api key sk-123 is disabled. the model gpt-4o-mini is not found."}}`,
+		`{"error":{"message":"the key is unauthorized. model gpt-4o-mini not found"}}`,
+		`{"error":{"code":"invalid_key","message":"model gpt-4o-mini not found"}}`,
+		// OpenRouter's documented 401 message is "Invalid credentials
+		// (OAuth session expired, disabled/invalid API key)": the credential
+		// phrasing must count as a key signal even when a model is named.
+		`{"error":{"message":"Invalid credentials. Model gpt-4o-mini not found."}}`,
+		`{"error":{"message":"Invalid credentials (OAuth session expired, disabled/invalid API key) for model gpt-4o-mini"}}`,
+	} {
+		if ModelProblemInBody([]byte(body)) {
+			t.Errorf("body %q = model problem, want false (key-blaming clause must win)", body)
+		}
+		resp := &http.Response{
+			StatusCode: http.StatusUnauthorized,
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}
+		if result := classifyOpenAIProbe(resp); result.Alive || result.Reason != "auth_failed" {
+			t.Errorf("401 + %q = %+v, want {alive:false reason:auth_failed}", body, result)
+		}
+	}
+}
+
+// TestModelProblemInBodyTerseCodeMatches: gateways that return a terse
+// 401 with ONLY an error code ({"code":"model_not_found"}, no message)
+// still name a model problem — the underscore code form must match, or a
+// valid key on such a gateway gets disabled (fail-closed on the wrong
+// side). The underscore form is shared by all denial phrasings
+// (model_not_available, model_not_supported, ...), not just not_found.
+func TestModelProblemInBodyTerseCodeMatches(t *testing.T) {
+	for _, body := range []string{
+		`{"error":{"code":"model_not_found"}}`,
+		`{"error":{"code":"model_not_allowed"}}`,
+		`{"error":{"code":"model_not_available"}}`,
+		`{"error":{"code":"model_not_supported"}}`,
+		`{"error":{"code":"model_not_entitled"}}`,
+		`{"error":{"code":"deployment_not_found"}}`,
+		`{"error":{"code":"deployment_not_available"}}`,
+		// camelCase codes collapse the same way ("ModelNotFound" →
+		// [model, not, found]); a code-only camelCase 401 must not disable.
+		`{"error":{"code":"ModelNotFound"}}`,
+		`{"error":{"code":"DeploymentNotFound"}}`,
+	} {
+		if !ModelProblemInBody([]byte(body)) {
+			t.Errorf("body %q = not a model problem, want true (terse code names the model)", body)
+		}
+	}
+	// The key-side underscore code must NOT be swallowed by the model gate:
+	// a dead key stays dead.
+	if ModelProblemInBody([]byte(`{"error":{"code":"key_not_found"}}`)) {
+		t.Error(`{"code":"key_not_found"} = model problem, want false`)
+	}
+}
+
+// TestModelProblemInBodyLongFormGap: long-winded model-denial sentences
+// with several words between "model"/"deployment" and the denial must still
+// match — a tight gap budget would classify them auth_failed and disable a
+// valid key (the original regression, in its long-form variant).
+func TestModelProblemInBodyLongFormGap(t *testing.T) {
+	for _, body := range []string{
+		`{"error":{"message":"This deployment with id gpt-4o-mini-0125 is currently not found"}}`,
+		`{"error":{"message":"The model that was requested by this account is not available"}}`,
+	} {
+		if !ModelProblemInBody([]byte(body)) {
+			t.Errorf("body %q = not a model problem, want true (long-form model denial)", body)
+		}
+	}
+}
+
+// TestCheckKeyRecoversAuthFailedKeyOnModelProblem401: a disabled auth_failed
+// key whose 401 body names a MODEL problem must be recovered (the key
+// authenticates; only the probe's hardcoded model is unavailable to it).
+// This is the recovery side of the flap the relay fix prevents: with the
+// same classification on both paths, a model-problem 401 recovers the key
+// and the next real request ALSO cools (not disables) it — no ping-pong.
+func TestCheckKeyRecoversAuthFailedKeyOnModelProblem401(t *testing.T) {
+	c, k := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":{"message":"The model 'gpt-4o-mini' does not exist","code":"model_not_found"}}`))
+	})
+	db.GetDB().Model(&model.Key{}).Where("id = ?", k.ID).Updates(map[string]interface{}{
+		"status":          model.KeyStatusDisabled,
+		"disabled_reason": "auth_failed",
+	})
+	db.GetDB().First(k)
+
+	recovered := false
+	c.SetOnKeyRecovered(func(keyID int64) { recovered = true })
+
+	c.checkKey(k)
+
+	var after model.Key
+	db.GetDB().First(&after, k.ID)
+	if after.Status != model.KeyStatusActive {
+		t.Errorf("status = %q, want active (model-problem 401 proves the key authenticates)", after.Status)
+	}
+	if !recovered {
+		t.Error("onRecovered not fired for a key whose 401 body names only a model problem")
 	}
 }
 
