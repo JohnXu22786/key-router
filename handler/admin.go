@@ -25,6 +25,7 @@ import (
 	"key-router/update"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 // version is injected at build time via -ldflags "-X main.version=..." Ã¢â‚¬â€ the
@@ -1173,6 +1174,13 @@ func (h *AdminHandler) GetStatsConsumptions(c *gin.Context) {
 	if keyID := c.Query("key_id"); keyID != "" {
 		query = query.Where("key_id = ?", keyID)
 	}
+	// Activity-page entity filter (Model / API Key / App).
+	filtered, err := applyActivityFilter(query, c.Query("filter_type"), c.Query("filter_value"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	query = filtered
 	if since := c.Query("since"); since != "" {
 		if t, err := time.Parse(time.RFC3339, since); err == nil {
 			query = query.Where("hour_bucket >= ?", t.Local())
@@ -1408,6 +1416,44 @@ type ActivityResponse struct {
 	Totals  map[string]float64     `json:"totals"`  // metric totals: spend/tokens/requests/cache
 }
 
+// applyActivityFilter constrains a consumption query by the Activity page's
+// entity filter (filter_type=model|key|app + filter_value). Shared by
+// GetActivity and GetStatsConsumptions so both endpoints see the same rows.
+// "Unknown" matches empty model/app names — the label the UI shows for rows
+// without one. filter_value for filter_type=key is the key's numeric id.
+func applyActivityFilter(q *gorm.DB, filterType, filterValue string) (*gorm.DB, error) {
+	if filterType == "" {
+		if filterValue != "" {
+			return nil, errors.New("filter_value requires filter_type")
+		}
+		return q, nil
+	}
+	if filterType != "model" && filterType != "key" && filterType != "app" {
+		return nil, errors.New("filter_type must be model|key|app")
+	}
+	if filterValue == "" {
+		return nil, fmt.Errorf("filter_value is required for filter_type=%s", filterType)
+	}
+	switch filterType {
+	case "model":
+		if filterValue == "Unknown" {
+			return q.Where("model_name = '' OR model_name IS NULL"), nil
+		}
+		return q.Where("model_name = ?", filterValue), nil
+	case "key":
+		id, err := strconv.ParseInt(filterValue, 10, 64)
+		if err != nil {
+			return nil, errors.New("filter_value must be a key id for filter_type=key")
+		}
+		return q.Where("key_id = ?", id), nil
+	default: // app
+		if filterValue == "Unknown" {
+			return q.Where("app_name = '' OR app_name IS NULL"), nil
+		}
+		return q.Where("app_name = ?", filterValue), nil
+	}
+}
+
 // GetActivity aggregates consumption for the Activity page.
 // Query params:
 //
@@ -1418,6 +1464,10 @@ type ActivityResponse struct {
 //	          per-subgroup stacks, e.g. spend by model, split by API key)
 //	rollup:   hour | day | week | month             (default day)
 //	since / until: RFC3339, inclusive range
+//	filter_type / filter_value: restrict rows to one entity before
+//	          aggregating (the Activity page's filter button). filter_type is
+//	          model|key|app; filter_value is the model/app name or a key id.
+//	          "Unknown" matches rows with an empty model/app name.
 func (h *AdminHandler) GetActivity(c *gin.Context) {
 	metric := c.DefaultQuery("metric", "spend")
 	groupBy := c.DefaultQuery("group_by", "model")
@@ -1473,12 +1523,15 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 		}
 	}
 
-	// Load consumption in range.
+	// Load consumption in range, restricted by the entity filter.
 	var rows []model.Consumption
-	if err := db.GetDB().
-		Where("hour_bucket >= ? AND hour_bucket <= ?", since, until).
-		Order("hour_bucket ASC").
-		Find(&rows).Error; err != nil {
+	query := db.GetDB().Where("hour_bucket >= ? AND hour_bucket <= ?", since, until)
+	query, err := applyActivityFilter(query, c.Query("filter_type"), c.Query("filter_value"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := query.Order("hour_bucket ASC").Find(&rows).Error; err != nil {
 		log.Printf("[admin] GetActivity load error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load consumption"})
 		return

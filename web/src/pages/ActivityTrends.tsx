@@ -6,11 +6,12 @@ import {
   Tooltip as RTooltip, ResponsiveContainer,
 } from 'recharts';
 import { getActivity, getKeys, ActivityResponse } from '../api/client';
-import { DateRange, fmtUSD, fmtUSDInt, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtTick, fmtBucket, ExploreOpts, maskKey, toChartData, computeTrending, modelFavicon } from './activityShared';
+import { DateRange, ActivityFilter, filterKey, fmtUSD, fmtUSDInt, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtTick, fmtBucket, ExploreOpts, maskKey, toChartData, computeTrending, modelFavicon } from './activityShared';
 const { Text } = Typography;
 
 interface TrendsProps {
   range: DateRange;
+  filter?: ActivityFilter | null;
   onNavigate?: (tab: 'explore', opts?: ExploreOpts) => void;
 }
 
@@ -66,11 +67,12 @@ interface SectionProps {
   title: string;
   groupBy: GroupMode;
   range: DateRange;
+  filter?: ActivityFilter | null;
   onNavigate?: (tab: 'explore', opts?: ExploreOpts) => void;
   keysByName: Map<string, string>;
 }
 
-const TrendSection: React.FC<SectionProps> = ({ title, groupBy, range, onNavigate, keysByName }) => {
+const TrendSection: React.FC<SectionProps> = ({ title, groupBy, range, filter, onNavigate, keysByName }) => {
   // Recharts tooltips default to a white card; paint them with theme tokens.
   const { token } = theme.useToken();
   const [metric, setMetric] = useState('spend');
@@ -78,11 +80,11 @@ const TrendSection: React.FC<SectionProps> = ({ title, groupBy, range, onNavigat
   const [prev, setPrev] = useState<ActivityResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
-  // A preset/metric switch drops the stale response (spinner); the 30s range
-  // slide (same fetch key) keeps the previous chart while refetching.
-  // Compared inside the effect: render-time ref writes would be defeated by
-  // StrictMode's double render.
-  const fetchKey = `${range.key}|${groupBy}|${metric}`;
+  // A preset/metric/filter switch drops the stale response (spinner); the
+  // 30s range slide (same fetch key) keeps the previous chart while
+  // refetching. Compared inside the effect: render-time ref writes would be
+  // defeated by StrictMode's double render.
+  const fetchKey = `${range.key}|${groupBy}|${metric}|${filterKey(filter)}`;
   const prevKeyRef = useRef<string | null>(null);
   const [hidden, setHidden] = useState<Set<string>>(new Set());
   const [chartType, setChartType] = useState<ChartType>('bar');
@@ -102,11 +104,11 @@ const TrendSection: React.FC<SectionProps> = ({ title, groupBy, range, onNavigat
         // daily, a year -> monthly (OR buckets the chart by the view scale).
         const rollup = range.granularity;
         // Current chart folds beyond top-5 into "Other" like the reference;
-        // the previous period is fetched unfiltered so every trending row has
-        // a complete sparkline.
+        // the previous period carries the same entity filter so sparklines
+        // and deltas stay consistent with the filtered rows.
         const [curRes, prevRes] = await Promise.all([
-          getActivity({ metric, group_by: groupBy, rollup, top: 5, since: range.since.toISOString(), until: range.until.toISOString() }),
-          getActivity({ metric, group_by: groupBy, rollup, top: 0, since: prevSince.toISOString(), until: range.since.toISOString() }),
+          getActivity({ metric, group_by: groupBy, rollup, top: 5, since: range.since.toISOString(), until: range.until.toISOString(), filter_type: filter?.type, filter_value: filter?.value }),
+          getActivity({ metric, group_by: groupBy, rollup, top: 0, since: prevSince.toISOString(), until: range.since.toISOString(), filter_type: filter?.type, filter_value: filter?.value }),
         ]);
         if (cancelled) return;
         setCur(curRes.data);
@@ -116,7 +118,7 @@ const TrendSection: React.FC<SectionProps> = ({ title, groupBy, range, onNavigat
     };
     fetch();
     return () => { cancelled = true; };
-  }, [range, metric, groupBy, title]);
+  }, [range, metric, groupBy, title, filter]);
 
   const metricLabel = METRICS.find(m => m.key === metric)!.label;
   const fmt = fmtFor(metric);
@@ -360,7 +362,7 @@ const TrendSection: React.FC<SectionProps> = ({ title, groupBy, range, onNavigat
   );
 };
 
-const ActivityTrends: React.FC<TrendsProps> = ({ range, onNavigate }) => {
+const ActivityTrends: React.FC<TrendsProps> = ({ range, filter, onNavigate }) => {
   const [keysByName, setKeysByName] = useState<Map<string, string>>(new Map());
 
   useEffect(() => {
@@ -373,9 +375,9 @@ const ActivityTrends: React.FC<TrendsProps> = ({ range, onNavigate }) => {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 32 }}>
-      <TrendSection title="Models" groupBy="model" range={range} onNavigate={onNavigate} keysByName={keysByName} />
-      <TrendSection title="API Keys" groupBy="key" range={range} onNavigate={onNavigate} keysByName={keysByName} />
-      <TrendSection title="Apps" groupBy="app" range={range} onNavigate={onNavigate} keysByName={keysByName} />
+      <TrendSection title="Models" groupBy="model" range={range} filter={filter} onNavigate={onNavigate} keysByName={keysByName} />
+      <TrendSection title="API Keys" groupBy="key" range={range} filter={filter} onNavigate={onNavigate} keysByName={keysByName} />
+      <TrendSection title="Apps" groupBy="app" range={range} filter={filter} onNavigate={onNavigate} keysByName={keysByName} />
     </div>
   );
 };
