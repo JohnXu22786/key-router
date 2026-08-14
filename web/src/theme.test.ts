@@ -15,14 +15,14 @@ function stubLocalStorage() {
 }
 
 describe('parseStoredThemeMode — missing/corrupt values fall back', () => {
-  it('defaults to light when nothing is stored (existing users keep the light UI)', () => {
-    expect(parseStoredThemeMode(null)).toBe('light');
+  it('defaults to following the system when nothing is stored', () => {
+    expect(parseStoredThemeMode(null)).toBe('system');
   });
 
-  it('falls back to light for unknown values', () => {
-    expect(parseStoredThemeMode('')).toBe('light');
-    expect(parseStoredThemeMode('neon')).toBe('light');
-    expect(parseStoredThemeMode('auto')).toBe('light');
+  it('falls back to system for unknown values', () => {
+    expect(parseStoredThemeMode('')).toBe('system');
+    expect(parseStoredThemeMode('neon')).toBe('system');
+    expect(parseStoredThemeMode('auto')).toBe('system');
   });
 
   it('accepts the three valid modes', () => {
@@ -58,7 +58,7 @@ describe('storage roundtrip', () => {
     setStoredThemeMode('system');
     expect(getStoredThemeMode()).toBe('system');
     store.clear();
-    expect(getStoredThemeMode()).toBe('light');
+    expect(getStoredThemeMode()).toBe('system');
   });
 });
 
@@ -70,7 +70,8 @@ describe('storage failures degrade gracefully', () => {
       getItem: () => { throw new Error('storage disabled'); },
       setItem: () => { throw new Error('storage disabled'); },
     };
-    // Nothing written this session yet → the default.
+    // A broken read still resolves to the session mode established above —
+    // not the default — because lastMode is the session truth.
     expect(getStoredThemeMode()).toBe('light');
     // setItem must not throw — the mode still applies in-session...
     expect(() => setStoredThemeMode('dark')).not.toThrow();
