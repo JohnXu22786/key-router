@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"key-router/billing"
 	"key-router/db"
 	"key-router/format"
+	"key-router/health"
 	"key-router/model"
 	"key-router/relay"
 	"key-router/selector"
@@ -291,9 +293,24 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			continue
 		}
 		if resp.StatusCode == http.StatusUnauthorized {
+			// A 401 usually means the key is invalid, but many gateways also
+			// answer 401 for an unknown / not-entitled MODEL. The health
+			// probe classifies such bodies as alive (the key authenticated;
+			// only the probe's model choice was wrong) — the relay must use
+			// the SAME classification, or a model-problem 401 disables the
+			// key here while the next probe pass recovers it (the disable →
+			// active → disable flap). Model/access problems cool the key
+			// down like the 403 path; genuine key-invalidity 401s disable.
+			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+			resp.Body.Close()
+			if health.ModelProblemInBody(errBody) {
+				h.Engine.MarkKeyRateLimited(key.ID, 30*time.Second)
+				log.Printf("[relay] key %d unauthorized for the requested model (401, cooling 30s, attempt %d/%d)", key.ID, attempt+1, maxRetries+1)
+				attempt++
+				continue
+			}
 			h.Engine.MarkKeyDisabled(key.ID, "auth_failed")
 			log.Printf("[relay] key %d disabled (auth failed, attempt %d/%d)", key.ID, attempt+1, maxRetries+1)
-			drainClose(resp)
 			attempt++
 			continue
 		}
@@ -615,60 +632,148 @@ func (h *ChatHandler) applySpendLimit(keyID, costMicro int64) {
 	}
 	log.Printf("[relay] key %d spent total %d (limit %d) — disabling (spend budget exhausted)",
 		keyID, key.TotalSpent, key.TotalSpendLimit)
-	h.Engine.MarkKeyDisabled(keyID, "spend_limit_exhausted")
+	h.Engine.MarkKeyDisabled(keyID, model.KeyDisabledReasonSpendLimit)
 }
 
-// extractAppName derives the client app name from the request headers,
-// following the OpenRouter attribution convention with a User-Agent fallback
-// (OpenAI has no official app header; the ecosystem uses these):
-//
-//  1. X-OpenRouter-Title / X-Title  — explicit display name (highest trust)
-//  2. HTTP-Referer                 — the app's URL (hostname as app identity)
-//  3. User-Agent product token     — e.g. "claude-code", "curl", "OpenAI/Python"
-//  4. ""                           — shown as "Unknown" in the Activity page
+// extractAppName derives the client app name from the request headers and
+// caps it at the AppName column width (varchar(255), 255 characters) on a
+// UTF-8 rune boundary, so a hostile over-long header cannot fail or truncate
+// the consumption insert.
 func extractAppName(h http.Header, body []byte) string {
-	// 1. Explicit app-name headers (highest trust).
-	//    - OpenRouter convention: X-OpenRouter-Title / X-Title
-	//    - Anthropic ecosystem clients (Claude Code sends "x-app: cli")
-	//    - Cursor's X-Cursor-Mode marks its requests ("ask"/"agent"/"plan")
-	for _, key := range []string{"X-OpenRouter-Title", "X-Title", "x-app"} {
-		if t := strings.TrimSpace(h.Get(key)); t != "" && t != "cli" {
+	return truncateAppName(extractAppNameUnchecked(h, body))
+}
+
+// extractAppNameUnchecked derives the client app name from the request
+// headers. The User-Agent is NOT a reliable app identifier — SDKs and proxies
+// overwrite it (axios, node-fetch, python-httpx, curl), so it is only used
+// for the few clients whose UA is their documented identity. Detection
+// follows each provider's actual attribution conventions, in trust order:
+//
+//  1. X-OpenRouter-Title / X-Title — OpenRouter attribution display name
+//     (X-Title is its backwards-compatible alias). Highest trust.
+//  2. x-app                        — Anthropic-ecosystem app id; the generic
+//     value "cli" is resolved to Claude Code by the signals in 3.
+//  3. Claude Code                  — X-Claude-Code-Session-Id (v2.1.86+),
+//     anthropic-beta: claude-code-*, or x-app: cli with a claude-cli UA.
+//  4. Provider-specific headers    — X-Cursor-Mode (Cursor), originator
+//     (Codex CLI family), X-OpenWebUI-* (Open WebUI).
+//  5. HTTP-Referer hostname        — OpenRouter's primary attribution
+//     identifier (the app's URL). Localhost referers are ignored.
+//  6. Known client User-Agent tokens — claude-cli, opencode, GeminiCLI,
+//     CherryStudio (Electron UA token), lobe-chat, lobehub, chatbox,
+//     continue, cline, cursor, codex, aider, open-webui.
+//  7. Request body client_metadata.app_name — older Codex releases.
+//  8. Browser User-Agent (Mozilla/...) — Chrome / Edge / Firefox / Safari.
+//  9. ""                           — shown as "Unknown" in the Activity page.
+func extractAppNameUnchecked(h http.Header, body []byte) string {
+	// 1. OpenRouter attribution display name (highest trust).
+	for _, key := range []string{"X-OpenRouter-Title", "X-Title"} {
+		if t := strings.TrimSpace(h.Get(key)); t != "" {
 			return t
 		}
 	}
-	// x-app: cli from Claude Code is generic; the UA identifies it better.
-	if strings.TrimSpace(h.Get("x-app")) == "cli" && strings.HasPrefix(h.Get("User-Agent"), "claude-cli/") {
+
+	// 2. Anthropic ecosystem: x-app carries the app id ("cli" for Claude
+	//    Code, resolved below once the other Claude Code signals are known).
+	if t := strings.TrimSpace(h.Get("x-app")); t != "" && !strings.EqualFold(t, "cli") {
+		return t
+	}
+
+	// 3. Claude Code: session header (v2.1.86+), anthropic-beta marker, or
+	//    the generic x-app: cli paired with the claude-cli UA.
+	if h.Get("X-Claude-Code-Session-Id") != "" ||
+		strings.Contains(strings.ToLower(h.Get("anthropic-beta")), "claude-code") ||
+		(strings.EqualFold(strings.TrimSpace(h.Get("x-app")), "cli") && strings.HasPrefix(h.Get("User-Agent"), "claude-cli/")) {
 		return "Claude Code"
 	}
+
+	// 4. Provider-specific identifying headers.
 	if h.Get("X-Cursor-Mode") != "" {
 		return "Cursor"
 	}
+	if v := h.Get("originator"); v != "" {
+		// Codex CLI family (openai/codex default_client.rs): the originator
+		// header is the real end-client identity, e.g. codex_cli_rs,
+		// codex-tui, codex_vscode, codex_atlas, codex_chatgpt_desktop.
+		switch strings.ToLower(v) {
+		case "codex-tui":
+			return "Codex TUI"
+		case "codex_vscode":
+			return "Codex (VS Code)"
+		case "codex_atlas":
+			return "Atlas"
+		case "codex_chatgpt_desktop":
+			return "ChatGPT"
+		default:
+			return "Codex"
+		}
+	}
+	for _, key := range []string{
+		"X-OpenWebUI-User-Name", "X-OpenWebUI-User-Id", "X-OpenWebUI-User-Email",
+		"X-OpenWebUI-User-Role", "X-OpenWebUI-Chat-Id",
+	} {
+		if h.Get(key) != "" {
+			return "Open WebUI"
+		}
+	}
 
-	// 2. Known client User-Agent prefixes (verified values from the wild):
-	//    claude-cli/2.1.96, opencode/1.14.28, Continue, codex, lobe-chat,
-	//    cursor (UA axios + X-Cursor-Mode already caught above), node-fetch.
+	// 5. HTTP-Referer hostname (OpenRouter attribution URL = app identity).
+	//    Clients send either "HTTP-Referer" (OpenRouter's documented name) or
+	//    the RFC-standard "Referer"; Go canonicalizes the wire name into the
+	//    Header map, so both keys must be probed.
+	ref := strings.TrimSpace(h.Get("HTTP-Referer"))
+	if ref == "" {
+		ref = strings.TrimSpace(h.Get("Referer"))
+	}
+	if ref != "" {
+		lref := strings.ToLower(ref)
+		if strings.HasPrefix(lref, "https://") {
+			ref = ref[len("https://"):]
+		} else if strings.HasPrefix(lref, "http://") {
+			ref = ref[len("http://"):]
+		}
+		if strings.HasPrefix(strings.ToLower(ref), "www.") {
+			ref = ref[len("www."):]
+		}
+		if i := strings.IndexAny(ref, "/"); i > 0 {
+			ref = ref[:i]
+		}
+		if i := strings.IndexByte(ref, '?'); i >= 0 {
+			ref = ref[:i]
+		}
+		if !isLocalHostname(ref) {
+			return ref
+		}
+	}
+
+	// 6. Known client User-Agent tokens. Only apps whose UA IS their
+	//    documented identity are matched here; SDK/proxy UAs (axios,
+	//    node-fetch, python-httpx, curl, OpenAI/Python, ...) never are.
 	if ua := h.Get("User-Agent"); ua != "" {
 		lua := strings.ToLower(ua)
-		known := []struct{ prefix, name string }{
-			{"claude-cli/", "Claude Code"},
-			{"opencode/", "OpenCode"},
-			{"codex", "Codex"},
+		known := []struct{ token, name string }{
+			{"claude-cli", "Claude Code"},
+			{"opencode", "OpenCode"},
+			{"geminicli", "Gemini CLI"},
+			{"cherrystudio", "Cherry Studio"},
 			{"lobe-chat", "LobeChat"},
 			{"lobehub", "LobeChat"},
-			{"cursor", "Cursor"},
+			{"chatbox", "Chatbox"},
 			{"continue", "Continue"},
 			{"cline", "Cline"},
-			{"cherry-studio", "Cherry Studio"},
-			{"chatbox", "Chatbox"},
+			{"cursor", "Cursor"},
+			{"codex", "Codex"},
+			{"aider", "Aider"},
+			{"open-webui", "Open WebUI"},
 		}
 		for _, k := range known {
-			if strings.Contains(lua, k.prefix) {
+			if strings.Contains(lua, k.token) {
 				return k.name
 			}
 		}
 	}
 
-	// 3. Codex sends app identity in the request body's client_metadata
+	// 7. Codex sends app identity in the request body's client_metadata
 	//    (client_metadata.app_name). Only parse when the body looks like a
 	//    chat request — don't choke on arbitrary bodies.
 	if len(body) > 0 {
@@ -682,48 +787,75 @@ func extractAppName(h http.Header, body []byte) string {
 		}
 	}
 
-	// 4. HTTP-Referer hostname (OpenRouter attribution).
-	if ref := strings.TrimSpace(h.Get("HTTP-Referer")); ref != "" {
-		// Keep the hostname (or path slug for github-style URLs).
-		ref = strings.TrimPrefix(ref, "https://")
-		ref = strings.TrimPrefix(ref, "http://")
-		ref = strings.TrimPrefix(ref, "www.")
-		if i := strings.IndexAny(ref, "/"); i > 0 {
-			ref = ref[:i]
-		}
-		if ref != "" {
-			return ref
-		}
-	}
-
-	// 5. Generic User-Agent product token fallback.
-	if ua := h.Get("User-Agent"); ua != "" {
-		// Browser UAs start with "Mozilla/5.0 (...) ..."; skip the prefix,
-		// the platform comment, and rendering-engine tokens (AppleWebKit,
-		// KHTML, Gecko, Version) to land on the real browser (Chrome, Firefox).
-		if strings.HasPrefix(ua, "Mozilla/") {
-			if i := strings.IndexByte(ua, ')'); i >= 0 {
-				ua = ua[i+1:]
-			}
-		}
-		fields := strings.Fields(ua)
-		for _, f := range fields {
-			tok := strings.TrimSpace(f)
-			if tok == "" {
-				continue
-			}
-			name := tok
-			if i := strings.IndexAny(name, " /"); i > 0 {
-				name = name[:i]
-			}
-			switch name {
-			case "AppleWebKit", "KHTML", "Gecko", "Version", "Safari", "like":
-				continue
-			}
-			return name
+	// 8. Browser User-Agents. The rendering-engine tokens differ between
+	//    Chrome/Edge/Firefox/Safari; Edg must be checked before Chrome
+	//    because Edge's UA contains both. Electron apps that carry no known
+	//    app token (VS Code, Slack, Discord, ...) are not "Chrome" — they
+	//    stay unknown unless identified by an earlier signal.
+	if ua := strings.ToLower(h.Get("User-Agent")); strings.HasPrefix(ua, "mozilla/") {
+		switch {
+		case strings.Contains(ua, "electron/"):
+			return ""
+		case strings.Contains(ua, "edg/"):
+			return "Edge"
+		case strings.Contains(ua, "firefox/"):
+			return "Firefox"
+		case strings.Contains(ua, "chrome/"):
+			return "Chrome"
+		case strings.Contains(ua, "safari/"):
+			return "Safari"
 		}
 	}
 	return ""
+}
+
+// isLocalHostname reports whether the host is the local machine — such
+// referers are meaningless for app attribution (OpenRouter requires
+// X-OpenRouter-Title to accompany localhost URLs).
+func isLocalHostname(host string) bool {
+	if host == "" {
+		return true
+	}
+	lower := strings.ToLower(host)
+	// Strip a trailing port; IPv6 literals keep their colons and brackets.
+	if i := strings.LastIndexByte(lower, ':'); i > 0 && !strings.Contains(lower[:i], ":") {
+		lower = lower[:i]
+	} else if strings.HasPrefix(lower, "[") {
+		if i := strings.IndexByte(lower, ']'); i >= 0 {
+			lower = lower[:i+1]
+		}
+	}
+	// "localhost" itself, its FQDN forms, and the reserved subdomains
+	// .localhost (RFC 6761) and .localhost.localdomain (RFC 6762, the
+	// macOS/BSD hostname). Suffix matching avoids swallowing real domains
+	// like localhost.com.
+	if lower == "localhost" || lower == "localhost." ||
+		strings.HasSuffix(lower, ".localhost") || strings.HasSuffix(lower, ".localhost.") ||
+		lower == "localhost.localdomain" || lower == "localhost.localdomain." ||
+		strings.HasSuffix(lower, ".localhost.localdomain") || strings.HasSuffix(lower, ".localhost.localdomain.") {
+		return true
+	}
+	// 0.0.0.0 is the any-address (not loopback per net.IP.IsLoopback), and
+	// the loopback ranges 127.0.0.0/8 and ::1 are handled by ParseIP below.
+	if lower == "0.0.0.0" {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(lower, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
+// truncateAppName caps the detected app name at the AppName column width
+// (varchar(255) — 255 characters, not bytes) on a UTF-8 rune boundary.
+func truncateAppName(s string) string {
+	const max = 255
+	if len(s) <= max {
+		return s
+	}
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max])
 }
 
 // extractUpstreamError pulls a readable error message from an upstream error
@@ -761,7 +893,11 @@ func extractUpstreamError(body []byte, statusCode int) string {
 // OpenAI-compatible APIs return 429 with error.code "insufficient_quota" or
 // "billing_hard_limit_reached"; Anthropic uses 402 Payment Required (handled
 // separately by status code) and some gateways return the code as a string
-// or in "error.type".
+// or in "error.type". "quota_exceeded" is deliberately NOT matched: gateways
+// use it for request/model rate-limit throttles as well as billing
+// exhaustion, and the cost of a wrong disable (a healthy key taken out of
+// rotation) outweighs the cost of a wrong cool-down — so it cools the key
+// down instead of disabling it.
 func isQuotaExhaustedError(body []byte) bool {
 	var payload struct {
 		Error json.RawMessage `json:"error"`
@@ -777,7 +913,7 @@ func isQuotaExhaustedError(body []byte) bool {
 		return false
 	}
 	switch inner.Code {
-	case "insufficient_quota", "billing_hard_limit_reached", "billing_not_active", "card_declined", "quota_exceeded":
+	case "insufficient_quota", "billing_hard_limit_reached", "billing_not_active", "card_declined":
 		return true
 	}
 	switch inner.Type {

@@ -1,7 +1,7 @@
 import React, { useEffect, useLayoutEffect, useState } from 'react';
 import { BrowserRouter, Routes, Route, Link, Navigate, useLocation, useNavigate } from 'react-router-dom';
 import {
-  Layout, Menu, Typography, theme, ConfigProvider, Alert, Button, Space,
+  Layout, Menu, Typography, theme, ConfigProvider, Alert, Button, Space, message,
 } from 'antd';
 import {
   CloudServerOutlined,
@@ -19,7 +19,7 @@ import Settings from './pages/Settings';
 import Help from './pages/Help';
 import ErrorBoundary from './components/ErrorBoundary';
 import { ThemeProvider, useThemeMode } from './ThemeContext';
-import { getAutoCheckState } from './api/client';
+import { getAutoCheckState, getHealth, applyUpdate, UpdateInfo } from './api/client';
 
 const { Sider, Content } = Layout;
 const { Title } = Typography;
@@ -32,17 +32,49 @@ const serverUrl = `http://localhost:${port}`;
 // LayoutWithRouter is rendered inside BrowserRouter context so useLocation() works
 const LayoutWithRouter: React.FC = () => {
   const [collapsed, setCollapsed] = useState(false);
-  const [updateInfo, setUpdateInfo] = useState<any>(null);
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  // Running app version (injected at build time, reported by /api/health)
+  const [version, setVersion] = useState('');
+  const [applying, setApplying] = useState(false);
   const location = useLocation();
   const navigate = useNavigate();
 
-  // Auto-update check result: the app checks on startup + daily (backend);
-  // here we surface a banner when a new version exists — no auto-apply.
+  // On load: write the build version into the sidebar badge, and surface the
+  // last auto-check result (startup + daily, backend) — when a new version
+  // exists the badge spot becomes an update button.
   useEffect(() => {
+    getHealth()
+      .then(res => setVersion(res.data?.version || ''))
+      .catch(() => {});
     getAutoCheckState()
       .then(res => { if (res.data?.update_available) setUpdateInfo(res.data); })
       .catch(() => {});
   }, []);
+
+  const handleApplyUpdate = async () => {
+    setApplying(true);
+    // The apply call blocks while the installer downloads (minutes) and the
+    // UAC prompt is answered — show a persistent spinner instead of a
+    // timeout error (the per-request timeout is 30 minutes, see client.ts).
+    const hideLoading = message.loading(
+      updateInfo?.install_mode === 'installed'
+        ? 'Downloading installer and preparing update…'
+        : 'Downloading and applying update…',
+      0,
+    );
+    try {
+      const res = await applyUpdate();
+      message.success(res.data.install_mode === 'installed'
+        ? 'Installer launched — KeyRouter will close and restart automatically.'
+        : 'Update applied — KeyRouter will restart automatically.');
+      setUpdateInfo(null);
+    } catch (err: any) {
+      message.error(err?.response?.data?.error || 'Failed to apply update');
+    } finally {
+      hideLoading();
+      setApplying(false);
+    }
+  };
 
   const menuItems = [
     { key: '/', icon: <BarChartOutlined />, label: <Link to="/">Activity</Link> },
@@ -92,23 +124,60 @@ const LayoutWithRouter: React.FC = () => {
             items={menuItems}
           />
         </div>
-        {/* Listen address, above the collapse trigger. Collapsed, only the
-            port fits. */}
-        <div
-          title={serverUrl}
-          style={{
-            padding: '8px 12px',
-            textAlign: 'center',
-            fontSize: 12,
-            lineHeight: '16px',
-            color: 'rgba(255, 255, 255, 0.65)',
-            whiteSpace: 'nowrap',
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            borderTop: '1px solid rgba(255, 255, 255, 0.08)',
-          }}
-        >
-          {collapsed ? `:${port}` : serverUrl}
+        {/* Version badge + listen address, above the collapse trigger. The
+            badge carries the update button when the auto-check found a newer
+            version. Collapsed, the button shows icon only. */}
+        <div style={{ borderTop: '1px solid rgba(255, 255, 255, 0.08)', padding: '8px 12px 0' }}>
+          {updateInfo?.update_available ? (
+            <Button
+              type="primary"
+              size="small"
+              block
+              loading={applying}
+              icon={<DownloadOutlined />}
+              onClick={handleApplyUpdate}
+              aria-label={`Update to v${updateInfo.latest_version}`}
+              title={updateInfo.install_mode === 'installed'
+                ? `Download installer and update to v${updateInfo.latest_version}`
+                : `Download and update to v${updateInfo.latest_version}`}
+              style={{ marginBottom: 8 }}
+            >
+              {collapsed ? '' : `Update v${updateInfo.latest_version}`}
+            </Button>
+          ) : (
+            version && (
+              <div
+                title={`KeyRouter v${version}`}
+                style={{
+                  textAlign: 'center',
+                  fontSize: 12,
+                  lineHeight: '16px',
+                  color: 'rgba(255, 255, 255, 0.45)',
+                  whiteSpace: 'nowrap',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  marginBottom: 8,
+                }}
+              >
+                v{version}
+              </div>
+            )
+          )}
+          <div
+            title={serverUrl}
+            style={{
+              textAlign: 'center',
+              fontSize: 12,
+              lineHeight: '16px',
+              color: 'rgba(255, 255, 255, 0.65)',
+              whiteSpace: 'nowrap',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              paddingBottom: 8,
+            }}
+          >
+            {collapsed ? `:${port}` : serverUrl}
+          </div>
         </div>
       </Sider>
       <Layout style={{ marginLeft: collapsed ? 80 : 200, minHeight: '100vh' }}>

@@ -681,6 +681,187 @@ func TestOpenAIToAnthropic_StopNormalization(t *testing.T) {
 	})
 }
 
+func TestOpenAIToAnthropic_ReasoningContent(t *testing.T) {
+	t.Run("reasoning_content field becomes thinking block", func(t *testing.T) {
+		// DeepSeek-style assistant messages carry reasoning_content; the
+		// Anthropic equivalent is a thinking block (regression: the field
+		// used to be silently dropped).
+		oaiReq := `{
+			"model": "deepseek-v4-flash",
+			"messages": [
+				{"role": "user", "content": "think hard"},
+				{"role": "assistant", "content": "final answer", "reasoning_content": "step 1: analyze; step 2: conclude"}
+			]
+		}`
+
+		anthReq, err := OpenAIRequestToAnthropic([]byte(oaiReq), "")
+		if err != nil {
+			t.Fatalf("conversion failed: %v", err)
+		}
+
+		var result map[string]interface{}
+		if err := json.Unmarshal(anthReq, &result); err != nil {
+			t.Fatalf("invalid JSON result: %v", err)
+		}
+		msgs := result["messages"].([]interface{})
+		asstMsg := msgs[1].(map[string]interface{})
+		content := asstMsg["content"].([]interface{})
+
+		var thinking, textBlock string
+		for _, c := range content {
+			block := c.(map[string]interface{})
+			switch block["type"] {
+			case "thinking":
+				thinking, _ = block["thinking"].(string)
+				if _, has := block["signature"]; !has {
+					t.Error("thinking block has no signature field")
+				}
+			case "text":
+				textBlock, _ = block["text"].(string)
+			}
+		}
+		if thinking != "step 1: analyze; step 2: conclude" {
+			t.Errorf("thinking = %q, want reasoning_content preserved", thinking)
+		}
+		if textBlock != "final answer" {
+			t.Errorf("text = %q, want final answer", textBlock)
+		}
+		// thinking precedes text (Anthropic's block convention)
+		if content[0].(map[string]interface{})["type"] != "thinking" {
+			t.Errorf("first block type = %v, want thinking", content[0].(map[string]interface{})["type"])
+		}
+	})
+
+	t.Run("reasoning content parts become thinking block", func(t *testing.T) {
+		// o-series-style chat gateways return reasoning as content parts
+		// ({"type":"reasoning","summary":[{...summary_text...}]})
+		oaiReq := `{
+			"model": "o3",
+			"messages": [
+				{"role": "user", "content": "hi"},
+				{"role": "assistant", "content": [
+					{"type": "reasoning", "summary": [{"type": "summary_text", "text": "hmm, let me think"}]},
+					{"type": "text", "text": "done"}
+				]}
+			]
+		}`
+
+		anthReq, err := OpenAIRequestToAnthropic([]byte(oaiReq), "")
+		if err != nil {
+			t.Fatalf("conversion failed: %v", err)
+		}
+		var result map[string]interface{}
+		json.Unmarshal(anthReq, &result)
+		msgs := result["messages"].([]interface{})
+		asstMsg := msgs[1].(map[string]interface{})
+		content := asstMsg["content"].([]interface{})
+
+		var thinking string
+		for _, c := range content {
+			block := c.(map[string]interface{})
+			if block["type"] == "thinking" {
+				thinking, _ = block["thinking"].(string)
+			}
+		}
+		if thinking != "hmm, let me think" {
+			t.Errorf("thinking = %q, want summary text preserved", thinking)
+		}
+	})
+}
+
+func TestAnthropicToOpenAI_ThinkingBlock(t *testing.T) {
+	t.Run("thinking blocks become reasoning_content", func(t *testing.T) {
+		// Anthropic assistant messages carry thinking blocks (extended
+		// thinking); the OpenAI equivalent is the reasoning_content field
+		// (regression: the blocks used to be silently dropped).
+		anthReq := `{
+			"model": "claude-sonnet-4",
+			"messages": [
+				{"role": "user", "content": "think hard"},
+				{"role": "assistant", "content": [
+					{"type": "thinking", "thinking": "let me reason", "signature": "sig-1"},
+					{"type": "text", "text": "answer"}
+				]}
+			],
+			"max_tokens": 100
+		}`
+
+		oaiReq, err := AnthropicRequestToOpenAI([]byte(anthReq), "")
+		if err != nil {
+			t.Fatalf("conversion failed: %v", err)
+		}
+		var result map[string]interface{}
+		if err := json.Unmarshal(oaiReq, &result); err != nil {
+			t.Fatalf("invalid JSON result: %v", err)
+		}
+		msgs := result["messages"].([]interface{})
+		asstMsg := msgs[1].(map[string]interface{})
+		if rc, ok := asstMsg["reasoning_content"].(string); !ok || rc != "let me reason" {
+			t.Errorf("reasoning_content = %v, want 'let me reason'", asstMsg["reasoning_content"])
+		}
+		if asstMsg["content"] != "answer" {
+			t.Errorf("content = %v, want answer", asstMsg["content"])
+		}
+	})
+
+	t.Run("multiple thinking blocks joined with newline", func(t *testing.T) {
+		// Two thinking blocks must not merge their boundary words — the
+		// blocks are joined with "\n" like the other conversions.
+		anthReq := `{
+			"model": "claude-sonnet-4",
+			"messages": [
+				{"role": "user", "content": "hi"},
+				{"role": "assistant", "content": [
+					{"type": "thinking", "thinking": "think A", "signature": "s1"},
+					{"type": "thinking", "thinking": "think B", "signature": "s2"},
+					{"type": "text", "text": "answer"}
+				]}
+			],
+			"max_tokens": 100
+		}`
+
+		oaiReq, err := AnthropicRequestToOpenAI([]byte(anthReq), "")
+		if err != nil {
+			t.Fatalf("conversion failed: %v", err)
+		}
+		var result map[string]interface{}
+		json.Unmarshal(oaiReq, &result)
+		msgs := result["messages"].([]interface{})
+		asstMsg := msgs[1].(map[string]interface{})
+		if rc, ok := asstMsg["reasoning_content"].(string); !ok || rc != "think A\nthink B" {
+			t.Errorf("reasoning_content = %q, want 'think A\\nthink B'", asstMsg["reasoning_content"])
+		}
+	})
+
+	t.Run("empty thinking block skipped", func(t *testing.T) {
+		// A block without text (e.g. redacted_thinking) must not produce a
+		// reasoning_content field at all.
+		anthReq := `{
+			"model": "claude-sonnet-4",
+			"messages": [
+				{"role": "user", "content": "hi"},
+				{"role": "assistant", "content": [
+					{"type": "redacted_thinking", "data": "abc"},
+					{"type": "text", "text": "answer"}
+				]}
+			],
+			"max_tokens": 100
+		}`
+
+		oaiReq, err := AnthropicRequestToOpenAI([]byte(anthReq), "")
+		if err != nil {
+			t.Fatalf("conversion failed: %v", err)
+		}
+		var result map[string]interface{}
+		json.Unmarshal(oaiReq, &result)
+		msgs := result["messages"].([]interface{})
+		asstMsg := msgs[1].(map[string]interface{})
+		if _, has := asstMsg["reasoning_content"]; has {
+			t.Errorf("reasoning_content = %v, want absent for empty thinking", asstMsg["reasoning_content"])
+		}
+	})
+}
+
 func TestAnthropicToOpenAI_ToolCallArgumentsString(t *testing.T) {
 	t.Run("tool_use input object becomes arguments JSON string", func(t *testing.T) {
 		anthReq := `{
@@ -1287,5 +1468,286 @@ func TestAnthropicStreamConverterTextHeldForAscendingOrder(t *testing.T) {
 	want := []string{"start:tool_use@0", "delta@0", "start:text@1", "delta@1", "delta@0"}
 	if strings.Join(order, ",") != strings.Join(want, ",") {
 		t.Fatalf("event order = %v, want %v", order, want)
+	}
+}
+
+func TestAnthropicStreamConverterReasoningContent(t *testing.T) {
+	// OpenAI reasoning_content deltas (DeepSeek/opencode style) must become
+	// Anthropic thinking blocks: content_block_start (thinking) before the
+	// thinking_delta, and a content_block_stop when the stream finishes
+	// (regression: the field was silently dropped).
+	conv := NewAnthropicStreamConverter()
+
+	// reasoning fragment → message_start + thinking start + thinking delta
+	evs, err := conv.Convert([]byte(`{"choices":[{"delta":{"reasoning_content":"step 1"}}]}`), "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs) != 3 {
+		t.Fatalf("expected 3 events (start + thinking start + delta), got %d", len(evs))
+	}
+	var cbs map[string]interface{}
+	json.Unmarshal(evs[1], &cbs)
+	if cbs["type"] != "content_block_start" {
+		t.Fatalf("event = %v, want content_block_start", cbs["type"])
+	}
+	if cbs["index"] != float64(0) {
+		t.Errorf("thinking block index = %v, want 0", cbs["index"])
+	}
+	cb := cbs["content_block"].(map[string]interface{})
+	if cb["type"] != "thinking" {
+		t.Errorf("content_block type = %v, want thinking", cb["type"])
+	}
+	var tde map[string]interface{}
+	json.Unmarshal(evs[2], &tde)
+	d := tde["delta"].(map[string]interface{})
+	if tde["type"] != "content_block_delta" || d["type"] != "thinking_delta" || d["thinking"] != "step 1" {
+		t.Errorf("delta event = %v, want thinking_delta 'step 1'", tde)
+	}
+	if tde["index"] != float64(0) {
+		t.Errorf("thinking delta index = %v, want 0", tde["index"])
+	}
+
+	// text delta → next block index (1)
+	evs, err = conv.Convert([]byte(`{"choices":[{"delta":{"content":"hi"}}]}`), "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs) != 2 {
+		t.Fatalf("expected 2 events (text start + delta), got %d", len(evs))
+	}
+	json.Unmarshal(evs[0], &cbs)
+	if cbs["type"] != "content_block_start" || cbs["index"] != float64(1) {
+		t.Errorf("text start = %v, want content_block_start@1", cbs)
+	}
+
+	// finish → both blocks closed in ascending order, then deferred terminator
+	evs, err = conv.Convert([]byte(`{"choices":[{"delta":{},"finish_reason":"stop"}]}`), "m")
+	if err != nil {
+		t.Fatalf("finish chunk with open blocks should emit stops, got error %v", err)
+	}
+	var stops []int
+	for _, ev := range evs {
+		var e map[string]interface{}
+		json.Unmarshal(ev, &e)
+		if e["type"] == "content_block_stop" {
+			stops = append(stops, int(e["index"].(float64)))
+		}
+	}
+	if len(stops) != 2 || stops[0] != 0 || stops[1] != 1 {
+		t.Fatalf("content_block_stop indexes = %v, want [0 1]", stops)
+	}
+}
+
+func TestAnthropicStreamConverterReasoningHeldWhileToolPending(t *testing.T) {
+	// Reasoning arriving while an EARLIER tool start is deferred must be
+	// held — emitting the thinking start would skip a block index (strict
+	// Anthropic validators require ascending starts).
+	conv := NewAnthropicStreamConverter()
+	// tool 0: args only → deferred, block index 0
+	_, err := conv.Convert([]byte(`{"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"arguments":"{"}}]}}]}`), "m")
+	if err != nil && err != ErrSkipChunk {
+		t.Fatal(err)
+	}
+	// reasoning → block index 1, must be held
+	evs, err := conv.Convert([]byte(`{"choices":[{"delta":{"reasoning_content":"think"}}]}`), "m")
+	if err != nil && err != ErrSkipChunk {
+		t.Fatal(err)
+	}
+	for _, ev := range evs {
+		var e map[string]interface{}
+		json.Unmarshal(ev, &e)
+		if e["type"] == "content_block_start" || e["type"] == "content_block_delta" {
+			t.Fatalf("thinking events emitted while tool start pending: %s", ev)
+		}
+	}
+	// tool 0 resolves → tool start@0, tool deltas (buffered + current
+	// fragment's), thinking start@1, thinking delta — starts ascending
+	evs, err = conv.Convert([]byte(`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_0","function":{"name":"f0","arguments":"}"}}]}}]}`), "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var order []string
+	for _, ev := range evs {
+		var e map[string]interface{}
+		json.Unmarshal(ev, &e)
+		switch e["type"] {
+		case "content_block_start":
+			cb := e["content_block"].(map[string]interface{})
+			order = append(order, "start:"+cb["type"].(string)+"@"+fmt.Sprintf("%v", e["index"]))
+		case "content_block_delta":
+			order = append(order, "delta@"+fmt.Sprintf("%v", e["index"]))
+		}
+	}
+	want := []string{"start:tool_use@0", "delta@0", "start:thinking@1", "delta@1", "delta@0"}
+	if strings.Join(order, ",") != strings.Join(want, ",") {
+		t.Fatalf("event order = %v, want %v", order, want)
+	}
+}
+
+func TestAnthropicStreamConverterReasoningAndTextAndToolsSameChunk(t *testing.T) {
+	// A single chunk carrying reasoning_content + content + tool_calls must
+	// assign ascending block indexes (thinking < text < tool) and emit each
+	// start before its deltas.
+	conv := NewAnthropicStreamConverter()
+	evs, err := conv.Convert([]byte(`{"choices":[{"delta":{
+		"reasoning_content":"think",
+		"content":"hi",
+		"tool_calls":[{"index":0,"id":"call_1","function":{"name":"f1","arguments":"{}"}}]
+	}}]}`), "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var order []string
+	for _, ev := range evs {
+		var e map[string]interface{}
+		json.Unmarshal(ev, &e)
+		switch e["type"] {
+		case "content_block_start":
+			cb := e["content_block"].(map[string]interface{})
+			order = append(order, "start:"+cb["type"].(string)+"@"+fmt.Sprintf("%v", e["index"]))
+		case "content_block_delta":
+			order = append(order, "delta@"+fmt.Sprintf("%v", e["index"]))
+		}
+	}
+	want := []string{
+		"start:thinking@0", "delta@0",
+		"start:text@1", "delta@1",
+		"start:tool_use@2", "delta@2",
+	}
+	if strings.Join(order, ",") != strings.Join(want, ",") {
+		t.Fatalf("event order = %v, want %v", order, want)
+	}
+}
+
+func TestAnthropicStreamConverterThinkingEOF(t *testing.T) {
+	// A thinking-only stream that ends with EOF (no finish chunk) must still
+	// close the thinking block and terminate cleanly.
+	conv := NewAnthropicStreamConverter()
+	_, err := conv.Convert([]byte(`{"choices":[{"delta":{"reasoning_content":"think"}}]}`), "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	evs := conv.CloseStream()
+	var stops []int
+	var sawDelta, sawStop bool
+	for _, ev := range evs {
+		var e map[string]interface{}
+		json.Unmarshal(ev, &e)
+		switch e["type"] {
+		case "content_block_stop":
+			stops = append(stops, int(e["index"].(float64)))
+		case "message_delta":
+			sawDelta = true
+		case "message_stop":
+			sawStop = true
+		}
+	}
+	if len(stops) != 1 || stops[0] != 0 {
+		t.Fatalf("content_block_stop = %v, want [0] for the thinking block", stops)
+	}
+	if !sawDelta || !sawStop {
+		t.Fatalf("missing termination events: delta=%v stop=%v", sawDelta, sawStop)
+	}
+}
+
+func TestAnthropicStreamConverterNamelessToolHeldThinkingFlushed(t *testing.T) {
+	// A nameless tool must be dropped at finish WITHOUT losing a held
+	// thinking block: the thinking start + buffered deltas still flush, and
+	// only the thinking block is closed (no orphan tool stop).
+	conv := NewAnthropicStreamConverter()
+	// tool 0: never gets a name → deferred
+	_, err := conv.Convert([]byte(`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"arguments":"{"}}]}}]}`), "m")
+	if err != nil && err != ErrSkipChunk {
+		t.Fatal(err)
+	}
+	// reasoning arrives while the tool start is deferred → held, block 1
+	_, err = conv.Convert([]byte(`{"choices":[{"delta":{"reasoning_content":"think"}}]}`), "m")
+	if err != nil && err != ErrSkipChunk {
+		t.Fatal(err)
+	}
+	// finish: tool dropped, thinking flushed with its buffered delta
+	evs, err := conv.Convert([]byte(`{"choices":[{"delta":{},"finish_reason":"stop"}]}`), "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var order []string
+	for _, ev := range evs {
+		var e map[string]interface{}
+		json.Unmarshal(ev, &e)
+		switch e["type"] {
+		case "content_block_start":
+			cb := e["content_block"].(map[string]interface{})
+			order = append(order, "start:"+cb["type"].(string)+"@"+fmt.Sprintf("%v", e["index"]))
+		case "content_block_delta":
+			order = append(order, "delta@"+fmt.Sprintf("%v", e["index"]))
+		case "content_block_stop":
+			order = append(order, "stop@"+fmt.Sprintf("%v", e["index"]))
+		}
+	}
+	want := []string{"start:thinking@1", "delta@1", "stop@1"}
+	if strings.Join(order, ",") != strings.Join(want, ",") {
+		t.Fatalf("event order = %v, want %v (nameless tool dropped, thinking preserved)", order, want)
+	}
+}
+
+func TestAnthropicToolsToOpenAI_MissingInputSchema(t *testing.T) {
+	// Symmetric guard: a non-conformant Anthropic gateway omitting
+	// input_schema must still produce an OpenAI tool with a parameters
+	// object (not null).
+	anthReq := `{
+		"model": "claude-sonnet-4",
+		"messages": [{"role": "user", "content": "hi"}],
+		"max_tokens": 100,
+		"tools": [{"name": "f", "description": "d", "type": "custom"}]
+	}`
+
+	oaiReq, err := AnthropicRequestToOpenAI([]byte(anthReq), "")
+	if err != nil {
+		t.Fatalf("conversion failed: %v", err)
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(oaiReq, &result); err != nil {
+		t.Fatalf("invalid JSON result: %v", err)
+	}
+	tools := result["tools"].([]interface{})
+	first := tools[0].(map[string]interface{})
+	fn := first["function"].(map[string]interface{})
+	params, ok := fn["parameters"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("parameters = %v, want object default", fn["parameters"])
+	}
+	if params["type"] != "object" {
+		t.Errorf("parameters = %v, want {type:object}", params)
+	}
+}
+
+func TestOpenAIToolsToAnthropic_MissingParameters(t *testing.T) {
+	// OpenAI-compatible gateways sometimes omit the function "parameters"
+	// field; Anthropic REQUIRES input_schema to be an object — it must
+	// default to {"type":"object"} instead of shipping null (regression:
+	// null input_schema 400s the upstream).
+	oaiReq := `{
+		"model": "gpt-4o",
+		"messages": [{"role": "user", "content": "hi"}],
+		"tools": [{"type": "function", "function": {"name": "f", "description": "d"}}]
+	}`
+
+	anthReq, err := OpenAIRequestToAnthropic([]byte(oaiReq), "")
+	if err != nil {
+		t.Fatalf("conversion failed: %v", err)
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(anthReq, &result); err != nil {
+		t.Fatalf("invalid JSON result: %v", err)
+	}
+	tools := result["tools"].([]interface{})
+	first := tools[0].(map[string]interface{})
+	schema, ok := first["input_schema"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("input_schema = %v, want object default", first["input_schema"])
+	}
+	if schema["type"] != "object" {
+		t.Errorf("input_schema = %v, want {type:object}", schema)
 	}
 }

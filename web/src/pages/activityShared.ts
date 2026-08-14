@@ -194,6 +194,18 @@ export const fmtPercent = (v: number): string => {
   return `${v.toFixed(2)}%`;
 };
 
+// cacheHitRate = cached / TOTAL input tokens (incl. cached), in percent.
+// The backend stores input_tokens under one convention for every provider:
+// total input including cached tokens (OpenAI's prompt_tokens includes
+// cached_tokens; Anthropic's input_tokens is folded at record time), so the
+// denominator is input alone — adding cache again would double-count it and
+// collapse high rates toward ~50%. Clamped to 100: legacy Anthropic rows
+// stored input WITHOUT cache, where cached tokens can exceed input.
+export const cacheHitRate = (input: number, cache: number): number => {
+  if (input <= 0) return 0;
+  return Math.min(100, (cache / input) * 100);
+};
+
 export const GRID = 'rgba(120,120,140,0.14)';
 export const AXIS = 'rgba(120,120,140,0.75)';
 

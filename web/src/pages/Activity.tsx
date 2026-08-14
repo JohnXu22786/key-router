@@ -345,7 +345,7 @@ const Activity: React.FC = () => {
               style={{ maxWidth: 400 }}
             />
           )}
-          <Button icon={<ReloadOutlined />} loading={loading} onClick={handleRefresh}>Refresh</Button>
+          <Button type="text" icon={<ReloadOutlined />} loading={loading} onClick={handleRefresh} aria-label="Refresh" />
         </Space>
       </div>
 

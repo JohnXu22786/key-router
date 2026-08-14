@@ -1391,8 +1391,16 @@ type ActivitySeriesPoint struct {
 	IsZero   bool    `json:"is_zero"` // explicit zero for chart stacking
 }
 
-// activityAcc accumulates one (bucket, group) cell.
-type activityAcc struct{ sum float64 }
+// activityAcc accumulates one (bucket, group) cell. sum is the selected
+// metric's value; spend/tokens/requests/cache track every metric so "rank
+// by <other metric>" can re-rank groups without re-reading the rows.
+type activityAcc struct {
+	sum      float64 // selected metric
+	spend    float64
+	tokens   float64
+	requests float64
+	cache    float64
+}
 
 // ActivityGroupSummary is one row of the Explore-style summary table.
 type ActivityGroupSummary struct {
@@ -1462,7 +1470,11 @@ func applyActivityFilter(q *gorm.DB, filterType, filterValue string) (*gorm.DB, 
 //	subgroup: model | key | app                    (optional second dimension,
 //	          must differ from group_by; splits each group's series into
 //	          per-subgroup stacks, e.g. spend by model, split by API key)
-//	rollup:   hour | day | week | month             (default day)
+//	rollup:   hour | day | week | month | total    (default day; total
+//	          collapses the whole range into a single "Total" bucket)
+//	rank_by:  current | spend | tokens | requests | cache (default current;
+//	          ranks the series Top-N (and the summary's default order) by the
+//	          given metric, which may differ from the charted one)
 //	since / until: RFC3339, inclusive range
 //	filter_type / filter_value: restrict rows to one entity before
 //	          aggregating (the Activity page's filter button). filter_type is
@@ -1473,6 +1485,7 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 	groupBy := c.DefaultQuery("group_by", "model")
 	subgroup := c.DefaultQuery("subgroup", "")
 	rollup := c.DefaultQuery("rollup", "day")
+	rankBy := c.DefaultQuery("rank_by", "current")
 	// Top-N for the chart: series beyond this many groups are folded into an
 	// "Other" series (#94a3b8) like OpenRouter. 0 = no folding.
 	topN := 0
@@ -1499,8 +1512,12 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 			return
 		}
 	}
-	if rollup != "hour" && rollup != "day" && rollup != "week" && rollup != "month" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "rollup must be hour|day|week|month"})
+	if rollup != "hour" && rollup != "day" && rollup != "week" && rollup != "month" && rollup != "total" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "rollup must be hour|day|week|month|total"})
+		return
+	}
+	if rankBy != "current" && rankBy != "spend" && rankBy != "tokens" && rankBy != "requests" && rankBy != "cache" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "rank_by must be current|spend|tokens|requests|cache"})
 		return
 	}
 
@@ -1561,7 +1578,7 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 				return n
 			}
 			return fmt.Sprintf("Key #%d", r.KeyID)
-		default: // app = the X-App request header ("" = "Unknown")
+		default: // app = the attribution-detected client app ("" = "Unknown")
 			if r.AppName != "" {
 				return r.AppName
 			}
@@ -1629,7 +1646,12 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 		if _, ok := agg[b][g]; !ok {
 			agg[b][g] = &activityAcc{}
 		}
-		agg[b][g].sum += valueOf(&rows[i])
+		a := agg[b][g]
+		a.sum += valueOf(&rows[i])
+		a.spend += rows[i].CostUSD
+		a.tokens += float64(rows[i].InputTokens + rows[i].OutputTokens)
+		a.requests += float64(rows[i].RequestCount)
+		a.cache += float64(rows[i].CacheHitTokens)
 		if !seenGroup[g] {
 			seenGroup[g] = true
 			groupOrder = append(groupOrder, g)
@@ -1685,19 +1707,41 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 		}
 	}
 
-	// Series groups are ordered by total Sum (desc) so the chart's Top-N set
-	// matches the summary table's ordering.
-	sort.Slice(groupOrder, func(i, j int) bool {
-		var si, sj float64
+	// Series groups are ordered by the rank metric (desc) so the chart's
+	// Top-N set matches the summary table's ordering. "current" means the
+	// selected chart metric (its totals live in acc.sum).
+	rankTotal := func(acc *activityAcc) float64 {
+		switch rankBy {
+		case "spend":
+			return acc.spend
+		case "tokens":
+			return acc.tokens
+		case "requests":
+			return acc.requests
+		case "cache":
+			return acc.cache
+		default:
+			return acc.sum
+		}
+	}
+	// rankTotals: per-group total of the rank metric, computed once and used
+	// by both the series ordering and the summary sort.
+	rankTotals := make(map[string]float64, len(groupOrder))
+	for _, g := range groupOrder {
+		var s float64
 		for _, b := range bucketOrder {
-			if m, ok := agg[b][groupOrder[i]]; ok {
-				si += m.sum
-			}
-			if m, ok := agg[b][groupOrder[j]]; ok {
-				sj += m.sum
+			if m, ok := agg[b][g]; ok {
+				s += rankTotal(m)
 			}
 		}
-		return si > sj
+		rankTotals[g] = s
+	}
+	sort.Slice(groupOrder, func(i, j int) bool {
+		si, sj := rankTotals[groupOrder[i]], rankTotals[groupOrder[j]]
+		if si != sj {
+			return si > sj
+		}
+		return groupOrder[i] < groupOrder[j]
 	})
 
 	// Build the response.
@@ -1832,9 +1876,14 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 			Percent: percent,
 		})
 	}
-	// Sort summary by Sum descending (OpenRouter's default rank = current metric).
+	// Sort summary by the rank metric descending (OpenRouter's "Rank by"
+	// control; "current" = the chart metric's sum).
 	sort.Slice(resp.Summary, func(i, j int) bool {
-		return resp.Summary[i].Sum > resp.Summary[j].Sum
+		si, sj := rankTotals[resp.Summary[i].Group], rankTotals[resp.Summary[j].Group]
+		if si != sj {
+			return si > sj
+		}
+		return resp.Summary[i].Group < resp.Summary[j].Group
 	})
 
 	c.JSON(http.StatusOK, resp)
@@ -1864,8 +1913,9 @@ func mondayOf(t time.Time) time.Time {
 
 // activityBucketLabel is the ONE place that maps a time to a rollup bucket
 // label (year-qualified "YYYY-MM-DD", "YYYY-MM-DD 15:00", "2006-01-02",
-// "YYYY-MM"). Both the axis builder and the row aggregation use it, so a
-// row can never be labeled off the axis and silently dropped.
+// "YYYY-MM", or "Total" for the total rollup). Both the axis builder and the
+// row aggregation use it, so a row can never be labeled off the axis and
+// silently dropped.
 func activityBucketLabel(t time.Time, rollup string) string {
 	switch rollup {
 	case "hour":
@@ -1874,19 +1924,22 @@ func activityBucketLabel(t time.Time, rollup string) string {
 		return mondayOf(t).Format("2006-01-02")
 	case "month":
 		return t.Format("2006-01")
+	case "total":
+		return "Total"
 	default:
 		return t.Format("2006-01-02")
 	}
 }
 
 // buildActivityAxis builds a CONTINUOUS bucket axis over since..until at the
-// requested rollup (hour|day|week|month), so days/hours without traffic still
-// appear (OR renders the full range). Hour buckets are floored to the LOCAL
-// hour (billing truncates hour_bucket to the local hour too — UTC Truncate
-// would misalign in half-hour-offset zones like +05:30); day/week step
-// calendar-wise (AddDate) so a 25-hour DST fall-back day neither duplicates
-// a date label nor skips a week; the repeated wall-clock hour of a fall-back
-// keeps a single bucket (both passes aggregate into it by label).
+// requested rollup (hour|day|week|month|total), so days/hours without traffic
+// still appear (OR renders the full range). Hour buckets are floored to the
+// LOCAL hour (billing truncates hour_bucket to the local hour too — UTC
+// Truncate would misalign in half-hour-offset zones like +05:30); day/week
+// step calendar-wise (AddDate) so a 25-hour DST fall-back day neither
+// duplicates a date label nor skips a week; the repeated wall-clock hour of
+// a fall-back keeps a single bucket (both passes aggregate into it by
+// label). The total rollup collapses everything into one "Total" bucket.
 func buildActivityAxis(since, until time.Time, rollup string) []string {
 	bucketOf := func(t time.Time) string {
 		return activityBucketLabel(t, rollup)
@@ -1910,6 +1963,8 @@ func buildActivityAxis(since, until time.Time, rollup string) []string {
 		for t := mondayOf(since); !t.After(until); t = t.AddDate(0, 0, 7) {
 			bucketOrder = append(bucketOrder, bucketOf(t))
 		}
+	case "total":
+		bucketOrder = append(bucketOrder, "Total")
 	default: // month
 		start := time.Date(since.Year(), since.Month(), 1, 0, 0, 0, 0, since.Location())
 		for t := start; !t.After(until); t = t.AddDate(0, 1, 0) {
