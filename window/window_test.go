@@ -250,6 +250,72 @@ func TestWindowManager_CheckLimit(t *testing.T) {
 	})
 }
 
+// TestSlidingWindow_RestoredOldStateDecays guards the "old data residue"
+// scenario: a window restored from persisted state (windows.json) whose
+// lastCleanup is far in the past must slide the stale buckets out on the
+// first access — old counts expire exactly on schedule, never stick forever.
+func TestSlidingWindow_RestoredOldStateDecays(t *testing.T) {
+	// Mirrors the real persisted weekly window (key 6 in windows.json):
+	// 3 days of usage, head=2 (bucket 2 is the current bucket, spanning
+	// [lastCleanup, lastCleanup+24h)), buckets 0-1 hold the two earlier
+	// days.
+	persisted := func(lastCleanup time.Time) exportedState {
+		return exportedState{
+			ReqBuckets:  []int64{660, 7522, 1034, 0, 0, 0, 0},
+			TokBuckets:  []int64{0, 0, 0, 0, 0, 0, 0},
+			CostBuckets: []int64{0, 0, 0, 0, 0, 0, 0},
+			Head:        2,
+			LastCleanup: lastCleanup.UnixNano(),
+		}
+	}
+	// The real file saves mid-bucket, so lastCleanup is anchored 5h into
+	// the bucket that was current when the app closed: elapsed at access
+	// is closure + 5h, keeping every boundary below ≥5h from truncation.
+	closed := func(days int) time.Time {
+		return time.Now().Add(-time.Duration(days)*24*time.Hour - 5*time.Hour)
+	}
+
+	t.Run("3-day closure keeps all data (still within window)", func(t *testing.T) {
+		sw := NewSlidingWindow(model.WindowRPW, 7, 24*time.Hour)
+		sw.importState(persisted(closed(3)))
+		if got := sw.Count(); got != 9216 {
+			t.Errorf("Count() after 3-day closure = %d, want 9216", got)
+		}
+	})
+
+	t.Run("6-day closure drops buckets whose start passed the window edge", func(t *testing.T) {
+		sw := NewSlidingWindow(model.WindowRPW, 7, 24*time.Hour)
+		sw.importState(persisted(closed(6)))
+		// Buckets 0 and 1 started 8d5h / 7d5h before reopen — past the
+		// 7-day edge, so they slide out. Only the current bucket (started
+		// 6d5h before reopen) survives: the weekly window quantizes to
+		// 24h buckets, dropping a bucket when its START passes the edge.
+		if got := sw.Count(); got != 1034 {
+			t.Errorf("Count() after 6-day closure = %d, want 1034", got)
+		}
+	})
+
+	t.Run("closure past the whole window zeroes everything", func(t *testing.T) {
+		sw := NewSlidingWindow(model.WindowRPW, 7, 24*time.Hour)
+		sw.importState(persisted(closed(8)))
+		if got := sw.Count(); got != 0 {
+			t.Errorf("Count() after 8-day closure = %d, want 0", got)
+		}
+	})
+
+	t.Run("manager restore then closure slides like the live app", func(t *testing.T) {
+		wm := NewWindowManager()
+		wm.RestoreAll(PersistedWindows{
+			6: {
+				model.WindowRPW: persisted(closed(3)),
+			},
+		})
+		if got := wm.GetCount(6, model.WindowRPW); got != 9216 {
+			t.Errorf("GetCount after restore+3-day closure = %d, want 9216", got)
+		}
+	})
+}
+
 // Helper to simulate time passing by moving lastCleanup backward
 func testAdvanceTime(sw *SlidingWindow, n int) {
 	sw.mu.Lock()
