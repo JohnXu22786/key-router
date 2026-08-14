@@ -9,6 +9,7 @@ import {
   BarChart, Bar,
 } from 'recharts';
 import { getConsumptions, getOverview, getKeys, getProviders, Consumption, OverviewStats, Key, Provider } from '../api/client';
+import { cacheHitRate } from './activityShared';
 import dayjs from 'dayjs';
 
 const { Title, Text } = Typography;
@@ -154,14 +155,19 @@ const Stats: React.FC = () => {
   const delta = (curV: number, prevV: number) =>
     prevV > 0 ? ((curV - prevV) / prevV) * 100 : (curV > 0 ? 100 : 0);
 
+  // Cache hit rate = cached / total input tokens (incl. cached); the delta
+  // compares the RATE against the previous period, like the Activity page.
+  const curRate = cacheHitRate(cur.input, cur.cache);
+  const prevRate = cacheHitRate(prev.input, prev.cache);
+
   const kpis = [
     { label: 'Total Spend', value: fmtUSD(cur.cost), delta: delta(cur.cost, prev.cost) },
     { label: 'Requests', value: fmtCompact(cur.requests), delta: delta(cur.requests, prev.requests) },
     { label: 'Token Volume', value: fmtTokens(cur.tokens), delta: delta(cur.tokens, prev.tokens) },
     {
       label: 'Cache Hit Rate',
-      value: `${((cur.cache / Math.max(1, cur.input + cur.cache)) * 100).toFixed(1)}%`,
-      delta: delta(cur.cache, prev.cache),
+      value: `${curRate.toFixed(1)}%`,
+      delta: delta(curRate, prevRate),
     },
   ];
 
