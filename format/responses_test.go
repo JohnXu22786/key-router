@@ -62,10 +62,12 @@ func TestResponsesRequestToChatCompletion(t *testing.T) {
 		}
 	}
 
-	// messages: system (instructions) + user + assistant-with-tool-calls + tool
+	// messages: system (instructions) + user + assistant-with-tool-calls +
+	// tool + padded trailing assistant (chat completions rejects a
+	// conversation ending in a tool message)
 	msgs, _ := req["messages"].([]interface{})
-	if len(msgs) != 4 {
-		t.Fatalf("messages = %d, want 4: %v", len(msgs), msgs)
+	if len(msgs) != 5 {
+		t.Fatalf("messages = %d, want 5: %v", len(msgs), msgs)
 	}
 	sys := msgs[0].(map[string]interface{})
 	if sys["role"] != "system" || sys["content"] != "You are helpful." {
@@ -92,6 +94,10 @@ func TestResponsesRequestToChatCompletion(t *testing.T) {
 	tool := msgs[3].(map[string]interface{})
 	if tool["role"] != "tool" || tool["tool_call_id"] != "call_9" || tool["content"] != "72F" {
 		t.Errorf("tool message = %v", tool)
+	}
+	pad := msgs[4].(map[string]interface{})
+	if pad["role"] != "assistant" || pad["content"] != "" {
+		t.Errorf("trailing pad message = %v, want assistant with empty content", pad)
 	}
 
 	// text.format json_schema â†’ response_format
@@ -996,5 +1002,285 @@ func TestResponsesStreamConverterThinkingDelta(t *testing.T) {
 	}
 	if types := eventTypes(t, evs); strings.Join(types, ",") != "response.reasoning_summary_text.done,response.output_item.done" {
 		t.Fatalf("thinking stop events = %v", types)
+	}
+}
+
+func TestResponsesRequestToChatCompletionFileAttachment(t *testing.T) {
+	// An input_file part must survive into the chat file content part
+	// (regression: it used to be silently dropped).
+	body := `{"model":"m","input":[
+		{"type":"message","role":"user","content":[
+			{"type":"input_text","text":"read this"},
+			{"type":"input_file","file_data":"data:application/pdf;base64,JVBER","filename":"report.pdf"}
+		]}
+	]}`
+	out, err := ResponsesRequestToChatCompletion([]byte(body), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req map[string]interface{}
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := req["messages"].([]interface{})
+	if len(msgs) != 1 {
+		t.Fatalf("messages = %v", msgs)
+	}
+	content := msgs[0].(map[string]interface{})["content"].([]interface{})
+	if len(content) != 2 {
+		t.Fatalf("content parts = %v", content)
+	}
+	file := content[1].(map[string]interface{})
+	if file["type"] != "file" {
+		t.Fatalf("part = %v, want file", file)
+	}
+	f, _ := file["file"].(map[string]interface{})
+	if f["file_data"] != "data:application/pdf;base64,JVBER" || f["filename"] != "report.pdf" {
+		t.Errorf("file part = %v", f)
+	}
+}
+
+func TestResponsesRequestToChatCompletionToolOutputParts(t *testing.T) {
+	// function_call_output with a parts array → chat tool content parts
+	// (regression: Responses-shaped parts used to pass through unconverted).
+	body := `{"model":"m","input":[
+		{"type":"function_call_output","call_id":"call_9","output":[
+			{"type":"output_text","text":"72F"},
+			{"type":"input_image","image_url":"data:image/png;base64,iVBOR"}
+		]}
+	]}`
+	out, err := ResponsesRequestToChatCompletion([]byte(body), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req map[string]interface{}
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := req["messages"].([]interface{})
+	if len(msgs) != 2 {
+		t.Fatalf("messages = %v (tool + padded assistant)", msgs)
+	}
+	tool := msgs[0].(map[string]interface{})
+	if tool["role"] != "tool" || tool["tool_call_id"] != "call_9" {
+		t.Fatalf("tool message = %v", tool)
+	}
+	parts := tool["content"].([]interface{})
+	if len(parts) != 2 {
+		t.Fatalf("tool content parts = %v", parts)
+	}
+	txt := parts[0].(map[string]interface{})
+	if txt["type"] != "text" || txt["text"] != "72F" {
+		t.Errorf("text part = %v", txt)
+	}
+	img := parts[1].(map[string]interface{})
+	iu, _ := img["image_url"].(map[string]interface{})
+	if img["type"] != "image_url" || iu["url"] != "data:image/png;base64,iVBOR" {
+		t.Errorf("image part = %v", img)
+	}
+}
+
+func TestResponsesRequestToChatCompletionToolOutputNull(t *testing.T) {
+	// A tool that returned nothing → "" content, never null.
+	body := `{"model":"m","input":[{"type":"function_call_output","call_id":"call_9"}]}`
+	out, err := ResponsesRequestToChatCompletion([]byte(body), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req map[string]interface{}
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := req["messages"].([]interface{})
+	tool := msgs[0].(map[string]interface{})
+	if tool["content"] != "" {
+		t.Errorf("tool content = %v, want empty string", tool["content"])
+	}
+	if tool["tool_call_id"] != "call_9" {
+		t.Errorf("tool_call_id = %v", tool["tool_call_id"])
+	}
+}
+
+func TestResponsesRequestToAnthropicFileAndImage(t *testing.T) {
+	// input_file → Anthropic document block; uppercase DATA: + MIME-wrapped
+	// base64 image → base64 source with stripped newlines.
+	png := "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+	wrapped := strings.ReplaceAll(png, "AAAA", "AAA\nAAA")
+	// the payload must be JSON-escaped inside the request body
+	wrappedJSON := strings.ReplaceAll(wrapped, "\n", "\\n")
+	body := `{"model":"m","input":[{"type":"message","role":"user","content":[
+		{"type":"input_file","file_data":"data:application/pdf;base64,JVBER","filename":"a.pdf"},
+		{"type":"input_image","image_url":"DATA:image/png;base64,` + wrappedJSON + `"}
+	]}]}`
+	out, err := ResponsesRequestToAnthropic([]byte(body), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req map[string]interface{}
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := req["messages"].([]interface{})
+	content := msgs[0].(map[string]interface{})["content"].([]interface{})
+	if len(content) != 2 {
+		t.Fatalf("content = %v, want 2 blocks (document + image)", content)
+	}
+	doc := content[0].(map[string]interface{})
+	if doc["type"] != "document" {
+		t.Fatalf("block = %v, want document", doc)
+	}
+	if doc["title"] != "a.pdf" {
+		t.Errorf("document title = %v", doc["title"])
+	}
+	img := content[1].(map[string]interface{})
+	src, _ := img["source"].(map[string]interface{})
+	if img["type"] != "image" || src["type"] != "base64" || src["media_type"] != "image/png" {
+		t.Fatalf("image block = %v", img)
+	}
+	if src["data"] != strings.ReplaceAll(png, "AAAA", "AAAAAA") {
+		t.Errorf("image data = %q, want newline-stripped base64", src["data"])
+	}
+}
+
+func TestResponsesRequestToAnthropicToolOutputParts(t *testing.T) {
+	// function_call_output parts array → Anthropic tool_result blocks;
+	// missing output → "" (never null).
+	body := `{"model":"m","input":[
+		{"type":"function_call_output","call_id":"call_9","output":[
+			{"type":"output_text","text":"72F"},
+			{"type":"input_file","file_data":"data:application/pdf;base64,JVBER","filename":"r.pdf"}
+		]},
+		{"type":"function_call_output","call_id":"call_10"}
+	]}`
+	out, err := ResponsesRequestToAnthropic([]byte(body), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req map[string]interface{}
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	// consecutive function_call_output items merge into one user message
+	// with two tool_result blocks
+	msgs, _ := req["messages"].([]interface{})
+	if len(msgs) != 1 {
+		t.Fatalf("messages = %v", msgs)
+	}
+	content := msgs[0].(map[string]interface{})["content"].([]interface{})
+	if len(content) != 2 {
+		t.Fatalf("content = %v, want 2 tool_result blocks", content)
+	}
+	tr := content[0].(map[string]interface{})
+	if tr["type"] != "tool_result" || tr["tool_use_id"] != "call_9" {
+		t.Fatalf("tool_result = %v", tr)
+	}
+	blocks := tr["content"].([]interface{})
+	if len(blocks) != 2 {
+		t.Fatalf("tool_result content = %v", blocks)
+	}
+	if blocks[0].(map[string]interface{})["type"] != "text" {
+		t.Errorf("first block = %v, want text", blocks[0])
+	}
+	if blocks[1].(map[string]interface{})["type"] != "document" {
+		t.Errorf("second block = %v, want document", blocks[1])
+	}
+	tr2 := content[1].(map[string]interface{})
+	if tr2["content"] != "" || tr2["tool_use_id"] != "call_10" {
+		t.Errorf("empty tool_result = %v", tr2)
+	}
+}
+
+func TestResponsesRequestToChatCompletionToolOutputUnexpectedShape(t *testing.T) {
+	// A non-conformant client that reports a number/object as tool output
+	// must not have it shipped upstream as chat tool content (400s) — it
+	// becomes "" instead.
+	body := `{"model":"m","input":[{"type":"function_call_output","call_id":"c1","output":42}]}`
+	out, err := ResponsesRequestToChatCompletion([]byte(body), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req map[string]interface{}
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := req["messages"].([]interface{})
+	tool := msgs[0].(map[string]interface{})
+	if tool["content"] != "" {
+		t.Errorf("tool content = %v, want empty string", tool["content"])
+	}
+}
+
+func TestResponsesRequestToAnthropicToolOutputUnexpectedShape(t *testing.T) {
+	// Non-conformant tool output (number/object/bool) must not reach
+	// Anthropic tool_result.content — it only accepts a string or blocks.
+	body := `{"model":"m","input":[{"type":"function_call_output","call_id":"c1","output":42}]}`
+	out, err := ResponsesRequestToAnthropic([]byte(body), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req map[string]interface{}
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := req["messages"].([]interface{})
+	tr := msgs[0].(map[string]interface{})["content"].([]interface{})[0].(map[string]interface{})
+	if tr["content"] != "" {
+		t.Errorf("tool_result content = %v, want empty string", tr["content"])
+	}
+}
+
+func TestResponsesRequestToChatCompletionEndsWithAssistantToolCalls(t *testing.T) {
+	// A conversation ending in an assistant message with pending
+	// function_call parts must be padded with tool messages answering each
+	// call (OpenAI rejects the bare tool_calls ending).
+	body := `{"model":"m","input":[{"type":"message","role":"assistant","content":[
+		{"type":"function_call","id":"fc_1","call_id":"call_7","name":"f","arguments":"{}"}
+	]}]}`
+	out, err := ResponsesRequestToChatCompletion([]byte(body), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req map[string]interface{}
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := req["messages"].([]interface{})
+	if len(msgs) != 2 {
+		t.Fatalf("messages = %v, want assistant + tool pad", msgs)
+	}
+	tool := msgs[1].(map[string]interface{})
+	if tool["role"] != "tool" || tool["tool_call_id"] != "call_7" || tool["content"] != "" {
+		t.Errorf("pad tool message = %v", tool)
+	}
+}
+
+func TestResponsesRequestNumericCallIDCoerced(t *testing.T) {
+	// A numeric call_id (non-conformant client) must not leak into
+	// tool_call_id/tool_use_id as a JSON number — upstreams require strings.
+	body := `{"model":"m","input":[{"type":"function_call_output","call_id":123,"output":"x"}]}`
+	out, err := ResponsesRequestToChatCompletion([]byte(body), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req map[string]interface{}
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := req["messages"].([]interface{})
+	tool := msgs[0].(map[string]interface{})
+	if tool["tool_call_id"] != "" {
+		t.Errorf("chat tool_call_id = %v, want empty string (numeric coerced)", tool["tool_call_id"])
+	}
+	out, err = ResponsesRequestToAnthropic([]byte(body), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ = req["messages"].([]interface{})
+	tr := msgs[0].(map[string]interface{})["content"].([]interface{})[0].(map[string]interface{})
+	if tr["tool_use_id"] != "" {
+		t.Errorf("anthropic tool_use_id = %v, want empty string (numeric coerced)", tr["tool_use_id"])
 	}
 }

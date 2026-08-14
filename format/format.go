@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"mime"
 	"path"
 	"sort"
@@ -173,6 +174,16 @@ func OpenAIRequestToAnthropic(body []byte, modelOverride string) ([]byte, error)
 		}
 		if len(anthMessages) > 0 {
 			anthReq["messages"] = anthMessages
+		} else {
+			// Anthropic REQUIRES a messages array; a system-only request
+			// (no user/assistant/tool turns) gets a minimal user turn.
+			anthReq["messages"] = []interface{}{map[string]interface{}{
+				"role": "user",
+				"content": []interface{}{map[string]interface{}{
+					"type": "text",
+					"text": "",
+				}},
+			}}
 		}
 	}
 
@@ -218,6 +229,14 @@ func appendMerged(list *[]interface{}, msg map[string]interface{}) {
 // mergeContentParts combines two message contents (strings and/or arrays)
 // into one content value, normalizing mixed forms to an array.
 func mergeContentParts(a interface{}, aHas bool, b interface{}, bHas bool) interface{} {
+	// An explicit null content (legal in OpenAI serializations) must not
+	// wipe out the other message's accumulated content.
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
 	aArr, aIsArr := a.([]interface{})
 	bArr, bIsArr := b.([]interface{})
 	if aIsArr && bIsArr {
@@ -479,6 +498,17 @@ type AnthropicStreamConverter struct {
 	textBlockIdx int         // assigned when the text block first opens
 	nextBlockIdx int         // next free content block index
 	toolBlocks   map[int]int // openai tool_call index -> anthropic content block index
+	// The text block start is held while tool starts are deferred so ALL
+	// content_block_start events flush together in ascending block-index
+	// order (the text index is assigned after any pending tools', so
+	// emitting it early would skip a lower index).
+	textPending bool
+	textDeltas  [][]byte // buffered text deltas while the text start is held
+	// Some gateways delay a tool call's id/name to a later fragment. The
+	// content_block_start (which must carry both) is held back until they
+	// are known, buffering argument deltas in the meantime; pendingStarts
+	// is keyed by the openai tool_call index.
+	pendingStarts map[int]*pendingToolStart
 	// OpenAI sends usage in a chunk AFTER the finish chunk (with
 	// include_usage). message_delta/message_stop are therefore deferred until
 	// that chunk arrives (or the stream ends) so the synthesized
@@ -488,9 +518,111 @@ type AnthropicStreamConverter struct {
 	pendingTokens    int64
 }
 
+// pendingToolStart is a deferred content_block_start for a tool whose id and
+// name had not both arrived when its first fragment was seen.
+type pendingToolStart struct {
+	blockIdx int
+	id       string
+	name     string
+	deltas   [][]byte // buffered input_json_delta events
+}
+
 // NewAnthropicStreamConverter creates a fresh converter
 func NewAnthropicStreamConverter() *AnthropicStreamConverter {
-	return &AnthropicStreamConverter{toolBlocks: make(map[int]int)}
+	return &AnthropicStreamConverter{
+		toolBlocks:    make(map[int]int),
+		pendingStarts: make(map[int]*pendingToolStart),
+	}
+}
+
+// allPendingResolved reports whether every deferred tool start has both id
+// and name (only then may they be flushed, in ascending block-index order).
+func (c *AnthropicStreamConverter) allPendingResolved() bool {
+	for _, ps := range c.pendingStarts {
+		if ps.id == "" || ps.name == "" {
+			return false
+		}
+	}
+	return true
+}
+
+// flushPendingStart emits the deferred content_block_start for a tool (with
+// whatever id/name is known) followed by its buffered argument deltas, and
+// removes it from the pending set.
+func (c *AnthropicStreamConverter) flushPendingStart(ti int) [][]byte {
+	ps, ok := c.pendingStarts[ti]
+	if !ok {
+		return nil
+	}
+	delete(c.pendingStarts, ti)
+	startEv, _ := json.Marshal(map[string]interface{}{
+		"type":  "content_block_start",
+		"index": ps.blockIdx,
+		"content_block": map[string]interface{}{
+			"type":  "tool_use",
+			"id":    ps.id,
+			"name":  ps.name,
+			"input": map[string]interface{}{},
+		},
+	})
+	return append([][]byte{startEv}, ps.deltas...)
+}
+
+// flushAllPendingStarts emits every deferred start (deferred tools plus a
+// held text block) in block-index order (used at stream end, or when all
+// deferred tools become resolvable — strict Anthropic validators require
+// ascending block indexes). A tool whose name never arrived is dropped
+// entirely — Anthropic rejects a nameless tool_use block, and an unusable
+// tool call must not 400 the whole stream.
+func (c *AnthropicStreamConverter) flushAllPendingStarts() [][]byte {
+	type entry struct {
+		ti     int // -1 for the text block
+		block  int
+		id     string
+		name   string
+		deltas [][]byte
+	}
+	entries := make([]entry, 0, len(c.pendingStarts)+1)
+	for ti, ps := range c.pendingStarts {
+		entries = append(entries, entry{ti, ps.blockIdx, ps.id, ps.name, ps.deltas})
+	}
+	if c.textPending {
+		entries = append(entries, entry{ti: -1, block: c.textBlockIdx})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].block < entries[j].block })
+	var events [][]byte
+	for _, e := range entries {
+		if e.ti < 0 {
+			// held text block: emit its start, then the buffered deltas
+			c.textPending = false
+			c.textOpened = true
+			startEv, _ := json.Marshal(map[string]interface{}{
+				"type":  "content_block_start",
+				"index": e.block,
+				"content_block": map[string]interface{}{
+					"type": "text",
+					"text": "",
+				},
+			})
+			events = append(events, startEv)
+			events = append(events, c.textDeltas...)
+			c.textDeltas = nil
+			continue
+		}
+		ps := c.pendingStarts[e.ti]
+		if ps.name == "" {
+			delete(c.pendingStarts, e.ti)
+			delete(c.toolBlocks, e.ti)
+			continue
+		}
+		if ps.id == "" {
+			// Never received an id — synthesize one so the tool_use block
+			// stays well-formed.
+			ps.id = fmt.Sprintf("toolu_%d", ps.blockIdx)
+		}
+		events = append(events, c.flushPendingStart(e.ti)...)
+	}
+	return events
 }
 
 // Begin returns the synthetic message_start event (once) and any other
@@ -597,16 +729,22 @@ func (c *AnthropicStreamConverter) Convert(chunk []byte, modelName string) ([][]
 			if !c.textOpened {
 				c.textBlockIdx = c.nextBlockIdx
 				c.nextBlockIdx++
-				c.textOpened = true
-				startEv, _ := json.Marshal(map[string]interface{}{
-					"type":  "content_block_start",
-					"index": c.textBlockIdx,
-					"content_block": map[string]interface{}{
-						"type": "text",
-						"text": "",
-					},
-				})
-				events = append(events, startEv)
+				if len(c.pendingStarts) > 0 {
+					// Tool starts are held — hold the text start too so
+					// every start flushes in ascending block order.
+					c.textPending = true
+				} else {
+					c.textOpened = true
+					startEv, _ := json.Marshal(map[string]interface{}{
+						"type":  "content_block_start",
+						"index": c.textBlockIdx,
+						"content_block": map[string]interface{}{
+							"type": "text",
+							"text": "",
+						},
+					})
+					events = append(events, startEv)
+				}
 			}
 			ev, _ := json.Marshal(map[string]interface{}{
 				"type":  "content_block_delta",
@@ -616,7 +754,11 @@ func (c *AnthropicStreamConverter) Convert(chunk []byte, modelName string) ([][]
 					"text": content,
 				},
 			})
-			events = append(events, ev)
+			if c.textPending {
+				c.textDeltas = append(c.textDeltas, ev)
+			} else {
+				events = append(events, ev)
+			}
 		}
 
 		// Tool call fragments (delta.tool_calls[i].function.arguments)
@@ -635,23 +777,67 @@ func (c *AnthropicStreamConverter) Convert(chunk []byte, modelName string) ([][]
 				}
 				blockIdx, seen := c.toolBlocks[ti]
 				if !seen {
-					// First fragment for this tool: emit content_block_start
+					// First fragment for this tool: assign the block index.
+					// Some gateways delay the tool id/name to a later fragment
+					// — hold the content_block_start (and buffer argument
+					// deltas) until both are known, so the emitted block never
+					// carries nulls.
 					blockIdx = c.nextBlockIdx
 					c.nextBlockIdx++
 					c.toolBlocks[ti] = blockIdx
 
-					fn, _ := safeMap(tcMap["function"])
-					startEv, _ := json.Marshal(map[string]interface{}{
-						"type":  "content_block_start",
-						"index": blockIdx,
-						"content_block": map[string]interface{}{
-							"type":  "tool_use",
-							"id":    tcMap["id"],
-							"name":  fn["name"],
-							"input": map[string]interface{}{},
-						},
-					})
-					events = append(events, startEv)
+					var id, name string
+					if v, ok := tcMap["id"].(string); ok {
+						id = v
+					}
+					if fn, ok := safeMap(tcMap["function"]); ok {
+						if n, ok := fn["name"].(string); ok {
+							name = n
+						}
+					}
+					if id != "" && name != "" && len(c.pendingStarts) == 0 && !c.textPending {
+						// Nothing deferred — emit immediately (block indexes
+						// stay ascending).
+						startEv, _ := json.Marshal(map[string]interface{}{
+							"type":  "content_block_start",
+							"index": blockIdx,
+							"content_block": map[string]interface{}{
+								"type":  "tool_use",
+								"id":    id,
+								"name":  name,
+								"input": map[string]interface{}{},
+							},
+						})
+						events = append(events, startEv)
+					} else {
+						// Either id/name are missing, or an earlier block
+						// (tool or text) is already deferred — hold this
+						// start so every start is flushed together in
+						// ascending block-index order.
+						c.pendingStarts[ti] = &pendingToolStart{blockIdx: blockIdx, id: id, name: name}
+					}
+				} else if ps, ok := c.pendingStarts[ti]; ok {
+					// Start still pending — pick up the id/name if this
+					// fragment carries them. The start is held until every
+					// deferred start is resolvable so they can be flushed in
+					// ascending block-index order (fragments may arrive in any
+					// order; strict Anthropic validators require ascending
+					// block indexes).
+					if ps.id == "" {
+						if v, ok := tcMap["id"].(string); ok {
+							ps.id = v
+						}
+					}
+					if ps.name == "" {
+						if fn, ok := safeMap(tcMap["function"]); ok {
+							if n, ok := fn["name"].(string); ok {
+								ps.name = n
+							}
+						}
+					}
+					if ps.id != "" && ps.name != "" && c.allPendingResolved() {
+						events = append(events, c.flushAllPendingStarts()...)
+					}
 				}
 				if fn, ok := safeMap(tcMap["function"]); ok {
 					if args, ok := safeString(fn, "arguments"); ok && args != "" {
@@ -663,7 +849,12 @@ func (c *AnthropicStreamConverter) Convert(chunk []byte, modelName string) ([][]
 								"partial_json": args,
 							},
 						})
-						events = append(events, deltaEv)
+						if ps, ok := c.pendingStarts[ti]; ok {
+							// start not yet emitted — buffer the delta
+							ps.deltas = append(ps.deltas, deltaEv)
+						} else {
+							events = append(events, deltaEv)
+						}
 					}
 				}
 			}
@@ -694,6 +885,11 @@ func (c *AnthropicStreamConverter) Convert(chunk []byte, modelName string) ([][]
 				outputTokens = int64(ct)
 			}
 		}
+
+		// Flush any deferred tool starts (a pending id/name never arrived)
+		// so the client still receives complete tool_use blocks before the
+		// content_block_stop events.
+		events = append(events, c.flushAllPendingStarts()...)
 
 		// Close all open blocks in ascending index order (text block and any
 		// tool blocks)
@@ -774,6 +970,9 @@ func (c *AnthropicStreamConverter) CloseStream() [][]byte {
 		return c.terminate()
 	}
 
+	// Flush any deferred tool starts, then close open blocks.
+	var events [][]byte
+	events = append(events, c.flushAllPendingStarts()...)
 	closeIdx := make([]int, 0, len(c.toolBlocks)+1)
 	for _, blockIdx := range c.toolBlocks {
 		closeIdx = append(closeIdx, blockIdx)
@@ -783,7 +982,6 @@ func (c *AnthropicStreamConverter) CloseStream() [][]byte {
 	}
 	sort.Ints(closeIdx)
 
-	var events [][]byte
 	for _, blockIdx := range closeIdx {
 		stopEv, _ := json.Marshal(map[string]interface{}{
 			"type":  "content_block_stop",
@@ -1123,15 +1321,26 @@ func convertOpenAIContentArray(content []interface{}) []interface{} {
 				"text": p["text"],
 			})
 		case "image_url":
-			imageURL, ok := safeMap(p["image_url"])
-			if !ok {
+			// Some gateways send the URL as a bare string instead of the
+			// standard {"url": ...} object — accept both shapes.
+			var url string
+			switch v := p["image_url"].(type) {
+			case string:
+				url = v
+			case map[string]interface{}:
+				url = safeStringOrDefault(v, "url", "")
+			}
+			if url == "" {
 				continue
 			}
-			url := safeStringOrDefault(imageURL, "url", "")
 			if isDataURI(url) {
 				// data:image/png;base64,iVBOR... → split into media_type + raw data
 				parts := strings.SplitN(url, ",", 2)
 				if len(parts) == 2 {
+					b64 := stripBase64Newlines(parts[1])
+					if b64 == "" {
+						continue // empty payload — skipping beats a 400
+					}
 					mediaType := strings.Split(strings.TrimPrefix(strings.ToLower(parts[0]), "data:"), ";")[0]
 					if mediaType == "" {
 						mediaType = "image/png"
@@ -1141,7 +1350,7 @@ func convertOpenAIContentArray(content []interface{}) []interface{} {
 						"source": map[string]interface{}{
 							"type":       "base64",
 							"media_type": mediaType,
-							"data":       parts[1],
+							"data":       b64,
 						},
 					})
 				}
@@ -1449,6 +1658,14 @@ func convertOpenAIAssistantMessage(m map[string]interface{}) map[string]interfac
 		}
 	}
 
+	if anthContent == nil {
+		// Anthropic rejects null assistant content — an empty text block
+		// is the accepted shape (mirrors responsesAssistantContent).
+		anthContent = []interface{}{map[string]interface{}{
+			"type": "text",
+			"text": "",
+		}}
+	}
 	result["content"] = anthContent
 	return result
 }

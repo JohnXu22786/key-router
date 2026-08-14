@@ -206,3 +206,27 @@ func TestExtractStreamUsageResponses(t *testing.T) {
 		t.Errorf("Format = %q, want openai semantics", usage.Format)
 	}
 }
+
+// TestChatCompletionResponseToResponsesMissingTotalTokens guards the
+// total_tokens fallback: gateways that omit total_tokens must not produce a
+// Responses object reporting total_tokens: 0.
+func TestChatCompletionResponseToResponsesMissingTotalTokens(t *testing.T) {
+	body := `{"id":"chatcmpl-7","object":"chat.completion","model":"m",
+		"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"hi"}}],
+		"usage":{"prompt_tokens":10,"completion_tokens":5}}`
+	out, err := ChatCompletionResponseToResponses([]byte(body), "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(out, &resp); err != nil {
+		t.Fatal(err)
+	}
+	u := resp["usage"].(map[string]interface{})
+	if u["total_tokens"] != float64(15) {
+		t.Errorf("total_tokens = %v, want 15 (derived from input + output)", u["total_tokens"])
+	}
+	if u["input_tokens"] != float64(10) || u["output_tokens"] != float64(5) {
+		t.Errorf("usage = %v", u)
+	}
+}

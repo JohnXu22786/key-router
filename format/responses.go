@@ -93,6 +93,37 @@ func ResponsesRequestToChatCompletion(body []byte, modelOverride string) ([]byte
 		}
 	}
 	if len(messages) > 0 {
+		last, _ := messages[len(messages)-1].(map[string]interface{})
+		switch safeStringOrDefault(last, "role", "") {
+		case "tool":
+			// chat completions does not accept a conversation ending in a
+			// tool message (the standard stateless tool-loop shape ends
+			// with function_call_output) — pad a trailing empty assistant
+			// turn, like the Anthropic→OpenAI conversion does.
+			messages = append(messages, map[string]interface{}{
+				"role":    "assistant",
+				"content": "",
+			})
+		case "assistant":
+			// An assistant turn ending the conversation with pending
+			// tool_calls must be followed by tool messages answering each
+			// call, or the upstream rejects the request.
+			if tcs, ok := safeArr(last, "tool_calls"); ok {
+				for _, tc := range tcs {
+					tcMap, ok := safeMap(tc)
+					if !ok {
+						continue
+					}
+					if id, ok := safeString(tcMap, "id"); ok && id != "" {
+						messages = append(messages, map[string]interface{}{
+							"role":         "tool",
+							"tool_call_id": id,
+							"content":      "",
+						})
+					}
+				}
+			}
+		}
 		out["messages"] = messages
 	} else {
 		// chat completions REQUIRES a messages array; an instructions-less
@@ -179,15 +210,21 @@ func responsesInputItemToChat(item interface{}, systemParts *[]string) []interfa
 				case "input_text", "output_text":
 					textParts = append(textParts, map[string]interface{}{
 						"type": "text",
-						"text": p["text"],
+						"text": safeStringOrDefault(p, "text", ""),
 					})
 				case "input_image":
-					textParts = append(textParts, map[string]interface{}{
-						"type": "image_url",
-						"image_url": map[string]interface{}{
-							"url": responsesImageURL(p),
-						},
-					})
+					if u := responsesImageURL(p); u != "" {
+						textParts = append(textParts, map[string]interface{}{
+							"type": "image_url",
+							"image_url": map[string]interface{}{
+								"url": u,
+							},
+						})
+					}
+				case "input_file":
+					if b := responsesFileToChat(p); b != nil {
+						textParts = append(textParts, b)
+					}
 				case "function_call":
 					// assistant tool-call part → chat tool_calls. The id MUST
 					// be the CALL id — the client echoes it back in
@@ -198,7 +235,7 @@ func responsesInputItemToChat(item interface{}, systemParts *[]string) []interfa
 						"id":   firstNonEmpty(p["call_id"], p["id"]),
 						"type": "function",
 						"function": map[string]interface{}{
-							"name":      p["name"],
+							"name":      safeStringOrDefault(p, "name", ""),
 							"arguments": args,
 						},
 					})
@@ -215,13 +252,80 @@ func responsesInputItemToChat(item interface{}, systemParts *[]string) []interfa
 		}
 		return []interface{}{msg}
 	case "function_call_output":
+		// The output may be a plain string or an array of Responses-shaped
+		// parts (text/image/file) — convert them to chat tool content parts
+		// instead of shipping Responses blocks upstream. null → "" (chat
+		// tool messages must never carry null content).
 		return []interface{}{map[string]interface{}{
 			"role":         "tool",
-			"tool_call_id": m["call_id"],
-			"content":      m["output"],
+			"tool_call_id": firstNonEmpty(m["call_id"], ""),
+			"content":      responsesOutputToChatContent(m["output"]),
 		}}
 	}
 	return nil
+}
+
+// responsesFileToChat converts a Responses API input_file part into a chat
+// file content part. Returns nil when the file cannot be represented
+// (file_id-only references need a Files API round-trip with the client's
+// own account).
+func responsesFileToChat(p map[string]interface{}) interface{} {
+	fileData, _ := p["file_data"].(string)
+	if fileData == "" {
+		return nil
+	}
+	file := map[string]interface{}{"file_data": fileData}
+	if filename := cleanFileName(safeStringOrDefault(p, "filename", "")); filename != "" {
+		file["filename"] = filename
+	}
+	return map[string]interface{}{"type": "file", "file": file}
+}
+
+// responsesOutputToChatContent converts a function_call_output value (string
+// or array of Responses-shaped output parts) into chat tool message content.
+// nil/unrepresentable becomes "" — OpenAI tool messages must not carry null.
+func responsesOutputToChatContent(output interface{}) interface{} {
+	if output == nil {
+		return ""
+	}
+	if s, ok := output.(string); ok {
+		return s
+	}
+	arr, ok := output.([]interface{})
+	if !ok {
+		// Not a string and not a parts array (e.g. a raw number/object from
+		// a non-conformant client) — shipping it upstream as tool content
+		// would 400. Empty is the only shape every gateway accepts.
+		return ""
+	}
+	var parts []interface{}
+	for _, part := range arr {
+		p, ok := safeMap(part)
+		if !ok {
+			continue
+		}
+		switch safeStringOrDefault(p, "type", "") {
+		case "input_text", "output_text":
+			parts = append(parts, map[string]interface{}{"type": "text", "text": safeStringOrDefault(p, "text", "")})
+		case "input_image":
+			if u := responsesImageURL(p); u != "" {
+				parts = append(parts, map[string]interface{}{
+					"type": "image_url",
+					"image_url": map[string]interface{}{
+						"url": u,
+					},
+				})
+			}
+		case "input_file":
+			if b := responsesFileToChat(p); b != nil {
+				parts = append(parts, b)
+			}
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return parts
 }
 
 // responsesTextFormatToResponseFormat maps the Responses API's text.format
@@ -355,13 +459,32 @@ func ResponsesRequestToAnthropic(body []byte, modelOverride string) ([]byte, err
 					})
 				}
 			case "function_call_output":
-				// tool output → user message with a tool_result part
+				// tool output → user message with a tool_result part.
+				// Anthropic tool_result.content must be a string or an
+				// array of content blocks — never null. Parts arrays are
+				// converted to Anthropic blocks (text/image/document).
+				content := m["output"]
+				if content == nil {
+					content = ""
+				} else if arr, ok := content.([]interface{}); ok {
+					converted := responsesOutputToAnthropic(arr)
+					if len(converted) == 0 {
+						content = ""
+					} else {
+						content = converted
+					}
+				} else if _, ok := content.(string); !ok {
+					// Non-conformant output shape (number/object/bool) —
+					// Anthropic tool_result.content only accepts a string or
+					// an array of blocks. Empty is the only safe shape.
+					content = ""
+				}
 				anthMessages = append(anthMessages, map[string]interface{}{
 					"role": "user",
 					"content": []interface{}{map[string]interface{}{
 						"type":        "tool_result",
-						"tool_use_id": m["call_id"],
-						"content":     m["output"],
+						"tool_use_id": firstNonEmpty(m["call_id"], ""),
+						"content":     content,
 					}},
 				})
 			}
@@ -450,9 +573,15 @@ func responsesUserContent(content interface{}) []interface{} {
 			}
 			switch safeStringOrDefault(p, "type", "") {
 			case "input_text", "output_text":
-				parts = append(parts, map[string]interface{}{"type": "text", "text": p["text"]})
+				parts = append(parts, map[string]interface{}{"type": "text", "text": safeStringOrDefault(p, "text", "")})
 			case "input_image":
-				parts = append(parts, responsesImageToAnthropic(p))
+				if b := responsesImageToAnthropic(p); b != nil {
+					parts = append(parts, b)
+				}
+			case "input_file":
+				if b := responsesFileToAnthropic(p); b != nil {
+					parts = append(parts, b)
+				}
 			}
 		}
 	}
@@ -462,27 +591,61 @@ func responsesUserContent(content interface{}) []interface{} {
 	return parts
 }
 
-// responsesImageToAnthropic converts an input_image part into an Anthropic
-// image block (data URIs → base64 source, http(s) URLs → url source).
-func responsesImageToAnthropic(p map[string]interface{}) interface{} {
-	url := responsesImageURL(p)
-	if strings.HasPrefix(url, "data:") {
-		parts := strings.SplitN(url, ",", 2)
-		if len(parts) == 2 {
-			mediaType := strings.TrimPrefix(parts[0], "data:")
-			mediaType = strings.Split(mediaType, ";")[0]
-			if mediaType == "" {
-				mediaType = "image/png"
+// responsesOutputToAnthropic converts a function_call_output parts array
+// (Responses-shaped output parts) into Anthropic content blocks. Returns an
+// empty slice when nothing is representable.
+func responsesOutputToAnthropic(arr []interface{}) []interface{} {
+	var parts []interface{}
+	for _, part := range arr {
+		p, ok := safeMap(part)
+		if !ok {
+			continue
+		}
+		switch safeStringOrDefault(p, "type", "") {
+		case "input_text", "output_text":
+			parts = append(parts, map[string]interface{}{"type": "text", "text": safeStringOrDefault(p, "text", "")})
+		case "input_image":
+			if b := responsesImageToAnthropic(p); b != nil {
+				parts = append(parts, b)
 			}
-			return map[string]interface{}{
-				"type": "image",
-				"source": map[string]interface{}{
-					"type":       "base64",
-					"media_type": mediaType,
-					"data":       parts[1],
-				},
+		case "input_file":
+			if b := responsesFileToAnthropic(p); b != nil {
+				parts = append(parts, b)
 			}
 		}
+	}
+	return parts
+}
+
+// responsesImageToAnthropic converts an input_image part into an Anthropic
+// image block (data URIs → base64 source, http(s) URLs → url source).
+// Returns nil for empty payloads (data URI with no content), which the
+// caller skips.
+func responsesImageToAnthropic(p map[string]interface{}) interface{} {
+	url := responsesImageURL(p)
+	if isDataURI(url) {
+		parts := strings.SplitN(url, ",", 2)
+		if len(parts) == 2 {
+			b64 := stripBase64Newlines(parts[1])
+			if b64 != "" {
+				mediaType := strings.Split(strings.TrimPrefix(strings.ToLower(parts[0]), "data:"), ";")[0]
+				if mediaType == "" {
+					mediaType = "image/png"
+				}
+				return map[string]interface{}{
+					"type": "image",
+					"source": map[string]interface{}{
+						"type":       "base64",
+						"media_type": mediaType,
+						"data":       b64,
+					},
+				}
+			}
+		}
+		return nil
+	}
+	if url == "" {
+		return nil
 	}
 	return map[string]interface{}{
 		"type": "image",
@@ -491,6 +654,21 @@ func responsesImageToAnthropic(p map[string]interface{}) interface{} {
 			"url":  url,
 		},
 	}
+}
+
+// responsesFileToAnthropic converts a Responses API input_file part into an
+// Anthropic document block, reusing the chat file-part conversion. Returns
+// nil for file_id-only references (they need a Files API round-trip).
+func responsesFileToAnthropic(p map[string]interface{}) interface{} {
+	fileData, _ := p["file_data"].(string)
+	if fileData == "" {
+		return nil
+	}
+	file := map[string]interface{}{"file_data": fileData}
+	if filename := cleanFileName(safeStringOrDefault(p, "filename", "")); filename != "" {
+		file["filename"] = filename
+	}
+	return openAIFilePartToAnthropic(map[string]interface{}{"file": file})
 }
 
 // responsesAssistantContent converts an assistant message item's content
@@ -511,13 +689,13 @@ func responsesAssistantContent(content interface{}) []interface{} {
 			}
 			switch safeStringOrDefault(p, "type", "") {
 			case "output_text", "input_text":
-				parts = append(parts, map[string]interface{}{"type": "text", "text": p["text"]})
+				parts = append(parts, map[string]interface{}{"type": "text", "text": safeStringOrDefault(p, "text", "")})
 			case "function_call":
 				// arguments is a JSON string; Anthropic input must be an object
 				parts = append(parts, map[string]interface{}{
 					"type":  "tool_use",
 					"id":    firstNonEmpty(p["call_id"], p["id"]),
-					"name":  p["name"],
+					"name":  safeStringOrDefault(p, "name", ""),
 					"input": parseArgumentsObject(p["arguments"]),
 				})
 			}
@@ -529,17 +707,17 @@ func responsesAssistantContent(content interface{}) []interface{} {
 	return parts
 }
 
-// firstNonEmpty returns the first non-empty string value.
+// firstNonEmpty returns the first non-empty string value. Values that are
+// not strings (e.g. a numeric call_id from a non-conformant client) are
+// coerced to "" — id/tool_call_id/tool_use_id fields must be strings for
+// every upstream protocol.
 func firstNonEmpty(vals ...interface{}) interface{} {
 	for _, v := range vals {
 		if s, ok := v.(string); ok && s != "" {
 			return s
 		}
-		if v != nil {
-			return v
-		}
 	}
-	return nil
+	return ""
 }
 
 // jsonString marshals v into a JSON string (or "{}" on failure).
