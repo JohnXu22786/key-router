@@ -106,8 +106,8 @@ func (c *Calculator) CalculateCost(modelName string, usage *model.TokenUsage) fl
 // RecordConsumption writes a consumption record to the database.
 // modelName is the model actually served (post route-target resolution); it
 // powers the Activity page's by-model aggregation.
-// appName is the client app from the X-App request header ("" when absent);
-// it powers the Activity page's "Top Apps" panel.
+// appName is the client app detected from the provider attribution headers
+// ("" when absent); it powers the Activity page's "Top Apps" panel.
 // routePrice, when non-nil and non-zero, overrides the Pricing table (each
 // route can carry its own per-1M rates — e.g. a cheap and a premium key for
 // the same model).
