@@ -324,8 +324,17 @@ func TestActivityFilter(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Explicit range covering the fixture rows (yesterday + today noon): the
+	// default since..until window ("now-7d .. now") would drop today's row
+	// when the suite runs before noon.
+	now := time.Now()
+	since := time.Date(now.Year(), now.Month(), now.Day()-1, 0, 0, 0, 0, now.Location())
+	until := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
+	rangeQS := fmt.Sprintf("since=%s&until=%s",
+		url.QueryEscape(since.Format(time.RFC3339)), url.QueryEscape(until.Format(time.RFC3339)))
+
 	// filter_type=model&filter_value=g1 -> only the two g1 rows ($0.01 + $0.02).
-	code, totals, rows := activityGet(t, e, "metric=spend&group_by=key&rollup=day&filter_type=model&filter_value=g1")
+	code, totals, rows := activityGet(t, e, "metric=spend&group_by=key&rollup=day&filter_type=model&filter_value=g1&"+rangeQS)
 	if code != 200 {
 		t.Fatalf("model filter status = %d", code)
 	}
@@ -337,7 +346,7 @@ func TestActivityFilter(t *testing.T) {
 	}
 
 	// filter_type=key&filter_value=<k2 id> -> only k2's row ($0.02).
-	code, totals, rows = activityGet(t, e, fmt.Sprintf("metric=spend&group_by=model&rollup=day&filter_type=key&filter_value=%d", key2.ID))
+	code, totals, rows = activityGet(t, e, fmt.Sprintf("metric=spend&group_by=model&rollup=day&filter_type=key&filter_value=%d&%s", key2.ID, rangeQS))
 	if code != 200 {
 		t.Fatalf("key filter status = %d", code)
 	}
@@ -346,7 +355,7 @@ func TestActivityFilter(t *testing.T) {
 	}
 
 	// filter_type=app&filter_value=testapp -> only k2's row.
-	code, totals, rows = activityGet(t, e, "metric=spend&group_by=model&rollup=day&filter_type=app&filter_value=testapp")
+	code, totals, rows = activityGet(t, e, "metric=spend&group_by=model&rollup=day&filter_type=app&filter_value=testapp&"+rangeQS)
 	if code != 200 {
 		t.Fatalf("app filter status = %d", code)
 	}
@@ -356,7 +365,7 @@ func TestActivityFilter(t *testing.T) {
 
 	// filter_type=app&filter_value=Unknown -> all rows with an EMPTY app name
 	// (k1's g1 row + the g2 row + the empty-model row): 5+3+1 = 9 requests.
-	code, totals, rows = activityGet(t, e, "metric=requests&group_by=model&rollup=day&filter_type=app&filter_value=Unknown")
+	code, totals, rows = activityGet(t, e, "metric=requests&group_by=model&rollup=day&filter_type=app&filter_value=Unknown&"+rangeQS)
 	if code != 200 {
 		t.Fatalf("app=Unknown status = %d", code)
 	}
@@ -368,7 +377,7 @@ func TestActivityFilter(t *testing.T) {
 	}
 
 	// filter_type=model&filter_value=Unknown -> the empty-model_name row only.
-	code, totals, rows = activityGet(t, e, "metric=requests&group_by=model&rollup=day&filter_type=model&filter_value=Unknown")
+	code, totals, rows = activityGet(t, e, "metric=requests&group_by=model&rollup=day&filter_type=model&filter_value=Unknown&"+rangeQS)
 	if code != 200 {
 		t.Fatalf("model=Unknown status = %d", code)
 	}
@@ -416,11 +425,19 @@ func TestConsumptionsFilter(t *testing.T) {
 		return rec.Code, rows
 	}
 
-	code, rows := get("filter_type=model&filter_value=g2")
+	// Explicit range covering the fixture rows (see TestActivityFilter): the
+	// default since..until window drops today's noon row before noon.
+	now := time.Now()
+	since := time.Date(now.Year(), now.Month(), now.Day()-1, 0, 0, 0, 0, now.Location())
+	until := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
+	rangeQS := fmt.Sprintf("since=%s&until=%s",
+		url.QueryEscape(since.Format(time.RFC3339)), url.QueryEscape(until.Format(time.RFC3339)))
+
+	code, rows := get("filter_type=model&filter_value=g2&" + rangeQS)
 	if code != 200 || len(rows) != 1 || rows[0].ModelName != "g2" {
 		t.Fatalf("model=g2: code=%d rows=%d, want exactly the g2 row", code, len(rows))
 	}
-	code, rows = get("filter_type=app&filter_value=testapp")
+	code, rows = get("filter_type=app&filter_value=testapp&" + rangeQS)
 	if code != 200 || len(rows) != 1 || rows[0].ModelName != "g1" {
 		t.Fatalf("app=testapp: code=%d rows=%d, want exactly the k2 g1 row", code, len(rows))
 	}
