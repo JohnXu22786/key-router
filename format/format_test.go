@@ -2,6 +2,8 @@ package format
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -1046,5 +1048,244 @@ func TestOpenAIStreamConverterThinking(t *testing.T) {
 	}
 	if len(chunk.Choices) == 0 || chunk.Choices[0].Delta.ReasoningContent != "because X" {
 		t.Fatalf("reasoning_content not mapped: %s", chunks[0])
+	}
+}
+
+func TestOpenAIRequestToAnthropicSystemOnly(t *testing.T) {
+	// A system-only chat request must still produce an Anthropic messages
+	// array (regression: it used to be omitted, 400ing the upstream).
+	out, err := OpenAIRequestToAnthropic([]byte(`{"model":"m","messages":[{"role":"system","content":"You are helpful."}]}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req map[string]interface{}
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	if req["system"] != "You are helpful." {
+		t.Errorf("system = %v", req["system"])
+	}
+	msgs, ok := req["messages"].([]interface{})
+	if !ok || len(msgs) != 1 {
+		t.Fatalf("messages = %v, want 1 minimal user turn", req["messages"])
+	}
+	m := msgs[0].(map[string]interface{})
+	if m["role"] != "user" {
+		t.Errorf("message role = %v, want user", m["role"])
+	}
+}
+
+func TestMergeContentPartsExplicitNull(t *testing.T) {
+	// An explicit null content on the second message must not wipe the
+	// first message's accumulated content.
+	got := mergeContentParts("keep me", true, nil, true)
+	if got != "keep me" {
+		t.Errorf("mergeContentParts(null) = %v, want accumulated text preserved", got)
+	}
+	got = mergeContentParts(nil, true, "other", true)
+	if got != "other" {
+		t.Errorf("mergeContentParts(nil, other) = %v", got)
+	}
+}
+
+func TestAnthropicStreamConverterDelayedToolID(t *testing.T) {
+	// A gateway that delays the tool id/name to a later fragment must not
+	// produce a content_block_start with null id/name (regression: the
+	// start used to be emitted from the first fragment only).
+	conv := NewAnthropicStreamConverter()
+	evs, err := conv.Convert([]byte(`{"id":"c1","choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"arguments":"{\"a\":1}"}}]}}]}`), "m")
+	if err != nil && err != ErrSkipChunk {
+		t.Fatal(err)
+	}
+	// start must NOT be emitted yet
+	for _, ev := range evs {
+		var e map[string]interface{}
+		json.Unmarshal(ev, &e)
+		if e["type"] == "content_block_start" {
+			t.Fatalf("content_block_start emitted before id/name known: %s", ev)
+		}
+	}
+	// second fragment carries id + name; arguments continue
+	evs, err = conv.Convert([]byte(`{"id":"c2","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_weather","arguments":"}"}}]}}]}`), "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// event order must be: content_block_start (with id/name) → buffered
+	// first-fragment delta {"a":1} → current fragment delta "}"
+	var gotStart bool
+	var deltaTexts []string
+	for _, ev := range evs {
+		var e map[string]interface{}
+		json.Unmarshal(ev, &e)
+		switch e["type"] {
+		case "content_block_start":
+			gotStart = true
+			cb := e["content_block"].(map[string]interface{})
+			if cb["id"] != "call_1" || cb["name"] != "get_weather" {
+				t.Fatalf("content_block_start = %v, want id call_1 / name get_weather", cb)
+			}
+		case "content_block_delta":
+			if !gotStart {
+				t.Fatalf("content_block_delta emitted before content_block_start: %s", ev)
+			}
+			d := e["delta"].(map[string]interface{})
+			if d["type"] != "input_json_delta" {
+				t.Fatalf("delta = %v", d)
+			}
+			deltaTexts = append(deltaTexts, d["partial_json"].(string))
+		}
+	}
+	if !gotStart {
+		t.Fatalf("no content_block_start in events: %v", evs)
+	}
+	// both the buffered first-fragment arguments and the follow-up must be
+	// replayed in order after the start
+	if len(deltaTexts) != 2 || deltaTexts[0] != `{"a":1}` || deltaTexts[1] != "}" {
+		t.Fatalf("delta texts = %v, want [{\"a\":1} }] (buffered args replayed in order)", deltaTexts)
+	}
+}
+
+func TestAnthropicStreamConverterDeferredStartsAscendingOrder(t *testing.T) {
+	// Two tools whose id/name arrive late must have their
+	// content_block_start events flushed in ascending block-index order,
+	// even when the fragments arrive in a different order.
+	conv := NewAnthropicStreamConverter()
+	// tool index 1's first fragment arrives first → block index 0
+	_, err := conv.Convert([]byte(`{"choices":[{"delta":{"tool_calls":[{"index":1,"type":"function","function":{"arguments":"{"}}]}}]}`), "m")
+	if err != nil && err != ErrSkipChunk {
+		t.Fatal(err)
+	}
+	// tool index 0's first fragment → block index 1
+	_, err = conv.Convert([]byte(`{"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"arguments":"{"}}]}}]}`), "m")
+	if err != nil && err != ErrSkipChunk {
+		t.Fatal(err)
+	}
+	// both resolve in array order [0,1] — starts must still be block 0 then block 1
+	evs, err := conv.Convert([]byte(`{"choices":[{"delta":{"tool_calls":[
+		{"index":0,"id":"call_0","function":{"name":"f0","arguments":"}"}},
+		{"index":1,"id":"call_1","function":{"name":"f1","arguments":"}"}}
+	]}}]}`), "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var starts []int
+	for _, ev := range evs {
+		var e map[string]interface{}
+		json.Unmarshal(ev, &e)
+		if e["type"] == "content_block_start" {
+			starts = append(starts, int(e["index"].(float64)))
+		}
+	}
+	if len(starts) != 2 || starts[0] != 0 || starts[1] != 1 {
+		t.Fatalf("start order = %v, want [0 1] (ascending block indexes)", starts)
+	}
+}
+
+func TestAnthropicStreamConverterNamelessToolDropped(t *testing.T) {
+	// A tool whose name never arrives must be dropped at stream end — no
+	// malformed content_block_start, no orphan content_block_stop.
+	conv := NewAnthropicStreamConverter()
+	_, err := conv.Convert([]byte(`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"arguments":"{\"a\":1}"}}]}}]}`), "m")
+	if err != nil && err != ErrSkipChunk {
+		t.Fatal(err)
+	}
+	evs := conv.CloseStream()
+	for _, ev := range evs {
+		var e map[string]interface{}
+		json.Unmarshal(ev, &e)
+		switch e["type"] {
+		case "content_block_start":
+			t.Fatalf("nameless tool emitted a start: %s", ev)
+		case "content_block_stop":
+			t.Fatalf("orphan content_block_stop for dropped tool: %s", ev)
+		}
+	}
+}
+
+func TestAnthropicStreamConverterHoldsCompleteToolWhileEarlierPending(t *testing.T) {
+	// A fully-formed tool must not emit its start while an EARLIER tool
+	// (lower block index) is still deferred — all starts flush together in
+	// ascending block order.
+	conv := NewAnthropicStreamConverter()
+	// tool 0 first fragment: args only → deferred, block index 0
+	_, err := conv.Convert([]byte(`{"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"arguments":"{"}}]}}]}`), "m")
+	if err != nil && err != ErrSkipChunk {
+		t.Fatal(err)
+	}
+	// tool 1 fully formed → must be HELD, not emitted (block index 1)
+	evs, err := conv.Convert([]byte(`{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_1","function":{"name":"f1","arguments":"{\"b\":2}"}}]}}]}`), "m")
+	if err != nil && err != ErrSkipChunk {
+		t.Fatal(err)
+	}
+	for _, ev := range evs {
+		var e map[string]interface{}
+		json.Unmarshal(ev, &e)
+		if e["type"] == "content_block_start" {
+			t.Fatalf("start emitted while earlier tool still pending: %s", ev)
+		}
+	}
+	// tool 0 resolves → both flush in block order [0, 1]
+	evs, err = conv.Convert([]byte(`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_0","function":{"name":"f0","arguments":"}"}}]}}]}`), "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var starts []int
+	for _, ev := range evs {
+		var e map[string]interface{}
+		json.Unmarshal(ev, &e)
+		if e["type"] == "content_block_start" {
+			starts = append(starts, int(e["index"].(float64)))
+		}
+	}
+	if len(starts) != 2 || starts[0] != 0 || starts[1] != 1 {
+		t.Fatalf("start order = %v, want [0 1]", starts)
+	}
+}
+
+func TestAnthropicStreamConverterTextHeldForAscendingOrder(t *testing.T) {
+	// Text deltas arriving while a lower-indexed tool start is deferred
+	// must be held — emitting the text start early would skip a block
+	// index (strict Anthropic validators require ascending order).
+	conv := NewAnthropicStreamConverter()
+	// tool 0: args only → deferred, block index 0
+	_, err := conv.Convert([]byte(`{"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"arguments":"{"}}]}}]}`), "m")
+	if err != nil && err != ErrSkipChunk {
+		t.Fatal(err)
+	}
+	// text delta → block index 1, must be held (no start, no delta yet)
+	evs, err := conv.Convert([]byte(`{"choices":[{"delta":{"content":"hello"}}]}`), "m")
+	if err != nil && err != ErrSkipChunk {
+		t.Fatal(err)
+	}
+	for _, ev := range evs {
+		var e map[string]interface{}
+		json.Unmarshal(ev, &e)
+		if e["type"] == "content_block_start" || e["type"] == "content_block_delta" {
+			t.Fatalf("text events emitted while tool start pending: %s", ev)
+		}
+	}
+	// tool 0 resolves → tool start(0), text start(1), text delta, tool delta
+	evs, err = conv.Convert([]byte(`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_0","function":{"name":"f0","arguments":"}"}}]}}]}`), "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var order []string
+	for _, ev := range evs {
+		var e map[string]interface{}
+		json.Unmarshal(ev, &e)
+		switch e["type"] {
+		case "content_block_start":
+			cb := e["content_block"].(map[string]interface{})
+			order = append(order, "start:"+cb["type"].(string)+"@"+fmt.Sprintf("%v", e["index"]))
+		case "content_block_delta":
+			order = append(order, "delta@"+fmt.Sprintf("%v", e["index"]))
+		}
+	}
+	// starts must be ascending; each block's deltas follow its own start
+	// (the tool's buffered delta precedes the text start, which is valid —
+	// deltas may interleave across blocks, starts may not)
+	want := []string{"start:tool_use@0", "delta@0", "start:text@1", "delta@1", "delta@0"}
+	if strings.Join(order, ",") != strings.Join(want, ",") {
+		t.Fatalf("event order = %v, want %v", order, want)
 	}
 }

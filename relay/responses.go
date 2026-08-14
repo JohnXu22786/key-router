@@ -137,6 +137,12 @@ func ChatCompletionResponseToResponses(body []byte, modelName string) ([]byte, e
 		if u.PromptDetails != nil {
 			cached = u.PromptDetails.CachedTokens
 		}
+		// Some gateways omit total_tokens — derive it from the parts that
+		// are present so the Responses object never reports a bogus 0.
+		total := u.TotalTokens
+		if total == 0 {
+			total = u.PromptTokens + u.CompletionTokens
+		}
 		resp["usage"] = map[string]interface{}{
 			"input_tokens": u.PromptTokens,
 			"input_tokens_details": map[string]interface{}{
@@ -146,7 +152,7 @@ func ChatCompletionResponseToResponses(body []byte, modelName string) ([]byte, e
 			"output_tokens_details": map[string]interface{}{
 				"reasoning_tokens": 0,
 			},
-			"total_tokens": u.TotalTokens,
+			"total_tokens": total,
 		}
 	}
 

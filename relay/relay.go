@@ -939,6 +939,11 @@ func extractStreamUsage(data []byte, inputFormat, upstreamFormat string, usage *
 			usage.PromptTokens = chunk.Usage.PromptTokens
 			usage.CompletionTokens = chunk.Usage.CompletionTokens
 			usage.TotalTokens = chunk.Usage.TotalTokens
+			// Same derivation as ParseTokenUsage: a gateway omitting
+			// total_tokens must not zero out the usage record.
+			if usage.TotalTokens == 0 {
+				usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+			}
 			if chunk.Usage.PromptDetails != nil {
 				usage.CacheHitTokens = chunk.Usage.PromptDetails.CachedTokens
 			}
@@ -1006,6 +1011,9 @@ func extractStreamUsage(data []byte, inputFormat, upstreamFormat string, usage *
 			usage.PromptTokens = u.InputTokens
 			usage.CompletionTokens = u.OutputTokens
 			usage.TotalTokens = u.TotalTokens
+			if usage.TotalTokens == 0 {
+				usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+			}
 			if u.InputDetails != nil {
 				usage.CacheHitTokens = u.InputDetails.CachedTokens
 			}
@@ -1301,12 +1309,21 @@ func extractAnthropicUsage(anthResp map[string]interface{}) map[string]interface
 
 	inputTokens := toFloat64(usage["input_tokens"])
 	outputTokens := toFloat64(usage["output_tokens"])
+	cacheCreation := toFloat64(usage["cache_creation_input_tokens"])
+	cacheRead := toFloat64(usage["cache_read_input_tokens"])
+	// OpenAI convention: prompt_tokens INCLUDES cached tokens (the
+	// streaming converter applies the same rule) so the client sees
+	// identical usage whether or not stream:true was set.
+	promptTokens := inputTokens + cacheCreation + cacheRead
 	return map[string]interface{}{
 		"input_tokens":      inputTokens,
 		"output_tokens":     outputTokens,
-		"prompt_tokens":     inputTokens,
+		"prompt_tokens":     promptTokens,
 		"completion_tokens": outputTokens,
-		"total_tokens":      inputTokens + outputTokens,
+		"total_tokens":      promptTokens + outputTokens,
+		"prompt_tokens_details": map[string]interface{}{
+			"cached_tokens": cacheCreation + cacheRead,
+		},
 	}
 }
 
@@ -1368,6 +1385,12 @@ func ParseTokenUsage(body []byte, format string) *model.TokenUsage {
 			usage.PromptTokens = resp.Usage.PromptTokens
 			usage.CompletionTokens = resp.Usage.CompletionTokens
 			usage.TotalTokens = resp.Usage.TotalTokens
+			// Some OpenAI-compatible gateways omit total_tokens — derive it
+			// so billing (and the streaming SetUsage gate below) never
+			// reports 0 for a request that consumed tokens.
+			if usage.TotalTokens == 0 {
+				usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+			}
 			if resp.Usage.PromptDetails != nil {
 				usage.CacheHitTokens = resp.Usage.PromptDetails.CachedTokens
 			}
@@ -1409,6 +1432,11 @@ func ParseTokenUsage(body []byte, format string) *model.TokenUsage {
 			usage.PromptTokens = resp.Usage.InputTokens
 			usage.CompletionTokens = resp.Usage.OutputTokens
 			usage.TotalTokens = resp.Usage.TotalTokens
+			// Same derivation as the openai branch: a gateway omitting
+			// total_tokens must not zero out billing.
+			if usage.TotalTokens == 0 {
+				usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+			}
 			if resp.Usage.InputDetails != nil {
 				usage.CacheHitTokens = resp.Usage.InputDetails.CachedTokens
 			}

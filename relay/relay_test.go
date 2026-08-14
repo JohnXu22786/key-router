@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"key-router/model"
 )
 
 // TestCompletionToStreamChunkPreservesReasoning guards the DeepSeek
@@ -75,5 +77,70 @@ func TestCompletionToStreamChunkDeltaForm(t *testing.T) {
 	}
 	if chunk.Choices[0].Delta.ReasoningContent != "thinking" {
 		t.Errorf("delta reasoning_content lost: %q", chunk.Choices[0].Delta.ReasoningContent)
+	}
+}
+
+// TestExtractAnthropicUsageCacheTokens guards usage consistency between the
+// non-stream Anthropic→OpenAI path and the streaming path: prompt_tokens
+// must INCLUDE cached tokens in both (regression: the non-stream path
+// reported input tokens without cache, so stream:false showed less usage
+// than stream:true for the same upstream response).
+func TestExtractAnthropicUsageCacheTokens(t *testing.T) {
+	usage := extractAnthropicUsage(map[string]interface{}{
+		"usage": map[string]interface{}{
+			"input_tokens":                10.0,
+			"output_tokens":               5.0,
+			"cache_creation_input_tokens": 3.0,
+			"cache_read_input_tokens":     2.0,
+		},
+	})
+	if usage["prompt_tokens"] != float64(15) {
+		t.Errorf("prompt_tokens = %v, want 15 (10 input + 3 create + 2 read)", usage["prompt_tokens"])
+	}
+	if usage["total_tokens"] != float64(20) {
+		t.Errorf("total_tokens = %v, want 20", usage["total_tokens"])
+	}
+	details, _ := usage["prompt_tokens_details"].(map[string]interface{})
+	if details["cached_tokens"] != float64(5) {
+		t.Errorf("cached_tokens = %v, want 5", details["cached_tokens"])
+	}
+	if usage["input_tokens"] != float64(10) {
+		t.Errorf("input_tokens = %v, want 10 (raw Anthropic semantics)", usage["input_tokens"])
+	}
+}
+
+// TestParseTokenUsageDerivesTotalTokens guards billing when an OpenAI-
+// compatible gateway omits total_tokens: the record must still count the
+// request (regression: total 0 zeroed out billing and the streaming
+// SetUsage gate).
+func TestParseTokenUsageDerivesTotalTokens(t *testing.T) {
+	u := ParseTokenUsage([]byte(`{"usage":{"prompt_tokens":10,"completion_tokens":5}}`), "openai")
+	if u.TotalTokens != 15 {
+		t.Errorf("TotalTokens = %d, want 15 (derived)", u.TotalTokens)
+	}
+	u = ParseTokenUsage([]byte(`{"usage":{"input_tokens":10,"output_tokens":5}}`), "responses")
+	if u.TotalTokens != 15 {
+		t.Errorf("responses TotalTokens = %d, want 15 (derived)", u.TotalTokens)
+	}
+	// explicit total wins
+	u = ParseTokenUsage([]byte(`{"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":12}}`), "openai")
+	if u.TotalTokens != 12 {
+		t.Errorf("TotalTokens = %d, want 12 (explicit)", u.TotalTokens)
+	}
+}
+
+// TestExtractStreamUsageDerivesTotalTokens guards the SSE-path counterpart
+// of ParseTokenUsage: a streaming gateway omitting total_tokens must not
+// zero the usage record (token-rate-limit windows would count nothing).
+func TestExtractStreamUsageDerivesTotalTokens(t *testing.T) {
+	usage := &model.TokenUsage{}
+	extractStreamUsage([]byte(`{"choices":[{"delta":{"content":"x"}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`), "openai", "openai", usage)
+	if usage.TotalTokens != 15 {
+		t.Errorf("openai TotalTokens = %d, want 15 (derived)", usage.TotalTokens)
+	}
+	usage = &model.TokenUsage{}
+	extractStreamUsage([]byte(`{"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":5}}}`), "responses", "responses", usage)
+	if usage.TotalTokens != 15 {
+		t.Errorf("responses TotalTokens = %d, want 15 (derived)", usage.TotalTokens)
 	}
 }
