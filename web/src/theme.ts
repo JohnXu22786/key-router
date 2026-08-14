@@ -12,9 +12,9 @@ export const THEME_MODE_KEY = 'keyrouter.theme-mode';
 // sync even when persistence fails.
 export const THEME_MODE_CHANGE_EVENT = 'keyrouter:theme-mode-change';
 
-// Default: light — preserves the app's current appearance for users who
-// never touch the setting (the UI shipped light-only before this feature).
-export const DEFAULT_THEME_MODE: ThemeMode = 'light';
+// Default: follow the OS — the app tracks the system theme for users who
+// never touch the setting. An explicit light/dark choice still wins.
+export const DEFAULT_THEME_MODE: ThemeMode = 'system';
 
 // Maps a raw stored value to a valid mode; anything unknown (corrupt value,
 // legacy content, missing key) falls back to the default.
