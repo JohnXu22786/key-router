@@ -1561,7 +1561,7 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 				return n
 			}
 			return fmt.Sprintf("Key #%d", r.KeyID)
-		default: // app = the X-App request header ("" = "Unknown")
+		default: // app = the attribution-detected client app ("" = "Unknown")
 			if r.AppName != "" {
 				return r.AppName
 			}

@@ -182,7 +182,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter }) => {
     Uncached: Math.max(0, (inSeries[i]?.value || 0) - d.value),
   }));
 
-  // Top API Keys (tokens) and Top Apps (X-App header, tokens)
+  // Top API Keys (tokens) and Top Apps (attribution headers, tokens)
   const keyTokens = groupTotals(curList, c => {
     const k = keys.find(x => x.id === c.key_id);
     return k?.name || `Key #${c.key_id}`;
