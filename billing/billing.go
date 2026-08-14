@@ -104,14 +104,17 @@ func (c *Calculator) CalculateCost(modelName string, usage *model.TokenUsage) fl
 }
 
 // RecordConsumption writes a consumption record to the database.
-// modelName is the model actually served (post route-target resolution); it
-// powers the Activity page's by-model aggregation.
+// modelName is the model the CLIENT requested (the model group id) — it is
+// what the Activity page groups by. priceModel is the model actually served
+// upstream (post route-target resolution) and keys the Pricing-table fallback,
+// so billing follows the upstream price while the activity page shows the
+// ingress model. For pass-through routes the two are identical.
 // appName is the client app detected from the provider attribution headers
 // ("" when absent); it powers the Activity page's "Top Apps" panel.
 // routePrice, when non-nil and non-zero, overrides the Pricing table (each
 // route can carry its own per-1M rates — e.g. a cheap and a premium key for
 // the same model).
-func RecordConsumption(keyID int64, modelName, appName string, usage *model.TokenUsage, routePrice *model.Route) (*model.Consumption, error) {
+func RecordConsumption(keyID int64, modelName, priceModel, appName string, usage *model.TokenUsage, routePrice *model.Route) (*model.Consumption, error) {
 	// Truncate to the LOCAL hour: time.Truncate aligns to UTC hours, which
 	// misaligns buckets in non-whole-hour-offset zones (e.g. +05:30).
 	nowT := time.Now()
@@ -129,9 +132,12 @@ func RecordConsumption(keyID int64, modelName, appName string, usage *model.Toke
 			prompt, completion = routePrice.PromptPer1M, routePrice.CompletionPer1M
 			cacheRead, cacheWrite = routePrice.CacheReadPer1M, routePrice.CacheWritePer1M
 		} else {
-			// Try to find pricing — exact model name first, then the "*" wildcard
+			// Try to find pricing — exact model name first, then the "*" wildcard.
+			// Keyed on priceModel (the upstream model actually served): the
+			// provider bills at that price even though the activity page shows
+			// the client-requested model name.
 			var p model.Pricing
-			exact := db.GetDB().Where("model_name = ?", modelName).First(&p).Error
+			exact := db.GetDB().Where("model_name = ?", priceModel).First(&p).Error
 			if exact != nil {
 				db.GetDB().Where("model_name = ?", "*").First(&p)
 			}
