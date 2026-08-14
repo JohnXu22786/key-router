@@ -195,7 +195,20 @@ func (c *Checker) checkAll() {
 	wg.Wait()
 }
 
+// budgetExhausted reports whether the key has consumed its lifetime spend
+// budget. The cap is an administrative limit, not an upstream health
+// condition: once exhausted, the key must never be probed (each probe is a
+// billable chat completion) or revived by the checker — only an admin reset
+// (POST /api/keys/:id/reset-spend) re-admits it. Guarding on the budget
+// itself (not on the disabled_reason) also covers keys whose reason was
+// overwritten by a concurrent failure path.
+func budgetExhausted(key *model.Key) bool {
+	return key.TotalSpendLimit > 0 && key.TotalSpent >= key.TotalSpendLimit
+}
+
 // shouldProbeKey decides whether a key is due for a probe this pass.
+//   - Keys whose lifetime spend budget is exhausted are admin-capped — never
+//     probed.
 //   - Disabled keys with an empty reason are admin-disabled — never probed.
 //   - Disabled (system) / rate-limited keys: every pass, EXCEPT a
 //     rate-limited key whose cooldown is still running — probing it can't
@@ -203,6 +216,9 @@ func (c *Checker) checkAll() {
 //     probe is a billable chat completion.
 //   - Active keys: at most once per activeProbeInterval (throttled).
 func (c *Checker) shouldProbeKey(key *model.Key) bool {
+	if budgetExhausted(key) {
+		return false // lifetime budget cap reached — never probe nor recover
+	}
 	if key.Status == model.KeyStatusDisabled && key.DisabledReason == "" {
 		return false // deliberately disabled by an admin
 	}
@@ -251,11 +267,30 @@ type ProbeResult struct {
 //   - Disabled/rate-limited key: recovery happens ONLY when a probe does not
 //     classify the key as failing (never on a timer).
 func (c *Checker) checkKey(key *model.Key) {
+	// Refresh the pass snapshot before probing: the key was loaded seconds
+	// ago, and since then the relay may have exhausted its lifetime budget
+	// or an admin may have disabled it — a probe is a billable chat
+	// completion, so the fresh state decides whether one is still allowed.
+	var fresh model.Key
+	if err := db.GetDB().First(&fresh, key.ID).Error; err != nil {
+		return
+	}
+	key = &fresh
+
 	// Disabled keys are only auto-recovered when the disabled_reason was set
 	// by the system (auth_failed / insufficient_quota / ...). A key disabled
 	// deliberately by an admin has an empty reason (UpdateKey clears it) and
 	// stays out of rotation.
 	if key.Status == model.KeyStatusDisabled && key.DisabledReason == "" {
+		return
+	}
+
+	// A key whose lifetime spend budget is exhausted must stay out of
+	// rotation: the cap is an administrative limit, not an upstream health
+	// condition, so a successful probe must never revive it (that would let
+	// traffic keep overspending the budget on every health pass). Only an
+	// admin reset (POST /api/keys/:id/reset-spend) re-admits the key.
+	if budgetExhausted(key) {
 		return
 	}
 
@@ -308,12 +343,16 @@ func (c *Checker) checkKey(key *model.Key) {
 	}
 
 	// Re-check the status from the DB before marking active: the relay may
-	// have marked this key rate-limited again (fresh cooldown) or an admin
-	// may have disabled it while our probe was in flight — wiping that state
-	// would immediately re-admit a hot/disabled key.
+	// have marked this key rate-limited again (fresh cooldown), exhausted
+	// its budget, or an admin may have disabled it while our probe was in
+	// flight — wiping that state would immediately re-admit a hot/capped
+	// key.
 	var current model.Key
 	if err := db.GetDB().First(&current, key.ID).Error; err != nil {
 		return
+	}
+	if budgetExhausted(&current) {
+		return // budget exhausted while the probe was in flight
 	}
 	if current.Status == model.KeyStatusDisabled && current.DisabledReason == "" {
 		return // deliberately disabled while probing
@@ -333,12 +372,14 @@ func (c *Checker) checkKey(key *model.Key) {
 		key.ID, truncateKey(key.KeyValue))
 
 	// Guarded update: don't clobber a fresher state written while our probe
-	// was in flight. Deliberately-disabled keys (empty reason) are excluded;
-	// system-disabled and rate-limited keys are the ones we recover — but a
-	// rate_limited_until still in the future (the relay re-cooled this key
-	// between the re-check above and this write) must NOT be wiped.
+	// was in flight. Deliberately-disabled keys (empty reason) and
+	// budget-exhausted keys are excluded (the cap is an admin limit, never
+	// an upstream health condition); system-disabled and rate-limited keys
+	// are the ones we recover — but a rate_limited_until still in the future
+	// (the relay re-cooled this key between the re-check above and this
+	// write) must NOT be wiped.
 	res := db.GetDB().Model(&model.Key{}).
-		Where("id = ? AND (status <> ? OR disabled_reason <> ?) AND (rate_limited_until IS NULL OR rate_limited_until <= ?)",
+		Where("id = ? AND (status <> ? OR disabled_reason <> ?) AND (total_spend_limit IS NULL OR total_spend_limit = 0 OR total_spent < total_spend_limit) AND (rate_limited_until IS NULL OR rate_limited_until <= ?)",
 			key.ID, model.KeyStatusDisabled, "", time.Now()).
 		Updates(map[string]interface{}{
 			"status":             model.KeyStatusActive,
@@ -371,14 +412,18 @@ func (c *Checker) recordFailure(key *model.Key, reason string) {
 	}
 	// Persist the reason so the UI can show WHY the key is down. Skip the
 	// write when the reason is unchanged (avoids pointless DB churn on every
-	// interval for a key that stays broken).
+	// interval for a key that stays broken) — and never overwrite a budget
+	// cap already recorded in the DB: the relay may have exhausted the
+	// key's budget while this probe was in flight, and that state must
+	// survive (otherwise the key would be probed again next pass and the
+	// budget bypassed).
 	if key.DisabledReason != reason {
 		res := db.GetDB().Model(&model.Key{}).
-			Where("id = ?", key.ID).
+			Where("id = ? AND (total_spend_limit IS NULL OR total_spend_limit = 0 OR total_spent < total_spend_limit)", key.ID).
 			Updates(map[string]interface{}{"disabled_reason": reason})
 		if res.Error != nil {
 			log.Printf("[health] failed to record failure reason for key %d: %v", key.ID, res.Error)
-		} else {
+		} else if res.RowsAffected > 0 {
 			key.DisabledReason = reason // keep the in-memory copy in sync
 		}
 	}

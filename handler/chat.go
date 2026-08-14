@@ -615,7 +615,7 @@ func (h *ChatHandler) applySpendLimit(keyID, costMicro int64) {
 	}
 	log.Printf("[relay] key %d spent total %d (limit %d) — disabling (spend budget exhausted)",
 		keyID, key.TotalSpent, key.TotalSpendLimit)
-	h.Engine.MarkKeyDisabled(keyID, "spend_limit_exhausted")
+	h.Engine.MarkKeyDisabled(keyID, model.KeyDisabledReasonSpendLimit)
 }
 
 // extractAppName derives the client app name from the request headers,
