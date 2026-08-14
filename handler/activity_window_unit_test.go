@@ -34,8 +34,8 @@ func TestActivityWindow(t *testing.T) {
 
 	// Week: since is a Thursday, until a Saturday — both inside the same
 	// Monday-anchored week; `to` must open the NEXT Monday.
-	weekSince := time.Date(2026, 8, 13, 10, 0, 0, 0, loc)  // Thursday
-	weekUntil := time.Date(2026, 8, 15, 10, 0, 0, 0, loc)  // Saturday
+	weekSince := time.Date(2026, 8, 13, 10, 0, 0, 0, loc) // Thursday
+	weekUntil := time.Date(2026, 8, 15, 10, 0, 0, 0, loc) // Saturday
 	from, to = activityWindow(weekSince, weekUntil, "week")
 	if !from.Equal(time.Date(2026, 8, 10, 0, 0, 0, 0, loc)) ||
 		!to.Equal(time.Date(2026, 8, 17, 0, 0, 0, 0, loc)) {
