@@ -68,6 +68,13 @@ func Init(dataDir string) error {
 		return err
 	}
 
+	// Migrate legacy consumption rows whose model_name holds the upstream
+	// TARGET model back to the model the client requested (the model group
+	// id). One-time, marker-gated; see migrateConsumptionModelToIngress.
+	if err := migrateConsumptionModelToIngress(db); err != nil {
+		return err
+	}
+
 	// Seed default settings if not exist
 	seedDefaults(db)
 
@@ -197,6 +204,192 @@ func migrateAnthropicInputTokensOnce(db *gorm.DB) error {
 		return tx.Create(&model.Setting{Key: migrationInputTokensInclCache, Value: "1"}).Error
 	})
 	return err
+}
+
+// migrateConsumptionModelToIngress migrates consumption rows recorded by
+// older builds, whose model_name held the upstream TARGET model (the name the
+// relay substituted into the forwarded request). Since the model-by-ingress
+// change, model_name stores the model the CLIENT requested (the model group
+// id) — the Activity page groups by it. This migration rewrites legacy rows
+// to the new format using the route configuration as the reverse mapping.
+//
+// Ambiguity rules (best-effort: rows are only rewritten when the CURRENT
+// route configuration can attribute them with certainty):
+//   - a row is remapped only when its key's provider has EXACTLY ONE group
+//     targeting that model (the same target via two providers resolves per
+//     provider, so each provider's rows stay correct);
+//   - rows whose key was deleted fall back to the globally-unique mapping;
+//   - a target name that equals ANY live group's GroupID is never rewritten:
+//     rows carrying that name may be either legacy target-format rows or
+//     already-correct ingress rows (a pass-through group's id, or a chain
+//     where one group's id is another group's target). The two are
+//     indistinguishable, so all such rows stay untouched — rewriting them
+//     could mis-attribute already-correct rows;
+//   - rows with no unique mapping (two groups on the same provider targeting
+//     the same model, or a name that is not a route target — e.g. pass-through
+//     models, which already stored the ingress name) are left untouched;
+//   - attribution is computed from the CURRENT configuration: rows whose
+//     routes or groups were deleted since recording may be attributed to a
+//     surviving group targeting the same name (unavoidable without per-row
+//     provenance). In particular, the id of a DELETED pass-through group is
+//     not protected by the live-group-id rule, so its already-correct rows
+//     can be relabeled by a live group whose route targets that id.
+//     Unmigrated rows keep showing the upstream name on the Activity page for
+//     the life of the database; they are deliberately NOT re-processed later
+//     (see below).
+//
+// One-time: the completion marker (a settings row) is written in the same
+// transaction, so a re-run — which would corrupt post-migration rows whose
+// ingress name happens to equal another group's target — never happens.
+// The marker insert is conflict-tolerant (OnConflict DoNothing) so a second
+// app instance racing the first at startup cannot fail on the unique key.
+// Idempotent and atomic (single transaction), runs at launch before the
+// server accepts requests. Rows written by a still-running PRE-UPGRADE
+// instance after this migration commits are not remapped (the marker gates
+// any later run) — restart after upgrading is expected.
+func migrateConsumptionModelToIngress(db *gorm.DB) error {
+	var n int64
+	if err := db.Model(&model.Setting{}).Where("key = ?", model.SettingConsumptionModelSource).Count(&n).Error; err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+
+	// groupID: model group id -> its public group id (the ingress model name).
+	var groups []model.ModelGroup
+	if err := db.Find(&groups).Error; err != nil {
+		return err
+	}
+	groupID := make(map[int64]string, len(groups))
+	liveGroupIDs := make(map[string]bool, len(groups))
+	for i := range groups {
+		groupID[groups[i].ID] = groups[i].GroupID
+		liveGroupIDs[groups[i].GroupID] = true
+	}
+
+	// byProvider[providerID][targetModel] = set of group ids targeting it on
+	// that provider; byTarget[targetModel] = group ids across ALL providers
+	// (for rows whose key no longer exists).
+	byProvider := make(map[int64]map[string]map[string]bool)
+	byTarget := make(map[string]map[string]bool)
+	var routes []model.Route
+	if err := db.Find(&routes).Error; err != nil {
+		return err
+	}
+	for i := range routes {
+		r := &routes[i]
+		if r.TargetModel == "" {
+			continue // pass-through: rows already carry the ingress name
+		}
+		gid, ok := groupID[r.ModelGroupID]
+		if !ok {
+			continue // group deleted: its rows cannot be attributed anymore
+		}
+		if byProvider[r.ProviderID] == nil {
+			byProvider[r.ProviderID] = make(map[string]map[string]bool)
+		}
+		if byProvider[r.ProviderID][r.TargetModel] == nil {
+			byProvider[r.ProviderID][r.TargetModel] = make(map[string]bool)
+		}
+		byProvider[r.ProviderID][r.TargetModel][gid] = true
+		if byTarget[r.TargetModel] == nil {
+			byTarget[r.TargetModel] = make(map[string]bool)
+		}
+		byTarget[r.TargetModel][gid] = true
+	}
+
+	// Compute the remap statements before opening the transaction so a
+	// failure leaves nothing half-applied.
+	type remap struct {
+		providerID int64 // 0 = orphan rows (key deleted), globally-unique mapping
+		groupID    string
+		target     string
+	}
+	solo := func(set map[string]bool) (string, bool) {
+		if len(set) != 1 {
+			return "", false
+		}
+		for g := range set {
+			return g, true
+		}
+		return "", false
+	}
+	// A remap whose target equals a live group id is never emitted: the rows
+	// matching it may already be correct (see the doc comment), and skipping
+	// it also makes remaps order-independent (no chain where one remap's
+	// groupID is another remap's target).
+	remappable := func(target string, groups map[string]bool) (string, bool) {
+		if liveGroupIDs[target] {
+			return "", false
+		}
+		return solo(groups)
+	}
+	var remaps []remap
+	for providerID, byTargetPerProvider := range byProvider {
+		for target, groups := range byTargetPerProvider {
+			if gid, ok := remappable(target, groups); ok {
+				remaps = append(remaps, remap{providerID, gid, target})
+			}
+		}
+	}
+	for target, groups := range byTarget {
+		if gid, ok := remappable(target, groups); ok {
+			remaps = append(remaps, remap{0, gid, target})
+		}
+	}
+	if len(remaps) == 0 {
+		// Nothing to rewrite (fresh install or no target-mapped routes): just
+		// set the marker so later installs of legacy rows are not reprocessed.
+		return db.Clauses(clause.OnConflict{DoNothing: true}).
+			Create(&model.Setting{Key: model.SettingConsumptionModelSource, Value: "ingress"}).Error
+	}
+
+	log.Printf("[db] migrating consumption model names from upstream target to ingress model (%d target(s))", len(remaps))
+	tx := db.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+			panic(r)
+		}
+	}()
+
+	for _, rm := range remaps {
+		// Rows with a live key are restricted to the key's provider; orphan
+		// rows (providerID 0) fall back to the globally-unique mapping.
+		if rm.providerID != 0 {
+			if err := tx.Exec(
+				"UPDATE consumptions SET model_name = ? WHERE model_name = ? AND key_id IN (SELECT id FROM keys WHERE provider_id = ?)",
+				rm.groupID, rm.target, rm.providerID,
+			).Error; err != nil {
+				tx.Rollback()
+				return err
+			}
+		} else if err := tx.Exec(
+			"UPDATE consumptions SET model_name = ? WHERE model_name = ? AND key_id NOT IN (SELECT id FROM keys)",
+			rm.groupID, rm.target,
+		).Error; err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+	// Mark the migration done in the same transaction so a crash cannot
+	// leave the data half-remapped with the marker set. DoNothing: a second
+	// app instance that raced the first through the marker check must not
+	// fail on the unique key (its UPDATEs are no-ops by then).
+	if err := tx.Clauses(clause.OnConflict{DoNothing: true}).
+		Create(&model.Setting{Key: model.SettingConsumptionModelSource, Value: "ingress"}).Error; err != nil {
+		tx.Rollback()
+		return err
+	}
+	if err := tx.Commit().Error; err != nil {
+		return err
+	}
+	log.Println("[db] consumption model migration complete (target → ingress)")
+	return nil
 }
 
 // seedDefaults inserts default settings if they don't exist
