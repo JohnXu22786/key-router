@@ -415,7 +415,7 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			// (read/conversion failure) must not inflate costs or burn
 			// rate-limit quotas — the client received an error, not work.
 			if streamErr == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				consumption, err := billing.RecordConsumption(key.ID, targetModel, extractAppName(c.Request.Header, meta.RequestBody), usage, route.Route)
+				consumption, err := billing.RecordConsumption(key.ID, reqMeta.Model, targetModel, extractAppName(c.Request.Header, meta.RequestBody), usage, route.Route)
 				if err != nil {
 					log.Printf("[relay] failed to record consumption for key %d: %v", key.ID, err)
 				}
@@ -508,7 +508,7 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			// performed and must not burn the key's request budgets.
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				usage := relay.ParseTokenUsage(responseBody, rr.UpstreamFormat)
-				consumption, err := billing.RecordConsumption(key.ID, targetModel, extractAppName(c.Request.Header, meta.RequestBody), usage, route.Route)
+				consumption, err := billing.RecordConsumption(key.ID, reqMeta.Model, targetModel, extractAppName(c.Request.Header, meta.RequestBody), usage, route.Route)
 				if err != nil {
 					log.Printf("[relay] failed to record consumption for key %d: %v", key.ID, err)
 				}
