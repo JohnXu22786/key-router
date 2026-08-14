@@ -34,9 +34,9 @@ func (a *App) RejectingNew() bool {
 	return a.stop
 }
 
-// BeginShutdown marks the server as shutting down: new requests (relay and
-// admin) return 503 while currently-streaming responses are allowed to
-// finish, then Shutdown waits for them.
+// BeginShutdown marks the server as shutting down. New requests are handled
+// by the shutdown middleware (left unanswered); in-flight requests are
+// allowed to finish naturally, then the server is closed.
 func (a *App) BeginShutdown() {
 	a.mu.Lock()
 	a.stop = true
@@ -99,22 +99,29 @@ func (a *App) StartBackground() error {
 	return nil
 }
 
-// Shutdown gracefully stops the HTTP server: rejects new connections (via
-// net/http Shutdown) and waits for in-flight SSE streams to complete before
-// returning. BeginShutdown should be called first so application-level
-// requests are also refused while streams finish.
+// Shutdown gracefully stops the HTTP server. The listener is closed first
+// (new connections get connection refused — the failure signal every client
+// auto-retries), then in-flight requests are allowed to finish NATURALLY:
+// no deadline, the agent keeps receiving its streaming response until it
+// completes. Requests that reached the server after shutdown began are
+// closed without a response by the shutdown middleware, so their clients
+// see a connection error and auto-retry.
+//
+// Accepted trade-off: a request that never finishes blocks Shutdown forever
+// (e.g. a downstream client that stops reading mid-stream with no write
+// deadline — relay writes then block once the socket buffer fills). This is
+// the explicit "let in-flight requests finish naturally" requirement; the
+// process exits as soon as the drain completes.
+//
+// BeginShutdown should be called first so the middleware stops answering
+// new work while streams finish.
 func (a *App) Shutdown() error {
 	a.BeginShutdown()
 	if a.Server == nil {
 		return nil
 	}
-	// Grace period long enough for typical agent streams; Shutdown keeps
-	// serving active connections until they finish or this expires.
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	err := a.Server.Shutdown(ctx)
+	err := a.Server.Shutdown(context.Background())
 	if err != nil {
-		// e.g. in-flight SSE streams longer than the grace period
 		log.Printf("[server] shutdown incomplete: %v", err)
 	}
 	return err

@@ -262,20 +262,24 @@ func TestApplyInstalledKeepsTempForInstaller(t *testing.T) {
 }
 
 // TestCleanupStaleDownloads: the startup cleanup removes only old updater
-// temp files — never fresh ones or unrelated files.
+// and restart-helper temp files — never fresh ones or unrelated files.
 func TestCleanupStaleDownloads(t *testing.T) {
 	dir := t.TempDir()
 	old := filepath.Join(dir, "keyrouter-update-1.exe")
+	oldRestart := filepath.Join(dir, "keyrouter-restart-1.bat")
 	fresh := filepath.Join(dir, "keyrouter-update-2.exe")
+	freshRestart := filepath.Join(dir, "keyrouter-restart-2.bat")
 	other := filepath.Join(dir, "unrelated.bat")
-	for _, p := range []string{old, fresh, other} {
+	for _, p := range []string{old, oldRestart, fresh, freshRestart, other} {
 		if err := os.WriteFile(p, []byte("x"), 0644); err != nil {
 			t.Fatal(err)
 		}
 	}
 	oldTime := time.Now().Add(-48 * time.Hour)
-	if err := os.Chtimes(old, oldTime, oldTime); err != nil {
-		t.Fatal(err)
+	for _, p := range []string{old, oldRestart} {
+		if err := os.Chtimes(p, oldTime, oldTime); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	cleanupStaleDownloads(dir, 24*time.Hour)
@@ -283,8 +287,14 @@ func TestCleanupStaleDownloads(t *testing.T) {
 	if _, err := os.Stat(old); !os.IsNotExist(err) {
 		t.Error("stale updater temp file was not removed")
 	}
+	if _, err := os.Stat(oldRestart); !os.IsNotExist(err) {
+		t.Error("stale restart helper script was not removed")
+	}
 	if _, err := os.Stat(fresh); err != nil {
 		t.Error("fresh updater temp file must be kept")
+	}
+	if _, err := os.Stat(freshRestart); err != nil {
+		t.Error("fresh restart helper script must be kept")
 	}
 	if _, err := os.Stat(other); err != nil {
 		t.Error("unrelated file must be kept")

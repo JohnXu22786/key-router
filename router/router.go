@@ -53,6 +53,19 @@ func SetUpdateExitHook(fn func()) {
 	}
 }
 
+// SetRestartHook wires the gateway-restart triggers into the shared admin
+// handler: /api/restart calls schedule first (failures become 500, nothing
+// happens), responds 200, then calls quit to run the graceful shutdown.
+func SetRestartHook(schedule func() error, quit func()) {
+	sharedAdminHandler.mu.Lock()
+	h := sharedAdminHandler.h
+	sharedAdminHandler.mu.Unlock()
+	if h != nil {
+		h.RestartSchedule = schedule
+		h.RestartQuit = quit
+	}
+}
+
 // sharedAdminHandler is a package-level reference so main can inject hooks
 // after the handler is constructed inside Setup.
 var sharedAdminHandler = struct {
@@ -152,6 +165,7 @@ func Setup(
 
 		// Actions
 		api.POST("/reload", adminHandler.ReloadConfig)
+		api.POST("/restart", adminHandler.Restart)
 
 		// SSE push channel: the UI subscribes here and re-fetches affected
 		// resources on events instead of relying on poll intervals alone.

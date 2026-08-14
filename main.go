@@ -176,6 +176,13 @@ func main() {
 	// calls the hook after responding to the UI.
 	router.SetUpdateExitHook(requestExitForUpdate)
 
+	// The gateway restart endpoint: /api/restart schedules a fresh instance
+	// before responding (a scheduling failure becomes a 500), then triggers
+	// the graceful shutdown after the response is flushed — new requests
+	// are rejected while in-flight API calls drain, the process exits, and
+	// the wait-for-exit helper starts the new instance.
+	router.SetRestartHook(update.ScheduleRelaunchAfterExit, requestRestartQuit)
+
 	// Remove leftover updater temp files (interrupted downloads, cancelled
 	// installers) from previous runs. Best-effort — never fails startup.
 	update.CleanupStaleDownloads()
@@ -221,6 +228,10 @@ func main() {
 	// Record the window handle for the post-update exit path (closes the
 	// window when no close-to-tray handler is installed).
 	setUpdateExitWindow(uintptr(w.Window()))
+	// Record the restart quit path: on non-Windows, terminating the webview
+	// loop is what starts the graceful shutdown (Windows uses the window
+	// close path instead).
+	setRestartQuitFn(func() { w.Terminate() })
 
 	// System tray (Windows): clicking the window X hides to the tray instead
 	// of quitting; single-clicking the tray icon restores the window, the
@@ -236,17 +247,21 @@ func main() {
 
 	// When window closes, stop server
 	log.Println("[main] window closed, shutting down...")
-	// Reject NEW requests first (in-flight SSE streams are allowed to finish
-	// in the background — the agent keeps receiving its response until it
-	// completes, then the process exits).
+	// Refuse NEW work: the shutdown middleware closes new requests'
+	// connections without a response, so clients see a connection failure
+	// and auto-retry — the one failure mode every agent retries. Health
+	// stays answerable until the listener closes.
 	middleware.BeginShutdown()
 	close(stopPersist)
 	<-persistDone
 	// Disable (not just Stop) so an in-flight async Restart from
 	// UpdateSettings can't relaunch the loop after shutdown
 	checker.Disable()
-	// Stop serving FIRST so no in-flight relay can increment windows between
-	// the save and shutdown (those increments would be lost on restart)
+	// Shutdown closes the listener (new connections get refused) and waits
+	// for in-flight requests to finish NATURALLY — no deadline: the agent
+	// keeps receiving its streaming response until it completes, however
+	// long that takes. No in-flight relay runs after this, so the window
+	// save below is consistent.
 	app.Shutdown()
 	pruneWindows()
 	if err := engine.WindowManager.SaveToFile(windowsPath); err != nil {
