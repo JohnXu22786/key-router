@@ -144,3 +144,165 @@ func TestExtractStreamUsageDerivesTotalTokens(t *testing.T) {
 		t.Errorf("responses TotalTokens = %d, want 15 (derived)", usage.TotalTokens)
 	}
 }
+
+// TestConvertOpenAIResponseToAnthropicReasoning guards the non-stream
+// OpenAI→Anthropic response path: the model's reasoning_content must
+// survive as a thinking block (regression: it was silently dropped).
+func TestConvertOpenAIResponseToAnthropicReasoning(t *testing.T) {
+	body := `{
+		"id":"chatcmpl-1",
+		"object":"chat.completion",
+		"model":"deepseek-v4-flash",
+		"choices":[{
+			"index":0,
+			"finish_reason":"stop",
+			"message":{
+				"role":"assistant",
+				"content":"final answer",
+				"reasoning_content":"step 1: think; step 2: conclude"
+			}
+		}]
+	}`
+
+	out, err := ConvertOpenAIResponseToAnthropic([]byte(body))
+	if err != nil {
+		t.Fatalf("conversion failed: %v", err)
+	}
+	var anth map[string]interface{}
+	if err := json.Unmarshal(out, &anth); err != nil {
+		t.Fatalf("invalid JSON result: %v", err)
+	}
+	content, ok := anth["content"].([]interface{})
+	if !ok {
+		t.Fatalf("content = %v, want block array", anth["content"])
+	}
+	if len(content) != 2 {
+		t.Fatalf("content = %d blocks, want 2 (thinking + text)", len(content))
+	}
+	first := content[0].(map[string]interface{})
+	if first["type"] != "thinking" || first["thinking"] != "step 1: think; step 2: conclude" {
+		t.Errorf("first block = %v, want thinking block with reasoning", first)
+	}
+	if _, has := first["signature"]; !has {
+		t.Error("thinking block has no signature field")
+	}
+	second := content[1].(map[string]interface{})
+	if second["type"] != "text" || second["text"] != "final answer" {
+		t.Errorf("second block = %v, want text block", second)
+	}
+}
+
+// TestConvertOpenAIResponseToAnthropicReasoningParts covers the o-series
+// content-parts shape ({"type":"reasoning","summary":[...]}) on the same
+// conversion path, including accumulation from BOTH sources (the
+// reasoning_content field and a reasoning part, in that order).
+func TestConvertOpenAIResponseToAnthropicReasoningParts(t *testing.T) {
+	body := `{
+		"id":"chatcmpl-2",
+		"object":"chat.completion",
+		"model":"o3",
+		"choices":[{
+			"index":0,
+			"finish_reason":"stop",
+			"message":{
+				"role":"assistant",
+				"reasoning_content":"field reasoning",
+				"content":[
+					{"type":"reasoning","summary":[{"type":"summary_text","text":"part reasoning"}]},
+					{"type":"text","text":"answer"}
+				]
+			}
+		}]
+	}`
+
+	out, err := ConvertOpenAIResponseToAnthropic([]byte(body))
+	if err != nil {
+		t.Fatalf("conversion failed: %v", err)
+	}
+	var anth map[string]interface{}
+	if err := json.Unmarshal(out, &anth); err != nil {
+		t.Fatalf("invalid JSON result: %v", err)
+	}
+	content := anth["content"].([]interface{})
+	if len(content) != 2 {
+		t.Fatalf("content = %d blocks, want 2 (thinking + text)", len(content))
+	}
+	first := content[0].(map[string]interface{})
+	// both sources accumulate, field first, joined with "\n"
+	if first["type"] != "thinking" || first["thinking"] != "field reasoning\npart reasoning" {
+		t.Errorf("first block = %v, want thinking block with both reasoning sources", first)
+	}
+	second := content[1].(map[string]interface{})
+	if second["type"] != "text" || second["text"] != "answer" {
+		t.Errorf("second block = %v, want text block", second)
+	}
+}
+
+// TestConvertAnthropicResponseToOpenAIThinking guards the non-stream
+// Anthropic→OpenAI response path: thinking blocks must survive as
+// message.reasoning_content (regression: they were silently dropped).
+func TestConvertAnthropicResponseToOpenAIThinking(t *testing.T) {
+	body := `{
+		"id":"msg_1",
+		"type":"message",
+		"role":"assistant",
+		"model":"claude-sonnet-4",
+		"content":[
+			{"type":"thinking","thinking":"let me reason","signature":"sig-1"},
+			{"type":"text","text":"answer"}
+		],
+		"stop_reason":"end_turn",
+		"usage":{"input_tokens":5,"output_tokens":3}
+	}`
+
+	out, err := ConvertAnthropicResponseToOpenAI([]byte(body), "claude-sonnet-4")
+	if err != nil {
+		t.Fatalf("conversion failed: %v", err)
+	}
+	var oai map[string]interface{}
+	if err := json.Unmarshal(out, &oai); err != nil {
+		t.Fatalf("invalid JSON result: %v", err)
+	}
+	choices := oai["choices"].([]interface{})
+	choice := choices[0].(map[string]interface{})
+	msg := choice["message"].(map[string]interface{})
+	if rc, ok := msg["reasoning_content"].(string); !ok || rc != "let me reason" {
+		t.Errorf("reasoning_content = %v, want 'let me reason'", msg["reasoning_content"])
+	}
+	if msg["content"] != "answer" {
+		t.Errorf("content = %v, want answer", msg["content"])
+	}
+}
+
+// TestConvertAnthropicResponseToOpenAIThinkingMultipleBlocks pins the "\n"
+// join across multiple thinking blocks (boundary words must not merge).
+func TestConvertAnthropicResponseToOpenAIThinkingMultipleBlocks(t *testing.T) {
+	body := `{
+		"id":"msg_2",
+		"type":"message",
+		"role":"assistant",
+		"model":"claude-sonnet-4",
+		"content":[
+			{"type":"thinking","thinking":"think A","signature":"s1"},
+			{"type":"thinking","thinking":"think B","signature":"s2"},
+			{"type":"text","text":"answer"}
+		],
+		"stop_reason":"end_turn",
+		"usage":{"input_tokens":5,"output_tokens":3}
+	}`
+
+	out, err := ConvertAnthropicResponseToOpenAI([]byte(body), "claude-sonnet-4")
+	if err != nil {
+		t.Fatalf("conversion failed: %v", err)
+	}
+	var oai map[string]interface{}
+	if err := json.Unmarshal(out, &oai); err != nil {
+		t.Fatalf("invalid JSON result: %v", err)
+	}
+	choices := oai["choices"].([]interface{})
+	choice := choices[0].(map[string]interface{})
+	msg := choice["message"].(map[string]interface{})
+	if rc, ok := msg["reasoning_content"].(string); !ok || rc != "think A\nthink B" {
+		t.Errorf("reasoning_content = %q, want 'think A\\nthink B'", msg["reasoning_content"])
+	}
+}
