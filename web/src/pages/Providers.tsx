@@ -589,7 +589,29 @@ const Providers: React.FC = () => {
               <Descriptions.Item label="Total Cost">${detailData.total_cost?.toFixed(6)}</Descriptions.Item>
             </Descriptions>
             <Title level={5} style={{ marginTop: 16 }}>Window Counters</Title>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16, maxWidth: 480 }}>
+            {/* Lifetime budget: a one-time spend cap, not a sliding window.
+                First under the counters heading so the full limit story is
+                visible — the key disables permanently once spent reaches
+                the cap. */}
+            {budget && (
+              <div style={{ maxWidth: 480, marginTop: 12 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <Text strong>Lifetime Budget</Text>
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    {budget.limit > 0
+                      ? `$${microUsdToUsd(budget.spent).toFixed(2)} / $${microUsdToUsd(budget.limit).toFixed(2)}`
+                      : `$${microUsdToUsd(budget.spent).toFixed(2)} (no budget)`}
+                  </Text>
+                </div>
+                <Progress
+                  size="small"
+                  percent={budget.limit > 0 ? Math.min(100, budget.spent / budget.limit * 100) : 0}
+                  status={budget.limit > 0 && budget.spent >= budget.limit ? 'exception' : undefined}
+                  format={(p) => `${(p ?? 0).toFixed(1)}%`}
+                />
+              </div>
+            )}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16, maxWidth: 480, marginTop: 12 }}>
               {windowTypes.map(wt => {
                 const c = detailData.counts?.[wt.key];
                 if (!c) return null;
@@ -617,26 +639,6 @@ const Providers: React.FC = () => {
                 );
               })}
             </div>
-            {/* Lifetime budget: a one-time spend cap, not a sliding window.
-                Shown on the panel so the full limit story is visible — the
-                key disables permanently once spent reaches the cap. */}
-            {budget && (
-              <div style={{ maxWidth: 480, marginTop: 12 }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                  <Text strong>Lifetime Budget</Text>
-                  <Text type="secondary" style={{ fontSize: 12 }}>
-                    {budget.limit > 0
-                      ? `$${microUsdToUsd(budget.spent).toFixed(2)} / $${microUsdToUsd(budget.limit).toFixed(2)}`
-                      : `$${microUsdToUsd(budget.spent).toFixed(2)} (no budget)`}
-                  </Text>
-                </div>
-                <Progress
-                  size="small"
-                  percent={budget.limit > 0 ? Math.min(100, budget.spent / budget.limit * 100) : 0}
-                  status={budget.limit > 0 && budget.spent >= budget.limit ? 'exception' : undefined}
-                />
-              </div>
-            )}
           </div>
         )}
       </Modal>
