@@ -10,7 +10,7 @@ import ActivityExplore from './ActivityExplore';
 // cycle (Activity -> child -> Activity) can hand the children undefined
 // constants and crash the page.
 import {
-  makeRanges, customRange, CUSTOM_KEY, CUSTOM_LABEL, ExploreOpts,
+  makeRanges, customRange, CUSTOM_KEY, CUSTOM_LABEL, floorWindowUntil, ExploreOpts,
   ActivityFilter, ActivityFilterType, FILTER_TYPES, modelFavicon, maskKey,
 } from './activityShared';
 import type { DateRange } from './activityShared';
@@ -88,7 +88,18 @@ const Activity: React.FC = () => {
 
   const range = useMemo<DateRange>(() => {
     if (rangeKey === CUSTOM_KEY && custom) return customRange(custom.since, custom.until);
-    return ranges.find(r => r.key === rangeKey) ?? ranges.find(r => r.key === '1d') ?? ranges[0];
+    const r = ranges.find(r => r.key === rangeKey) ?? ranges.find(r => r.key === '1d') ?? ranges[0];
+    // Preset windows snap BOTH bounds to the bucket grid: the live partial
+    // bucket keeps accumulating usage, so showing it makes every 30s
+    // auto-refresh read as "accumulating" instead of rolling. Snapped, the
+    // window is exactly the preset length, perfectly stable between
+    // refreshes, and slides by one bucket when the grid rolls over.
+    // Custom ranges keep their exact picked bounds.
+    return {
+      ...r,
+      since: floorWindowUntil(r.since, r.granularity),
+      until: floorWindowUntil(r.until, r.granularity),
+    };
   }, [rangeKey, custom, ranges]);
 
   const handleRefresh = useCallback(async () => {

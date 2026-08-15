@@ -109,6 +109,35 @@ export function makeRanges(now: dayjs.Dayjs): DateRange[] {
 export const CUSTOM_KEY = 'custom';
 export const CUSTOM_LABEL = 'Custom range';
 
+// floorWindowUntil snaps a time to the START of the bucket that contains it
+// at the given granularity. Preset windows snap BOTH bounds to the bucket
+// grid: the live (current partial) bucket keeps accumulating usage, so
+// showing it makes every 30s auto-refresh read as "accumulating" instead of
+// rolling. Snapped, the window is exactly the preset length, perfectly
+// stable between refreshes, and slides by one bucket when the bucket grid
+// rolls over. Sub-hour granularities snap to their own step (min15 -> the
+// 15-minute clock cell). Custom ranges keep their exact user-picked bounds
+// — never snapped.
+export function floorWindowUntil(until: dayjs.Dayjs, granularity: Granularity): dayjs.Dayjs {
+  if (granularity === 'minute') return until.startOf('minute');
+  if (granularity === 'min15') return until.subtract(until.minute() % 15, 'minute').startOf('minute');
+  if (granularity === 'hour') return until.startOf('hour');
+  if (granularity === 'day') return until.startOf('day');
+  return until.startOf('month');
+}
+
+// exclusiveUntil is floorWindowUntil minus one second: the activity endpoint
+// widens the query window to the bucket CONTAINING `until` (see
+// activityWindow in admin.go), so one second before the floored bucket makes
+// the widened window end exactly AT the floored bucket — the server then
+// excludes the live bucket from its response instead of the client having to
+// filter it. Used for the hourly-or-coarser server queries (Trends/Explore);
+// sub-hour ranges keep the live hour in the response because its rows are
+// the data source the client re-samples onto its minute axis.
+export function exclusiveUntil(until: dayjs.Dayjs, granularity: Granularity): dayjs.Dayjs {
+  return floorWindowUntil(until, granularity).subtract(1, 'second');
+}
+
 // customRange wraps a user-picked from/to window; the bucket granularity is
 // derived from the window's length.
 export function customRange(since: dayjs.Dayjs, until: dayjs.Dayjs): DateRange {

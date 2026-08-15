@@ -2,7 +2,8 @@ import { describe, it, expect } from 'vitest';
 import dayjs from 'dayjs';
 import {
   makeRanges, customRange, granularityFor, series, stackedData, bucketAxis,
-  bucketWindowShare, groupTotals, fmtTick, fmtBucket, fmtDayLabel, CUSTOM_KEY,
+  bucketWindowShare, groupTotals, floorWindowUntil, exclusiveUntil,
+  fmtTick, fmtBucket, fmtDayLabel, CUSTOM_KEY,
   computeTrending, toChartData, cacheHitRate, resampleResponse,
 } from './activityShared';
 import type { ActivityResponse } from '../api/client';
@@ -155,6 +156,69 @@ describe('series — continuous axis bucketing', () => {
     expect(out.length).toBe(7);
     expect(out[0].label).toBe('08-01');
     expect(out[0].value).toBe(0);
+  });
+});
+
+describe('floorWindowUntil — rolling windows end at the last complete bucket', () => {
+  it('floors to the granularity bucket start', () => {
+    const t = dayjs('2026-08-13T16:05:30');
+    expect(floorWindowUntil(t, 'minute').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-13 16:05:00');
+    expect(floorWindowUntil(t, 'min15').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-13 16:00:00');
+    expect(floorWindowUntil(t, 'hour').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-13 16:00:00');
+    expect(floorWindowUntil(t, 'day').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-13 00:00:00');
+    expect(floorWindowUntil(t, 'month').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-01 00:00:00');
+  });
+
+  it('a 24h window snapped to the bucket grid excludes the live bucket entirely', () => {
+    // Both bounds snap to the hour grid: [16:00 yesterday, 16:00 today).
+    // The 16:00 bucket (recorded up to the fetch at 16:30) has ZERO overlap
+    // with the snapped window — that is what stops the auto-refresh from
+    // accumulating the live hour.
+    const since = floorWindowUntil(dayjs('2026-08-12T16:05:00'), 'hour');
+    const until = floorWindowUntil(dayjs('2026-08-13T16:30:00'), 'hour');
+    expect(since.format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-12 16:00:00');
+    expect(until.format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-13 16:00:00');
+    expect(bucketWindowShare('2026-08-13T16:00:00', since, until, dayjs('2026-08-13T16:30:00'), 'hour')).toBe(0);
+    // Boundary hours inside the snapped window are whole…
+    expect(bucketWindowShare('2026-08-12T16:00:00', since, until, dayjs('2026-08-13T16:30:00'), 'hour')).toBe(1);
+    // …and interior hours stay whole too.
+    expect(bucketWindowShare('2026-08-13T12:00:00', since, until, dayjs('2026-08-13T16:30:00'), 'hour')).toBe(1);
+  });
+
+  it('a snapped 24h window is perfectly stable across auto-refreshes', () => {
+    // Two refreshes 30s apart: both bounds snap to the SAME bucket grid, so
+    // the window and the data are identical — the totals never creep, and
+    // the window slides by one bucket only when the hour rolls over.
+    const rows = [
+      { hour_bucket: '2026-08-12T16:00:00', v: 60 },
+      { hour_bucket: '2026-08-12T17:00:00', v: 60 },
+      { hour_bucket: '2026-08-13T15:00:00', v: 60 },
+      { hour_bucket: '2026-08-13T16:00:00', v: 30 }, // live hour — must be excluded
+    ];
+    const refresh1 = series(rows, r => r.v,
+      floorWindowUntil(dayjs('2026-08-12T16:05:00'), 'hour'),
+      floorWindowUntil(dayjs('2026-08-13T16:30:00'), 'hour'),
+      dayjs('2026-08-13T16:30:00'), 'hour');
+    const refresh2 = series([
+      ...rows.slice(0, 3),
+      { hour_bucket: '2026-08-13T16:00:00', v: 31 }, // live hour grows +1 — still excluded
+    ], r => r.v,
+      floorWindowUntil(dayjs('2026-08-12T16:05:30'), 'hour'),
+      floorWindowUntil(dayjs('2026-08-13T16:30:30'), 'hour'),
+      dayjs('2026-08-13T16:30:30'), 'hour');
+    expect(refresh1.map(p => p.label)).toEqual(refresh2.map(p => p.label));
+    const t1 = refresh1.reduce((a, p) => a + p.value, 0);
+    const t2 = refresh2.reduce((a, p) => a + p.value, 0);
+    expect(t1).toBe(180); // exactly 24 whole hours, live hour excluded
+    expect(t2).toBe(t1); // no creep from the live hour
+  });
+
+  it('exclusiveUntil lands one second before the floored bucket for server queries', () => {
+    // The activity endpoint widens the window to the bucket CONTAINING
+    // until; one second before the floored bucket makes it end exactly at
+    // the floored bucket, so the server excludes the live bucket itself.
+    expect(exclusiveUntil(dayjs('2026-08-13T16:00:00'), 'hour').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-13 15:59:59');
+    expect(exclusiveUntil(dayjs('2026-08-13T00:00:00'), 'day').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-12 23:59:59');
   });
 });
 
