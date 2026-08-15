@@ -1,5 +1,5 @@
 import dayjs from 'dayjs';
-import { ActivityResponse } from '../api/client';
+import { ActivityResponse, ActivitySeriesPoint, ActivityGroupSummary } from '../api/client';
 
 // Shared helpers for the Activity pages. Kept OUT of Activity.tsx so no page
 // ever imports from it (Activity -> child -> activityShared would be a
@@ -8,9 +8,11 @@ import { ActivityResponse } from '../api/client';
 // dayjs and the API client — a leaf module.
 
 // Bucket granularity for a range. Mirrors OpenRouter's rollup ladder
-// (Hourly / Daily / Weekly / Monthly): sub-3-day windows bucket by hour,
-// up to two months by day, anything longer by month.
-export type Granularity = 'hour' | 'day' | 'month';
+// (Hourly / Daily / Weekly / Monthly) but adds sub-hour scales so short
+// windows (15m / 30m / 1h / 3h) get a fine-grained time axis instead of one
+// or two hourly bars: up to 1h buckets by minute, up to 3h by 15 minutes,
+// sub-3-day windows by hour, up to two months by day, longer by month.
+export type Granularity = 'minute' | 'min15' | 'hour' | 'day' | 'month';
 
 export interface DateRange {
   key: string;
@@ -79,11 +81,12 @@ export function makeRanges(now: dayjs.Dayjs): DateRange[] {
   const monthStart = now.startOf('month');
   const yearStart = now.startOf('year');
   return [
-    // Rolling windows (badge = the preset's own compact duration).
-    { key: '15m', label: 'Past 15 Minutes', badge: '15m', since: now.subtract(15, 'minute'), until: now, granularity: 'hour' },
-    { key: '30m', label: 'Past 30 Minutes', badge: '30m', since: now.subtract(30, 'minute'), until: now, granularity: 'hour' },
-    { key: '1h', label: 'Past 1 Hour', badge: '1h', since: now.subtract(1, 'hour'), until: now, granularity: 'hour' },
-    { key: '3h', label: 'Past 3 Hours', badge: '3h', since: now.subtract(3, 'hour'), until: now, granularity: 'hour' },
+    // Rolling windows (badge = the preset's own compact duration). Short
+    // windows bucket sub-hour so the axis carries a real time scale.
+    { key: '15m', label: 'Past 15 Minutes', badge: '15m', since: now.subtract(15, 'minute'), until: now, granularity: 'minute' },
+    { key: '30m', label: 'Past 30 Minutes', badge: '30m', since: now.subtract(30, 'minute'), until: now, granularity: 'minute' },
+    { key: '1h', label: 'Past 1 Hour', badge: '1h', since: now.subtract(1, 'hour'), until: now, granularity: 'minute' },
+    { key: '3h', label: 'Past 3 Hours', badge: '3h', since: now.subtract(3, 'hour'), until: now, granularity: 'min15' },
     { key: '1d', label: 'Past 24 Hours', badge: '1d', since: now.subtract(24, 'hour'), until: now, granularity: 'hour' },
     { key: '2d', label: 'Past 48 Hours', badge: '2d', since: now.subtract(48, 'hour'), until: now, granularity: 'hour' },
     { key: '1w', label: 'Past 1 Week', badge: '1w', since: now.subtract(7, 'day'), until: now, granularity: 'day' },
@@ -113,11 +116,14 @@ export function customRange(since: dayjs.Dayjs, until: dayjs.Dayjs): DateRange {
 }
 
 // granularityFor picks the bucket size for an arbitrary (custom) window:
-// sub-3-day windows stay hourly, up to two months daily, longer monthly.
+// up to 1h per minute, up to 3h per 15 minutes, sub-3-day windows hourly,
+// up to two months daily, longer monthly.
 export function granularityFor(since: dayjs.Dayjs, until: dayjs.Dayjs): Granularity {
-  const days = until.diff(since, 'hour', true) / 24;
-  if (days < 3) return 'hour';
-  if (days < 60) return 'day';
+  const hours = until.diff(since, 'hour', true);
+  if (hours <= 1) return 'minute';
+  if (hours <= 3) return 'min15';
+  if (hours < 72) return 'hour';
+  if (hours < 24 * 60) return 'day';
   return 'month';
 }
 
@@ -154,25 +160,28 @@ export const fmtDayLabel = (mmdd: string): string => {
   return `${MONTHS[m - 1] || m} ${d}`;
 };
 
-// fmtTick renders a bucket label for chart axes: hour -> "15:00",
-// day ("MM-DD" or "YYYY-MM-DD") -> "Jul 13", week ("YYYY-MM-DD") -> "Aug 13",
-// month ("YYYY-MM") -> "Aug 26".
+// fmtTick renders a bucket label for chart axes: minute -> "15:50",
+// hour -> "15:00", day ("MM-DD" or "YYYY-MM-DD") -> "Jul 13",
+// week ("YYYY-MM-DD") -> "Aug 13", month ("YYYY-MM") -> "Aug '26".
 export function fmtTick(granularity: Granularity, label: string): string {
-  if (granularity === 'hour') {
-    // "YYYY-MM-DD HH:00" -> slice(11) = "HH:00"; client-side "MM-DD HH:00" -> slice(6).
+  if (granularity === 'hour' || granularity === 'minute' || granularity === 'min15') {
+    // "YYYY-MM-DD HH:00"/"YYYY-MM-DD HH:mm" -> slice(11) = the time;
+    // client-side "MM-DD HH:mm" -> slice(6).
     return label.indexOf('-') === 4 ? label.slice(11) : label.slice(6);
   }
   if (label.length >= 7 && label.indexOf('-') === 4) {
     const [y, m, d] = label.split('-');
-    return d ? `${MONTHS[Number(m) - 1] || m} ${Number(d)}` : `${MONTHS[Number(m) - 1] || m} ${y.slice(2)}`;
+    // Month buckets ("YYYY-MM") render the year explicitly — a bare "Aug 26"
+    // reads as a DAY on a year-long axis.
+    return d ? `${MONTHS[Number(m) - 1] || m} ${Number(d)}` : `${MONTHS[Number(m) - 1] || m} '${y.slice(2)}`;
   }
   return fmtDayLabel(label);
 }
 
-// fmtBucket renders a bucket label for tooltips: "Jul 13, 15:00" /
+// fmtBucket renders a bucket label for tooltips: "Jul 13, 15:50" /
 // "Jul 13" / "Aug 13, 2026" / "Aug 2026".
 export function fmtBucket(granularity: Granularity, label: string): string {
-  if (granularity === 'hour') {
+  if (granularity === 'hour' || granularity === 'minute' || granularity === 'min15') {
     const [md, hm] = label.split(' ');
     return `${fmtDayLabel(md)}, ${hm}`;
   }
@@ -259,51 +268,156 @@ export function modelFavicon(name: string): FaviconInfo {
 // The backend stores hourly consumption rows; the charts bucket them by the
 // selected range's granularity so a 24h view draws 24 hourly points, a
 // month view draws daily points and a year view monthly ones (OR behavior).
+// Sub-hour granularities (minute / min15) re-sample the hourly rows onto a
+// fine axis — see overlapFractions.
 
 // A row needs only hour_bucket for bucketing; callers pass their own value
 // extractor.
 export interface BucketedRow { hour_bucket: string; }
 
 export interface SeriesPoint {
-  label: string; // human label: "MM-DD HH:00" / "MM-DD" / "YYYY-MM"
+  label: string; // human label: "MM-DD HH:mm" / "MM-DD HH:00" / "MM-DD" / "YYYY-MM"
   sort: string;  // sortable key
   value: number;
+}
+
+// STEP_MIN is the fixed minute step of the sub-hour granularities; the
+// calendar-unit ones (null) advance by that unit instead.
+const STEP_MIN: Record<Granularity, number | null> = {
+  minute: 1,
+  min15: 15,
+  hour: null,
+  day: null,
+  month: null,
+};
+
+// bucketLabel maps a bucket start to its axis label/sort key.
+function bucketLabel(granularity: Granularity, t: dayjs.Dayjs): { label: string; sort: string } {
+  switch (granularity) {
+    case 'minute':
+    case 'min15':
+      return { label: t.format('MM-DD HH:mm'), sort: t.format('YYYY-MM-DD HH:mm') };
+    case 'hour': return { label: t.format('MM-DD HH:00'), sort: t.format('YYYY-MM-DD HH:00') };
+    case 'day': return { label: t.format('MM-DD'), sort: t.format('YYYY-MM-DD') };
+    case 'month': return { label: t.format('YYYY-MM'), sort: t.format('YYYY-MM') };
+  }
+}
+
+// bucketStarts lists the bucket START times covering since..until at the
+// granularity's step (sub-hour granularities advance by STEP_MIN minutes
+// and the min15 axis is floored to the 15-minute clock cell; the others
+// advance by their calendar unit). Buckets are kept only while their sort
+// key strictly increases: DST fall-back repeats wall-clock times (dayjs
+// steps in elapsed time) — for hour granularity the repeat is consecutive
+// ("01:00" twice), for minute steps the whole repeated hour re-appears
+// non-consecutively ("01:59" then "01:00" again) — dropping the repeats
+// keeps the axis monotonic and the repeated hour's usage lands on its
+// first occurrence. (Rows serialized with the second occurrence's offset
+// are re-anchored by dayjs to the first occurrence's hour — the chart and
+// the KPI proration shift identically, so the totals stay consistent.)
+function bucketStarts(since: dayjs.Dayjs, until: dayjs.Dayjs, granularity: Granularity): dayjs.Dayjs[] {
+  const stepMin = STEP_MIN[granularity];
+  const unit = granularity === 'hour' ? 'hour' : granularity === 'day' ? 'day' : 'month';
+  const out: dayjs.Dayjs[] = [];
+  let cur = stepMin != null ? since.startOf('minute')
+    : granularity === 'hour' ? since.startOf('hour')
+    : granularity === 'day' ? since.startOf('day')
+    : since.startOf('month');
+  if (granularity === 'min15') cur = cur.subtract(cur.minute() % 15, 'minute');
+  let prevSort = '';
+  while (!cur.isAfter(until)) {
+    const sort = bucketLabel(granularity, cur).sort;
+    if (sort > prevSort) { out.push(cur); prevSort = sort; }
+    cur = stepMin != null ? cur.add(stepMin, 'minute') : cur.add(1, unit);
+  }
+  return out;
 }
 
 // bucketAxis builds a CONTINUOUS bucket axis over since..until at the given
 // granularity (empty buckets included, like OR's full-range charts).
 export function bucketAxis(since: dayjs.Dayjs, until: dayjs.Dayjs, granularity: Granularity): SeriesPoint[] {
-  const fmt = (t: dayjs.Dayjs): { label: string; sort: string } => {
-    switch (granularity) {
-      case 'hour': return { label: t.format('MM-DD HH:00'), sort: t.format('YYYY-MM-DD HH:00') };
-      case 'day': return { label: t.format('MM-DD'), sort: t.format('YYYY-MM-DD') };
-      case 'month': return { label: t.format('YYYY-MM'), sort: t.format('YYYY-MM') };
-    }
-  };
-  const step = granularity === 'hour' ? 'hour' : granularity === 'day' ? 'day' : 'month';
-  const out: SeriesPoint[] = [];
-  let cur = granularity === 'hour' ? since.startOf('hour') : granularity === 'day' ? since.startOf('day') : since.startOf('month');
-  while (!cur.isAfter(until)) {
-    const f = fmt(cur);
-    // DST fall-back repeats a wall-clock hour (dayjs 'hour' steps in elapsed
-    // time); keep one bucket — the duplicate would double-print the values.
-    if (out.length === 0 || out[out.length - 1].label !== f.label) {
-      out.push({ label: f.label, sort: f.sort, value: 0 });
-    }
-    cur = cur.add(1, step);
+  return bucketStarts(since, until, granularity).map(t => {
+    const f = bucketLabel(granularity, t);
+    return { label: f.label, sort: f.sort, value: 0 };
+  });
+}
+
+// overlapFractions splits ONE hourly row across the sub-hour axis buckets
+// overlapping the WINDOW [since, until), returning [axisIndex, fraction]
+// pairs. A row covers [hour, hour+1h) but only up to `cutoff` — the time
+// its value was recorded: the current hour accumulates live usage, so a
+// PAST window (previous period, calendar preset) shares its boundary hour
+// with the live window, and that hour's value must be divided by its real
+// coverage (cutoff - hour), not by (until - hour). Each bucket gets the
+// fraction of the row proportional to its overlap with the row's data and
+// the window — the uniform-within-hour assumption needed because the
+// stored data is hourly while the axis is finer. Values outside the window
+// are never counted, so the window total is preserved.
+function overlapFractions(
+  hourBucket: string,
+  since: dayjs.Dayjs,
+  until: dayjs.Dayjs,
+  cutoff: dayjs.Dayjs,
+  starts: dayjs.Dayjs[],
+  stepMin: number,
+): Array<[number, number]> {
+  const h = dayjs(hourBucket).startOf('hour');
+  let covEnd = h.add(1, 'hour');
+  if (covEnd.isAfter(cutoff)) covEnd = cutoff;
+  const coverage = covEnd.diff(h, 'minute', true);
+  if (coverage <= 0) return [];
+  const perMin = 1 / coverage;
+  const out: Array<[number, number]> = [];
+  for (let i = 0; i < starts.length; i++) {
+    const s = starts[i];
+    const e = s.add(stepMin, 'minute');
+    const overlap = Math.min(e.valueOf(), covEnd.valueOf(), until.valueOf())
+      - Math.max(s.valueOf(), h.valueOf(), since.valueOf());
+    if (overlap > 0) out.push([i, perMin * (overlap / 60000)]);
   }
   return out;
 }
 
+// rowWindowShare returns the fraction of an hourly row's value that lies
+// inside [since, until): the same coverage math as overlapFractions,
+// summed over the window. Used to prorate KPI sums and group tables on
+// sub-hour windows so every number on the page agrees with the charts.
+// `cutoff` is the time the row's value was recorded (see overlapFractions).
+export function rowWindowShare(hourBucket: string, since: dayjs.Dayjs, until: dayjs.Dayjs, cutoff: dayjs.Dayjs): number {
+  const h = dayjs(hourBucket).startOf('hour');
+  let covEnd = h.add(1, 'hour');
+  if (covEnd.isAfter(cutoff)) covEnd = cutoff;
+  const coverage = covEnd.diff(h, 'minute', true);
+  if (coverage <= 0) return 0;
+  const overlap = Math.min(covEnd.valueOf(), until.valueOf()) - Math.max(h.valueOf(), since.valueOf());
+  if (overlap <= 0) return 0;
+  return (overlap / 60000) / coverage;
+}
+
 // series buckets rows by the range's granularity onto a continuous axis.
+// `cutoff` is the time the rows' values were recorded (see overlapFractions)
+// — pass the fetch time; past windows must NOT pass their own `until`.
 export function series<T extends BucketedRow>(
   list: T[],
   valFn: (c: T) => number,
   since: dayjs.Dayjs,
   until: dayjs.Dayjs,
+  cutoff: dayjs.Dayjs,
   granularity: Granularity,
 ): SeriesPoint[] {
   const axis = bucketAxis(since, until, granularity);
+  const stepMin = STEP_MIN[granularity];
+  if (stepMin != null) {
+    // Sub-hour axis: the rows are hourly, so distribute each row's value
+    // over the minute buckets overlapping its hour.
+    const starts = bucketStarts(since, until, granularity);
+    for (const r of list) {
+      for (const [i, f] of overlapFractions(r.hour_bucket, since, until, cutoff, starts, stepMin)) {
+        axis[i].value += valFn(r) * f;
+      }
+    }
+    return axis;
+  }
   const keyOf = (t: dayjs.Dayjs): string =>
     granularity === 'hour' ? t.format('YYYY-MM-DD HH:00') : granularity === 'day' ? t.format('YYYY-MM-DD') : t.format('YYYY-MM');
   const idx = new Map(axis.map((p, i) => [p.sort, i]));
@@ -323,6 +437,7 @@ export function stackedData<T extends BucketedRow>(
   valFn: (c: T) => number,
   since: dayjs.Dayjs,
   until: dayjs.Dayjs,
+  cutoff: dayjs.Dayjs,
   granularity: Granularity,
 ): Array<Record<string, any>> {
   const axis = bucketAxis(since, until, granularity);
@@ -331,6 +446,20 @@ export function stackedData<T extends BucketedRow>(
     groups.forEach(g => { row[g] = 0; });
     return row;
   });
+  const stepMin = STEP_MIN[granularity];
+  if (stepMin != null) {
+    // Sub-hour axis: distribute each hourly row over its overlapping
+    // minute buckets (see series).
+    const starts = bucketStarts(since, until, granularity);
+    for (const r of list) {
+      const g = keyFn(r);
+      const v = valFn(r);
+      for (const [i, f] of overlapFractions(r.hour_bucket, since, until, cutoff, starts, stepMin)) {
+        rows[i][g] = (rows[i][g] ?? 0) + v * f;
+      }
+    }
+    return rows;
+  }
   const keyOf = (t: dayjs.Dayjs): string =>
     granularity === 'hour' ? t.format('YYYY-MM-DD HH:00') : granularity === 'day' ? t.format('YYYY-MM-DD') : t.format('YYYY-MM');
   const idx = new Map(axis.map((p, i) => [p.sort, i]));
@@ -347,11 +476,93 @@ export function stackedData<T extends BucketedRow>(
   return rows;
 }
 
-// groupTotals sums a metric per group, sorted descending.
-export function groupTotals<T extends BucketedRow>(list: T[], keyFn: (c: T) => string, valFn: (c: T) => number) {
+// resampleResponse re-samples an HOURLY-rolled ActivityResponse onto a
+// sub-hour client axis (the Trends/Explore API rolls up at most hourly —
+// see activityWindow in admin.go). Every hourly series point is distributed
+// over the minute buckets overlapping the window exactly like series() does
+// for raw rows (cutoff = the fetch time, see overlapFractions); every group
+// stays zero-filled per bucket (the server emits full bucket x group grids
+// with is_zero flags). Summary and totals are RECOMPUTED from the resampled
+// buckets (server semantics: min/max/avg over non-empty buckets, value =
+// last bucket, percent of the total) so the Trends "Trending" deltas agree
+// with the re-bucketed chart.
+export function resampleResponse(
+  resp: ActivityResponse,
+  since: dayjs.Dayjs,
+  until: dayjs.Dayjs,
+  cutoff: dayjs.Dayjs,
+  granularity: 'minute' | 'min15',
+): ActivityResponse {
+  const stepMin = STEP_MIN[granularity]!;
+  const starts = bucketStarts(since, until, granularity);
+  const buckets = bucketAxis(since, until, granularity).map(p => p.label);
+  const groups = Array.from(new Set(resp.series.map(s => s.group)));
+  // group -> bucket label -> value
+  const acc = new Map<string, Map<string, number>>();
+  for (const p of resp.series) {
+    if (p.value === 0) continue;
+    let base = acc.get(p.group);
+    if (!base) { base = new Map(); acc.set(p.group, base); }
+    for (const [i, f] of overlapFractions(p.bucket, since, until, cutoff, starts, stepMin)) {
+      const b = buckets[i];
+      base.set(b, (base.get(b) ?? 0) + p.value * f);
+    }
+  }
+  const series: ActivitySeriesPoint[] = [];
+  for (const b of buckets) {
+    for (const g of groups) {
+      const v = acc.get(g)?.get(b) ?? 0;
+      series.push({ bucket: b, group: g, value: v, is_zero: v === 0 });
+    }
+  }
+  const groupSum = new Map<string, number>();
+  let totalSum = 0;
+  for (const g of groups) {
+    const s = buckets.reduce((a, b) => a + (acc.get(g)?.get(b) ?? 0), 0);
+    groupSum.set(g, s);
+    totalSum += s;
+  }
+  const summary: ActivityGroupSummary[] = groups.map(g => {
+    const vals = buckets.map(b => acc.get(g)?.get(b) ?? 0);
+    const nonZero = vals.filter(v => v > 0);
+    const sum = groupSum.get(g) ?? 0;
+    return {
+      group: g,
+      min: nonZero.length ? Math.min(...nonZero) : 0,
+      max: nonZero.length ? Math.max(...nonZero) : 0,
+      avg: nonZero.length ? sum / nonZero.length : 0,
+      sum,
+      value: vals[vals.length - 1] ?? 0,
+      percent: totalSum > 0 ? (sum / totalSum) * 100 : 0,
+    };
+  });
+  // Groups folded away server-side (beyond top-N) keep their ORIGINAL
+  // summary rows: the response only carries their totals, so they cannot be
+  // re-bucketed — Trends' deltas for them stay on the server's raw sums,
+  // exactly as before this change (the chart itself only draws top-N + Other).
+  const resampledGroups = new Set(groups);
+  summary.push(...resp.summary.filter(s => !resampledGroups.has(s.group)));
+  const totals = { ...resp.totals };
+  const metricTotal = series.reduce((a, p) => a + p.value, 0);
+  if (resp.metric === 'spend') totals.spend = metricTotal;
+  else if (resp.metric === 'tokens') totals.tokens = metricTotal;
+  else if (resp.metric === 'requests') totals.requests = metricTotal;
+  else if (resp.metric === 'cache') totals.cache = metricTotal;
+  return { ...resp, rollup: granularity, buckets, series, summary, totals };
+}
+
+// groupTotals sums a metric per group, sorted descending. An optional
+// factorFn prorates each row (e.g. rowWindowShare on sub-hour windows) so
+// ranked lists agree with the distributed charts.
+export function groupTotals<T extends BucketedRow>(
+  list: T[],
+  keyFn: (c: T) => string,
+  valFn: (c: T) => number,
+  factorFn?: (c: T) => number,
+) {
   const acc = new Map<string, number>();
   for (const c of list) {
-    acc.set(keyFn(c), (acc.get(keyFn(c)) || 0) + valFn(c));
+    acc.set(keyFn(c), (acc.get(keyFn(c)) || 0) + valFn(c) * (factorFn?.(c) ?? 1));
   }
   return [...acc.entries()].sort((a, b) => b[1] - a[1]);
 }
