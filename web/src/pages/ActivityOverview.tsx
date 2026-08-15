@@ -450,8 +450,10 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
         </Col>
       </Row>
 
-      {/* Usage by model — stacked bars */}
-      <div style={{ marginBottom: 16 }}>
+      {/* Usage by model + Request volume by model — stacked bars in one
+          auto-fit grid like the KPI row: no hardcoded per-row count — wide
+          screens get both side by side, narrow screens wrap to one per row. */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 440px), 1fr))', gap: 16, marginBottom: 16 }}>
         <ChartCard
           title="Usage by model"
           extra={<ExploreLink onClick={() => goExplore({ metric: 'spend', groupBy: 'model' })} />}
@@ -470,31 +472,25 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
             </ResponsiveContainer>
           )}
         />
+        <ChartCard
+          title="Request volume by model"
+          extra={<ExploreLink onClick={() => goExplore({ metric: 'requests', groupBy: 'model' })} />}
+          groups={reqGroups}
+          renderChart={(vis) => (
+            <ResponsiveContainer width="100%" height={260}>
+              <BarChart data={reqByModel} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
+                <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={(v) => fmtTick(gran, String(v))} />
+                <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={50} tickFormatter={(v) => fmtCompact(Number(v))} />
+                <Tooltip formatter={(v: any, name: any) => [fmtCompact(Number(v)), String(name)]} contentStyle={{ borderRadius: 8, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
+                {vis.map((m, i) => (
+                  <Bar key={m} dataKey={m} stackId="a" fill={reqColor.get(m)} maxBarSize={14} radius={i === vis.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]} />
+                ))}
+              </BarChart>
+            </ResponsiveContainer>
+          )}
+        />
       </div>
-
-      <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
-        {/* Request volume by model — stacked bars */}
-        <Col xs={24} lg={24}>
-          <ChartCard
-            title="Request volume by model"
-            extra={<ExploreLink onClick={() => goExplore({ metric: 'requests', groupBy: 'model' })} />}
-            groups={reqGroups}
-            renderChart={(vis) => (
-              <ResponsiveContainer width="100%" height={260}>
-                <BarChart data={reqByModel} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
-                  <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} minTickGap={20} tickFormatter={(v) => fmtTick(gran, String(v))} />
-                  <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={50} tickFormatter={(v) => fmtCompact(Number(v))} />
-                  <Tooltip formatter={(v: any, name: any) => [fmtCompact(Number(v)), String(name)]} contentStyle={{ borderRadius: 8, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
-                  {vis.map((m, i) => (
-                    <Bar key={m} dataKey={m} stackId="a" fill={reqColor.get(m)} maxBarSize={14} radius={i === vis.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]} />
-                  ))}
-                </BarChart>
-              </ResponsiveContainer>
-            )}
-          />
-        </Col>
-      </Row>
 
       <Row gutter={[16, 16]}>
         {/* Token breakdown — stacked bars (Prompt + Completion; no
