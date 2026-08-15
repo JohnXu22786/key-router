@@ -7,6 +7,7 @@ import {
   computeTrending, toChartData, cacheHitRate, resampleResponse,
 } from './activityShared';
 import type { ActivityResponse } from '../api/client';
+import type { Granularity } from './activityShared';
 
 // A fixed "now" matching the OR snapshot context: Thursday, Aug 13 2026,
 // 16:05 local. The dynamic badge expectations (16h / 4d / 13d / 7mo) are
@@ -156,6 +157,61 @@ describe('series — continuous axis bucketing', () => {
     expect(out.length).toBe(7);
     expect(out[0].label).toBe('08-01');
     expect(out[0].value).toBe(0);
+  });
+});
+
+describe('preset windows snapped to the bucket grid', () => {
+  // Mirrors Activity.tsx: presets snap BOTH bounds; custom ranges don't.
+  const snapped = (r: { key: string; since: dayjs.Dayjs; until: dayjs.Dayjs; granularity: Granularity }) => ({
+    ...r,
+    since: floorWindowUntil(r.since, r.granularity),
+    until: floorWindowUntil(r.until, r.granularity),
+  });
+  const NOW = dayjs('2026-08-13T16:05:30'); // Thursday
+
+  it('every rolling preset is exactly its nominal length of complete buckets', () => {
+    const byKey = new Map(makeRanges(NOW).map(r => [r.key, snapped(r)]));
+    const w = (k: string) => byKey.get(k)!;
+    expect(w('15m').until.diff(w('15m').since, 'minute')).toBe(15);
+    expect(w('30m').until.diff(w('30m').since, 'minute')).toBe(30);
+    expect(w('1h').until.diff(w('1h').since, 'minute')).toBe(60);
+    expect(w('3h').until.diff(w('3h').since, 'minute')).toBe(180);
+    expect(w('3h').since.minute() % 15).toBe(0); // 3h -> 15-minute grid
+    expect(w('3h').until.minute() % 15).toBe(0);
+    expect(w('1d').until.diff(w('1d').since, 'hour')).toBe(24);
+    expect(w('1d').since.minute()).toBe(0);      // 1d -> hour grid
+    expect(w('1d').until.minute()).toBe(0);
+    expect(w('2d').until.diff(w('2d').since, 'hour')).toBe(48);
+    expect(w('1w').until.diff(w('1w').since, 'day')).toBe(7);
+    expect(w('1w').until.hour()).toBe(0);        // 1w -> day grid
+    expect(w('1mo').until.diff(w('1mo').since, 'day')).toBe(31); // Jul 13..Aug 13
+    expect(w('1mo').until.hour()).toBe(0);
+    expect(w('1y').until.diff(w('1y').since, 'month')).toBe(12);
+    expect(w('1y').since.date()).toBe(1);        // 1y -> month grid
+  });
+
+  it('calendar presets snap to their own grid, live bucket excluded', () => {
+    const byKey = new Map(makeRanges(NOW).map(r => [r.key, snapped(r)]));
+    const w = (k: string) => byKey.get(k)!;
+    // Today: midnight .. current hour (live hour excluded).
+    expect(w('today').since.format('YYYY-MM-DD HH:mm')).toBe('2026-08-13 00:00');
+    expect(w('today').until.format('YYYY-MM-DD HH:mm')).toBe('2026-08-13 16:00');
+    // Yesterday: a whole 24h, unchanged.
+    expect(w('yesterday').until.diff(w('yesterday').since, 'hour')).toBe(24);
+    // This week: Monday .. today 00:00 (live day excluded).
+    expect(w('week').since.day()).toBe(1);
+    expect(w('week').until.format('YYYY-MM-DD')).toBe('2026-08-13');
+    expect(w('week').until.hour()).toBe(0);
+    // This month: 1st .. today 00:00 (live day excluded).
+    expect(w('month').since.date()).toBe(1);
+    expect(w('month').until.format('YYYY-MM-DD')).toBe('2026-08-13');
+    // This year: Jan 1 .. Aug 1 (live month excluded).
+    expect(w('year').since.format('YYYY-MM-DD')).toBe('2026-01-01');
+    expect(w('year').until.format('YYYY-MM-DD')).toBe('2026-08-01');
+    // Past periods were already on boundaries — unchanged.
+    expect(w('prevweek').until.diff(w('prevweek').since, 'day')).toBe(7);
+    expect(w('prevmonth').until.diff(w('prevmonth').since, 'day')).toBe(31);
+    expect(w('prevyear').until.diff(w('prevyear').since, 'year')).toBe(1);
   });
 });
 
