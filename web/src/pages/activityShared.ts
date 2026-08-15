@@ -378,25 +378,61 @@ function overlapFractions(
   return out;
 }
 
-// rowWindowShare returns the fraction of an hourly row's value that lies
-// inside [since, until): the same coverage math as overlapFractions,
-// summed over the window. Used to prorate KPI sums and group tables on
-// sub-hour windows so every number on the page agrees with the charts.
-// `cutoff` is the time the row's value was recorded (see overlapFractions).
-export function rowWindowShare(hourBucket: string, since: dayjs.Dayjs, until: dayjs.Dayjs, cutoff: dayjs.Dayjs): number {
-  const h = dayjs(hourBucket).startOf('hour');
-  let covEnd = h.add(1, 'hour');
+// bucketWindowShare returns the fraction of a bucket's recorded value that
+// lies inside [since, until]. hour_bucket rows are truncated to the LOCAL
+// hour; the "bucket" is the containing hour/day/month for the corresponding
+// granularity — sub-hour windows (minute/min15) still have HOURLY rows, so
+// they share the 'hour' math (rowWindowShare's coverage, generalized).
+//
+// A bucket covers [start, start+unit); its recorded value only covers up to
+// `cutoff` (the fetch time) — the bucket containing cutoff accumulates live
+// usage, so its value is divided by the real coverage, never by a window
+// boundary (a past window sharing that hour must not inflate it).
+//
+// Interior buckets lie fully inside the window and keep share 1; boundary
+// buckets are prorated to the overlap, so a rolling window shows exactly
+// the data inside its span and repeated auto-refreshes never accumulate
+// pre-window (or post-window) usage into the totals.
+export function bucketWindowShare(
+  hourBucket: string,
+  since: dayjs.Dayjs,
+  until: dayjs.Dayjs,
+  cutoff: dayjs.Dayjs,
+  granularity: Granularity,
+): number {
+  const h = dayjs(hourBucket);
+  // Rows are always hourly; day/month granularity aggregates the containing
+  // calendar unit, sub-hour (minute/min15) stays on the hour.
+  const rowUnit = granularity === 'day' ? 'day' : granularity === 'month' ? 'month' : 'hour';
+  const start = rowUnit === 'hour' ? h.startOf('hour') : rowUnit === 'day' ? h.startOf('day') : h.startOf('month');
+  let covEnd = start.add(1, rowUnit);
+  // DST fall-back repeats a wall-clock hour (01:00 EDT then 01:00 EST) and
+  // both occurrences truncate to the SAME hourly row, so its recorded value
+  // covers two elapsed hours. The elapsed +1h step lands on the same
+  // wall-clock hour exactly then (spring-forward skips an hour and lands
+  // two ahead; half-hour zones like Lord Howe land on :30) — walk minute by
+  // minute to the first instant whose wall-clock hour differs, which is the
+  // second occurrence's end in every transition shape. A window crossing
+  // the repeat hour must divide by this real coverage, never by 60 minutes
+  // (that would inflate the share up to 2x).
+  if (rowUnit === 'hour' && covEnd.hour() === start.hour()) {
+    while (covEnd.hour() === start.hour() && covEnd.diff(start, 'minute', true) < 180) {
+      covEnd = covEnd.add(1, 'minute');
+    }
+  }
   if (covEnd.isAfter(cutoff)) covEnd = cutoff;
-  const coverage = covEnd.diff(h, 'minute', true);
+  const coverage = covEnd.diff(start, 'minute', true);
   if (coverage <= 0) return 0;
-  const overlap = Math.min(covEnd.valueOf(), until.valueOf()) - Math.max(h.valueOf(), since.valueOf());
+  const overlap = Math.min(covEnd.valueOf(), until.valueOf()) - Math.max(start.valueOf(), since.valueOf());
   if (overlap <= 0) return 0;
   return (overlap / 60000) / coverage;
 }
 
 // series buckets rows by the range's granularity onto a continuous axis.
-// `cutoff` is the time the rows' values were recorded (see overlapFractions)
-// — pass the fetch time; past windows must NOT pass their own `until`.
+// `cutoff` is the time the rows' values were recorded (see
+// bucketWindowShare) — pass the fetch time; past windows must NOT pass
+// their own `until`. Boundary buckets are prorated to the window overlap so
+// the chart shows only the data inside the window.)
 export function series<T extends BucketedRow>(
   list: T[],
   valFn: (c: T) => number,
@@ -423,13 +459,17 @@ export function series<T extends BucketedRow>(
   const idx = new Map(axis.map((p, i) => [p.sort, i]));
   for (const r of list) {
     const i = idx.get(keyOf(dayjs(r.hour_bucket)));
-    if (i !== undefined) axis[i].value += valFn(r);
+    if (i !== undefined) {
+      axis[i].value += valFn(r) * bucketWindowShare(r.hour_bucket, since, until, cutoff, granularity);
+    }
   }
   return axis;
 }
 
 // stackedData buckets rows per group onto a continuous axis; every group
 // gets a column in each bucket row (zero-filled), like OR's stacked charts.
+// Boundary buckets are prorated like series() so the stacks stay consistent
+// with the KPI cards.
 export function stackedData<T extends BucketedRow>(
   list: T[],
   groups: string[],
@@ -470,7 +510,7 @@ export function stackedData<T extends BucketedRow>(
       // Rows whose group is outside `groups` still accumulate under their
       // own key — callers fold those keys into "Other". Guarding against
       // an uninitialized key keeps the fold from summing NaN into Other.
-      rows[i][g] = (rows[i][g] ?? 0) + valFn(r);
+      rows[i][g] = (rows[i][g] ?? 0) + valFn(r) * bucketWindowShare(r.hour_bucket, since, until, cutoff, granularity);
     }
   }
   return rows;
@@ -552,8 +592,8 @@ export function resampleResponse(
 }
 
 // groupTotals sums a metric per group, sorted descending. An optional
-// factorFn prorates each row (e.g. rowWindowShare on sub-hour windows) so
-// ranked lists agree with the distributed charts.
+// factorFn prorates each row (e.g. bucketWindowShare on a rolling window)
+// so ranked lists agree with the prorated charts.
 export function groupTotals<T extends BucketedRow>(
   list: T[],
   keyFn: (c: T) => string,

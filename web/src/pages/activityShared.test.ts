@@ -2,8 +2,8 @@ import { describe, it, expect } from 'vitest';
 import dayjs from 'dayjs';
 import {
   makeRanges, customRange, granularityFor, series, stackedData, bucketAxis,
-  fmtTick, fmtBucket, fmtDayLabel, CUSTOM_KEY, computeTrending, toChartData,
-  cacheHitRate, resampleResponse, rowWindowShare, groupTotals,
+  bucketWindowShare, groupTotals, fmtTick, fmtBucket, fmtDayLabel, CUSTOM_KEY,
+  computeTrending, toChartData, cacheHitRate, resampleResponse,
 } from './activityShared';
 import type { ActivityResponse } from '../api/client';
 
@@ -155,6 +155,157 @@ describe('series — continuous axis bucketing', () => {
     expect(out.length).toBe(7);
     expect(out[0].label).toBe('08-01');
     expect(out[0].value).toBe(0);
+  });
+});
+
+describe('bucketWindowShare — rolling windows prorate boundary buckets', () => {
+  it('prorates the since-boundary hour to the window overlap', () => {
+    const since = dayjs('2026-08-13T13:05:00');
+    const until = dayjs('2026-08-13T16:05:00');
+    expect(bucketWindowShare('2026-08-13T13:00:00', since, until, until, 'hour')).toBeCloseTo(55 / 60, 10);
+  });
+
+  it('keeps interior buckets whole and the current partial hour at its real value', () => {
+    const since = dayjs('2026-08-13T13:05:00');
+    const until = dayjs('2026-08-13T16:05:00');
+    // Interior hour: the whole bucket lies inside the window.
+    expect(bucketWindowShare('2026-08-13T14:00:00', since, until, until, 'hour')).toBe(1);
+    // Current partial hour: the recorded value IS the elapsed usage, so the
+    // share is 1 — the bar must not be double-prorated.
+    expect(bucketWindowShare('2026-08-13T16:00:00', since, until, until, 'hour')).toBe(1);
+  });
+
+  it('drops rows whose bucket lies outside the window', () => {
+    const since = dayjs('2026-08-13T13:05:00');
+    const until = dayjs('2026-08-13T16:05:00');
+    expect(bucketWindowShare('2026-08-13T12:00:00', since, until, until, 'hour')).toBe(0);
+    expect(bucketWindowShare('2026-08-13T17:00:00', since, until, until, 'hour')).toBe(0);
+  });
+
+  it('divides a past boundary hour by its real coverage, not the window', () => {
+    // Prev-period window [10:05, 13:05) fetched at 16:05: the 13:00 bucket's
+    // recorded value covers the whole hour, so the window's share is the
+    // 5 minutes inside it — dividing by the full hour, never by the window
+    // length, keeps the share honest.
+    const since = dayjs('2026-08-13T10:05:00');
+    const until = dayjs('2026-08-13T13:05:00');
+    expect(bucketWindowShare('2026-08-13T13:00:00', since, until, dayjs('2026-08-13T16:05:00'), 'hour')).toBeCloseTo(5 / 60, 10);
+  });
+
+  it('excludes the live bucket from a past calendar window (yesterday)', () => {
+    // "Yesterday" ends at midnight; the 00:00 bucket holds TODAY's usage,
+    // which lies entirely after the window — it must contribute nothing
+    // instead of leaking a full live hour into the totals.
+    const since = dayjs('2026-08-12T00:00:00');
+    const until = dayjs('2026-08-13T00:00:00');
+    expect(bucketWindowShare('2026-08-13T00:00:00', since, until, dayjs('2026-08-13T16:05:00'), 'hour')).toBe(0);
+  });
+
+  it('drops a bucket whose hour starts exactly at the window end', () => {
+    // Window ends at 16:00 sharp; the 16:00 bucket's recorded value lies
+    // entirely after the window (cutoff later) — share must be 0, never a
+    // leak of the hour's usage into the totals.
+    const since = dayjs('2026-08-13T13:05:00');
+    const until = dayjs('2026-08-13T16:00:00');
+    expect(bucketWindowShare('2026-08-13T16:00:00', since, until, dayjs('2026-08-13T16:05:00'), 'hour')).toBe(0);
+  });
+
+  it('prorates day and month boundary buckets', () => {
+    const since = dayjs('2026-08-10T12:00:00');
+    const until = dayjs('2026-08-13T12:00:00');
+    // The 10th's usage before noon lies outside the window.
+    expect(bucketWindowShare('2026-08-10T00:00:00', since, until, until, 'day')).toBeCloseTo(12 / 24, 10);
+    expect(bucketWindowShare('2026-08-11T00:00:00', since, until, until, 'day')).toBe(1);
+    const mSince = dayjs('2026-01-10T00:00:00');
+    const mUntil = dayjs('2026-03-20T00:00:00');
+    expect(bucketWindowShare('2026-01-01T00:00:00', mSince, mUntil, mUntil, 'month')).toBeCloseTo(22 / 31, 10);
+    expect(bucketWindowShare('2026-02-01T00:00:00', mSince, mUntil, mUntil, 'month')).toBe(1);
+  });
+
+  it('prev and current windows never double-count the shared boundary hour', () => {
+    // The 13:00 bucket is returned by BOTH the current query (since floors
+    // to the containing hour) and the prev-period query (until includes it).
+    // Prorated to their own windows the shares sum to exactly 1.
+    const since = dayjs('2026-08-13T13:05:00');
+    const until = dayjs('2026-08-13T16:05:00');
+    const prevSince = dayjs('2026-08-13T10:05:00');
+    const curShare = bucketWindowShare('2026-08-13T13:00:00', since, until, until, 'hour');
+    const prevShare = bucketWindowShare('2026-08-13T13:00:00', prevSince, since, until, 'hour');
+    expect(curShare).toBeCloseTo(55 / 60, 10);
+    expect(prevShare).toBeCloseTo(5 / 60, 10);
+    expect(curShare + prevShare).toBeCloseTo(1, 10);
+  });
+});
+
+describe('series — rolling windows never accumulate phantom data', () => {
+  it('a 15m window shows only its own data, not the whole boundary hour', () => {
+    // Uniform 1/min usage. The 15:00 bucket holds the FULL hour; only the
+    // 15:50–16:00 part lies in the window. Before the fix the chart showed
+    // 60 + 5 = 65 units for a 15-minute window; now it shows exactly 15.
+    const since = dayjs('2026-08-13T15:50:00');
+    const until = dayjs('2026-08-13T16:05:00');
+    const out = series([
+      { hour_bucket: '2026-08-13T15:00:00', v: 60 },
+      { hour_bucket: '2026-08-13T16:00:00', v: 5 },
+    ], r => r.v, since, until, until, 'hour');
+    expect(out.map(p => p.value)).toEqual([10, 5]);
+    expect(out.reduce((a, p) => a + p.value, 0)).toBe(15);
+  });
+
+  it('a 3h window drops the pre-window minutes of the boundary hour', () => {
+    const since = dayjs('2026-08-13T13:05:00');
+    const until = dayjs('2026-08-13T16:05:00');
+    const out = series([
+      { hour_bucket: '2026-08-13T13:00:00', v: 60 },
+      { hour_bucket: '2026-08-13T14:00:00', v: 60 },
+      { hour_bucket: '2026-08-13T15:00:00', v: 60 },
+      { hour_bucket: '2026-08-13T16:00:00', v: 5 },
+    ], r => r.v, since, until, until, 'hour');
+    expect(out.map(p => p.value)).toEqual([55, 60, 60, 5]);
+  });
+
+  it('repeated auto-refreshes grow only by real in-window usage', () => {
+    // The 30s slide drops 30s of the first bucket and the current hour
+    // records 0.5 more real usage — the window total must stay 180 (exactly
+    // 3 hours at 1/min), never creeping with phantom boundary data.
+    const rows1 = [
+      { hour_bucket: '2026-08-13T13:00:00', v: 60 },
+      { hour_bucket: '2026-08-13T14:00:00', v: 60 },
+      { hour_bucket: '2026-08-13T15:00:00', v: 60 },
+      { hour_bucket: '2026-08-13T16:00:00', v: 5 },
+    ];
+    const rows2 = [
+      { hour_bucket: '2026-08-13T13:00:00', v: 60 },
+      { hour_bucket: '2026-08-13T14:00:00', v: 60 },
+      { hour_bucket: '2026-08-13T15:00:00', v: 60 },
+      { hour_bucket: '2026-08-13T16:00:00', v: 5.5 },
+    ];
+    const w1 = series(rows1, r => r.v, dayjs('2026-08-13T13:05:00'), dayjs('2026-08-13T16:05:00'), dayjs('2026-08-13T16:05:00'), 'hour');
+    const w2 = series(rows2, r => r.v, dayjs('2026-08-13T13:05:30'), dayjs('2026-08-13T16:05:30'), dayjs('2026-08-13T16:05:30'), 'hour');
+    expect(w1.reduce((a, p) => a + p.value, 0)).toBeCloseTo(180, 10);
+    expect(w2.reduce((a, p) => a + p.value, 0)).toBeCloseTo(180, 10);
+    expect(w2[0].value).toBeCloseTo(54.5, 10);
+    expect(w2[3].value).toBeCloseTo(5.5, 10);
+  });
+
+  it('prorates stacked charts and group totals with the same share', () => {
+    const since = dayjs('2026-08-13T13:05:00');
+    const until = dayjs('2026-08-13T16:05:00');
+    const rows = [
+      { hour_bucket: '2026-08-13T13:00:00', m: 'a', n: 60 },
+      { hour_bucket: '2026-08-13T14:00:00', m: 'a', n: 60 },
+      { hour_bucket: '2026-08-13T15:00:00', m: 'b', n: 60 },
+      { hour_bucket: '2026-08-13T16:00:00', m: 'a', n: 5 },
+    ];
+    const stacked = stackedData(rows, ['a', 'b'], r => r.m, r => r.n, since, until, until, 'hour');
+    expect(stacked.map(r => [r.label, r.a, r.b])).toEqual([
+      ['08-13 13:00', 55, 0],
+      ['08-13 14:00', 60, 0],
+      ['08-13 15:00', 0, 60],
+      ['08-13 16:00', 5, 0],
+    ]);
+    const totals = groupTotals(rows, r => r.m, r => r.n, r => bucketWindowShare(r.hour_bucket, since, until, until, 'hour'));
+    expect(totals).toEqual([['a', 120], ['b', 60]]);
   });
 });
 
@@ -419,30 +570,6 @@ describe('resampleResponse — Trends hourly rollup onto a sub-hour axis', () =>
     // -> 24 + 45x3; 14:00 hour: 15 x4; 15:00 hour: 30 x4; 16:00 bucket: 0.
     expect(out.series.map(p => p.value)).toEqual([24, 45, 45, 45, 15, 15, 15, 15, 30, 30, 30, 30, 0]);
     expect(out.series.reduce((a, p) => a + p.value, 0)).toBeCloseTo(180 * (53 / 60) + 60 + 120, 6);
-  });
-});
-
-describe('rowWindowShare — KPI proration on sub-hour windows', () => {
-  const since = dayjs('2026-08-13T15:50:00');
-  const until = dayjs('2026-08-13T16:05:00');
-  const cutoff = until;
-
-  it('scales boundary hours by their in-window overlap, full rows by 1, outside rows by 0', () => {
-    expect(rowWindowShare('2026-08-13T15:00:00', since, until, cutoff)).toBeCloseTo(10 / 60, 6);
-    expect(rowWindowShare('2026-08-13T14:00:00', since, until, cutoff)).toBe(0);
-    // The current hour's row covers [16:00, until) — its whole value is in-window.
-    expect(rowWindowShare('2026-08-13T16:00:00', since, until, cutoff)).toBe(1);
-    // A past hour fully inside a wider window keeps its whole value.
-    expect(rowWindowShare('2026-08-13T16:00:00', since, dayjs('2026-08-13T18:05:00'), dayjs('2026-08-13T18:05:00'))).toBe(1);
-  });
-
-  it('uses the real coverage for past windows (cutoff > until)', () => {
-    const prevSince = dayjs('2026-08-13T10:00:00');
-    const prevUntil = dayjs('2026-08-13T10:10:00');
-    const cut = dayjs('2026-08-13T10:30:00');
-    // 10:00 bucket holds usage recorded up to 10:30; only 10 of its 30 min
-    // fall in the window.
-    expect(rowWindowShare('2026-08-13T10:00:00', prevSince, prevUntil, cut)).toBeCloseTo(10 / 30, 6);
   });
 });
 
