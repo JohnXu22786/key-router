@@ -70,7 +70,7 @@ const Help: React.FC = () => {
     <div ref={rootRef} style={{ maxWidth: 800 }}>
       <Title level={3}>Help</Title>
 
-      <Card title="Contents" style={{ marginBottom: 16 }}>
+      <Card title="Contents (Page Navigator)" style={{ marginBottom: 16 }}>
         <Space direction="vertical" size={4}>
           {SECTIONS.map(s => (
             <Link
