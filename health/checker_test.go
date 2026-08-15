@@ -6,19 +6,24 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"key-router/db"
 	"key-router/model"
+	"key-router/selector"
 )
 
 // newTestEnv wires a temp DB with one provider (pointing at the given
 // upstream handler) and one key, and returns the checker + the persisted
-// key. The upstream handler lets tests simulate successful or failing
-// health probes without network access.
-func newTestEnv(t *testing.T, upstream http.HandlerFunc) (*Checker, *model.Key) {
+// key + a routing engine wired to the checker EXACTLY like main.go wires
+// them (checker -> engine.RecordResult). The upstream handler lets tests
+// simulate successful or failing health probes without network access, and
+// the engine lets them observe the resulting status flips through
+// SetOnStatusChanged.
+func newTestEnv(t *testing.T, upstream http.HandlerFunc) (*Checker, *model.Key, *selector.Engine) {
 	t.Helper()
 	if err := db.Init(filepath.Join(t.TempDir(), "data")); err != nil {
 		t.Fatal(err)
@@ -43,7 +48,13 @@ func newTestEnv(t *testing.T, upstream http.HandlerFunc) (*Checker, *model.Key) 
 	if err := db.GetDB().First(k).Error; err != nil {
 		t.Fatal(err)
 	}
-	return NewChecker(), k
+
+	engine := selector.NewEngine()
+	c := NewChecker()
+	c.SetOnKeyResult(func(keyID int64, ok bool, reason string) {
+		engine.RecordResult(keyID, ok, reason, 30*time.Second)
+	})
+	return c, k, engine
 }
 
 func okUpstream(w http.ResponseWriter, r *http.Request) {
@@ -53,11 +64,11 @@ func okUpstream(w http.ResponseWriter, r *http.Request) {
 
 // TestCheckKeyDoesNotRecoverDuringCooldown guards the relay's rate-limit
 // failover: a rate-limited key with a still-running cooldown must NOT be
-// flipped back to active by a successful health probe. Recovering early
+// flipped back to active by successful health probes. Recovering early
 // re-admits a hot key, the next request re-triggers the 429, and the
 // status ping-pongs (rate_limited -> active -> rate_limited).
 func TestCheckKeyDoesNotRecoverDuringCooldown(t *testing.T) {
-	c, k := newTestEnv(t, okUpstream)
+	c, k, engine := newTestEnv(t, okUpstream)
 	until := time.Now().Add(10 * time.Minute)
 	db.GetDB().Model(&model.Key{}).Where("id = ?", k.ID).Updates(map[string]interface{}{
 		"status":             model.KeyStatusRateLimited,
@@ -66,10 +77,11 @@ func TestCheckKeyDoesNotRecoverDuringCooldown(t *testing.T) {
 	// Reload so checkKey sees the persisted state
 	db.GetDB().First(k)
 
-	recovered := false
-	c.SetOnKeyRecovered(func(keyID int64) { recovered = true })
+	var flips []string
+	engine.SetOnStatusChanged(func(_ int64, status string) { flips = append(flips, status) })
 
 	c.checkKey(k)
+	c.checkKey(k) // even a second successful probe must not recover early
 
 	var after model.Key
 	db.GetDB().First(&after, k.ID)
@@ -79,15 +91,16 @@ func TestCheckKeyDoesNotRecoverDuringCooldown(t *testing.T) {
 	if after.RateLimitedUntil == nil || !after.RateLimitedUntil.Equal(until) {
 		t.Errorf("rate_limited_until = %v, want %v (cooldown must not be wiped)", after.RateLimitedUntil, until)
 	}
-	if recovered {
-		t.Error("onRecovered fired while the cooldown was still running")
+	if len(flips) != 0 {
+		t.Errorf("status events = %v, want none while the cooldown is still running", flips)
 	}
 }
 
-// TestCheckKeyRecoversAfterCooldownExpiry: once the cooldown has passed, a
-// successful probe must recover the key (rate_limited -> active).
+// TestCheckKeyRecoversAfterCooldownExpiry: once the cooldown has passed,
+// successful probes must recover the key (rate_limited -> active) — but
+// only after TWO consecutive successes, the state machine's enable rule.
 func TestCheckKeyRecoversAfterCooldownExpiry(t *testing.T) {
-	c, k := newTestEnv(t, okUpstream)
+	c, k, engine := newTestEnv(t, okUpstream)
 	expired := time.Now().Add(-1 * time.Minute)
 	db.GetDB().Model(&model.Key{}).Where("id = ?", k.ID).Updates(map[string]interface{}{
 		"status":             model.KeyStatusRateLimited,
@@ -95,18 +108,24 @@ func TestCheckKeyRecoversAfterCooldownExpiry(t *testing.T) {
 	})
 	db.GetDB().First(k)
 
-	recovered := false
-	c.SetOnKeyRecovered(func(keyID int64) { recovered = true })
+	var flips []string
+	engine.SetOnStatusChanged(func(_ int64, status string) { flips = append(flips, status) })
 
+	// One success is not enough — the key must prove itself twice.
 	c.checkKey(k)
-
 	var after model.Key
 	db.GetDB().First(&after, k.ID)
-	if after.Status != model.KeyStatusActive {
-		t.Errorf("status = %q, want active (cooldown expired, probe ok)", after.Status)
+	if after.Status != model.KeyStatusRateLimited {
+		t.Fatalf("status after 1st probe = %q, want rate_limited (recovery needs 2 consecutive successes)", after.Status)
 	}
-	if !recovered {
-		t.Error("onRecovered not fired after cooldown expiry")
+
+	c.checkKey(k)
+	db.GetDB().First(&after, k.ID)
+	if after.Status != model.KeyStatusActive {
+		t.Errorf("status = %q, want active (cooldown expired, 2 probes ok)", after.Status)
+	}
+	if !reflect.DeepEqual(flips, []string{model.KeyStatusActive}) {
+		t.Errorf("status events = %v, want [active]", flips)
 	}
 }
 
@@ -120,7 +139,7 @@ func TestCheckKeyRecoversAfterCooldownExpiry(t *testing.T) {
 func TestCheckKeyDoesNotRecoverAuthFailedKey(t *testing.T) {
 	// The gateway's models endpoint does not authenticate (200 for any key)
 	// but the chat endpoint rejects the key with 401.
-	c, k := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
+	c, k, engine := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/models" {
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte(`{"data":[]}`))
@@ -134,9 +153,14 @@ func TestCheckKeyDoesNotRecoverAuthFailedKey(t *testing.T) {
 	})
 	db.GetDB().First(k)
 
-	recovered := false
-	c.SetOnKeyRecovered(func(keyID int64) { recovered = true })
+	var flips []string
+	engine.SetOnStatusChanged(func(_ int64, status string) { flips = append(flips, status) })
 
+	// Probe TWICE: a single probe could not distinguish "still failing"
+	// from "fail-open misclassification" (recovery needs 2 successes), so
+	// two failing probes are the minimal sequence that would flip the key
+	// active if the classifier regressed to alive for a bare 401.
+	c.checkKey(k)
 	c.checkKey(k)
 
 	var after model.Key
@@ -147,8 +171,8 @@ func TestCheckKeyDoesNotRecoverAuthFailedKey(t *testing.T) {
 	if after.DisabledReason != "auth_failed" {
 		t.Errorf("disabled_reason = %q, want auth_failed", after.DisabledReason)
 	}
-	if recovered {
-		t.Error("onRecovered fired for a key that still fails auth on the chat endpoint")
+	if len(flips) != 0 {
+		t.Errorf("status events = %v, want none (a single failure must not change a disabled key)", flips)
 	}
 }
 
@@ -157,19 +181,24 @@ func TestCheckKeyDoesNotRecoverAuthFailedKey(t *testing.T) {
 // probe succeeds (e.g. the admin fixed the key), a disabled auth_failed key
 // returns to active.
 func TestCheckKeyRecoversAuthFailedKeyWhenUsable(t *testing.T) {
-	c, k := newTestEnv(t, okUpstream)
+	c, k, engine := newTestEnv(t, okUpstream)
 	db.GetDB().Model(&model.Key{}).Where("id = ?", k.ID).Updates(map[string]interface{}{
 		"status":          model.KeyStatusDisabled,
 		"disabled_reason": "auth_failed",
 	})
 	db.GetDB().First(k)
 
-	recovered := false
-	c.SetOnKeyRecovered(func(keyID int64) { recovered = true })
+	var flips []string
+	engine.SetOnStatusChanged(func(_ int64, status string) { flips = append(flips, status) })
 
 	c.checkKey(k)
-
 	var after model.Key
+	db.GetDB().First(&after, k.ID)
+	if after.Status != model.KeyStatusDisabled {
+		t.Fatalf("status after 1st probe = %q, want disabled (one success is not enough)", after.Status)
+	}
+
+	c.checkKey(k)
 	db.GetDB().First(&after, k.ID)
 	if after.Status != model.KeyStatusActive {
 		t.Errorf("status = %q, want active (key usable again)", after.Status)
@@ -177,8 +206,8 @@ func TestCheckKeyRecoversAuthFailedKeyWhenUsable(t *testing.T) {
 	if after.DisabledReason != "" {
 		t.Errorf("disabled_reason = %q, want cleared after recovery", after.DisabledReason)
 	}
-	if !recovered {
-		t.Error("onRecovered not fired for a key whose probe now succeeds")
+	if !reflect.DeepEqual(flips, []string{model.KeyStatusActive}) {
+		t.Errorf("status events = %v, want [active]", flips)
 	}
 }
 
@@ -192,7 +221,7 @@ func TestCheckKeyRecoversAuthFailedKeyWhenUsable(t *testing.T) {
 // completion), so the upstream handler must see zero requests.
 func TestCheckKeyDoesNotRecoverSpendLimitExhausted(t *testing.T) {
 	hits := 0
-	c, k := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
+	c, k, _ := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
 		hits++
 		okUpstream(w, r)
 	})
@@ -208,9 +237,6 @@ func TestCheckKeyDoesNotRecoverSpendLimitExhausted(t *testing.T) {
 		t.Error("shouldProbeKey returned true for a spend-capped key (it would be probed every pass)")
 	}
 
-	recovered := false
-	c.SetOnKeyRecovered(func(keyID int64) { recovered = true })
-
 	c.checkKey(k)
 
 	var after model.Key
@@ -220,9 +246,6 @@ func TestCheckKeyDoesNotRecoverSpendLimitExhausted(t *testing.T) {
 	}
 	if after.DisabledReason != model.KeyDisabledReasonSpendLimit {
 		t.Errorf("disabled_reason = %q, want spend_limit_exhausted", after.DisabledReason)
-	}
-	if recovered {
-		t.Error("onRecovered fired for a key whose budget is exhausted")
 	}
 	if hits != 0 {
 		t.Errorf("upstream probed %d time(s), want 0 (spend-capped keys must not be probed)", hits)
@@ -238,7 +261,7 @@ func TestCheckKeyDoesNotRecoverSpendLimitSetMidProbe(t *testing.T) {
 	// The handler runs during the probe, after newTestEnv returns — bind the
 	// key id through a variable in the closure's scope instead of k itself.
 	var keyID int64
-	c, k := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
+	c, k, engine := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
 		// Simulate the relay's applySpendLimit landing while the probe is in
 		// flight: the key's budget crosses the limit and it is disabled.
 		db.GetDB().Model(&model.Key{}).Where("id = ?", keyID).Updates(map[string]interface{}{
@@ -261,8 +284,8 @@ func TestCheckKeyDoesNotRecoverSpendLimitSetMidProbe(t *testing.T) {
 	})
 	db.GetDB().First(k)
 
-	recovered := false
-	c.SetOnKeyRecovered(func(keyID int64) { recovered = true })
+	var flips []string
+	engine.SetOnStatusChanged(func(_ int64, status string) { flips = append(flips, status) })
 
 	c.checkKey(k)
 
@@ -274,8 +297,8 @@ func TestCheckKeyDoesNotRecoverSpendLimitSetMidProbe(t *testing.T) {
 	if after.DisabledReason != model.KeyDisabledReasonSpendLimit {
 		t.Errorf("disabled_reason = %q, want spend_limit_exhausted", after.DisabledReason)
 	}
-	if recovered {
-		t.Error("onRecovered fired for a key whose budget was exhausted mid-probe")
+	if len(flips) != 0 {
+		t.Errorf("status events = %v, want none for a budget-capped key", flips)
 	}
 }
 
@@ -286,7 +309,7 @@ func TestCheckKeyDoesNotRecoverSpendLimitSetMidProbe(t *testing.T) {
 // cap) and a later success could revive it.
 func TestCheckKeyDoesNotOverwriteSpendLimitReasonMidProbe(t *testing.T) {
 	var keyID int64
-	c, k := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
+	c, k, _ := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
 		db.GetDB().Model(&model.Key{}).Where("id = ?", keyID).Updates(map[string]interface{}{
 			"status":          model.KeyStatusDisabled,
 			"disabled_reason": model.KeyDisabledReasonSpendLimit,
@@ -322,7 +345,7 @@ func TestCheckKeyDoesNotOverwriteSpendLimitReasonMidProbe(t *testing.T) {
 // otherwise a billable chat completion runs on a capped key.
 func TestCheckKeyStaleSnapshotBudgetExhausted(t *testing.T) {
 	hits := 0
-	c, k := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
+	c, k, _ := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
 		hits++
 		okUpstream(w, r)
 	})
@@ -351,7 +374,7 @@ func TestCheckKeyStaleSnapshotBudgetExhausted(t *testing.T) {
 // the relay's spend-limit disable must survive untouched.
 func TestCheckKeyActiveStartBudgetCrossedMidProbe(t *testing.T) {
 	var keyID int64
-	c, k := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
+	c, k, engine := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
 		db.GetDB().Model(&model.Key{}).Where("id = ?", keyID).Updates(map[string]interface{}{
 			"status":          model.KeyStatusDisabled,
 			"disabled_reason": model.KeyDisabledReasonSpendLimit,
@@ -367,8 +390,8 @@ func TestCheckKeyActiveStartBudgetCrossedMidProbe(t *testing.T) {
 	})
 	db.GetDB().First(k)
 
-	recovered := false
-	c.SetOnKeyRecovered(func(keyID int64) { recovered = true })
+	var flips []string
+	engine.SetOnStatusChanged(func(_ int64, status string) { flips = append(flips, status) })
 
 	c.checkKey(k)
 
@@ -380,8 +403,8 @@ func TestCheckKeyActiveStartBudgetCrossedMidProbe(t *testing.T) {
 	if after.DisabledReason != model.KeyDisabledReasonSpendLimit {
 		t.Errorf("disabled_reason = %q, want spend_limit_exhausted", after.DisabledReason)
 	}
-	if recovered {
-		t.Error("onRecovered fired for an active key whose budget was exhausted mid-probe")
+	if len(flips) != 0 {
+		t.Errorf("status events = %v, want none for a budget-capped key", flips)
 	}
 }
 
@@ -424,7 +447,7 @@ func TestOpenAIProbeUsesChatCompletions(t *testing.T) {
 // and every probe is now a billable chat completion. Once the cooldown
 // expires, probing resumes.
 func TestShouldProbeKeySkipsRateLimitedCooldown(t *testing.T) {
-	c, k := newTestEnv(t, okUpstream)
+	c, k, _ := newTestEnv(t, okUpstream)
 	until := time.Now().Add(10 * time.Minute)
 	db.GetDB().Model(&model.Key{}).Where("id = ?", k.ID).Updates(map[string]interface{}{
 		"status":             model.KeyStatusRateLimited,
@@ -464,13 +487,13 @@ func TestClassifyOpenAIProbe403IsNotAuthFailure(t *testing.T) {
 }
 
 // TestCheckKeyRecoversAuthFailedKeyOn403 pins the recovery semantics for a
-// 403 probe: a key disabled for auth_failed is recovered by a 403 response,
+// 403 probe: a key disabled for auth_failed is recovered by 403 responses,
 // because a 403 proves the key itself authenticates (the model is denied,
 // not the key) — the same proof the relay accepts (403 -> 30s cooldown,
-// never a disable). Recovery is gated on the probe not classifying the key
-// as failing; 403 is deliberately not "failing".
+// never a disable). Recovery is gated on the state machine: 2 consecutive
+// successful probes; 403 is deliberately not "failing".
 func TestCheckKeyRecoversAuthFailedKeyOn403(t *testing.T) {
-	c, k := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
+	c, k, engine := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 	})
 	db.GetDB().Model(&model.Key{}).Where("id = ?", k.ID).Updates(map[string]interface{}{
@@ -479,9 +502,10 @@ func TestCheckKeyRecoversAuthFailedKeyOn403(t *testing.T) {
 	})
 	db.GetDB().First(k)
 
-	recovered := false
-	c.SetOnKeyRecovered(func(keyID int64) { recovered = true })
+	var flips []string
+	engine.SetOnStatusChanged(func(_ int64, status string) { flips = append(flips, status) })
 
+	c.checkKey(k)
 	c.checkKey(k)
 
 	var after model.Key
@@ -489,91 +513,45 @@ func TestCheckKeyRecoversAuthFailedKeyOn403(t *testing.T) {
 	if after.Status != model.KeyStatusActive {
 		t.Errorf("status = %q, want active (403 proves the key authenticates)", after.Status)
 	}
-	if !recovered {
-		t.Error("onRecovered not fired for a key that authenticated (403)")
+	if !reflect.DeepEqual(flips, []string{model.KeyStatusActive}) {
+		t.Errorf("status events = %v, want [active]", flips)
 	}
 }
 
-// TestRecordFailureRequiresConsecutiveFailures guards against the
-// auth_failed/rate_limited status flash: a SINGLE transient probe failure
-// (upstream hiccup) must not yank a healthy key out of rotation — the
-// auto-disable (via the onFailed callback, which main.go wires to
-// engine.MarkKeyDisabled) only happens once probes fail consecutively.
-func TestRecordFailureRequiresConsecutiveFailures(t *testing.T) {
-	c, k := newTestEnv(t, okUpstream)
-	var failed []string
-	c.SetOnKeyFailed(func(keyID int64, reason string) { failed = append(failed, reason) })
+// TestCheckKeySingleProbeFailureCoolsNotDisables: a single failed probe of
+// an ACTIVE key must mark the key once and cool it for failover — but must
+// NOT disable it. Disabling requires 2 consecutive failures with the SAME
+// permanent reason (auth_failed / insufficient_quota); a transient probe
+// failure (here an HTTP 500) only ever cools, no matter how often it
+// repeats.
+func TestCheckKeySingleProbeFailureCoolsNotDisables(t *testing.T) {
+	c, k, engine := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
 
-	c.recordFailure(k, "auth_failed")
-	if len(failed) != 0 {
-		t.Fatalf("disabled after a single probe failure: %v", failed)
-	}
+	var flips []string
+	engine.SetOnStatusChanged(func(_ int64, status string) { flips = append(flips, status) })
+
+	c.checkKey(k)
 	var after model.Key
 	db.GetDB().First(&after, k.ID)
-	if after.Status != model.KeyStatusActive {
-		t.Errorf("status = %q, want active after one transient failure", after.Status)
+	if after.Status != model.KeyStatusRateLimited {
+		t.Fatalf("status = %q after one failed probe, want rate_limited (mark once, fail over, don't disable)", after.Status)
 	}
-	// The failure reason is still persisted (visible in the UI) — but the
-	// key stays in rotation.
-	if after.DisabledReason != "auth_failed" {
-		t.Errorf("disabled_reason = %q, want auth_failed (reason should still be recorded)", after.DisabledReason)
+	// The reason the UI shows for the cooled key is the HTTP status itself.
+	if after.DisabledReason != "http_500" {
+		t.Errorf("disabled_reason = %q, want http_500", after.DisabledReason)
+	}
+	if !reflect.DeepEqual(flips, []string{model.KeyStatusRateLimited}) {
+		t.Errorf("status events = %v, want [rate_limited]", flips)
 	}
 
-	c.recordFailure(k, "auth_failed")
-	if len(failed) != 1 || failed[0] != "auth_failed" {
-		t.Fatalf("onFailed = %v, want [auth_failed] after two consecutive failures", failed)
-	}
-}
-
-// TestRecordFailureFallbackDisablesConsecutively covers the no-callback
-// path (no main.go wiring, e.g. embedded use): two consecutive auth
-// failures must end with the key disabled in the DB.
-func TestRecordFailureFallbackDisablesConsecutively(t *testing.T) {
-	c, k := newTestEnv(t, okUpstream) // no onFailed wired
-
-	c.recordFailure(k, "auth_failed")
-	var after model.Key
+	// Repeated identical TRANSIENT failures must never disable.
+	c.checkKey(k)
+	c.checkKey(k)
 	db.GetDB().First(&after, k.ID)
-	if after.Status != model.KeyStatusActive {
-		t.Fatalf("status = %q, want active after one transient failure (fallback path)", after.Status)
-	}
-
-	c.recordFailure(k, "auth_failed")
-	db.GetDB().First(&after, k.ID)
-	if after.Status != model.KeyStatusDisabled {
-		t.Errorf("status = %q, want disabled after consecutive failures (fallback path)", after.Status)
-	}
-	if after.DisabledReason != "auth_failed" {
-		t.Errorf("disabled_reason = %q, want auth_failed", after.DisabledReason)
-	}
-}
-
-// TestRecordFailureMixedFailureSequence: an auth failure that follows
-// UNRELATED failures (rate_limited/upstream_error) is not a repeated auth
-// failure — the key must stay in rotation until auth fails again. Rate
-// limits and upstream errors also keep the general backoff counter busy,
-// which must not trip the auth-disable gate. An intervening non-auth
-// failure also BREAKS an auth streak: [auth, rate_limited, auth] must not
-// disable on the last probe.
-func TestRecordFailureMixedFailureSequence(t *testing.T) {
-	c, k := newTestEnv(t, okUpstream)
-	var failed []string
-	c.SetOnKeyFailed(func(keyID int64, reason string) { failed = append(failed, reason) })
-
-	c.recordFailure(k, "rate_limited") // unrelated failure
-	c.recordFailure(k, "auth_failed")  // first auth failure — must NOT disable
-	if len(failed) != 0 {
-		t.Fatalf("disabled after [rate_limited, auth_failed]: %v", failed)
-	}
-	var after model.Key
-	db.GetDB().First(&after, k.ID)
-	if after.Status != model.KeyStatusActive {
-		t.Fatalf("status = %q, want active after [rate_limited, auth_failed]", after.Status)
-	}
-
-	c.recordFailure(k, "auth_failed") // second auth failure — disable
-	if len(failed) != 1 || failed[0] != "auth_failed" {
-		t.Fatalf("onFailed = %v, want [auth_failed] after repeated auth failures", failed)
+	if after.Status == model.KeyStatusDisabled {
+		t.Fatal("status = disabled after repeated 500 probes — transient failures never disable")
 	}
 }
 
@@ -647,7 +625,7 @@ func TestClassifyOpenAIProbe401EmptyBodyIsAuthFailed(t *testing.T) {
 // a RATE-LIMIT signal on many gateways (e.g. OpenRouter's "you've made too
 // many requests to this model"), NOT a billing/quota exhaustion. Classifying
 // it as insufficient_quota disables a healthy key on a transient throttle.
-// It must classify as rate_limited (cooldown, no disable).
+// It must classify as http_429 (cooldown, no disable).
 func TestClassifyOpenAIProbe429QuotaExceededIsRateLimited(t *testing.T) {
 	resp := &http.Response{
 		StatusCode: http.StatusTooManyRequests,
@@ -655,8 +633,8 @@ func TestClassifyOpenAIProbe429QuotaExceededIsRateLimited(t *testing.T) {
 			`{"error":{"code":"quota_exceeded","message":"You've made too many requests to this model within a short time window."}}`)),
 	}
 	result := classifyOpenAIProbe(resp)
-	if result.Alive || result.Reason != "rate_limited" {
-		t.Errorf("429 + quota_exceeded = %+v, want {alive:false reason:rate_limited}", result)
+	if result.Alive || result.Reason != "http_429" {
+		t.Errorf("429 + quota_exceeded = %+v, want {alive:false reason:http_429}", result)
 	}
 }
 
@@ -679,16 +657,16 @@ func TestQuotaErrorInBodyKeepsBillingCodes(t *testing.T) {
 // TestCheckKeyKeepsActiveKeyOnModelProblem401 is the end-to-end regression:
 // an ACTIVE key whose probe comes back 401 + model-not-found (the probe's
 // hardcoded model is unavailable on this gateway) must survive repeated
-// probe passes WITHOUT being disabled. Before the fix, two consecutive
-// probes classified the key auth_failed and yanked it out of rotation.
+// probe passes WITHOUT being disabled. The classifier treats the 401 as a
+// SUCCESS (the key authenticated), so no failure streak can ever build.
 func TestCheckKeyKeepsActiveKeyOnModelProblem401(t *testing.T) {
-	c, k := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
+	c, k, engine := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 		w.Write([]byte(`{"error":{"message":"The model 'gpt-4o-mini' does not exist","code":"model_not_found"}}`))
 	})
 
-	failed := false
-	c.SetOnKeyFailed(func(keyID int64, reason string) { failed = true })
+	var flips []string
+	engine.SetOnStatusChanged(func(_ int64, status string) { flips = append(flips, status) })
 
 	c.checkKey(k)
 	c.checkKey(k) // second consecutive probe must not disable either
@@ -698,8 +676,8 @@ func TestCheckKeyKeepsActiveKeyOnModelProblem401(t *testing.T) {
 	if after.Status != model.KeyStatusActive {
 		t.Errorf("status = %q, want active (model-problem 401 must not disable the key)", after.Status)
 	}
-	if failed {
-		t.Error("onFailed fired for a key whose only problem is the probe's model choice")
+	if len(flips) != 0 {
+		t.Errorf("status events = %v, want none for an active key whose probe stays healthy", flips)
 	}
 }
 
@@ -810,12 +788,13 @@ func TestModelProblemInBodyLongFormGap(t *testing.T) {
 
 // TestCheckKeyRecoversAuthFailedKeyOnModelProblem401: a disabled auth_failed
 // key whose 401 body names a MODEL problem must be recovered (the key
-// authenticates; only the probe's hardcoded model is unavailable to it).
-// This is the recovery side of the flap the relay fix prevents: with the
-// same classification on both paths, a model-problem 401 recovers the key
-// and the next real request ALSO cools (not disables) it — no ping-pong.
+// authenticates; only the probe's hardcoded model is unavailable to it) —
+// after the state machine's 2 consecutive successful observations. This is
+// the recovery side of the flap the relay fix prevents: with the same
+// classification on both paths, a model-problem 401 recovers the key and
+// the next real request ALSO cools (not disables) it — no ping-pong.
 func TestCheckKeyRecoversAuthFailedKeyOnModelProblem401(t *testing.T) {
-	c, k := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
+	c, k, engine := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 		w.Write([]byte(`{"error":{"message":"The model 'gpt-4o-mini' does not exist","code":"model_not_found"}}`))
 	})
@@ -825,34 +804,35 @@ func TestCheckKeyRecoversAuthFailedKeyOnModelProblem401(t *testing.T) {
 	})
 	db.GetDB().First(k)
 
-	recovered := false
-	c.SetOnKeyRecovered(func(keyID int64) { recovered = true })
+	var flips []string
+	engine.SetOnStatusChanged(func(_ int64, status string) { flips = append(flips, status) })
 
 	c.checkKey(k)
+	if after := loadTestKey(t, k.ID); after.Status != model.KeyStatusDisabled {
+		t.Fatalf("status after 1st probe = %q, want disabled (one success is not enough)", after.Status)
+	}
+	c.checkKey(k)
 
-	var after model.Key
-	db.GetDB().First(&after, k.ID)
+	after := loadTestKey(t, k.ID)
 	if after.Status != model.KeyStatusActive {
 		t.Errorf("status = %q, want active (model-problem 401 proves the key authenticates)", after.Status)
 	}
-	if !recovered {
-		t.Error("onRecovered not fired for a key whose 401 body names only a model problem")
+	if !reflect.DeepEqual(flips, []string{model.KeyStatusActive}) {
+		t.Errorf("status events = %v, want [active]", flips)
 	}
 }
 
-// TestRecordFailureNonAuthBreaksAuthStreak: an auth failure, then an
-// unrelated failure, then another auth failure must NOT disable — the
-// streak was broken in the middle, so the final auth failure is the first
-// of a new streak.
-func TestRecordFailureNonAuthBreaksAuthStreak(t *testing.T) {
-	c, k := newTestEnv(t, okUpstream)
-	var failed []string
-	c.SetOnKeyFailed(func(keyID int64, reason string) { failed = append(failed, reason) })
-
-	c.recordFailure(k, "auth_failed")
-	c.recordFailure(k, "rate_limited") // breaks the auth streak
-	c.recordFailure(k, "auth_failed")  // first auth failure of a NEW streak
-	if len(failed) != 0 {
-		t.Fatalf("disabled after [auth_failed, rate_limited, auth_failed]: %v", failed)
+func loadTestKey(t *testing.T, id int64) model.Key {
+	t.Helper()
+	var k model.Key
+	if err := db.GetDB().First(&k, id).Error; err != nil {
+		t.Fatal(err)
 	}
+	return k
 }
+
+// TestCheckKeySingleProbeFailureCoolsNotDisables above covers the old
+// recordFailure semantics (mark once + failover, never disable on one
+// failure); mixed-streak and streak-breaking rules are engine-level and
+// pinned in selector/outcome_test.go (RecordResult).
+

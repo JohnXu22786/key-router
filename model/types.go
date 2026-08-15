@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"time"
 )
@@ -37,6 +38,37 @@ const (
 // never revive it (the cap is an administrative limit, not an upstream
 // health condition).
 const KeyDisabledReasonSpendLimit = "spend_limit_exhausted"
+
+// Failure reasons recorded in Key.DisabledReason (and used by the key
+// status state machine in selector.Engine). Reasons are either SEMANTIC
+// (auth_failed, insufficient_quota — permanent key/account problems) or an
+// http_<code> string (HTTPStatusReason — unambiguous upstream statuses the
+// UI renders as "HTTP 429" etc.).
+const (
+	// ReasonAuthFailed: the key itself was rejected (401 whose body blames
+	// the key). Permanent — 2 consecutive observations disable the key.
+	ReasonAuthFailed = "auth_failed"
+	// ReasonInsufficientQuota: the account/key has no balance left (402, or
+	// 429 carrying a billing-exhaustion code). Permanent — 2 consecutive
+	// observations disable the key (a successful probe can later recover it).
+	ReasonInsufficientQuota = "insufficient_quota"
+	// ReasonNetworkError: the upstream could not be reached at all (no
+	// response). Transient — only cools the key.
+	ReasonNetworkError = "network_error"
+)
+
+// HTTPStatusReason builds the display reason for an unambiguous upstream
+// status (e.g. 429 -> "http_429"). The UI renders it as "HTTP 429".
+func HTTPStatusReason(status int) string { return fmt.Sprintf("http_%d", status) }
+
+// DisableClassReason reports whether a failure reason is PERMANENT for the
+// key: after 2 consecutive observations with the same permanent reason the
+// key is disabled. Transient reasons (http_429, http_5xx, network_error,
+// model problems) only cool the key — a rate limit resolves on its own and
+// must never take a healthy key out of rotation.
+func DisableClassReason(reason string) bool {
+	return reason == ReasonAuthFailed || reason == ReasonInsufficientQuota
+}
 
 // RecoveryStrategy constants
 const (
