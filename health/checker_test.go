@@ -638,18 +638,18 @@ func TestClassifyOpenAIProbe429QuotaExceededIsRateLimited(t *testing.T) {
 	}
 }
 
-// TestQuotaErrorInBodyKeepsBillingCodes: quotaErrorInBody must still report
-// genuine billing-exhaustion codes as quota errors (insufficient_quota /
-// billing_hard_limit_reached), while excluding the rate-limit code
-// quota_exceeded.
-func TestQuotaErrorInBodyKeepsBillingCodes(t *testing.T) {
-	if !quotaErrorInBody([]byte(`{"error":{"code":"insufficient_quota"}}`)) {
+// TestQuotaExhaustedInBodyKeepsBillingCodes: QuotaExhaustedInBody must
+// still report genuine billing-exhaustion codes as quota errors
+// (insufficient_quota / billing_hard_limit_reached), while excluding the
+// rate-limit code quota_exceeded.
+func TestQuotaExhaustedInBodyKeepsBillingCodes(t *testing.T) {
+	if !QuotaExhaustedInBody([]byte(`{"error":{"code":"insufficient_quota"}}`)) {
 		t.Error("insufficient_quota must be a quota error")
 	}
-	if !quotaErrorInBody([]byte(`{"error":{"type":"billing_error"}}`)) {
+	if !QuotaExhaustedInBody([]byte(`{"error":{"type":"billing_error"}}`)) {
 		t.Error("billing_error must be a quota error")
 	}
-	if quotaErrorInBody([]byte(`{"error":{"code":"quota_exceeded"}}`)) {
+	if QuotaExhaustedInBody([]byte(`{"error":{"code":"quota_exceeded"}}`)) {
 		t.Error("quota_exceeded is a rate-limit code, must NOT be a quota error")
 	}
 }

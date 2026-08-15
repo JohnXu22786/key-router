@@ -404,21 +404,22 @@ func (c *Checker) testAnthropic(keyValue string, provider *model.Provider) Probe
 }
 
 // classifyOpenAIProbe classifies an OpenAI-format probe response.
-// Only a genuine key-invalidity signal (401 naming the KEY, 402, or a 429
-// carrying a billing-exhaustion code) means the key is unusable. A 400/404
-// ("model not found", endpoint not supported) AND a 403 (model/endpoint
-// access denied — the KEY itself authenticated) still prove the key works,
-// mirroring the relay's own 403 handling (a 30s cooldown, never a disable —
-// 403 is often model access, not key invalidity). A 401 whose body names a
-// MODEL problem (unknown model, key not entitled to the probe's hardcoded
-// model) also proves the key authenticated: the probe's model choice is
-// wrong, not the key — disabling on it takes every usable key out of
-// rotation. A 429 whose body carries a billing-exhaustion code is classified
-// as insufficient_quota (disabled), not a transient rate limit — an
-// over-quota key never recovers on its own. "quota_exceeded" is NOT a
-// billing code: on many gateways (e.g. OpenRouter) it is the RATE-LIMIT
-// code ("you've made too many requests to this model"), so it cools the key
-// down instead of disabling it.
+// Only a genuine key-invalidity signal (401 naming the KEY, 402, a 400
+// naming the key on Gemini-style gateways, or a 429 carrying a
+// billing-exhaustion code) means the key is unusable. A 400/404 ("model not
+// found", endpoint not supported) AND a 403 (model/endpoint access denied —
+// the KEY itself authenticated) still prove the key works, mirroring the
+// relay's own 403 handling (a 30s cooldown, never a disable — 403 is often
+// model access, not key invalidity). A 401 whose body names a MODEL problem
+// (unknown model, key not entitled to the probe's hardcoded model) also
+// proves the key authenticated: the probe's model choice is wrong, not the
+// key — disabling on it takes every usable key out of rotation. A 429 whose
+// body carries a billing-exhaustion code is classified as insufficient_quota
+// (disabled), not a transient rate limit — an over-quota key never recovers
+// on its own. "quota_exceeded" is NOT a billing code: on many gateways
+// (e.g. OpenRouter) it is the RATE-LIMIT code ("you've made too many
+// requests to this model"), so it cools the key down instead of disabling
+// it.
 //
 // Failed probes carry a display reason: semantic for classified problems
 // (auth_failed / insufficient_quota), the bare HTTP status (http_429,
@@ -437,12 +438,24 @@ func classifyOpenAIProbe(resp *http.Response) ProbeResult {
 		}
 		// Bare 401, or a body that blames the key: fail-closed.
 		return ProbeResult{Alive: false, Reason: model.ReasonAuthFailed}
+	case resp.StatusCode == http.StatusBadRequest:
+		// Some gateways report an invalid KEY with 400 instead of 401 —
+		// most notably Gemini ("API key not valid", reason API_KEY_INVALID);
+		// Azure's "Deployment ... not found" 400s are MODEL problems, not
+		// key problems. Read the body: a key-invalidity signal classifies
+		// as auth_failed; everything else proves the key authenticated.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		resp.Body.Close()
+		if KeyInvalidInBody(body) {
+			return ProbeResult{Alive: false, Reason: model.ReasonAuthFailed}
+		}
+		return ProbeResult{Alive: true}
 	case resp.StatusCode == http.StatusPaymentRequired:
 		return ProbeResult{Alive: false, Reason: model.ReasonInsufficientQuota}
 	case resp.StatusCode == http.StatusTooManyRequests:
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 		resp.Body.Close()
-		if quotaErrorInBody(body) {
+		if QuotaExhaustedInBody(body) {
 			return ProbeResult{Alive: false, Reason: model.ReasonInsufficientQuota}
 		}
 		return ProbeResult{Alive: false, Reason: model.HTTPStatusReason(resp.StatusCode)}
@@ -451,212 +464,6 @@ func classifyOpenAIProbe(resp *http.Response) ProbeResult {
 	default:
 		return ProbeResult{Alive: true}
 	}
-}
-
-// ModelProblemInBody reports whether a 401 error body blames the MODEL
-// (unknown model, no access to the model) rather than the key. The health
-// probe sends a hardcoded model that many gateways don't have, and such
-// gateways often answer with 401 — reading the body is the only way to tell
-// "the key is invalid" from "the key is fine, the probe's model is not".
-// Explicit key-invalidity signals always win (fail-closed on ambiguity).
-// Exported so the relay (handler/chat.go) applies the SAME classification to
-// real traffic — otherwise a model-problem 401 disables the key on the
-// relay path while the next probe pass recovers it (disable → active →
-// disable flap).
-func ModelProblemInBody(body []byte) bool {
-	var payload struct {
-		Error struct {
-			Message string `json:"message"`
-			Code    string `json:"code"`
-			Type    string `json:"type"`
-		} `json:"error"`
-	}
-	if json.Unmarshal(body, &payload) != nil {
-		return false
-	}
-	tokens := normalizeTokens(payload.Error.Message + " " + payload.Error.Code + " " + payload.Error.Type)
-
-	// The gateway explicitly blamed the key — the key is invalid even if a
-	// model is mentioned too. Key-scoped denial phrasings ("key does not
-	// exist", "key disabled", ...) must NOT be outvoted by a model mention
-	// in the same body: a dead key stays dead.
-	for _, sig := range keyInvalidSignals {
-		if seqMatch(tokens, sig) {
-			return false
-		}
-	}
-
-	// Otherwise the body must point at a MODEL (or Azure-style deployment)
-	// and deny it in some way.
-	for _, sig := range modelProblemSignals {
-		if seqMatch(tokens, sig) {
-			return true
-		}
-	}
-	return false
-}
-
-// normalizeTokens lowercases a body and splits it into word tokens, treating
-// any non-alphanumeric character as a separator and splitting camelCase
-// boundaries. This collapses the punctuation variance gateways use —
-// "model_not_found", "ModelNotFound", "model not found",
-// "model gpt-4o-mini is not found" and "model: not found" all become
-// comparable token sequences.
-func normalizeTokens(s string) []string {
-	var words []string
-	var cur []byte
-	flush := func() {
-		if len(cur) > 0 {
-			words = append(words, string(cur))
-			cur = cur[:0]
-		}
-	}
-	prevLower := false
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch {
-		case c >= 'a' && c <= 'z':
-			cur = append(cur, c)
-			prevLower = true
-		case c >= 'A' && c <= 'Z':
-			// camelCase boundary: "ModelNotFound" → [model, not, found]
-			if prevLower && len(cur) > 0 {
-				flush()
-			}
-			cur = append(cur, c+('a'-'A'))
-			prevLower = false
-		case c >= '0' && c <= '9':
-			cur = append(cur, c)
-			prevLower = false
-		default:
-			flush()
-			prevLower = false
-		}
-	}
-	flush()
-	return words
-}
-
-// seqMatch reports whether the signal's words appear in tokens IN ORDER,
-// ignoring up to maxGapUnmatched other tokens between consecutive signal
-// words. A signal word must still appear as a whole token, so "invalid key"
-// never matches inside "invalidate keys" — but "api key sk-123 is invalid"
-// DOES match [key invalid] (the echoed key ID sits between the words).
-const maxGapUnmatched = 8
-
-func seqMatch(tokens []string, sig []string) bool {
-	if len(sig) == 0 {
-		return false
-	}
-	// For each occurrence of the first word, try to walk the rest of the
-	// signal allowing up to maxGapUnmatched foreign tokens between words.
-	for i := 0; i < len(tokens); i++ {
-		if tokens[i] != sig[0] {
-			continue
-		}
-		pos := i + 1
-		matched := true
-		for _, w := range sig[1:] {
-			found := -1
-			for j := pos; j < len(tokens) && j-pos <= maxGapUnmatched; j++ {
-				if tokens[j] == w {
-					found = j
-					break
-				}
-			}
-			if found < 0 {
-				matched = false
-				break
-			}
-			pos = found + 1
-		}
-		if matched {
-			return true
-		}
-	}
-	return false
-}
-
-// keyInvalidSignals are token sequences that prove the KEY is invalid,
-// regardless of any model mention in the same body (fail-closed).
-var keyInvalidSignals = [][]string{
-	{"invalid", "key"},
-	{"incorrect", "key"},
-	{"key", "invalid"},
-	{"key", "not", "found"},
-	{"key", "does", "not", "exist"},
-	{"key", "not", "exist"},
-	{"no", "such", "key"},
-	{"key", "disabled"},
-	{"key", "inactive"},
-	{"key", "unauthorized"},
-	{"key", "revoked"},
-	{"key", "expired"},
-	{"authentication"},
-	{"unauthorized", "key"},
-	{"bad", "credentials"},
-	{"invalid", "credentials"},
-	{"credentials", "invalid"},
-}
-
-// modelProblemSignals are token sequences that prove the key authenticated
-// and only the probe's MODEL is unavailable/denied. Kept fail-open ONLY for
-// phrasings that name the model and its denial — the key signal list above
-// is checked first and wins on any overlap.
-var modelProblemSignals = [][]string{
-	{"model", "not", "found"},
-	{"model", "not", "exist"},
-	{"model", "does", "not", "exist"},
-	{"model", "not", "allowed"},
-	{"model", "not", "available"},
-	{"model", "unavailable"},
-	{"model", "not", "supported"},
-	{"model", "not", "entitled"},
-	{"model", "no", "access"},
-	{"model", "access", "denied"},
-	{"model", "denied"},
-	{"model", "disabled"},
-	{"model", "inactive"},
-	{"deployment", "not", "found"},
-	{"deployment", "not", "exist"},
-	{"deployment", "does", "not", "exist"},
-	{"deployment", "not", "available"},
-	{"deployment", "not", "allowed"},
-	{"deployment", "disabled"},
-	{"deployment", "inactive"},
-}
-
-// quotaErrorInBody reports whether an error body carries a billing-exhaustion
-// code (OpenAI 429 + insufficient_quota / billing_hard_limit_reached, or a
-// gateway using error.type). "quota_exceeded" is deliberately NOT matched:
-// gateways use it for request/model rate-limit throttles as well as billing
-// exhaustion, and the cost of a wrong disable (a healthy key taken out of
-// rotation) outweighs the cost of a wrong cool-down (an over-quota key keeps
-// failing over until an admin notices) — so it must cool the key down, not
-// disable it.
-func quotaErrorInBody(body []byte) bool {
-	var payload struct {
-		Error json.RawMessage `json:"error"`
-	}
-	if json.Unmarshal(body, &payload) != nil || len(payload.Error) == 0 {
-		return false
-	}
-	var inner struct {
-		Code string `json:"code"`
-		Type string `json:"type"`
-	}
-	if json.Unmarshal(payload.Error, &inner) != nil {
-		return false
-	}
-	switch inner.Code {
-	case "insufficient_quota", "billing_hard_limit_reached", "billing_not_active", "card_declined":
-		return true
-	}
-	switch inner.Type {
-	case "insufficient_quota", "billing_error", "billing_not_active":
-		return true
-	}
-	return false
 }
 
 // classifyAnthropicProbe classifies an Anthropic probe response.

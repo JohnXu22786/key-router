@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -268,7 +269,7 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			// chunk of the body to classify.
 			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 			resp.Body.Close()
-			if isQuotaExhaustedError(errBody) {
+			if health.QuotaExhaustedInBody(errBody) {
 				h.Engine.RecordResult(key.ID, false, model.ReasonInsufficientQuota, 30*time.Second)
 				log.Printf("[relay] key %d quota exhausted (429 + quota error, attempt %d/%d)", key.ID, attempt+1, maxRetries+1)
 				attempt++
@@ -341,6 +342,29 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			drainClose(resp)
 			attempt++
 			continue
+		}
+		if resp.StatusCode == http.StatusBadRequest {
+			// Some gateways report an invalid KEY with 400 instead of 401 —
+			// most notably Gemini ("API key not valid", reason
+			// API_KEY_INVALID). Read the body (full passthrough size — a
+			// verbose gateway page must reach the client intact): a body
+			// that blames the KEY marks the key once (auth_failed, fail
+			// over to the next key); any other 400 is a request/model
+			// problem — restore the body and pass it through untouched
+			// below.
+			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxRequestBody+1))
+			if len(errBody) > maxRequestBody {
+				errBody = errBody[:maxRequestBody]
+			}
+			originalBody := resp.Body
+			resp.Body = io.NopCloser(bytes.NewReader(errBody))
+			originalBody.Close() // return the upstream connection to the pool
+			if health.KeyInvalidInBody(errBody) {
+				h.Engine.RecordResult(key.ID, false, model.ReasonAuthFailed, 30*time.Second)
+				log.Printf("[relay] key %d rejected as invalid (400 + key error, cooling 30s, attempt %d/%d)", key.ID, attempt+1, maxRetries+1)
+				attempt++
+				continue
+			}
 		}
 		if resp.StatusCode >= 500 || resp.StatusCode == http.StatusRequestTimeout ||
 			resp.StatusCode == http.StatusConflict || resp.StatusCode == http.StatusTooEarly {
@@ -622,6 +646,14 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 		log.Printf("[relay] all %d attempts quota-exhausted for model %s", maxRetries+1, reqMeta.Model)
 		writeRelayError(c, inputFormat, http.StatusPaymentRequired, "upstream_quota_exhausted", "upstream_error",
 			"All upstream keys have exhausted their quota")
+		return
+	case http.StatusBadRequest:
+		// Every attempt was a 400 that blamed the KEY (Gemini-style
+		// gateways). The client's request is fine — the upstream keys are
+		// not, so surface the key problem, not a request error.
+		log.Printf("[relay] all %d attempts rejected keys as invalid for model %s", maxRetries+1, reqMeta.Model)
+		writeRelayError(c, inputFormat, http.StatusUnauthorized, "upstream_key_invalid", "upstream_error",
+			"All upstream keys were rejected as invalid")
 		return
 	}
 	log.Printf("[relay] all %d attempts failed for model %s", maxRetries+1, reqMeta.Model)
@@ -932,39 +964,4 @@ func extractUpstreamError(body []byte, statusCode int) string {
 		msg = http.StatusText(statusCode)
 	}
 	return msg
-}
-
-// isQuotaExhaustedError reports whether an upstream error body means the
-// account/key has no balance left (as opposed to a transient rate limit).
-// OpenAI-compatible APIs return 429 with error.code "insufficient_quota" or
-// "billing_hard_limit_reached"; Anthropic uses 402 Payment Required (handled
-// separately by status code) and some gateways return the code as a string
-// or in "error.type". "quota_exceeded" is deliberately NOT matched: gateways
-// use it for request/model rate-limit throttles as well as billing
-// exhaustion, and the cost of a wrong disable (a healthy key taken out of
-// rotation) outweighs the cost of a wrong cool-down — so it cools the key
-// down instead of disabling it.
-func isQuotaExhaustedError(body []byte) bool {
-	var payload struct {
-		Error json.RawMessage `json:"error"`
-	}
-	if json.Unmarshal(body, &payload) != nil || len(payload.Error) == 0 {
-		return false
-	}
-	var inner struct {
-		Code string `json:"code"`
-		Type string `json:"type"`
-	}
-	if json.Unmarshal(payload.Error, &inner) != nil {
-		return false
-	}
-	switch inner.Code {
-	case "insufficient_quota", "billing_hard_limit_reached", "billing_not_active", "card_declined":
-		return true
-	}
-	switch inner.Type {
-	case "insufficient_quota", "billing_error", "billing_not_active":
-		return true
-	}
-	return false
 }
