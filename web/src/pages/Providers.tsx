@@ -477,7 +477,19 @@ const Providers: React.FC = () => {
       </Modal>
 
       {/* Key modal */}
-      <Modal title={editingKey ? 'Edit Key' : 'Add Key'} open={keyModal} onOk={saveKey} onCancel={() => { setKeyModal(false); setEditingKey(null); }} width={680}>
+      <Modal
+        title={editingKey ? 'Edit Key' : 'Add Key'}
+        open={keyModal}
+        onOk={saveKey}
+        onCancel={() => { setKeyModal(false); setEditingKey(null); }}
+        width={680}
+        centered
+        // The form is taller than the desktop window (1000x580): center the
+        // modal and cap the body so it always fits the viewport — the footer
+        // (OK/Cancel) stays visible and the bottom fields are reachable by
+        // scrolling the body instead of being cut off.
+        styles={{ body: { maxHeight: 'calc(100vh - 200px)', overflowY: 'auto' } }}
+      >
         <Form form={keyForm} layout="vertical" onValuesChange={(changed) => { if ('status' in changed) statusTouched.current = true; }}>
           <Form.Item name="provider_id" label="Provider" rules={[{ required: true }]}>
             <Select placeholder="Select a provider" showSearch options={providers.map(p => ({ value: p.id, label: `${p.name} (${p.type})` }))} />
@@ -550,7 +562,19 @@ const Providers: React.FC = () => {
       </Modal>
 
       {/* Key detail modal */}
-      <Modal title={`Key Detail: ${detailData?.key?.name || ''}`} open={detailOpen} onCancel={() => setDetailOpen(false)} footer={null} width={700}>
+      <Modal
+        title={`Key Detail: ${detailData?.key?.name || ''}`}
+        open={detailOpen}
+        onCancel={() => setDetailOpen(false)}
+        footer={null}
+        width={700}
+        centered
+        // Same treatment as the Edit Key modal: the panel is taller than the
+        // desktop window (1000x580), so center it and cap the body — the
+        // window counters and lifetime budget at the bottom are always
+        // reachable by scrolling the body, never cut off.
+        styles={{ body: { maxHeight: 'calc(100vh - 200px)', overflowY: 'auto' } }}
+      >
         {detailData && (
           <div>
             <Descriptions column={2} bordered size="small">
