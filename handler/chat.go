@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -237,7 +238,9 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			}
 			// Cool the key down so the retry loop fails over to sibling keys
 			// instead of re-selecting the same dead route every attempt.
-			h.Engine.MarkKeyRateLimited(key.ID, 30*time.Second)
+			// A network error is transient: mark once, fail over, never
+			// disable on it.
+			h.Engine.RecordResult(key.ID, false, model.ReasonNetworkError, 30*time.Second)
 			attempt++
 			continue
 		}
@@ -260,13 +263,14 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			// 429 is ambiguous: OpenAI returns 429 + error.code
 			// "insufficient_quota" / "billing_hard_limit_reached" when the
 			// account has no balance left, and a plain 429 (no such code) for
-			// genuine rate limiting. Quota exhaustion must DISABLE the key
-			// (it would never recover on its own); a real rate limit only
-			// cools it down. Read a bounded chunk of the body to classify.
+			// genuine rate limiting. Quota exhaustion DISABLES the key after
+			// 2 consecutive identical observations (it would never recover
+			// on its own); a real rate limit only cools it. Read a bounded
+			// chunk of the body to classify.
 			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 			resp.Body.Close()
-			if isQuotaExhaustedError(errBody) {
-				h.Engine.MarkKeyDisabled(key.ID, "insufficient_quota")
+			if health.QuotaExhaustedInBody(errBody) {
+				h.Engine.RecordResult(key.ID, false, model.ReasonInsufficientQuota, 30*time.Second)
 				log.Printf("[relay] key %d quota exhausted (429 + quota error, attempt %d/%d)", key.ID, attempt+1, maxRetries+1)
 				attempt++
 				continue
@@ -287,7 +291,9 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 					retryAfter = time.Duration(sec) * time.Second
 				}
 			}
-			h.Engine.MarkKeyRateLimited(key.ID, retryAfter)
+			// Plain 429: the key is hot, not broken — mark once with the
+			// upstream's own cooldown and fail over. The UI shows "HTTP 429".
+			h.Engine.RecordResult(key.ID, false, model.HTTPStatusReason(resp.StatusCode), retryAfter)
 			log.Printf("[relay] key %d rate limited, cooling %v (attempt %d/%d)", key.ID, retryAfter, attempt+1, maxRetries+1)
 			attempt++
 			continue
@@ -300,45 +306,73 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			// the SAME classification, or a model-problem 401 disables the
 			// key here while the next probe pass recovers it (the disable →
 			// active → disable flap). Model/access problems cool the key
-			// down like the 403 path; genuine key-invalidity 401s disable.
+			// down like the 403 path; genuine key-invalidity 401s disable
+			// after 2 consecutive identical observations.
 			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 			resp.Body.Close()
 			if health.ModelProblemInBody(errBody) {
-				h.Engine.MarkKeyRateLimited(key.ID, 30*time.Second)
+				h.Engine.RecordResult(key.ID, false, model.HTTPStatusReason(resp.StatusCode), 30*time.Second)
 				log.Printf("[relay] key %d unauthorized for the requested model (401, cooling 30s, attempt %d/%d)", key.ID, attempt+1, maxRetries+1)
 				attempt++
 				continue
 			}
-			h.Engine.MarkKeyDisabled(key.ID, "auth_failed")
-			log.Printf("[relay] key %d disabled (auth failed, attempt %d/%d)", key.ID, attempt+1, maxRetries+1)
+			h.Engine.RecordResult(key.ID, false, model.ReasonAuthFailed, 30*time.Second)
+			log.Printf("[relay] key %d auth failed (401, cooling 30s, attempt %d/%d)", key.ID, attempt+1, maxRetries+1)
 			attempt++
 			continue
 		}
 		if resp.StatusCode == http.StatusForbidden {
 			// 403 is often model/endpoint access (not key invalidity) on
 			// OpenAI-compatible gateways — cool down temporarily instead of
-			// permanently disabling (which would brick valid keys).
-			h.Engine.MarkKeyRateLimited(key.ID, 30*time.Second)
+			// permanently disabling (which would brick valid keys). The UI
+			// shows "HTTP 403".
+			h.Engine.RecordResult(key.ID, false, model.HTTPStatusReason(resp.StatusCode), 30*time.Second)
 			log.Printf("[relay] key %d forbidden (403, cooling 30s, attempt %d/%d)", key.ID, attempt+1, maxRetries+1)
 			drainClose(resp)
 			attempt++
 			continue
 		}
 		if resp.StatusCode == http.StatusPaymentRequired {
-			// 402 insufficient_quota: the key has no balance left — take it
-			// out of rotation (no auto-recovery; needs an admin top-up) and
-			// fail over to a sibling key.
-			h.Engine.MarkKeyDisabled(key.ID, "insufficient_quota")
+			// 402 insufficient_quota: the key has no balance left — after 2
+			// consecutive identical observations it is taken out of rotation
+			// (a successful probe can later recover it) and the retry loop
+			// fails over to a sibling key.
+			h.Engine.RecordResult(key.ID, false, model.ReasonInsufficientQuota, 30*time.Second)
 			log.Printf("[relay] key %d quota exhausted (402, attempt %d/%d)", key.ID, attempt+1, maxRetries+1)
 			drainClose(resp)
 			attempt++
 			continue
 		}
+		if resp.StatusCode == http.StatusBadRequest {
+			// Some gateways report an invalid KEY with 400 instead of 401 —
+			// most notably Gemini ("API key not valid", reason
+			// API_KEY_INVALID). Read the body (full passthrough size — a
+			// verbose gateway page must reach the client intact): a body
+			// that blames the KEY marks the key once (auth_failed, fail
+			// over to the next key); any other 400 is a request/model
+			// problem — restore the body and pass it through untouched
+			// below.
+			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxRequestBody+1))
+			if len(errBody) > maxRequestBody {
+				errBody = errBody[:maxRequestBody]
+			}
+			originalBody := resp.Body
+			resp.Body = io.NopCloser(bytes.NewReader(errBody))
+			originalBody.Close() // return the upstream connection to the pool
+			if health.KeyInvalidInBody(errBody) {
+				h.Engine.RecordResult(key.ID, false, model.ReasonAuthFailed, 30*time.Second)
+				log.Printf("[relay] key %d rejected as invalid (400 + key error, cooling 30s, attempt %d/%d)", key.ID, attempt+1, maxRetries+1)
+				attempt++
+				continue
+			}
+		}
 		if resp.StatusCode >= 500 || resp.StatusCode == http.StatusRequestTimeout ||
 			resp.StatusCode == http.StatusConflict || resp.StatusCode == http.StatusTooEarly {
 			log.Printf("[relay] upstream %d for key %d (attempt %d/%d)", resp.StatusCode, key.ID, attempt+1, maxRetries+1)
-			// Mark key as temporarily unavailable so another key is picked next attempt
-			h.Engine.MarkKeyRateLimited(key.ID, 30*time.Second)
+			// Upstream failures are transient: mark the key once (the UI
+			// shows the bare status, e.g. "HTTP 500") and fail over to the
+			// next key this attempt.
+			h.Engine.RecordResult(key.ID, false, model.HTTPStatusReason(resp.StatusCode), 30*time.Second)
 			drainClose(resp)
 			attempt++
 			continue
@@ -350,6 +384,11 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 		// 3xx gets a 502 (a redirect the client can't follow without leaking
 		// the upstream URL), 4xx gets the upstream status.
 		if reqMeta.Stream && resp.StatusCode >= 300 {
+			// The upstream ANSWERED (client/model error, not a key problem —
+			// the same classification the health probe applies to 4xx/3xx):
+			// record a success observation so the key can build its recovery
+			// streak even when every request errors client-side.
+			h.Engine.RecordResult(key.ID, true, "", 0)
 			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxRequestBody+1))
 			resp.Body.Close()
 			if len(errBody) > maxRequestBody {
@@ -441,6 +480,10 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 				} else {
 					h.Engine.WindowManager.IncrementAllWithCost(key.ID, 0, costMicro)
 				}
+				// Every successful request is one ordered observation toward
+				// the key's recovery streak (2 consecutive successes return
+				// a cooled/disabled key to active).
+				h.Engine.RecordResult(key.ID, true, "", 0)
 				// Lifetime budget: accumulate spend; if the key's total
 				// budget is exhausted, take it out of rotation permanently.
 				if costMicro > 0 {
@@ -471,6 +514,10 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			// NOTE: this runs BEFORE c.Status() so the envelope's own status
 			// and Content-Type can be written.
 			if resp.StatusCode >= 400 && format.NeedConvert(inputFormat, rr.UpstreamFormat) {
+				// The upstream answered (4xx = client/model problem, not a
+				// key problem — the probe classifies 4xx as alive): record
+				// the success observation like the streaming path.
+				h.Engine.RecordResult(key.ID, true, "", 0)
 				msg := extractUpstreamError(responseBody, resp.StatusCode)
 				writeRelayError(c, inputFormat, resp.StatusCode, "upstream_error", "upstream_error", msg)
 				return
@@ -486,6 +533,10 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 				if json.Unmarshal(responseBody, &errCheck) == nil && relay.IsErrorPayload(errCheck.Error) {
 					msg := extractUpstreamError(responseBody, resp.StatusCode)
 					log.Printf("[relay] upstream 200-with-error for key %d: %s", key.ID, msg)
+					// The key itself worked (it answered 200) — the error is
+					// request/model-scoped, so it still counts as a success
+					// observation for the key's streak.
+					h.Engine.RecordResult(key.ID, true, "", 0)
 					writeRelayError(c, inputFormat, http.StatusBadGateway, "upstream_error", "upstream_error", msg)
 					return
 				}
@@ -511,8 +562,12 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 				}
 				if convErr != nil {
 					// A malformed 2xx body in the wrong format must not be
-					// handed to the client as a successful response
+					// handed to the client as a successful response. The
+					// upstream still ANSWERED 2xx — the key worked — so it
+					// counts as a success observation (like the 200-with-
+					// error path).
 					log.Printf("[relay] format conversion error: %v", convErr)
+					h.Engine.RecordResult(key.ID, true, "", 0)
 					writeRelayError(c, inputFormat, http.StatusBadGateway, "upstream_response_invalid", "upstream_error",
 						"upstream returned an invalid response")
 					return
@@ -530,6 +585,10 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 				}
 				costMicro := int64(consumption.CostUSD * 1e6)
 				h.Engine.RecordSuccess(key.ID, usage.TotalTokens, costMicro)
+				// Every successful request is one ordered observation toward
+				// the key's recovery streak (2 consecutive successes return
+				// a cooled/disabled key to active).
+				h.Engine.RecordResult(key.ID, true, "", 0)
 				if costMicro > 0 {
 					h.applySpendLimit(key.ID, costMicro)
 				}
@@ -537,11 +596,22 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 
 			// 3xx without Location is useless to the client (and a redirect
 			// would bypass the gateway) — surface it as an upstream error.
+			// The upstream still answered, so it counts as a success
+			// observation for the key.
 			if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 				log.Printf("[relay] upstream redirect %d for key %d", resp.StatusCode, key.ID)
+				h.Engine.RecordResult(key.ID, true, "", 0)
 				writeRelayError(c, inputFormat, http.StatusBadGateway, "upstream_redirect", "upstream_error",
 					"upstream returned a redirect")
 				return
+			}
+
+			// Remaining statuses here are non-retryable same-format 4xx
+			// (400/404/422/...): pass the upstream error through to the
+			// client. The key answered — success observation (the probe
+			// classifies 4xx as alive for the same reason).
+			if resp.StatusCode >= 400 {
+				h.Engine.RecordResult(key.ID, true, "", 0)
 			}
 
 			// Commit status, then write the (possibly converted) body
@@ -576,6 +646,14 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 		log.Printf("[relay] all %d attempts quota-exhausted for model %s", maxRetries+1, reqMeta.Model)
 		writeRelayError(c, inputFormat, http.StatusPaymentRequired, "upstream_quota_exhausted", "upstream_error",
 			"All upstream keys have exhausted their quota")
+		return
+	case http.StatusBadRequest:
+		// Every attempt was a 400 that blamed the KEY (Gemini-style
+		// gateways). The client's request is fine — the upstream keys are
+		// not, so surface the key problem, not a request error.
+		log.Printf("[relay] all %d attempts rejected keys as invalid for model %s", maxRetries+1, reqMeta.Model)
+		writeRelayError(c, inputFormat, http.StatusUnauthorized, "upstream_key_invalid", "upstream_error",
+			"All upstream keys were rejected as invalid")
 		return
 	}
 	log.Printf("[relay] all %d attempts failed for model %s", maxRetries+1, reqMeta.Model)
@@ -886,39 +964,4 @@ func extractUpstreamError(body []byte, statusCode int) string {
 		msg = http.StatusText(statusCode)
 	}
 	return msg
-}
-
-// isQuotaExhaustedError reports whether an upstream error body means the
-// account/key has no balance left (as opposed to a transient rate limit).
-// OpenAI-compatible APIs return 429 with error.code "insufficient_quota" or
-// "billing_hard_limit_reached"; Anthropic uses 402 Payment Required (handled
-// separately by status code) and some gateways return the code as a string
-// or in "error.type". "quota_exceeded" is deliberately NOT matched: gateways
-// use it for request/model rate-limit throttles as well as billing
-// exhaustion, and the cost of a wrong disable (a healthy key taken out of
-// rotation) outweighs the cost of a wrong cool-down — so it cools the key
-// down instead of disabling it.
-func isQuotaExhaustedError(body []byte) bool {
-	var payload struct {
-		Error json.RawMessage `json:"error"`
-	}
-	if json.Unmarshal(body, &payload) != nil || len(payload.Error) == 0 {
-		return false
-	}
-	var inner struct {
-		Code string `json:"code"`
-		Type string `json:"type"`
-	}
-	if json.Unmarshal(payload.Error, &inner) != nil {
-		return false
-	}
-	switch inner.Code {
-	case "insufficient_quota", "billing_hard_limit_reached", "billing_not_active", "card_declined":
-		return true
-	}
-	switch inner.Type {
-	case "insufficient_quota", "billing_error", "billing_not_active":
-		return true
-	}
-	return false
 }

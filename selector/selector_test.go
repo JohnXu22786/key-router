@@ -102,11 +102,12 @@ func TestStatusChangedCallback(t *testing.T) {
 		got = append(got, status)
 	})
 
-	// MarkKeyRateLimited with an already-expired cooldown: MarkKeyDisabled
-	// deliberately keeps rate_limited_until, and MarkKeyActive refuses to
-	// recover a key whose cooldown is still running (that guard is tested
-	// elsewhere) — so the active flip only fires once the cooldown passed.
-	e.MarkKeyRateLimited(key.ID, 0)
+	// RecordResult cools the key with an already-expired cooldown (0s):
+	// MarkKeyDisabled deliberately keeps rate_limited_until, and MarkKeyActive
+	// refuses to recover a key whose cooldown is still running (that guard is
+	// tested elsewhere) — so the active flip only fires once the cooldown
+	// passed.
+	e.RecordResult(key.ID, false, "http_429", 0)
 	e.MarkKeyDisabled(key.ID, "auth_failed")
 	// A no-op flip (already disabled with the same reason) must NOT fire the
 	// callback: the RowsAffected==0 guard is what keeps the SSE push quiet

@@ -76,10 +76,24 @@ func main() {
 	// Initialize routing engine
 	engine := selector.NewEngine()
 
+	// Initialize health checker. The engine's status-changed callback below
+	// clears the checker's probe backoff latch on recovery, so the checker
+	// must exist before any status flip can be observed.
+	checker := health.NewChecker()
+
 	// SSE push hub: key status flips (relay/health checker) are published
 	// here so the UI re-fetches immediately — the "hot reload" path.
 	hub := events.NewHub()
 	engine.SetOnStatusChanged(func(keyID int64, status string) {
+		if status == model.KeyStatusActive {
+			// The checker's probe backoff latch only exists to stop billing
+			// probes on a still-failing key. A key can now return to active
+			// via 2 consecutive relay successes (RecordResult) without a
+			// probe ever succeeding — clear the latch so the checker's
+			// active-key safety net (detecting expired/over-quota keys) is
+			// not permanently blinded for it.
+			checker.ResetFailCount(keyID)
+		}
 		hub.Publish(events.Event{Type: events.TypeKeyStatusChanged, KeyID: keyID, Status: status})
 	})
 
@@ -145,13 +159,12 @@ func main() {
 
 	log.Println("[main] routing engine initialized")
 
-	// Initialize and start health checker
-	checker := health.NewChecker()
-	checker.SetOnKeyRecovered(func(keyID int64) {
-		engine.MarkKeyActive(keyID)
-	})
-	checker.SetOnKeyFailed(func(keyID int64, reason string) {
-		engine.MarkKeyDisabled(keyID, reason)
+	// Wire every probe outcome into the engine's key status state machine
+	// (RecordResult) — the SAME machine the relay feeds with real traffic,
+	// so a probe and a request count toward the same
+	// 2-consecutive-successes / 2-consecutive-same-failures thresholds.
+	checker.SetOnKeyResult(func(keyID int64, ok bool, reason string) {
+		engine.RecordResult(keyID, ok, reason, 30*time.Second)
 	})
 	checker.Start()
 	log.Println("[main] health checker started")

@@ -26,7 +26,17 @@ const reasonLabels: Record<string, string> = {
   insufficient_quota: 'Insufficient quota',
   rate_limited: 'Rate limited',
   upstream_error: 'Upstream error',
+  network_error: 'Network error',
   spend_limit_exhausted: 'Spend budget exhausted',
+};
+
+// reasonLabel renders a key's disabled_reason for the UI. Reasons recorded
+// as bare HTTP statuses ("http_429", "http_500", ...) are shown as "HTTP
+// 429" — the status is unambiguous and needs no guessed category; semantic
+// reasons (auth_failed, insufficient_quota, ...) use the label map.
+const reasonLabel = (reason: string): string => {
+  if (reason.startsWith('http_')) return `HTTP ${reason.slice(5)}`;
+  return reasonLabels[reason] || reason;
 };
 
 const metricOptions = [
@@ -339,8 +349,11 @@ const Providers: React.FC = () => {
       render: (s: string, r: Key) => (
         <Space size={4}>
           <Tag color={statusColors[s] || 'default'}>{s}</Tag>
-          {s === 'disabled' && r.disabled_reason && (
-            <Tag color="red">{reasonLabels[r.disabled_reason] || r.disabled_reason}</Tag>
+          {/* The reason explains WHY the key is down — for disabled keys the
+              disable cause, for rate_limited keys the upstream status that
+              cooled it (e.g. "HTTP 429"). */}
+          {(s === 'disabled' || s === 'rate_limited') && r.disabled_reason && (
+            <Tag color={s === 'disabled' ? 'red' : 'orange'}>{reasonLabel(r.disabled_reason)}</Tag>
           )}
           {/* Only for active keys: a rate_limited/disabled key already has
               a tag explaining its state — this one explains why an ACTIVE
@@ -580,12 +593,19 @@ const Providers: React.FC = () => {
             <Descriptions column={2} bordered size="small">
               <Descriptions.Item label="Status">
                 <Tag color={statusColors[detailData.key?.status] || 'default'}>{detailData.key?.status}</Tag>
-                {detailData.key?.status === 'disabled' && detailData.key?.disabled_reason && (
-                  <Tag color="red">{reasonLabels[detailData.key.disabled_reason] || detailData.key.disabled_reason}</Tag>
+                {(detailData.key?.status === 'disabled' || detailData.key?.status === 'rate_limited') && detailData.key?.disabled_reason && (
+                  <Tag color={detailData.key?.status === 'disabled' ? 'red' : 'orange'}>
+                    {reasonLabel(detailData.key.disabled_reason)}
+                  </Tag>
                 )}
               </Descriptions.Item>
               <Descriptions.Item label="Strategy">{detailData.key?.recovery_strategy}</Descriptions.Item>
               <Descriptions.Item label="Provider">{detailData.key?.provider?.name}</Descriptions.Item>
+              {detailData.key?.status === 'rate_limited' && detailData.key?.rate_limited_until && (
+                <Descriptions.Item label="Cooled until">
+                  {new Date(detailData.key.rate_limited_until).toLocaleString()}
+                </Descriptions.Item>
+              )}
               <Descriptions.Item label="Total Cost">${detailData.total_cost?.toFixed(6)}</Descriptions.Item>
             </Descriptions>
             <Title level={5} style={{ marginTop: 16 }}>Window Counters</Title>

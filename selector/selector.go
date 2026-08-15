@@ -30,10 +30,37 @@ type Engine struct {
 	// depends on it: every status write funnels through updateKeyStatus, so
 	// this single callback turns "a key changed" into an SSE push.
 	onStatusChanged func(keyID int64, status string)
+
+	// outcomeMu guards the per-key observation streaks below. The streaks
+	// are the raw material of the key status STATE MACHINE (RecordResult):
+	// every relayed request and every health probe is an observation,
+	// recorded in arrival order, and status flips happen only when a streak
+	// reaches its threshold — never on a single observation and never on a
+	// timer.
+	outcomeMu sync.Mutex
+	outcomes  map[int64]*KeyOutcome
+}
+
+// KeyOutcome tracks the ordered request/probe results for one key:
+//
+//   - SuccessStreak: consecutive successful observations (capped at 2).
+//     2 consecutive successes are required before a non-active key may
+//     return to active — a single success must not re-admit a flaky key
+//     (that single-success recovery is what made a failing key look
+//     "active" in the UI while traffic kept failing over to the next one).
+//   - FailureStreak / LastReason: consecutive failures with the SAME
+//     reason. 2 consecutive failures with the same PERMANENT reason
+//     (auth_failed / insufficient_quota) disable the key; any other
+//     sequence (different reasons, an intervening success) restarts the
+//     streak.
+type KeyOutcome struct {
+	SuccessStreak int
+	FailureStreak int
+	LastReason    string
 }
 
 // SetOnStatusChanged registers a callback invoked whenever a key's status
-// changes (via MarkKeyRateLimited / MarkKeyDisabled / MarkKeyActive). It is
+// changes (via RecordResult / MarkKeyDisabled / MarkKeyActive). It is
 // called after the DB write, while the engine lock is held — keep it cheap
 // and non-blocking (e.g. publish to an event hub).
 func (e *Engine) SetOnStatusChanged(cb func(keyID int64, status string)) {
@@ -57,6 +84,7 @@ func NewEngine() *Engine {
 		routes:        make(map[string][]*RouteEntry),
 		providers:     make(map[int64]*model.Provider),
 		keys:          make(map[int64][]*model.Key),
+		outcomes:      make(map[int64]*KeyOutcome),
 	}
 	e.Refresh()
 	return e
@@ -282,31 +310,6 @@ func (e *Engine) RecordSuccess(keyID int64, tokens int64, costMicroUSD int64) {
 	e.WindowManager.IncrementAllWithCost(keyID, tokens, costMicroUSD)
 }
 
-// MarkKeyRateLimited marks a key as rate limited.
-// A status guard prevents a stale in-flight relay response (the key was
-// picked earlier, then the admin disabled it) from clobbering newer state,
-// and the cooldown guard never SHRINKS an existing longer cooldown (a
-// sibling relay response must not re-admit a hot key early).
-func (e *Engine) MarkKeyRateLimited(keyID int64, retryAfter time.Duration) {
-	until := time.Now().Add(retryAfter)
-	res := db.GetDB().Model(&model.Key{}).
-		Where("id = ? AND status <> ? AND (rate_limited_until IS NULL OR rate_limited_until <= ?)",
-			keyID, model.KeyStatusDisabled, until).
-		Updates(map[string]interface{}{
-			"status":             model.KeyStatusRateLimited,
-			"rate_limited_until": until,
-		})
-	if res.Error != nil {
-		log.Printf("[selector] MarkKeyRateLimited DB error for key %d: %v", keyID, res.Error)
-	}
-	if res.RowsAffected == 0 {
-		// Key is disabled (admin), already has a longer cooldown, or is in a
-		// worse state — don't downgrade it, and don't touch the memory cache
-		return
-	}
-	e.updateKeyStatus(keyID, model.KeyStatusRateLimited, &until)
-}
-
 // MarkKeyDisabled marks a key as disabled due to auth error.
 // The status guard keeps a deliberately-disabled key from being re-marked
 // by a stale in-flight relay response.
@@ -327,13 +330,27 @@ func (e *Engine) MarkKeyDisabled(keyID int64, reason string) {
 	e.updateKeyDisabledReason(keyID, reason)
 }
 
-// MarkKeyActive marks a key as active (e.g., after health check recovers).
-// Guarded so a stale recovery can't clobber a fresh cooldown or a deliberate
-// admin disable; auth_failed-disabled keys (auto-recoverable) are allowed.
+// MarkKeyActive marks a key as active (e.g. after 2 consecutive successful
+// observations in RecordResult, or after the health checker recovers a
+// key). The UPDATE is fully guarded so a stale recovery can never clobber
+// fresher state:
+//
+//   - The row is only matched when something would actually change
+//     (status != active, a lingering reason, or a stale cooldown), so an
+//     already-active key produces no write, no memory update and no SSE
+//     event — every 2nd success on a healthy key is a no-op.
+//   - Deliberately-disabled keys (empty disabled_reason) are never
+//     re-admitted — only an explicit admin action can re-enable them.
+//   - Budget-capped keys (spend_limit_exhausted) are never re-admitted:
+//     the lifetime cap is an administrative limit, not an upstream health
+//     condition.
+//   - A still-running cooldown blocks recovery: the upstream's own
+//     wait-instruction must not be wiped (recovering early re-admits a hot
+//     key and the status ping-pongs).
 func (e *Engine) MarkKeyActive(keyID int64) {
 	res := db.GetDB().Model(&model.Key{}).
-		Where("id = ? AND (status <> ? OR disabled_reason = ?) AND (rate_limited_until IS NULL OR rate_limited_until <= ?)",
-			keyID, model.KeyStatusDisabled, "auth_failed", time.Now()).
+		Where("id = ? AND (status <> ? OR (disabled_reason IS NOT NULL AND disabled_reason <> '') OR rate_limited_until IS NOT NULL) AND (status <> ? OR (disabled_reason IS NOT NULL AND disabled_reason <> '')) AND (total_spend_limit IS NULL OR total_spend_limit = 0 OR total_spent < total_spend_limit) AND (rate_limited_until IS NULL OR rate_limited_until <= ?)",
+			keyID, model.KeyStatusActive, model.KeyStatusDisabled, time.Now()).
 		Updates(map[string]interface{}{
 			"status":             model.KeyStatusActive,
 			"rate_limited_until": nil,
@@ -343,9 +360,145 @@ func (e *Engine) MarkKeyActive(keyID int64) {
 		log.Printf("[selector] MarkKeyActive DB error for key %d: %v", keyID, res.Error)
 	}
 	if res.RowsAffected == 0 {
-		return // state changed — keep memory consistent with DB
+		return // state changed or nothing to do — keep memory consistent with DB
 	}
 	e.updateKeyStatus(keyID, model.KeyStatusActive, nil)
+}
+
+// RecordResult records one ordered observation of a key — the outcome of a
+// relayed upstream request or a health probe — and drives the key status
+// state machine:
+//
+//   - Every observation is recorded FIRST, in arrival order (the streak
+//     bookkeeping below), before any state is changed.
+//   - A failure (ok=false, reason=…) marks the key once, then the key is
+//     immediately cooled (failKey) so the retry loop fails over to the
+//     next key — the request itself is never abandoned because of a mark.
+//   - After 2 consecutive failures with the SAME permanent reason
+//     (auth_failed / insufficient_quota) the key is DISABLED. Transient
+//     reasons (http_429, http_5xx, network_error, …) only cool, no matter
+//     how often they repeat. An intervening success — or a failure with a
+//     different reason — restarts the streak.
+//   - After 2 consecutive successes (ok=true) the key returns to active,
+//     clearing the cooldown and the displayed reason. A single success
+//     never re-admits a cooled/disabled key.
+func (e *Engine) RecordResult(keyID int64, ok bool, reason string, cooldown time.Duration) {
+	e.outcomeMu.Lock()
+	oc := e.outcomes[keyID]
+	if oc == nil {
+		oc = &KeyOutcome{}
+		e.outcomes[keyID] = oc
+	}
+	if ok {
+		oc.SuccessStreak++
+		oc.FailureStreak = 0
+		oc.LastReason = ""
+		if oc.SuccessStreak > 2 {
+			oc.SuccessStreak = 2
+		}
+		streak := oc.SuccessStreak
+		e.outcomeMu.Unlock()
+		if streak >= 2 {
+			e.MarkKeyActive(keyID)
+		}
+		return
+	}
+	oc.SuccessStreak = 0
+	if oc.LastReason == reason {
+		oc.FailureStreak++
+	} else {
+		oc.FailureStreak = 1
+		oc.LastReason = reason
+	}
+	if oc.FailureStreak > 2 {
+		oc.FailureStreak = 2
+	}
+	streak := oc.FailureStreak
+	e.outcomeMu.Unlock()
+
+	// Failover now: take the key out of rotation so the retry loop picks
+	// the next key instead of re-selecting this one.
+	e.failKey(keyID, reason, cooldown)
+	if streak >= 2 && model.DisableClassReason(reason) {
+		e.MarkKeyDisabled(keyID, reason)
+	}
+}
+
+// failKey marks a key rate_limited with the given cooldown and persists the
+// failure reason for the UI, in one guarded UPDATE:
+//
+//   - Never downgrades a disabled key (its disable reason must survive).
+//   - Never shrinks an existing cooldown (a sibling failure with a shorter
+//     Retry-After must not re-admit a hot key early).
+//   - Never touches a budget-capped key (spend_limit_exhausted must
+//     survive; a capped key is out of rotation by admin decision).
+//   - When the row can't be updated (longer cooldown already running),
+//     the newest reason is still synced so the UI keeps showing WHY the
+//     key is down.
+func (e *Engine) failKey(keyID int64, reason string, cooldown time.Duration) {
+	until := time.Now().Add(cooldown)
+	res := db.GetDB().Model(&model.Key{}).
+		Where("id = ? AND status <> ? AND (rate_limited_until IS NULL OR rate_limited_until <= ?) AND (total_spend_limit IS NULL OR total_spend_limit = 0 OR total_spent < total_spend_limit)",
+			keyID, model.KeyStatusDisabled, until).
+		Updates(map[string]interface{}{
+			"status":             model.KeyStatusRateLimited,
+			"rate_limited_until": until,
+			"disabled_reason":    reason,
+		})
+	if res.Error != nil {
+		log.Printf("[selector] failKey DB error for key %d: %v", keyID, res.Error)
+		return
+	}
+	if res.RowsAffected == 0 {
+		// Key is disabled, budget-capped, or already running a longer
+		// cooldown — sync only the displayed reason where that is safe.
+		e.persistKeyReason(keyID, reason)
+		return
+	}
+	e.updateKeyStatus(keyID, model.KeyStatusRateLimited, &until)
+	e.updateKeyDisabledReason(keyID, reason)
+}
+
+// persistKeyReason records the failure reason on a COOLED key so the UI can
+// show why it is down (e.g. "HTTP 429"). Disabled keys keep their disable
+// reason, active keys have nothing to show, and budget-capped keys keep the
+// cap reason. Fires the SSE event when the reason actually changed so the
+// UI updates in place without waiting for its next poll.
+func (e *Engine) persistKeyReason(keyID int64, reason string) {
+	res := db.GetDB().Model(&model.Key{}).
+		Where("id = ? AND status = ? AND (disabled_reason IS NULL OR disabled_reason <> ?) AND (total_spend_limit IS NULL OR total_spend_limit = 0 OR total_spent < total_spend_limit)",
+			keyID, model.KeyStatusRateLimited, reason).
+		Updates(map[string]interface{}{"disabled_reason": reason})
+	if res.Error != nil {
+		log.Printf("[selector] persistKeyReason DB error for key %d: %v", keyID, res.Error)
+		return
+	}
+	if res.RowsAffected == 0 {
+		return // reason unchanged, or not a rate_limited key — nothing to show
+	}
+	e.updateKeyDisabledReason(keyID, reason)
+	e.notifyStatusChanged(keyID, model.KeyStatusRateLimited)
+}
+
+// notifyStatusChanged publishes the SSE event without a status write (the
+// reason-only path of persistKeyReason).
+func (e *Engine) notifyStatusChanged(keyID int64, status string) {
+	e.mu.Lock()
+	cb := e.onStatusChanged
+	e.mu.Unlock()
+	if cb != nil {
+		cb(keyID, status)
+	}
+}
+
+// ResetOutcome clears a key's recorded streak state. Called on admin
+// edits / resets / key re-creation so the new state does not inherit a
+// half-built failure or success streak (e.g. one prior auth failure must
+// not pre-dispose an edited key).
+func (e *Engine) ResetOutcome(keyID int64) {
+	e.outcomeMu.Lock()
+	delete(e.outcomes, keyID)
+	e.outcomeMu.Unlock()
 }
 
 // updateKeyStatus updates the in-memory key status.

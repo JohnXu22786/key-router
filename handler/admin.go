@@ -309,9 +309,11 @@ func (h *AdminHandler) DeleteProvider(c *gin.Context) {
 		return
 	}
 
-	// Drop window state for the deleted keys so memory/windows.json don't grow
+	// Drop window state and state-machine streaks for the deleted keys so
+	// memory/windows.json and the outcome tracker don't grow
 	for _, kid := range keyIDs {
 		h.Engine.WindowManager.Remove(kid)
+		h.Engine.ResetOutcome(kid)
 	}
 	h.Engine.Refresh()
 	c.JSON(http.StatusNoContent, nil)
@@ -451,9 +453,11 @@ func (h *AdminHandler) CreateKey(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	// A fresh key must not inherit a backoff latch or rate-limit window
-	// state from a deleted key whose SQLite rowid was reused
+	// A fresh key must not inherit a backoff latch, a half-built failure/
+	// success streak, or rate-limit window state from a deleted key whose
+	// SQLite rowid was reused
 	h.HealthChecker.ResetFailCount(k.ID)
+	h.Engine.ResetOutcome(k.ID)
 	h.Engine.WindowManager.Remove(k.ID)
 	h.Engine.Refresh()
 	c.JSON(http.StatusCreated, k)
@@ -560,9 +564,12 @@ func (h *AdminHandler) UpdateKey(c *gin.Context) {
 	}
 
 	// A deliberate admin disable (explicit "status":"disabled" in the payload)
-	// must clear a stale auto-recovery reason: the health checker only
-	// auto-recovers keys whose disabled_reason is "auth_failed". This applies
-	// even when the key is already disabled (re-affirming the disable).
+	// must clear a stale auto-recovery reason: the engine's state machine
+	// only auto-recovers disabled keys whose disabled_reason is non-empty
+	// (system-set: auth_failed / insufficient_quota), so an empty reason
+	// keeps the key out of rotation until an admin re-enables it. This
+	// applies even when the key is already disabled (re-affirming the
+	// disable).
 	if statusInPayload && k.Status == model.KeyStatusDisabled {
 		k.DisabledReason = ""
 	}
@@ -572,8 +579,11 @@ func (h *AdminHandler) UpdateKey(c *gin.Context) {
 		return
 	}
 	// A key edit (e.g. fixing the key_value of an auth_failed key) must
-	// resume health-check probing Ã¢â‚¬â€ clear the consecutive-failure latch.
+	// resume health-check probing (clear the consecutive-failure latch) and
+	// drop any half-built state-machine streak — a pre-edit failure must
+	// not pre-dispose the edited key.
 	h.HealthChecker.ResetFailCount(id)
+	h.Engine.ResetOutcome(id)
 	h.Engine.Refresh()
 	c.JSON(http.StatusOK, k)
 }
@@ -588,8 +598,10 @@ func (h *AdminHandler) DeleteKey(c *gin.Context) {
 	}
 	// Drop the key's window state so it can't grow memory/windows.json forever
 	h.Engine.WindowManager.Remove(id)
-	// Clear any health-checker backoff latch for the deleted id (rowid reuse)
+	// Clear any health-checker backoff latch and state-machine streak for
+	// the deleted id (rowid reuse)
 	h.HealthChecker.ResetFailCount(id)
+	h.Engine.ResetOutcome(id)
 	h.Engine.Refresh()
 	c.JSON(http.StatusNoContent, nil)
 }
@@ -1239,7 +1251,8 @@ func (h *AdminHandler) ResetKeySpend(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "key not found"})
 		return
 	}
-	h.Engine.Refresh() // reload in-memory status
+	h.Engine.ResetOutcome(id) // fresh budget = fresh streaks
+	h.Engine.Refresh()        // reload in-memory status
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 func (h *AdminHandler) GetKeyStatuses(c *gin.Context) {
