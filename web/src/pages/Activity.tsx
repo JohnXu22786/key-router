@@ -50,12 +50,20 @@ const EntityIcon: React.FC<{ name: string }> = ({ name }) => {
   );
 };
 
+// The last-used date range and entity filter survive visits to other pages:
+// the SPA never reloads, so these module-level values outlive the
+// component's unmount/remount across route switches (same pattern as Help's
+// scroll memory). A full page reload still starts from the defaults.
+let lastRangeKey = '1d';
+let lastCustom: { since: dayjs.Dayjs; until: dayjs.Dayjs } | null = null;
+let lastFilter: ActivityFilter | null = null;
+
 const Activity: React.FC = () => {
   const { token } = theme.useToken();
   const [tab, setTab] = useState<TabKey>('overview');
   // Default: Past 24 Hours — the window most users care about first.
-  const [rangeKey, setRangeKey] = useState('1d');
-  const [custom, setCustom] = useState<{ since: dayjs.Dayjs; until: dayjs.Dayjs } | null>(null);
+  const [rangeKey, setRangeKey] = useState(lastRangeKey);
+  const [custom, setCustom] = useState<{ since: dayjs.Dayjs; until: dayjs.Dayjs } | null>(lastCustom);
   const [loading, setLoading] = useState(false);
   // Trends "Explore" links hand the metric/grouping to the Explore tab.
   const [exploreInit, setExploreInit] = useState<ExploreOpts>({});
@@ -68,7 +76,7 @@ const Activity: React.FC = () => {
 
   // Global entity filter (Model / API Key / App), applied to every tab via
   // filter_type/filter_value on the activity + consumptions requests.
-  const [filter, setFilter] = useState<ActivityFilter | null>(null);
+  const [filter, setFilter] = useState<ActivityFilter | null>(lastFilter);
   const [filterOpen, setFilterOpen] = useState(false);
   const [filterMode, setFilterMode] = useState<ActivityFilterType>('model');
   // Option lists: models/apps seen in the current window, plus all keys.
@@ -97,6 +105,14 @@ const Activity: React.FC = () => {
     return () => clearInterval(t);
   }, []);
   useEffect(() => { setNow(dayjs()); }, [tab]);
+
+  // Save the current selections so the next mount (returning from another
+  // page) restores them instead of resetting to the defaults.
+  useEffect(() => {
+    lastRangeKey = rangeKey;
+    lastCustom = custom;
+    lastFilter = filter;
+  }, [rangeKey, custom, filter]);
 
   const onTabChange = (k: string) => {
     // A direct Explore-tab click (not a Trends "Explore" link) should start
