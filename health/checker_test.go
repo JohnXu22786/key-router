@@ -835,4 +835,3 @@ func loadTestKey(t *testing.T, id int64) model.Key {
 // recordFailure semantics (mark once + failover, never disable on one
 // failure); mixed-streak and streak-breaking rules are engine-level and
 // pinned in selector/outcome_test.go (RecordResult).
-

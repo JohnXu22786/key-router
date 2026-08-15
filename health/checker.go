@@ -29,13 +29,13 @@ type OnKeyResult func(keyID int64, ok bool, reason string)
 // is still detected and auto-disabled instead of sitting in rotation
 // forever.
 type Checker struct {
-	mu          sync.Mutex
-	interval    time.Duration
-	stopChan    chan struct{}
-	done        chan struct{} // closed when the loop goroutine exits
-	running     bool
-	disabled    bool // set by Disable(): the checker must never restart
-	onResult    OnKeyResult
+	mu       sync.Mutex
+	interval time.Duration
+	stopChan chan struct{}
+	done     chan struct{} // closed when the loop goroutine exits
+	running  bool
+	disabled bool // set by Disable(): the checker must never restart
+	onResult OnKeyResult
 	// failCount tracks consecutive probe failures per key so a persistently
 	// failing key (e.g. a billable Anthropic inference probe) is not probed
 	// every interval forever.
