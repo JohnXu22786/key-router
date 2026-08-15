@@ -13,7 +13,7 @@ import {
 import { getActivity, ActivityResponse, ActivityGroupSummary } from '../api/client';
 import {
   DateRange, ActivityFilter, filterKey, fmtUSDInt, fmtTokens, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS,
-  fmtPercent, fmt3sig, fmtTick, fmtBucket, modelFavicon, Granularity,
+  fmtPercent, fmt3sig, fmtTick, fmtBucket, modelFavicon, Granularity, exclusiveUntil,
 } from './activityShared';
 import './explore.css';
 
@@ -140,6 +140,17 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
       setError(false);
       const t0 = performance.now();
       try {
+        // The current window ends at the last complete bucket (the range's
+        // until is floored). Pass one second before it so the server
+        // excludes the live bucket from the response — except for sub-hour
+        // ranges, whose rows live in the current hour and are the data
+        // source for the client's fine axis. rollup=week/total fall back to
+        // the day floor: the week bucket is anchored to Monday and the
+        // total bucket aggregates everything, so excluding via the day
+        // boundary is the closest safe cut.
+        const subHourRange = range.granularity === 'minute' || range.granularity === 'min15';
+        const rollupGran: Granularity = rollup === 'hour' ? 'hour' : rollup === 'month' ? 'month' : 'day';
+        const curUntil = subHourRange ? range.until : exclusiveUntil(range.until, rollupGran);
         const res = await getActivity({
           metric,
           group_by: groupBy,
@@ -148,7 +159,7 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
           rank_by: rankBy,
           top: topN,
           since: range.since.toISOString(),
-          until: range.until.toISOString(),
+          until: curUntil.toISOString(),
           filter_type: filter?.type,
           filter_value: filter?.value,
         });

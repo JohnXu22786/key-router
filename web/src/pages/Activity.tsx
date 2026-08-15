@@ -10,7 +10,7 @@ import ActivityExplore from './ActivityExplore';
 // cycle (Activity -> child -> Activity) can hand the children undefined
 // constants and crash the page.
 import {
-  makeRanges, customRange, CUSTOM_KEY, CUSTOM_LABEL, ExploreOpts,
+  makeRanges, customRange, CUSTOM_KEY, CUSTOM_LABEL, floorWindowUntil, ExploreOpts,
   ActivityFilter, ActivityFilterType, FILTER_TYPES, modelFavicon, maskKey,
 } from './activityShared';
 import type { DateRange } from './activityShared';
@@ -88,7 +88,18 @@ const Activity: React.FC = () => {
 
   const range = useMemo<DateRange>(() => {
     if (rangeKey === CUSTOM_KEY && custom) return customRange(custom.since, custom.until);
-    return ranges.find(r => r.key === rangeKey) ?? ranges.find(r => r.key === '1d') ?? ranges[0];
+    const r = ranges.find(r => r.key === rangeKey) ?? ranges.find(r => r.key === '1d') ?? ranges[0];
+    // Preset windows snap BOTH bounds to the bucket grid: the live partial
+    // bucket keeps accumulating usage, so showing it makes every 30s
+    // auto-refresh read as "accumulating" instead of rolling. Snapped, the
+    // window is exactly the preset length, perfectly stable between
+    // refreshes, and slides by one bucket when the grid rolls over.
+    // Custom ranges keep their exact picked bounds.
+    return {
+      ...r,
+      since: floorWindowUntil(r.since, r.granularity),
+      until: floorWindowUntil(r.until, r.granularity),
+    };
   }, [rangeKey, custom, ranges]);
 
   const handleRefresh = useCallback(async () => {
@@ -260,12 +271,19 @@ const Activity: React.FC = () => {
 
   // --- Date range panel ----------------------------------------------------
 
+  // Collapsed to ONLY the custom entry while a custom range is active: the
+  // trigger already names the selection, so showing the preset lists again
+  // duplicates "Custom range" top (trigger) and bottom (panel button). The
+  // "Show all ranges" link restores the preset lists.
+  const [showAllRanges, setShowAllRanges] = useState(false);
+
   const onPresetClick = (key: string) => {
     if (key === CUSTOM_KEY) {
       // Entering custom mode immediately applies a default window
       // (last month) so the charts and the trigger stay consistent
       // until the user picks their own dates.
       setCustom(custom ?? { since: now.subtract(1, 'month'), until: now });
+      setShowAllRanges(false);
     }
     setRangeKey(key);
     setRangeOpen(false);
@@ -288,7 +306,40 @@ const Activity: React.FC = () => {
     </button>
   );
 
-  const rangePanel = (
+  const customButton = (active: boolean, onClick?: () => void) => (
+    <button
+      type="button"
+      onClick={onClick ?? (() => onPresetClick(CUSTOM_KEY))}
+      style={{
+        width: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '7px 8px', marginTop: 10,
+        borderRadius: 8, cursor: 'pointer', fontFamily: 'inherit', fontSize: 12, textAlign: 'left', color: 'inherit',
+        border: active ? `1px solid ${token.colorPrimary}` : '1px solid transparent',
+        background: active ? token.colorPrimaryBg : token.colorFillTertiary,
+      }}
+    >
+      <CalendarOutlined style={{ fontSize: 13, opacity: 0.7 }} />
+      {CUSTOM_LABEL}…
+    </button>
+  );
+
+  const rangePanel = rangeKey === CUSTOM_KEY && !showAllRanges ? (
+    <div style={{ width: 344 }}>
+      {/* Clicking the already-active custom entry (or the link) restores the
+          preset lists instead of dismissing the panel — a dead close would
+          strand the user with no way back to the presets. */}
+      {customButton(true, () => setShowAllRanges(true))}
+      <button
+        type="button"
+        onClick={() => setShowAllRanges(true)}
+        style={{
+          width: '100%', marginTop: 2, padding: '4px 8px', border: 'none', background: 'none', cursor: 'pointer',
+          fontFamily: 'inherit', fontSize: 12, textAlign: 'left', color: token.colorPrimary,
+        }}
+      >
+        Show all ranges
+      </button>
+    </div>
+  ) : (
     <div style={{ width: 344 }}>
       <div style={{ fontSize: 11, color: 'rgba(120,120,140,0.75)', textTransform: 'uppercase', letterSpacing: '0.04em', padding: '2px 2px 6px' }}>
         Rolling
@@ -302,19 +353,7 @@ const Activity: React.FC = () => {
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 4 }}>
         {ranges.slice(9).map(r => rangeCell(r, rangeKey === r.key))}
       </div>
-      <button
-        type="button"
-        onClick={() => onPresetClick(CUSTOM_KEY)}
-        style={{
-          width: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '7px 8px', marginTop: 10,
-          borderRadius: 8, cursor: 'pointer', fontFamily: 'inherit', fontSize: 12, textAlign: 'left', color: 'inherit',
-          border: rangeKey === CUSTOM_KEY ? `1px solid ${token.colorPrimary}` : '1px solid transparent',
-          background: rangeKey === CUSTOM_KEY ? token.colorPrimaryBg : token.colorFillTertiary,
-        }}
-      >
-        <CalendarOutlined style={{ fontSize: 13, opacity: 0.7 }} />
-        {CUSTOM_LABEL}…
-      </button>
+      {customButton(rangeKey === CUSTOM_KEY)}
     </div>
   );
 
@@ -339,27 +378,56 @@ const Activity: React.FC = () => {
               ) : 'Filter'}
             </Button>
           </Popover>
-          {/* Date range: a panel with the Rolling / Calendar presets. */}
+          {/* Date range: a panel with the Rolling / Calendar presets. While a
+              custom range is active the trigger shows just the label — the
+              start/end pickers next to it display the actual dates, so the
+              same range never renders twice. */}
           <Popover trigger="click" open={rangeOpen} onOpenChange={setRangeOpen} placement="bottomLeft" content={rangePanel}>
             <Button style={{ minWidth: 320, display: 'inline-flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, overflow: 'hidden', minWidth: 0 }}>
                 {rangeKey === CUSTOM_KEY
                   ? <Chip><CalendarOutlined style={{ fontSize: 11 }} /></Chip>
                   : <Chip>{range.badge}</Chip>}
-                <span className="tabular-nums" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{rangeText(range)}</span>
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {rangeKey === CUSTOM_KEY ? CUSTOM_LABEL : <span className="tabular-nums">{rangeText(range)}</span>}
+                </span>
               </span>
               <DownOutlined style={{ fontSize: 10, opacity: 0.6, flexShrink: 0 }} />
             </Button>
           </Popover>
-          {rangeKey === CUSTOM_KEY && (
-            <DatePicker.RangePicker
-              showTime
-              value={custom ? [custom.since, custom.until] : [now.subtract(1, 'month'), now]}
-              onChange={(v) => {
-                if (v && v[0] && v[1]) setCustom({ since: v[0], until: v[1] });
-              }}
-              style={{ maxWidth: 400 }}
-            />
+          {rangeKey === CUSTOM_KEY && custom && (
+            // Two independent pickers (not a RangePicker): clicking the end
+            // picker edits ONLY the end date — the RangePicker forced a
+            // start-then-end order and ignored direct end-date edits. A pick
+            // that would invert the range swaps the bounds (like the
+            // RangePicker's order behavior) so the window never inverts.
+            <Space size={4}>
+              <DatePicker
+                showTime
+                format="MMM D, h:mm a"
+                placeholder="Start"
+                value={custom.since}
+                onChange={(d) => {
+                  if (!d || !custom) return;
+                  setCustom(d.isAfter(custom.until)
+                    ? { since: custom.until, until: d }
+                    : { ...custom, since: d });
+                }}
+              />
+              <Text type="secondary" style={{ fontSize: 12 }}>–</Text>
+              <DatePicker
+                showTime
+                format="MMM D, h:mm a"
+                placeholder="End"
+                value={custom.until}
+                onChange={(d) => {
+                  if (!d || !custom) return;
+                  setCustom(d.isBefore(custom.since)
+                    ? { since: d, until: custom.since }
+                    : { ...custom, until: d });
+                }}
+              />
+            </Space>
           )}
           <Button type="text" icon={<ReloadOutlined />} loading={loading} onClick={handleRefresh} aria-label="Refresh" />
         </Space>

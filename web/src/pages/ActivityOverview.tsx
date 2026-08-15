@@ -6,7 +6,7 @@ import {
   BarChart, Bar, LineChart, Line,
 } from 'recharts';
 import { getConsumptions, getKeys, Consumption, Key } from '../api/client';
-import { DateRange, ActivityFilter, filterKey, ExploreOpts, fmtUSD, fmtTokens, fmtCompact, fmtTokensBare, fmtUSDInt, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtPercent, fmtTick, fmtBucket, series, stackedData, groupTotals, Granularity, maskKey, cacheHitRate, rowWindowShare } from './activityShared';
+import { DateRange, ActivityFilter, filterKey, ExploreOpts, fmtUSD, fmtTokens, fmtCompact, fmtTokensBare, fmtUSDInt, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtPercent, fmtTick, fmtBucket, series, stackedData, groupTotals, bucketWindowShare, Granularity, maskKey, cacheHitRate } from './activityShared';
 import dayjs from 'dayjs';
 
 const { Text } = Typography;
@@ -145,7 +145,8 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
   // 30s slide keeps sliding "now"), the stale data stays rendered against
   // the window AND the fetch time it actually covers instead of being
   // re-bucketed/prorated onto a slid window. cutoff is when the rows'
-  // values were recorded (hourly rows accumulate live usage).
+  // values were recorded (hourly rows accumulate live usage), so boundary
+  // buckets prorate by their REAL coverage, never by a window edge.
   const [win, setWin] = useState<{
     since: dayjs.Dayjs;
     until: dayjs.Dayjs;
@@ -176,6 +177,9 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
       setLoading(true);
       setError(false);
       try {
+        // When the rows' values were recorded: the current partial bucket
+        // accumulates live usage, so boundary proration divides by the real
+        // coverage up to this instant.
         const cutoff = dayjs();
         const [curRes, prevRes, keyRes] = await Promise.all([
           getConsumptions({ since: range.since.toISOString(), until: range.until.toISOString(), filter_type: filter?.type, filter_value: filter?.value }),
@@ -211,21 +215,17 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
   const axSince = win?.since ?? range.since;
   const axUntil = win?.until ?? range.until;
   const gran = win?.granularity ?? range.granularity;
-  // cutNow is when the rows' values were recorded: hourly rows accumulate
-  // live usage, so a PAST window shares its boundary hour with the live one
-  // and proration must divide by the real coverage, not by the window's
-  // own until.
+  // cutNow is when the rows' values were recorded (hourly rows accumulate
+  // live usage): boundary proration divides by the real coverage up to the
+  // fetch time, never by a window edge.
   const cutNow = win?.cutoff ?? dayjs();
-  // Sub-hour windows prorate every number (KPI sums, ranked tables) with
-  // the same window math the minute charts use, so the cards always add up
-  // to the chart; coarser granularities keep the raw boundary-hour sums.
-  const subHour = gran === 'minute' || gran === 'min15';
-  const curWin = subHour ? { since: axSince, until: axUntil, cutoff: cutNow } : null;
-  const prevWin = subHour ? { since: win?.prevSince ?? prevSince, until: axSince, cutoff: cutNow } : null;
-  const share = (c: Consumption): number => rowWindowShare(c.hour_bucket, axSince, axUntil, cutNow);
+  const prevWinSince = win?.prevSince ?? prevSince;
 
-  const sum = (l: Consumption[], win: { since: dayjs.Dayjs; until: dayjs.Dayjs; cutoff: dayjs.Dayjs } | null) => l.reduce((a, c) => {
-    const f = win ? rowWindowShare(c.hour_bucket, win.since, win.until, win.cutoff) : 1;
+  const sum = (l: Consumption[], since: dayjs.Dayjs, until: dayjs.Dayjs, cutoff: dayjs.Dayjs) => l.reduce((a, c) => {
+    // Boundary buckets prorate to the window overlap (the same math the
+    // charts use), so the KPI cards always add up to the chart and a
+    // rolling window never counts usage outside its span.
+    const f = bucketWindowShare(c.hour_bucket, since, until, cutoff, gran);
     return {
       spend: a.spend + c.cost_usd * f,
       requests: a.requests + c.request_count * f,
@@ -235,19 +235,22 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
     };
   }, { spend: 0, requests: 0, tokens: 0, cache: 0, input: 0 });
 
-  const cur = sum(curList, curWin);
-  const prev = sum(prevList, prevWin);
+  const cur = sum(curList, axSince, axUntil, cutNow);
+  const prev = sum(prevList, prevWinSince, axSince, cutNow);
   // Cache hit rate = cached / total input tokens (incl. cached) — one
   // consistent formula for both the KPI value and the sparkline.
-  const rateFor = (l: Consumption[], win: { since: dayjs.Dayjs; until: dayjs.Dayjs; cutoff: dayjs.Dayjs } | null) => {
-    const s = sum(l, win);
+  const rateFor = (l: Consumption[], since: dayjs.Dayjs, until: dayjs.Dayjs, cutoff: dayjs.Dayjs) => {
+    const s = sum(l, since, until, cutoff);
     return cacheHitRate(s.input, s.cache);
   };
-  const curRate = rateFor(curList, curWin);
-  const prevRate = rateFor(prevList, prevWin);
+  const curRate = rateFor(curList, axSince, axUntil, cutNow);
+  const prevRate = rateFor(prevList, prevWinSince, axSince, cutNow);
   const blended = cur.tokens > 0 ? (cur.spend / cur.tokens) * 1e6 : 0;
   const blendedPrev = prev.tokens > 0 ? (prev.spend / prev.tokens) * 1e6 : 0;
 
+  // share prorates one row to the CURRENT window — used by the ranked
+  // tables so they agree with the prorated charts and KPI cards.
+  const share = (c: Consumption) => bucketWindowShare(c.hour_bucket, axSince, axUntil, cutNow, gran);
   const costSeries = series(curList, c => c.cost_usd, axSince, axUntil, cutNow, gran);
   const tokenSeries = series(curList, c => c.input_tokens + c.output_tokens, axSince, axUntil, cutNow, gran);
   const reqSeries = series(curList, c => c.request_count, axSince, axUntil, cutNow, gran);
@@ -288,7 +291,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
 
   // --- Charts ---
   // Usage by model (spend, stacked bars, top-5 + Other like OR)
-  const modelSpend = groupTotals(curList, c => c.model_name || 'Unknown', c => c.cost_usd, subHour ? share : undefined);
+  const modelSpend = groupTotals(curList, c => c.model_name || 'Unknown', c => c.cost_usd, share);
   const topModels = modelSpend.slice(0, 5).map(([m]) => m);
   const usageByModel = stackedData(curList, [...topModels, 'Other'], c => c.model_name || 'Unknown', c => c.cost_usd, axSince, axUntil, cutNow, gran);
   // Fold everything below top-5 into "Other" per bucket.
@@ -308,7 +311,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
   const modelColor = new Map(modelGroups.map(g => [g.name, g.color]));
 
   // Request volume by model (stacked bars, top-5 + Other)
-  const modelReqs = groupTotals(curList, c => c.model_name || 'Unknown', c => c.request_count, subHour ? share : undefined);
+  const modelReqs = groupTotals(curList, c => c.model_name || 'Unknown', c => c.request_count, share);
   const topReqModels = modelReqs.slice(0, 5).map(([m]) => m);
   const reqByModel = stackedData(curList, [...topReqModels, 'Other'], c => c.model_name || 'Unknown', c => c.request_count, axSince, axUntil, cutNow, gran);
   const otherReqSet = new Set(modelReqs.slice(5).map(([m]) => m));
@@ -346,10 +349,10 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
   const keyTokens = groupTotals(curList, c => {
     const k = keys.find(x => x.id === c.key_id);
     return k?.name || `Key #${c.key_id}`;
-  }, c => c.input_tokens + c.output_tokens, subHour ? share : undefined);
+  }, c => c.input_tokens + c.output_tokens, share);
   const topKeys = keyTokens.slice(0, 5);
 
-  const appTokens = groupTotals(curList, c => c.app_name || 'Unknown', c => c.input_tokens + c.output_tokens, subHour ? share : undefined);
+  const appTokens = groupTotals(curList, c => c.app_name || 'Unknown', c => c.input_tokens + c.output_tokens, share);
   const topApps = appTokens.slice(0, 5);
 
   const kpiColors = ['#FF2D55', '#FF2D55', '#FF2D55', '#FF2D55', '#FF2D55'];

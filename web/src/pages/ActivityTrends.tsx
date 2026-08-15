@@ -6,7 +6,7 @@ import {
   Tooltip as RTooltip, ResponsiveContainer,
 } from 'recharts';
 import { getActivity, getKeys, ActivityResponse } from '../api/client';
-import { DateRange, ActivityFilter, filterKey, fmtUSD, fmtUSDInt, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtTick, fmtBucket, ExploreOpts, maskKey, toChartData, computeTrending, modelFavicon, resampleResponse } from './activityShared';
+import { DateRange, ActivityFilter, filterKey, fmtUSD, fmtUSDInt, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtTick, fmtBucket, ExploreOpts, maskKey, toChartData, computeTrending, modelFavicon, resampleResponse, exclusiveUntil } from './activityShared';
 import dayjs from 'dayjs';
 const { Text } = Typography;
 
@@ -111,10 +111,17 @@ const TrendSection: React.FC<SectionProps> = ({ title, groupBy, range, filter, o
         const rollup = subGran ? 'hour' : range.granularity;
         // Current chart folds beyond top-5 into "Other" like the reference;
         // the previous period carries the same entity filter so sparklines
-        // and deltas stay consistent with the filtered rows.
+        // and deltas stay consistent with the filtered rows. Both windows
+        // are snapped to the bucket grid, so the queries pass one second
+        // before each snapped bound and the server excludes the boundary
+        // bucket itself (sub-hour ranges keep the live hour — its rows are
+        // the re-sampling source — and the client minute axis drops the
+        // live bucket itself).
+        const curUntil = subGran ? range.until : exclusiveUntil(range.until, range.granularity);
+        const prevUntil = subGran ? range.since : exclusiveUntil(range.since, range.granularity);
         const [curRes, prevRes] = await Promise.all([
-          getActivity({ metric, group_by: groupBy, rollup, top: 5, since: range.since.toISOString(), until: range.until.toISOString(), filter_type: filter?.type, filter_value: filter?.value }),
-          getActivity({ metric, group_by: groupBy, rollup, top: 0, since: prevSince.toISOString(), until: range.since.toISOString(), filter_type: filter?.type, filter_value: filter?.value }),
+          getActivity({ metric, group_by: groupBy, rollup, top: 5, since: range.since.toISOString(), until: curUntil.toISOString(), filter_type: filter?.type, filter_value: filter?.value }),
+          getActivity({ metric, group_by: groupBy, rollup, top: 0, since: prevSince.toISOString(), until: prevUntil.toISOString(), filter_type: filter?.type, filter_value: filter?.value }),
         ]);
         if (cancelled) return;
         // cutNow: the rows' values were recorded up to NOW — the previous
