@@ -4,6 +4,7 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
@@ -89,6 +90,11 @@ func TestActivityEdgeCases(t *testing.T) {
 		{"key hourly tokens top5", "metric=tokens&group_by=key&rollup=hour&top=5", 200},
 		{"app daily requests", "metric=requests&group_by=app&rollup=day", 200},
 		{"cache daily", "metric=cache&group_by=model&rollup=day", 200},
+		{"blended daily", "metric=blended&group_by=model&rollup=day", 200},
+		{"blended hourly top5", "metric=blended&group_by=model&rollup=hour&top=5", 200},
+		{"blended ranked by blended", "metric=blended&group_by=model&rollup=day&rank_by=blended", 200},
+		{"blended ranked by spend", "metric=blended&group_by=model&rollup=day&rank_by=spend", 200},
+		{"spend ranked by blended", "metric=spend&group_by=model&rollup=day&rank_by=blended", 200},
 		{"model weekly spend", "metric=spend&group_by=model&rollup=week", 200},
 		{"model monthly spend", "metric=spend&group_by=model&rollup=month", 200},
 		{"model total spend", "metric=spend&group_by=model&rollup=total", 200},
@@ -444,6 +450,222 @@ type summaryRow struct {
 	Sum     float64 `json:"sum"`
 	Value   float64 `json:"value"`
 	Percent float64 `json:"percent"`
+}
+
+// TestActivityBlended pins the blended $/1M metric (the Overview "Blended
+// $/1M" KPI's Explore target): series values are per-bucket RATES
+// (spend/tokens*1e6 — never a sum of row rates), the summary Sum is the
+// group's overall rate over the whole range (which the fixture forces to
+// DIFFER from the sum of its per-bucket rates), Min/Max/Avg span the
+// per-bucket rates, Value is the last bucket's rate, Percent is the group's
+// share of total SPEND (rates don't add up to a total), and the "Other"
+// fold keeps a combined rate of the folded groups.
+//
+// Fixture on top of bootstrapActivity: g2 gains a pricier day2 row
+// ($0.006/60 tok, day1's g1 rows are $0.03/360 tok) and g1 gains a cheap
+// day2 row ($0.003/30 tok = rate 100) plus a pricey day1 row on k2
+// ($0.04/100 tok) so the per-bucket and per-subgroup rates diverge:
+//
+//	day1: g1 = 0.07/460 = 152.17, g2 = 0.012/60 = 200
+//	day2: g1 = 0.003/30 = 100,  g2 = 0.011/120 = 91.67
+//	g1 overall = 0.073/490 = 148.98 (sum of its bucket rates = 252.17)
+//	g2 overall = 0.023/180 = 127.78 (sum of its bucket rates = 291.67)
+//	k2 subgroup = 0.06/340 = 176.47 (sum of its row rates = 483.33)
+//
+// g2's tiny high-rate day1 row flips the ranking under a buggy
+// "sum of per-bucket rates" rank: that would order [g2 g1] (291.67 >
+// 252.17), while the correct overall-rate ranking is [g1 g2] (148.98 >
+// 127.78) — so the summary ORDER assertion pins the rank semantics too.
+func TestActivityBlended(t *testing.T) {
+	e := bootstrapActivity(t)
+	t.Cleanup(func() {
+		if sqlDB, err := db.GetDB().DB(); err == nil {
+			sqlDB.Close()
+		}
+	})
+
+	var k1, k2 model.Key
+	db.GetDB().Where("name = ?", "k1").First(&k1)
+	db.GetDB().Where("name = ?", "k2").First(&k2)
+	now := time.Now()
+	day1 := time.Date(now.Year(), now.Month(), now.Day()-1, 12, 0, 0, 0, now.Location())
+	day2 := time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, now.Location())
+	day1Label := day1.Format("2006-01-02")
+	day2Label := day2.Format("2006-01-02")
+	// Distinct hours satisfy the (key_id, hour_bucket) unique constraint.
+	db.GetDB().Create(&model.Consumption{KeyID: k1.ID, HourBucket: day2.Add(2 * time.Hour), ModelName: "g2", RequestCount: 1, InputTokens: 50, OutputTokens: 10, CacheHitTokens: 0, CostUSD: 0.006})
+	db.GetDB().Create(&model.Consumption{KeyID: k1.ID, HourBucket: day2.Add(3 * time.Hour), ModelName: "g1", RequestCount: 1, InputTokens: 25, OutputTokens: 5, CacheHitTokens: 0, CostUSD: 0.003})
+	db.GetDB().Create(&model.Consumption{KeyID: k2.ID, HourBucket: day1.Add(4 * time.Hour), ModelName: "g1", RequestCount: 2, InputTokens: 80, OutputTokens: 20, CacheHitTokens: 0, CostUSD: 0.04})
+	db.GetDB().Create(&model.Consumption{KeyID: k1.ID, HourBucket: day1.Add(2 * time.Hour), ModelName: "g2", RequestCount: 1, InputTokens: 50, OutputTokens: 10, CacheHitTokens: 0, CostUSD: 0.012})
+
+	req := httptest.NewRequest("GET", "/api/stats/activity?metric=blended&group_by=model&rollup=day&"+rangeQuery(t), nil)
+	req.Host = "localhost:9999"
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Series []struct {
+			Bucket string  `json:"bucket"`
+			Group  string  `json:"group"`
+			Value  float64 `json:"value"`
+		} `json:"series"`
+		Summary []struct {
+			Group   string  `json:"group"`
+			Min     float64 `json:"min"`
+			Max     float64 `json:"max"`
+			Avg     float64 `json:"avg"`
+			Sum     float64 `json:"sum"`
+			Value   float64 `json:"value"`
+			Percent float64 `json:"percent"`
+		} `json:"summary"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("bad json: %v\n%s", err, rec.Body.String())
+	}
+
+	eps := 0.01
+	seriesBy := map[string]map[string]float64{} // group -> bucket -> value
+	for _, s := range out.Series {
+		if seriesBy[s.Group] == nil {
+			seriesBy[s.Group] = map[string]float64{}
+		}
+		seriesBy[s.Group][s.Bucket] = s.Value
+	}
+	if v := seriesBy["g1"][day1Label]; math.Abs(v-152.173913) > eps {
+		t.Fatalf("g1 %s blended = %v, want 152.17 (0.07/460)", day1Label, v)
+	}
+	if v := seriesBy["g1"][day2Label]; math.Abs(v-100) > eps {
+		t.Fatalf("g1 %s blended = %v, want 100 (0.003/30)", day2Label, v)
+	}
+	if v := seriesBy["g2"][day1Label]; math.Abs(v-200) > eps {
+		t.Fatalf("g2 %s blended = %v, want 200 (0.012/60)", day1Label, v)
+	}
+	if v := seriesBy["g2"][day2Label]; math.Abs(v-91.666667) > eps {
+		t.Fatalf("g2 %s blended = %v, want 91.67 (0.011/120)", day2Label, v)
+	}
+	if v := seriesBy["Unknown"][day1Label]; v != 0 {
+		t.Fatalf("Unknown blended = %v, want 0 (zero spend)", v)
+	}
+
+	// Summary: ranked by OVERALL rate desc — g1 148.98 beats g2 127.78. A
+	// buggy sum-of-per-bucket-rates rank would order [g2 g1] (291.67 >
+	// 252.17), so this order assertion pins the rank semantics. Sum must be
+	// the overall rate, not 252.17/291.67.
+	got := map[string]struct{ min, max, avg, sum, value, pct float64 }{}
+	var order []string
+	for _, s := range out.Summary {
+		got[s.Group] = struct{ min, max, avg, sum, value, pct float64 }{s.Min, s.Max, s.Avg, s.Sum, s.Value, s.Percent}
+		order = append(order, s.Group)
+	}
+	if len(order) != 3 || order[0] != "g1" || order[1] != "g2" || order[2] != "Unknown" {
+		t.Fatalf("summary order = %v, want [g1 g2 Unknown] (overall-rate rank)", order)
+	}
+	g1 := got["g1"]
+	if math.Abs(g1.sum-148.979592) > eps {
+		t.Fatalf("g1 Sum = %v, want 148.98 (overall rate 0.073/490, NOT 252.17)", g1.sum)
+	}
+	if math.Abs(g1.avg-126.086957) > eps {
+		t.Fatalf("g1 Avg = %v, want 126.09 (mean of bucket rates)", g1.avg)
+	}
+	if math.Abs(g1.min-100) > eps || math.Abs(g1.max-152.173913) > eps {
+		t.Fatalf("g1 Min/Max = %v/%v, want 100/152.17 (per-bucket rates)", g1.min, g1.max)
+	}
+	if math.Abs(g1.value-100) > eps {
+		t.Fatalf("g1 Value = %v, want 100 (last bucket's rate)", g1.value)
+	}
+	if math.Abs(g1.pct-76.041667) > eps {
+		t.Fatalf("g1 Percent = %v, want 76.04 (share of total spend)", g1.pct)
+	}
+	g2 := got["g2"]
+	if math.Abs(g2.sum-127.777778) > eps {
+		t.Fatalf("g2 Sum = %v, want 127.78 (overall rate 0.023/180, NOT 291.67)", g2.sum)
+	}
+	if math.Abs(g2.avg-145.833333) > eps {
+		t.Fatalf("g2 Avg = %v, want 145.83 (mean of bucket rates)", g2.avg)
+	}
+	if math.Abs(g2.min-91.666667) > eps || math.Abs(g2.max-200) > eps {
+		t.Fatalf("g2 Min/Max = %v/%v, want 91.67/200 (per-bucket rates)", g2.min, g2.max)
+	}
+	if math.Abs(g2.value-91.666667) > eps {
+		t.Fatalf("g2 Value = %v, want 91.67 (last bucket's rate)", g2.value)
+	}
+	if math.Abs(g2.pct-23.958333) > eps {
+		t.Fatalf("g2 Percent = %v, want 23.96 (share of total spend)", g2.pct)
+	}
+	if got["Unknown"].sum != 0 || got["Unknown"].pct != 0 {
+		t.Fatalf("Unknown stats = %+v, want zeros", got["Unknown"])
+	}
+
+	// top=1: the folded Other series keeps a per-bucket COMBINED rate of the
+	// folded groups (spend and tokens summed first, rate derived last) —
+	// never a sum of row rates. day1 folds g2 + Unknown: (0.012+0)/(60+10)
+	// = 171.43 (a naive sum of g2's row rates would read 200); day2 folds g2
+	// alone: 0.011/120 = 91.67 (naive: 83.33 + 100 = 183.33).
+	req2 := httptest.NewRequest("GET", "/api/stats/activity?metric=blended&group_by=model&rollup=day&top=1&"+rangeQuery(t), nil)
+	req2.Host = "localhost:9999"
+	rec2 := httptest.NewRecorder()
+	e.ServeHTTP(rec2, req2)
+	if rec2.Code != 200 {
+		t.Fatalf("top=1 status = %d: %s", rec2.Code, rec2.Body.String())
+	}
+	var out2 struct {
+		Series []struct {
+			Group  string  `json:"group"`
+			Bucket string  `json:"bucket"`
+			Value  float64 `json:"value"`
+		} `json:"series"`
+	}
+	if err := json.Unmarshal(rec2.Body.Bytes(), &out2); err != nil {
+		t.Fatalf("bad json: %v\n%s", err, rec2.Body.String())
+	}
+	other := map[string]float64{}
+	for _, s := range out2.Series {
+		if s.Group == "Other" {
+			other[s.Bucket] = s.Value
+		}
+	}
+	if len(other) == 0 {
+		t.Fatalf("no Other series with top=1")
+	}
+	if v := other[day2Label]; math.Abs(v-91.666667) > eps {
+		t.Fatalf("Other %s blended = %v, want 91.67 (0.011/120 combined)", day2Label, v)
+	}
+	if v := other[day1Label]; math.Abs(v-171.428571) > eps {
+		t.Fatalf("Other %s blended = %v, want 171.43 (0.012/70 combined)", day1Label, v)
+	}
+
+	// subgroup=key: each subgroup's rate from ITS spend/tokens only. k2's
+	// combined day1 rate (0.06/340 = 176.47) must not be the sum of its row
+	// rates (83.33 + 400 = 483.33).
+	req3 := httptest.NewRequest("GET", "/api/stats/activity?metric=blended&group_by=model&subgroup=key&rollup=day&"+rangeQuery(t), nil)
+	req3.Host = "localhost:9999"
+	rec3 := httptest.NewRecorder()
+	e.ServeHTTP(rec3, req3)
+	if rec3.Code != 200 {
+		t.Fatalf("subgroup status = %d: %s", rec3.Code, rec3.Body.String())
+	}
+	var out3 struct {
+		Series []struct {
+			Group    string  `json:"group"`
+			Subgroup string  `json:"subgroup"`
+			Bucket   string  `json:"bucket"`
+			Value    float64 `json:"value"`
+		} `json:"series"`
+	}
+	if err := json.Unmarshal(rec3.Body.Bytes(), &out3); err != nil {
+		t.Fatalf("bad json: %v\n%s", err, rec3.Body.String())
+	}
+	subBy := map[string]float64{}
+	for _, s := range out3.Series {
+		if s.Group == "g1" && s.Bucket == day1Label {
+			subBy[s.Subgroup] = s.Value
+		}
+	}
+	if math.Abs(subBy["k1"]-83.333333) > eps || math.Abs(subBy["k2"]-176.470588) > eps {
+		t.Fatalf("g1 day1 subgroup rates = %v, want k1=83.33 k2=176.47", subBy)
+	}
 }
 
 func summaryGroups(s []summaryRow) []string {

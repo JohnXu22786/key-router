@@ -3,7 +3,7 @@ import dayjs from 'dayjs';
 import {
   makeRanges, customRange, granularityFor, series, stackedData, bucketAxis,
   fmtTick, fmtBucket, fmtDayLabel, CUSTOM_KEY, computeTrending, toChartData,
-  cacheHitRate,
+  cacheHitRate, resampleResponse, rowWindowShare, groupTotals,
 } from './activityShared';
 import type { ActivityResponse } from '../api/client';
 
@@ -80,8 +80,14 @@ describe('makeRanges — calendar-anchored presets', () => {
     expect(byKey.get('prevyear')!.until.format('YYYY-MM-DD')).toBe('2026-01-01');
   });
 
-  it('assigns granularity by scale: sub-day/hourly, weeks/months daily, years monthly', () => {
+  it('assigns granularity by scale: sub-hour minutes, hours, days, months', () => {
     const byKey = new Map(makeRanges(NOW).map(r => [r.key, r]));
+    expect(byKey.get('15m')!.granularity).toBe('minute');
+    expect(byKey.get('30m')!.granularity).toBe('minute');
+    expect(byKey.get('1h')!.granularity).toBe('minute');
+    expect(byKey.get('3h')!.granularity).toBe('min15');
+    expect(byKey.get('1d')!.granularity).toBe('hour');
+    expect(byKey.get('2d')!.granularity).toBe('hour');
     expect(byKey.get('today')!.granularity).toBe('hour');
     expect(byKey.get('yesterday')!.granularity).toBe('hour');
     expect(byKey.get('1w')!.granularity).toBe('day');
@@ -95,7 +101,11 @@ describe('makeRanges — calendar-anchored presets', () => {
 describe('custom range', () => {
   it('derives granularity from the window length', () => {
     const since = dayjs('2026-08-13T00:00:00');
-    expect(customRange(since, since.add(1, 'hour')).granularity).toBe('hour');
+    expect(customRange(since, since.add(15, 'minute')).granularity).toBe('minute');
+    expect(customRange(since, since.add(1, 'hour')).granularity).toBe('minute');
+    expect(customRange(since, since.add(2, 'hour')).granularity).toBe('min15');
+    expect(customRange(since, since.add(3, 'hour')).granularity).toBe('min15');
+    expect(customRange(since, since.add(4, 'hour')).granularity).toBe('hour');
     expect(customRange(since, since.add(2, 'day')).granularity).toBe('hour');   // < 3d
     expect(customRange(since, since.add(3, 'day')).granularity).toBe('day');
     expect(customRange(since, since.add(30, 'day')).granularity).toBe('day');
@@ -119,7 +129,7 @@ describe('series — continuous axis bucketing', () => {
     const until = dayjs('2026-08-13T13:00:00');
     const out = series(
       [row('2026-08-13T10:00:00'), row('2026-08-13T10:30:00'), row('2026-08-13T12:00:00')],
-      () => 1, since, until, 'hour',
+      () => 1, since, until, until, 'hour',
     );
     expect(out.map(p => p.label)).toEqual(['08-13 09:00', '08-13 10:00', '08-13 11:00', '08-13 12:00', '08-13 13:00']);
     expect(out.map(p => p.value)).toEqual([0, 2, 0, 1, 0]);
@@ -127,19 +137,21 @@ describe('series — continuous axis bucketing', () => {
 
   it('buckets a week daily and a year monthly', () => {
     const since = dayjs('2026-08-10T00:00:00');
-    const out = series([row('2026-08-11T03:00:00'), row('2026-08-13T22:00:00')], () => 5, since, since.add(4, 'day'), 'day');
+    const out = series([row('2026-08-11T03:00:00'), row('2026-08-13T22:00:00')], () => 5, since, since.add(4, 'day'), since.add(4, 'day'), 'day');
     expect(out.map(p => p.label)).toEqual(['08-10', '08-11', '08-12', '08-13', '08-14']);
     expect(out.map(p => p.value)).toEqual([0, 5, 0, 5, 0]);
 
     const ySince = dayjs('2026-01-01T00:00:00');
-    const yOut = series([row('2026-01-15T00:00:00'), row('2026-03-02T00:00:00')], () => 7, ySince, dayjs('2026-03-01T23:59:59'), 'month');
+    const yUntil = dayjs('2026-03-01T23:59:59');
+    const yOut = series([row('2026-01-15T00:00:00'), row('2026-03-02T00:00:00')], () => 7, ySince, yUntil, yUntil, 'month');
     expect(yOut.map(p => p.label)).toEqual(['2026-01', '2026-02', '2026-03']);
     expect(yOut.map(p => p.value)).toEqual([7, 0, 7]);
   });
 
   it('starts the axis at the range start, not at the first data point', () => {
     const since = dayjs('2026-08-01T00:00:00');
-    const out = series([row('2026-08-05T00:00:00')], () => 1, since, since.add(6, 'day'), 'day');
+    const until = since.add(6, 'day');
+    const out = series([row('2026-08-05T00:00:00')], () => 1, since, until, until, 'day');
     expect(out.length).toBe(7);
     expect(out[0].label).toBe('08-01');
     expect(out[0].value).toBe(0);
@@ -155,7 +167,7 @@ describe('stackedData', () => {
       { hour_bucket: '2026-08-13T10:00:00', m: 'b', n: 3 },
       { hour_bucket: '2026-08-13T10:30:00', m: 'b', n: 1 },
     ];
-    const out = stackedData(rows, ['a', 'b'], r => r.m, r => r.n, since, until, 'hour');
+    const out = stackedData(rows, ['a', 'b'], r => r.m, r => r.n, since, until, until, 'hour');
     expect(out).toEqual([
       { label: '08-13 09:00', sort: '2026-08-13 09:00', a: 2, b: 0 },
       { label: '08-13 10:00', sort: '2026-08-13 10:00', a: 0, b: 4 },
@@ -171,7 +183,7 @@ describe('stackedData', () => {
       { hour_bucket: '2026-08-13T09:00:00', m: 'tail', n: 4 },   // beyond top-N
       { hour_bucket: '2026-08-13T09:30:00', m: 'tail', n: 1 },
     ];
-    const out = stackedData(rows, ['top1', 'Other'], r => r.m, r => r.n, since, until, 'hour');
+    const out = stackedData(rows, ['top1', 'Other'], r => r.m, r => r.n, since, until, until, 'hour');
     // The caller folds 'tail' into Other: total must stay 6, never NaN.
     let other = 0;
     for (const [g, v] of Object.entries(out[0])) {
@@ -191,6 +203,260 @@ describe('bucketAxis', () => {
     const month = bucketAxis(dayjs('2026-01-01'), dayjs('2026-03-31'), 'month');
     expect(month.map(p => p.label)).toEqual(['2026-01', '2026-02', '2026-03']);
   });
+
+  it('builds a 1-minute axis covering the window start to its containing minute', () => {
+    const out = bucketAxis(dayjs('2026-08-13T15:50:00'), dayjs('2026-08-13T16:05:00'), 'minute');
+    expect(out).toHaveLength(16);
+    expect(out[0]).toMatchObject({ label: '08-13 15:50', sort: '2026-08-13 15:50', value: 0 });
+    expect(out[15]).toMatchObject({ label: '08-13 16:05', sort: '2026-08-13 16:05', value: 0 });
+    expect(out.map(p => p.label)).toEqual([
+      '08-13 15:50', '08-13 15:51', '08-13 15:52', '08-13 15:53', '08-13 15:54',
+      '08-13 15:55', '08-13 15:56', '08-13 15:57', '08-13 15:58', '08-13 15:59',
+      '08-13 16:00', '08-13 16:01', '08-13 16:02', '08-13 16:03', '08-13 16:04',
+      '08-13 16:05',
+    ]);
+  });
+
+  it('builds a 15-minute axis for a 3-hour window', () => {
+    const out = bucketAxis(dayjs('2026-08-13T13:00:00'), dayjs('2026-08-13T15:59:59'), 'min15');
+    expect(out.map(p => p.label)).toEqual([
+      '08-13 13:00', '08-13 13:15', '08-13 13:30', '08-13 13:45',
+      '08-13 14:00', '08-13 14:15', '08-13 14:30', '08-13 14:45',
+      '08-13 15:00', '08-13 15:15', '08-13 15:30', '08-13 15:45',
+    ]);
+  });
+
+  it('floors the 15-minute axis to the clock cell (never 13:07, 13:22, ...)', () => {
+    const out = bucketAxis(dayjs('2026-08-13T13:07:00'), dayjs('2026-08-13T14:05:00'), 'min15');
+    expect(out.map(p => p.label)).toEqual([
+      '08-13 13:00', '08-13 13:15', '08-13 13:30', '08-13 13:45',
+      '08-13 14:00',
+    ]);
+  });
+});
+
+describe('series — sub-hour distribution of hourly rows', () => {
+  // Consumption rows are hourly (hour_bucket); a sub-hour axis distributes
+  // each row's value over the minute buckets overlapping its hour,
+  // proportionally to the overlap (uniform-within-hour assumption). The
+  // current hour's row only covers up to `until`, so its rate is higher.
+  const since = dayjs('2026-08-13T15:50:00');
+  const until = dayjs('2026-08-13T16:05:00');
+
+  it('splits hourly totals across overlapping minute buckets, preserving window totals', () => {
+    const out = series(
+      [
+        { hour_bucket: '2026-08-13T15:00:00', v: 120 },  // full hour 15:00-16:00
+        { hour_bucket: '2026-08-13T16:00:00', v: 10 },   // current hour, only 5 min so far
+      ],
+      (r) => r.v, since, until, until, 'minute',
+    );
+    // 15:50-15:59 get 120/60 = 2 each; 16:00-16:04 get 10/5 = 2 each; 16:05 (the
+    // bucket containing `until`, no row coverage) stays 0.
+    expect(out.map(p => p.value)).toEqual([
+      2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+      2, 2, 2, 2, 2,
+      0,
+    ]);
+    // Window total = the hour's share overlapping the window + the partial hour.
+    expect(out.reduce((a, p) => a + p.value, 0)).toBeCloseTo(120 * (10 / 60) + 10, 6);
+  });
+
+  it('drops rows whose hour has no overlap with the window', () => {
+    const out = series(
+      [
+        { hour_bucket: '2026-08-13T14:00:00', v: 500 }, // entirely before the window
+        { hour_bucket: '2026-08-13T15:00:00', v: 60 },
+      ],
+      (r) => r.v, since, until, until, 'minute',
+    );
+    expect(out.map(p => p.value)).toEqual([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0]);
+    expect(out.reduce((a, p) => a + p.value, 0)).toBeCloseTo(60 * (10 / 60), 6);
+  });
+
+  it('distributes onto 15-minute buckets for a 3-hour window', () => {
+    const until = dayjs('2026-08-13T15:59:59');
+    const out = series(
+      [
+        { hour_bucket: '2026-08-13T13:00:00', v: 180 },
+        { hour_bucket: '2026-08-13T14:00:00', v: 60 },
+      ],
+      (r) => r.v,
+      dayjs('2026-08-13T13:00:00'), until, until, 'min15',
+    );
+    // 13:00 hour -> 45 per 15-min bucket (x4), 14:00 hour -> 15 per bucket (x4).
+    expect(out.map(p => p.value)).toEqual([45, 45, 45, 45, 15, 15, 15, 15, 0, 0, 0, 0]);
+  });
+
+  it('divides a PAST window boundary hour by its real coverage (cutoff), not the window end', () => {
+    // The previous period ends at 10:10, but its 10:00 boundary bucket holds
+    // usage recorded up to 10:30 (cutoff = fetch time). Dividing by the
+    // window end would inflate 120 into every minute of 10:00-10:10; the
+    // real coverage is 30 minutes, so only 40 of the 120 belong to the window.
+    const since = dayjs('2026-08-13T10:00:00');
+    const until = dayjs('2026-08-13T10:10:00');
+    const cutoff = dayjs('2026-08-13T10:30:00');
+    const out = series([{ hour_bucket: '2026-08-13T10:00:00', v: 120 }], (r) => r.v, since, until, cutoff, 'minute');
+    expect(out.map(p => p.value)).toEqual([4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0]);
+    expect(out.reduce((a, p) => a + p.value, 0)).toBeCloseTo(120 * (10 / 30), 6);
+  });
+});
+
+describe('stackedData — sub-hour distribution per group', () => {
+  it('distributes each group over the minute buckets without dropping or NaN', () => {
+    const since = dayjs('2026-08-13T15:50:00');
+    const until = dayjs('2026-08-13T16:00:00');
+    const rows = [
+      { hour_bucket: '2026-08-13T15:00:00', m: 'a', n: 120 },
+      { hour_bucket: '2026-08-13T15:00:00', m: 'b', n: 60 },
+      { hour_bucket: '2026-08-13T16:00:00', m: 'a', n: 10 },
+    ];
+    const out = stackedData(rows, ['a', 'b'], r => r.m, r => r.n, since, until, until, 'minute');
+    // 15:50-15:59: a=2, b=1; 16:00 (containing `until`, no coverage): 0/0.
+    expect(out.map(r => ({ a: r.a, b: r.b }))).toEqual([
+      { a: 2, b: 1 }, { a: 2, b: 1 }, { a: 2, b: 1 }, { a: 2, b: 1 }, { a: 2, b: 1 },
+      { a: 2, b: 1 }, { a: 2, b: 1 }, { a: 2, b: 1 }, { a: 2, b: 1 }, { a: 2, b: 1 },
+      { a: 0, b: 0 },
+    ]);
+    expect(Number.isNaN(out[0].a)).toBe(false);
+  });
+});
+
+describe('resampleResponse — Trends hourly rollup onto a sub-hour axis', () => {
+  // The server rolls up at most hourly; Trends asks for rollup=hour and
+  // re-samples the response onto the client's minute axis.
+  const resp = {
+    metric: 'spend', group_by: 'model', rollup: 'hour',
+    series: [
+      { bucket: '2026-08-13 15:00', group: 'a', value: 120, is_zero: false },
+      { bucket: '2026-08-13 15:00', group: 'b', value: 0, is_zero: true },
+      { bucket: '2026-08-13 16:00', group: 'a', value: 10, is_zero: false },
+      { bucket: '2026-08-13 16:00', group: 'b', value: 5, is_zero: false },
+    ],
+    summary: [{ group: 'a', min: 1, max: 2, avg: 3, sum: 130, value: 10, percent: 0 }],
+    buckets: ['2026-08-13 15:00', '2026-08-13 16:00'],
+    totals: { spend: 135, tokens: 0, requests: 0, cache: 0 },
+  };
+
+  it('re-buckets every group onto the minute axis with is_zero flags', () => {
+    const out = resampleResponse(resp, dayjs('2026-08-13T15:50:00'), dayjs('2026-08-13T16:05:00'), dayjs('2026-08-13T16:05:00'), 'minute');
+    expect(out.buckets).toHaveLength(16);
+    expect(out.buckets[0]).toBe('08-13 15:50');
+    // 16 buckets x 2 groups, all zero-filled like the server does.
+    expect(out.series).toHaveLength(32);
+    const a = out.series.filter(p => p.group === 'a').map(p => p.value);
+    const b = out.series.filter(p => p.group === 'b').map(p => p.value);
+    expect(a).toEqual([2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 0]);  // 15:00 (120/60) + 16:00 (10/5)
+    expect(b).toEqual([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0]);
+    expect(out.series.every(p => p.is_zero === (p.value === 0))).toBe(true);
+    // Summary is recomputed from the re-bucketed series (server semantics:
+    // min/max/avg over non-empty buckets, value = last bucket, percent of total).
+    const sa = out.summary.find(s => s.group === 'a')!;
+    const sb = out.summary.find(s => s.group === 'b')!;
+    expect(sa.sum).toBeCloseTo(30, 6);
+    expect(sb.sum).toBeCloseTo(5, 6);
+    expect(sa.min).toBeCloseTo(2, 6);
+    expect(sa.max).toBeCloseTo(2, 6);
+    expect(sa.avg).toBeCloseTo(2, 6);
+    expect(sa.value).toBe(0);   // last bucket (16:05) is empty
+    expect(sb.value).toBe(0);
+    expect(sa.percent).toBeCloseTo(30 / 35 * 100, 6);
+    // The re-sampled metric's total matches the series; the others carry over.
+    expect(out.totals.spend).toBeCloseTo(35, 6);
+    expect(out.totals.tokens).toBe(0);
+    expect(out.totals.requests).toBe(0);
+    expect(out.totals.cache).toBe(0);
+  });
+
+  it('keeps rollup/resp shape fields for chart consumption', () => {
+    const out = resampleResponse(resp, dayjs('2026-08-13T15:50:00'), dayjs('2026-08-13T16:05:00'), dayjs('2026-08-13T16:05:00'), 'minute');
+    expect(out.metric).toBe('spend');
+    expect(out.group_by).toBe('model');
+  });
+
+  it('preserves summary rows for groups beyond the server top-N (not in the series grid)', () => {
+    // The current-period response only carries top-5 + Other series, but its
+    // summary lists every group; dropped groups must keep their original
+    // (raw) row so Trends deltas don't read them as zero and show -100%.
+    const withTail = {
+      ...resp,
+      summary: [
+        ...resp.summary,
+        { group: 'tail-model', min: 9, max: 9, avg: 9, sum: 9, value: 9, percent: 4 },
+      ],
+    };
+    const out = resampleResponse(withTail, dayjs('2026-08-13T15:50:00'), dayjs('2026-08-13T16:05:00'), dayjs('2026-08-13T16:05:00'), 'minute');
+    const tail = out.summary.find(s => s.group === 'tail-model')!;
+    expect(tail).toEqual({ group: 'tail-model', min: 9, max: 9, avg: 9, sum: 9, value: 9, percent: 4 });
+    // Every group appears exactly once: the 2 resampled grid groups plus the
+    // preserved tail row.
+    expect(out.summary).toHaveLength(3);
+    expect(new Set(out.summary.map(s => s.group)).size).toBe(3);
+    // The resampled groups still get recomputed rows.
+    expect(out.summary.find(s => s.group === 'a')!.sum).toBeCloseTo(30, 6);
+  });
+
+  it('re-buckets onto a clock-aligned 15-minute axis from a mid-cell window start', () => {
+    const hourResp = {
+      ...resp,
+      series: [
+        { bucket: '2026-08-13 13:00', group: 'a', value: 180, is_zero: false },
+        { bucket: '2026-08-13 14:00', group: 'a', value: 60, is_zero: false },
+        { bucket: '2026-08-13 15:00', group: 'a', value: 120, is_zero: false },
+      ],
+      buckets: ['2026-08-13 13:00', '2026-08-13 14:00', '2026-08-13 15:00'],
+    };
+    const since = dayjs('2026-08-13T13:07:00');
+    const until = dayjs('2026-08-13T16:00:00');
+    const out = resampleResponse(hourResp, since, until, until, 'min15');
+    expect(out.buckets).toEqual([
+      '08-13 13:00', '08-13 13:15', '08-13 13:30', '08-13 13:45',
+      '08-13 14:00', '08-13 14:15', '08-13 14:30', '08-13 14:45',
+      '08-13 15:00', '08-13 15:15', '08-13 15:30', '08-13 15:45',
+      '08-13 16:00',
+    ]);
+    // 13:00 hour: 53 of its 60 minutes fall in the window (13:07-14:00)
+    // -> 24 + 45x3; 14:00 hour: 15 x4; 15:00 hour: 30 x4; 16:00 bucket: 0.
+    expect(out.series.map(p => p.value)).toEqual([24, 45, 45, 45, 15, 15, 15, 15, 30, 30, 30, 30, 0]);
+    expect(out.series.reduce((a, p) => a + p.value, 0)).toBeCloseTo(180 * (53 / 60) + 60 + 120, 6);
+  });
+});
+
+describe('rowWindowShare — KPI proration on sub-hour windows', () => {
+  const since = dayjs('2026-08-13T15:50:00');
+  const until = dayjs('2026-08-13T16:05:00');
+  const cutoff = until;
+
+  it('scales boundary hours by their in-window overlap, full rows by 1, outside rows by 0', () => {
+    expect(rowWindowShare('2026-08-13T15:00:00', since, until, cutoff)).toBeCloseTo(10 / 60, 6);
+    expect(rowWindowShare('2026-08-13T14:00:00', since, until, cutoff)).toBe(0);
+    // The current hour's row covers [16:00, until) — its whole value is in-window.
+    expect(rowWindowShare('2026-08-13T16:00:00', since, until, cutoff)).toBe(1);
+    // A past hour fully inside a wider window keeps its whole value.
+    expect(rowWindowShare('2026-08-13T16:00:00', since, dayjs('2026-08-13T18:05:00'), dayjs('2026-08-13T18:05:00'))).toBe(1);
+  });
+
+  it('uses the real coverage for past windows (cutoff > until)', () => {
+    const prevSince = dayjs('2026-08-13T10:00:00');
+    const prevUntil = dayjs('2026-08-13T10:10:00');
+    const cut = dayjs('2026-08-13T10:30:00');
+    // 10:00 bucket holds usage recorded up to 10:30; only 10 of its 30 min
+    // fall in the window.
+    expect(rowWindowShare('2026-08-13T10:00:00', prevSince, prevUntil, cut)).toBeCloseTo(10 / 30, 6);
+  });
+});
+
+describe('groupTotals — optional proration factor', () => {
+  it('multiplies each row by the factor when provided', () => {
+    const rows = [
+      { hour_bucket: '2026-08-13T15:00:00', m: 'a', n: 10 },
+      { hour_bucket: '2026-08-13T15:00:00', m: 'b', n: 6 },
+    ];
+    const factor = (r: { hour_bucket: string; m: string; n: number }) => (r.m === 'a' ? 0.5 : 1);
+    expect(groupTotals(rows, r => r.m, r => r.n, factor)).toEqual([['b', 6], ['a', 5]]);
+    // Without a factor the sums stay raw (existing behavior).
+    expect(groupTotals(rows, r => r.m, r => r.n)).toEqual([['a', 10], ['b', 6]]);
+  });
 });
 
 describe('label formatters', () => {
@@ -205,12 +471,21 @@ describe('label formatters', () => {
     expect(fmtDayLabel('2026-08-13')).toBe('Aug 13');
   });
 
+  it('formats minute ticks and tooltips like hours', () => {
+    expect(fmtTick('minute', '08-13 15:50')).toBe('15:50');
+    expect(fmtTick('min15', '2026-08-13 15:50')).toBe('15:50');
+    expect(fmtBucket('minute', '08-13 15:50')).toBe('Aug 13, 15:50');
+    expect(fmtBucket('min15', '2026-08-13 15:45')).toBe('Aug 13, 15:45');
+  });
+
   it('formats day, week and month buckets', () => {
     expect(fmtTick('day', '08-13')).toBe('Aug 13');
     expect(fmtBucket('day', '08-13')).toBe('Aug 13');
     expect(fmtTick('day', '2026-08-10')).toBe('Aug 10');   // week bucket label
     expect(fmtBucket('day', '2026-08-10')).toBe('Aug 10, 2026');
-    expect(fmtTick('month', '2026-08')).toBe('Aug 26');
+    // Month ticks must not read as day labels ("Aug 26" is ambiguous on a
+    // year-long axis); "Aug '26" shows the year explicitly.
+    expect(fmtTick('month', '2026-08')).toBe("Aug '26");
     expect(fmtBucket('month', '2026-08')).toBe('Aug 2026');
   });
 

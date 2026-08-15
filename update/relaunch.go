@@ -12,8 +12,8 @@ import (
 // executable. It powers the gateway restart endpoint (/api/restart): the
 // old process must be gone before the new one binds the server port, so
 // the new instance is never started here — only the helper is. Same
-// wait-for-exit mechanism as the update relaunch helpers, without any file
-// swapping.
+// wait-for-exit mechanism as the portable-update swap helper, without any
+// file swapping.
 func ScheduleRelaunchAfterExit() error {
 	exe, err := os.Executable()
 	if err != nil {

@@ -20,7 +20,11 @@ RequestExecutionLevel admin
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
-!define MUI_FINISHPAGE_RUN "$INSTDIR\KeyRouter.exe"
+; The Finish page starts the updated copy — through the (non-elevated)
+; explorer shell rather than directly: a child of this elevated installer
+; would run the app ELEVATED, and the app (tray, webview, localhost API)
+; must run at the user's normal integrity.
+!define MUI_FINISHPAGE_RUN_FUNCTION "LaunchUpdatedApp"
 !insertmacro MUI_PAGE_FINISH
 
 !insertmacro MUI_UNPAGE_CONFIRM
@@ -29,28 +33,27 @@ RequestExecutionLevel admin
 !insertmacro MUI_LANGUAGE "English"
 
 Section "Install"
-  ; The in-app updater launches this installer silently (/S) and then exits
-  ; the running copy so the exe can be replaced. The process may take a
-  ; moment to shut down (in-flight streams finish first), so on silent
-  ; installs wait for it — up to ~3 minutes — before writing; otherwise the
-  ; overwrite fails silently and the update looks like it "never happened".
-  ; Interactive installs skip the wait: an immediate File error tells the
-  ; user to close the app (the old behavior). tasklist's exit code is 0
-  ; whether or not a process matched, so the match is detected via find on
-  ; the output.
-  ${If} ${Silent}
-    StrCpy $0 0
-    ${Do}
-      ${If} $0 >= 300
-        ${ExitDo} ; give up after ~2-3 min — the File below reports the failure
-      ${EndIf}
-      nsExec::ExecToStack 'cmd /c "tasklist /FI "IMAGENAME eq KeyRouter.exe" | find /I "KeyRouter.exe" >nul"'
-      Pop $1 ; find's exit code (0 = KeyRouter.exe still running)
-      Pop $2 ; output (unused)
-      Sleep 300
-      IntOp $0 $0 + 1
-    ${LoopWhile} $1 = 0
-  ${EndIf}
+  ; The in-app updater launches this installer elevated (setup wizard shown,
+  ; not /S silent — the UI button promises "Launch Installer") and then
+  ; exits the running copy so the exe can be replaced. The process may take
+  ; a moment to shut down (in-flight streams finish first), so wait for it —
+  ; up to ~3 minutes — before writing; otherwise the overwrite fails and the
+  ; update looks like it "never happened". Manual installs with the app open
+  ; get the same grace period to close it instead of an immediate error.
+  ; tasklist's exit code is 0 whether or not a process matched, so the match
+  ; is detected via find on the output.
+  DetailPrint "Waiting for KeyRouter to exit (close the app to continue)..."
+  StrCpy $0 0
+  ${Do}
+    ${If} $0 >= 300
+      ${ExitDo} ; give up after ~2-3 min — the File below reports the failure
+    ${EndIf}
+    nsExec::ExecToStack 'cmd /c "tasklist /FI "IMAGENAME eq KeyRouter.exe" | find /I "KeyRouter.exe" >nul"'
+    Pop $1 ; find's exit code (0 = KeyRouter.exe still running)
+    Pop $2 ; output (unused)
+    Sleep 300
+    IntOp $0 $0 + 1
+  ${LoopWhile} $1 = 0
 
   ; Per-machine install (HKLM, Program Files): shortcuts and uninstall keys
   ; go to the all-users context so every account sees them.
@@ -97,3 +100,12 @@ Section "Uninstall"
   RMDir "$INSTDIR"
   ; User data in %LOCALAPPDATA%\KeyRouter is intentionally left intact.
 SectionEnd
+
+; LaunchUpdatedApp starts the freshly installed copy on the Finish page.
+; explorer.exe is the user's (non-elevated) shell, so the app inherits the
+; user's integrity level instead of this elevated installer's; it returns
+; immediately while the app starts in the background. The degenerate case
+; (explorer not running) silently skips the launch.
+Function LaunchUpdatedApp
+  Exec '"$WINDIR\explorer.exe" "$INSTDIR\KeyRouter.exe"'
+FunctionEnd

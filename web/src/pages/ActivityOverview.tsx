@@ -6,7 +6,7 @@ import {
   BarChart, Bar, LineChart, Line,
 } from 'recharts';
 import { getConsumptions, getKeys, Consumption, Key } from '../api/client';
-import { DateRange, ActivityFilter, filterKey, ExploreOpts, fmtUSD, fmtTokens, fmtCompact, fmtTokensBare, fmtUSDInt, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtPercent, fmtTick, fmtBucket, series, stackedData, groupTotals, Granularity, maskKey, cacheHitRate } from './activityShared';
+import { DateRange, ActivityFilter, filterKey, ExploreOpts, fmtUSD, fmtTokens, fmtCompact, fmtTokensBare, fmtUSDInt, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtPercent, fmtTick, fmtBucket, series, stackedData, groupTotals, Granularity, maskKey, cacheHitRate, rowWindowShare } from './activityShared';
 import dayjs from 'dayjs';
 
 const { Text } = Typography;
@@ -141,16 +141,27 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
   const [keys, setKeys] = useState<Key[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
-  // Last SUCCESSFUL window: while a refetch fails (server down, the 60s
-  // slide keeps sliding "now"), the stale data stays rendered against the
-  // window it actually covers instead of re-bucketing onto a slid axis.
-  const [win, setWin] = useState<{ since: dayjs.Dayjs; until: dayjs.Dayjs; granularity: Granularity } | null>(null);
+  // Last SUCCESSFUL fetch snapshot: while a refetch fails (server down, the
+  // 30s slide keeps sliding "now"), the stale data stays rendered against
+  // the window AND the fetch time it actually covers instead of being
+  // re-bucketed/prorated onto a slid window. cutoff is when the rows'
+  // values were recorded (hourly rows accumulate live usage).
+  const [win, setWin] = useState<{
+    since: dayjs.Dayjs;
+    until: dayjs.Dayjs;
+    granularity: Granularity;
+    prevSince: dayjs.Dayjs;
+    cutoff: dayjs.Dayjs;
+  } | null>(null);
   // Compares the fetch key INSIDE the effect (never during render, which
   // StrictMode's double render would defeat): a preset/window/filter switch
   // drops the stale data so the previous window's values are never shown
   // under the new axes; the 30s slide (same key) keeps them while refetching.
   const prevKeyRef = useRef<string | null>(null);
   const fetchKey = `${range.key}|${filterKey(filter)}`;
+  // The previous period of equal length (for KPI deltas and its proration).
+  const len = range.until.diff(range.since, 'millisecond');
+  const prevSince = range.since.subtract(len, 'millisecond');
 
   useEffect(() => {
     let cancelled = false;
@@ -165,8 +176,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
       setLoading(true);
       setError(false);
       try {
-        const len = range.until.diff(range.since, 'millisecond');
-        const prevSince = range.since.subtract(len, 'millisecond');
+        const cutoff = dayjs();
         const [curRes, prevRes, keyRes] = await Promise.all([
           getConsumptions({ since: range.since.toISOString(), until: range.until.toISOString(), filter_type: filter?.type, filter_value: filter?.value }),
           getConsumptions({ since: prevSince.toISOString(), until: range.since.toISOString(), filter_type: filter?.type, filter_value: filter?.value }),
@@ -176,7 +186,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
         setCurList(curRes.data);
         setPrevList(prevRes.data);
         setKeys(keyRes.data);
-        setWin({ since: range.since, until: range.until, granularity: range.granularity });
+        setWin({ since: range.since, until: range.until, granularity: range.granularity, prevSince, cutoff });
         keysRefForOverview = new Map(keyRes.data.map(k => [k.name || `Key #${k.id}`, k.key_value || '']));
       } catch { if (!cancelled) { setError(true); message.error('Failed to load activity'); } }
       finally { if (!cancelled) setLoading(false); }
@@ -193,41 +203,58 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
     return <Card><Text type="danger">Failed to load activity — check the log file.</Text></Card>;
   }
 
-  const sum = (l: Consumption[]) => l.reduce((a, c) => ({
-    spend: a.spend + c.cost_usd,
-    requests: a.requests + c.request_count,
-    tokens: a.tokens + c.input_tokens + c.output_tokens,
-    cache: a.cache + c.cache_hit_tokens,
-    input: a.input + c.input_tokens,
-  }), { spend: 0, requests: 0, tokens: 0, cache: 0, input: 0 });
-
-  const cur = sum(curList);
-  const prev = sum(prevList);
-  // Cache hit rate = cached / total input tokens (incl. cached) — one
-  // consistent formula for both the KPI value and the sparkline.
-  const rateFor = (l: Consumption[]) => {
-    const s = sum(l);
-    return cacheHitRate(s.input, s.cache);
-  };
-  const curRate = rateFor(curList);
-  const prevRate = rateFor(prevList);
-  const blended = cur.tokens > 0 ? (cur.spend / cur.tokens) * 1e6 : 0;
-  const blendedPrev = prev.tokens > 0 ? (prev.spend / prev.tokens) * 1e6 : 0;
-
   // Time series, bucketed at the range's granularity so the line follows
-  // the selected view scale (24h -> hourly points, 1mo -> daily, 1y -> monthly).
-  // While a refetch is in flight or failing, the axes stay on the last
-  // successful window so stale data is never re-bucketed onto a slid axis.
+  // the selected view scale (15m/1h -> minute points, 24h -> hourly,
+  // 1mo -> daily, 1y -> monthly). While a refetch is in flight or failing,
+  // the axes stay on the last successful window so stale data is never
+  // re-bucketed onto a slid axis.
   const axSince = win?.since ?? range.since;
   const axUntil = win?.until ?? range.until;
   const gran = win?.granularity ?? range.granularity;
-  const costSeries = series(curList, c => c.cost_usd, axSince, axUntil, gran);
-  const tokenSeries = series(curList, c => c.input_tokens + c.output_tokens, axSince, axUntil, gran);
-  const reqSeries = series(curList, c => c.request_count, axSince, axUntil, gran);
+  // cutNow is when the rows' values were recorded: hourly rows accumulate
+  // live usage, so a PAST window shares its boundary hour with the live one
+  // and proration must divide by the real coverage, not by the window's
+  // own until.
+  const cutNow = win?.cutoff ?? dayjs();
+  // Sub-hour windows prorate every number (KPI sums, ranked tables) with
+  // the same window math the minute charts use, so the cards always add up
+  // to the chart; coarser granularities keep the raw boundary-hour sums.
+  const subHour = gran === 'minute' || gran === 'min15';
+  const curWin = subHour ? { since: axSince, until: axUntil, cutoff: cutNow } : null;
+  const prevWin = subHour ? { since: win?.prevSince ?? prevSince, until: axSince, cutoff: cutNow } : null;
+  const share = (c: Consumption): number => rowWindowShare(c.hour_bucket, axSince, axUntil, cutNow);
+
+  const sum = (l: Consumption[], win: { since: dayjs.Dayjs; until: dayjs.Dayjs; cutoff: dayjs.Dayjs } | null) => l.reduce((a, c) => {
+    const f = win ? rowWindowShare(c.hour_bucket, win.since, win.until, win.cutoff) : 1;
+    return {
+      spend: a.spend + c.cost_usd * f,
+      requests: a.requests + c.request_count * f,
+      tokens: a.tokens + (c.input_tokens + c.output_tokens) * f,
+      cache: a.cache + c.cache_hit_tokens * f,
+      input: a.input + c.input_tokens * f,
+    };
+  }, { spend: 0, requests: 0, tokens: 0, cache: 0, input: 0 });
+
+  const cur = sum(curList, curWin);
+  const prev = sum(prevList, prevWin);
+  // Cache hit rate = cached / total input tokens (incl. cached) — one
+  // consistent formula for both the KPI value and the sparkline.
+  const rateFor = (l: Consumption[], win: { since: dayjs.Dayjs; until: dayjs.Dayjs; cutoff: dayjs.Dayjs } | null) => {
+    const s = sum(l, win);
+    return cacheHitRate(s.input, s.cache);
+  };
+  const curRate = rateFor(curList, curWin);
+  const prevRate = rateFor(prevList, prevWin);
+  const blended = cur.tokens > 0 ? (cur.spend / cur.tokens) * 1e6 : 0;
+  const blendedPrev = prev.tokens > 0 ? (prev.spend / prev.tokens) * 1e6 : 0;
+
+  const costSeries = series(curList, c => c.cost_usd, axSince, axUntil, cutNow, gran);
+  const tokenSeries = series(curList, c => c.input_tokens + c.output_tokens, axSince, axUntil, cutNow, gran);
+  const reqSeries = series(curList, c => c.request_count, axSince, axUntil, cutNow, gran);
   // Prompt caching per bucket (token sums, shared by the Cached/Uncached
   // chart and the rate sparkline below).
-  const inSeries = series(curList, c => c.input_tokens, axSince, axUntil, gran);
-  const cacheSeries = series(curList, c => c.cache_hit_tokens, axSince, axUntil, gran);
+  const inSeries = series(curList, c => c.input_tokens, axSince, axUntil, cutNow, gran);
+  const cacheSeries = series(curList, c => c.cache_hit_tokens, axSince, axUntil, cutNow, gran);
   // Blended $/1M per bucket (cost / tokens in the SAME bucket).
   const blendedSeries = costSeries.map((d, i) => ({
     label: d.label,
@@ -244,7 +271,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
   // goExplore opens the Explore tab seeded with a metric/grouping. The
   // reference KPI cards and section headers link to /activity/explore with
   // the matching query params; our Explore tab supports spend/tokens/
-  // requests/cache × model/key/app, so each link maps to the closest one.
+  // requests/cache/blended × model/key/app, so each link maps to its metric.
   const goExplore = (opts?: ExploreOpts) => onNavigate?.('explore', opts);
 
   // deltaFor: for the Blended $/1M KPI a RISE is negative (cost per token up
@@ -256,14 +283,14 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
     { label: 'Requests', value: fmtCompact(cur.requests), delta: deltaPct(cur.requests, prev.requests), badUp: false, series: reqSeries, explore: { metric: 'requests' }, fmtValue: fmtCompact },
     { label: 'Token volume', value: fmtTokensBare(cur.tokens), delta: deltaPct(cur.tokens, prev.tokens), badUp: false, series: tokenSeries, explore: { metric: 'tokens' }, fmtValue: fmtTokensBare },
     { label: 'Cache hit rate', value: fmtPercent(curRate), delta: deltaPct(curRate, prevRate), badUp: false, series: rateSeries, explore: { metric: 'cache' }, fmtValue: fmtPercent },
-    { label: 'Blended $/1M', value: `$${blended.toFixed(2)}`, delta: deltaPct(blended, blendedPrev), badUp: true, series: blendedSeries, explore: { metric: 'spend' }, fmtValue: (v: number) => `$${v.toFixed(2)}` },
+    { label: 'Blended $/1M', value: `$${blended.toFixed(2)}`, delta: deltaPct(blended, blendedPrev), badUp: true, series: blendedSeries, explore: { metric: 'blended' }, fmtValue: (v: number) => `$${v.toFixed(2)}` },
   ];
 
   // --- Charts ---
   // Usage by model (spend, stacked bars, top-5 + Other like OR)
-  const modelSpend = groupTotals(curList, c => c.model_name || 'Unknown', c => c.cost_usd);
+  const modelSpend = groupTotals(curList, c => c.model_name || 'Unknown', c => c.cost_usd, subHour ? share : undefined);
   const topModels = modelSpend.slice(0, 5).map(([m]) => m);
-  const usageByModel = stackedData(curList, [...topModels, 'Other'], c => c.model_name || 'Unknown', c => c.cost_usd, axSince, axUntil, gran);
+  const usageByModel = stackedData(curList, [...topModels, 'Other'], c => c.model_name || 'Unknown', c => c.cost_usd, axSince, axUntil, cutNow, gran);
   // Fold everything below top-5 into "Other" per bucket.
   const otherModelSet = new Set(modelSpend.slice(5).map(([m]) => m));
   usageByModel.forEach(row => {
@@ -281,9 +308,9 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
   const modelColor = new Map(modelGroups.map(g => [g.name, g.color]));
 
   // Request volume by model (stacked bars, top-5 + Other)
-  const modelReqs = groupTotals(curList, c => c.model_name || 'Unknown', c => c.request_count);
+  const modelReqs = groupTotals(curList, c => c.model_name || 'Unknown', c => c.request_count, subHour ? share : undefined);
   const topReqModels = modelReqs.slice(0, 5).map(([m]) => m);
-  const reqByModel = stackedData(curList, [...topReqModels, 'Other'], c => c.model_name || 'Unknown', c => c.request_count, axSince, axUntil, gran);
+  const reqByModel = stackedData(curList, [...topReqModels, 'Other'], c => c.model_name || 'Unknown', c => c.request_count, axSince, axUntil, cutNow, gran);
   const otherReqSet = new Set(modelReqs.slice(5).map(([m]) => m));
   reqByModel.forEach(row => {
     let sum = 0;
@@ -300,8 +327,8 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
 
   // Token breakdown: Prompt / Completion (no reasoning field in the model;
   // cached tokens stay in Prompt so nothing is double-counted).
-  const promptSeries = series(curList, c => c.input_tokens, axSince, axUntil, gran);
-  const compSeries = series(curList, c => c.output_tokens, axSince, axUntil, gran);
+  const promptSeries = series(curList, c => c.input_tokens, axSince, axUntil, cutNow, gran);
+  const compSeries = series(curList, c => c.output_tokens, axSince, axUntil, cutNow, gran);
   const tokenBreakdown = promptSeries.map((d, i) => ({
     label: d.label,
     Prompt: d.value,
@@ -319,10 +346,10 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
   const keyTokens = groupTotals(curList, c => {
     const k = keys.find(x => x.id === c.key_id);
     return k?.name || `Key #${c.key_id}`;
-  }, c => c.input_tokens + c.output_tokens);
+  }, c => c.input_tokens + c.output_tokens, subHour ? share : undefined);
   const topKeys = keyTokens.slice(0, 5);
 
-  const appTokens = groupTotals(curList, c => c.app_name || 'Unknown', c => c.input_tokens + c.output_tokens);
+  const appTokens = groupTotals(curList, c => c.app_name || 'Unknown', c => c.input_tokens + c.output_tokens, subHour ? share : undefined);
   const topApps = appTokens.slice(0, 5);
 
   const kpiColors = ['#FF2D55', '#FF2D55', '#FF2D55', '#FF2D55', '#FF2D55'];

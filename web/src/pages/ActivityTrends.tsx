@@ -6,7 +6,8 @@ import {
   Tooltip as RTooltip, ResponsiveContainer,
 } from 'recharts';
 import { getActivity, getKeys, ActivityResponse } from '../api/client';
-import { DateRange, ActivityFilter, filterKey, fmtUSD, fmtUSDInt, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtTick, fmtBucket, ExploreOpts, maskKey, toChartData, computeTrending, modelFavicon } from './activityShared';
+import { DateRange, ActivityFilter, filterKey, fmtUSD, fmtUSDInt, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtTick, fmtBucket, ExploreOpts, maskKey, toChartData, computeTrending, modelFavicon, resampleResponse } from './activityShared';
+import dayjs from 'dayjs';
 const { Text } = Typography;
 
 interface TrendsProps {
@@ -102,7 +103,12 @@ const TrendSection: React.FC<SectionProps> = ({ title, groupBy, range, filter, o
         const prevSince = range.since.subtract(len, 'millisecond');
         // Roll up at the range's granularity: 24h -> hourly, a month ->
         // daily, a year -> monthly (OR buckets the chart by the view scale).
-        const rollup = range.granularity;
+        // The API rolls up at most hourly, so sub-hour ranges (15m/30m/1h ->
+        // minute, 3h -> 15 min) fetch the hourly rollup and are re-sampled
+        // onto the client's minute axis below.
+        const subGran: 'minute' | 'min15' | null =
+          range.granularity === 'minute' || range.granularity === 'min15' ? range.granularity : null;
+        const rollup = subGran ? 'hour' : range.granularity;
         // Current chart folds beyond top-5 into "Other" like the reference;
         // the previous period carries the same entity filter so sparklines
         // and deltas stay consistent with the filtered rows.
@@ -111,8 +117,13 @@ const TrendSection: React.FC<SectionProps> = ({ title, groupBy, range, filter, o
           getActivity({ metric, group_by: groupBy, rollup, top: 0, since: prevSince.toISOString(), until: range.since.toISOString(), filter_type: filter?.type, filter_value: filter?.value }),
         ]);
         if (cancelled) return;
-        setCur(curRes.data);
-        setPrev(prevRes.data);
+        // cutNow: the rows' values were recorded up to NOW — the previous
+        // period's boundary hour holds the current period's live usage, so
+        // re-sampling must divide by the real coverage, not the past window's
+        // own end.
+        const cutNow = dayjs();
+        setCur(subGran ? resampleResponse(curRes.data, range.since, range.until, cutNow, subGran) : curRes.data);
+        setPrev(subGran ? resampleResponse(prevRes.data, prevSince, range.since, cutNow, subGran) : prevRes.data);
       } catch { if (!cancelled) { setError(true); message.error(`Failed to load ${title} trends`); } }
       finally { if (!cancelled) setLoading(false); }
     };

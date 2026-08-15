@@ -477,7 +477,19 @@ const Providers: React.FC = () => {
       </Modal>
 
       {/* Key modal */}
-      <Modal title={editingKey ? 'Edit Key' : 'Add Key'} open={keyModal} onOk={saveKey} onCancel={() => { setKeyModal(false); setEditingKey(null); }} width={680}>
+      <Modal
+        title={editingKey ? 'Edit Key' : 'Add Key'}
+        open={keyModal}
+        onOk={saveKey}
+        onCancel={() => { setKeyModal(false); setEditingKey(null); }}
+        width={680}
+        centered
+        // The form is taller than the desktop window (1000x580): center the
+        // modal and cap the body so it always fits the viewport — the footer
+        // (OK/Cancel) stays visible and the bottom fields are reachable by
+        // scrolling the body instead of being cut off.
+        styles={{ body: { maxHeight: 'calc(100vh - 200px)', overflowY: 'auto' } }}
+      >
         <Form form={keyForm} layout="vertical" onValuesChange={(changed) => { if ('status' in changed) statusTouched.current = true; }}>
           <Form.Item name="provider_id" label="Provider" rules={[{ required: true }]}>
             <Select placeholder="Select a provider" showSearch options={providers.map(p => ({ value: p.id, label: `${p.name} (${p.type})` }))} />
@@ -550,7 +562,19 @@ const Providers: React.FC = () => {
       </Modal>
 
       {/* Key detail modal */}
-      <Modal title={`Key Detail: ${detailData?.key?.name || ''}`} open={detailOpen} onCancel={() => setDetailOpen(false)} footer={null} width={700}>
+      <Modal
+        title={`Key Detail: ${detailData?.key?.name || ''}`}
+        open={detailOpen}
+        onCancel={() => setDetailOpen(false)}
+        footer={null}
+        width={700}
+        centered
+        // Same treatment as the Edit Key modal: the panel is taller than the
+        // desktop window (1000x580), so center it and cap the body — the
+        // window counters and lifetime budget at the bottom are always
+        // reachable by scrolling the body, never cut off.
+        styles={{ body: { maxHeight: 'calc(100vh - 200px)', overflowY: 'auto' } }}
+      >
         {detailData && (
           <div>
             <Descriptions column={2} bordered size="small">
@@ -565,7 +589,29 @@ const Providers: React.FC = () => {
               <Descriptions.Item label="Total Cost">${detailData.total_cost?.toFixed(6)}</Descriptions.Item>
             </Descriptions>
             <Title level={5} style={{ marginTop: 16 }}>Window Counters</Title>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16, maxWidth: 480 }}>
+            {/* Lifetime budget: a one-time spend cap, not a sliding window.
+                First under the counters heading so the full limit story is
+                visible — the key disables permanently once spent reaches
+                the cap. */}
+            {budget && (
+              <div style={{ maxWidth: 480, marginTop: 12 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <Text strong>Lifetime Budget</Text>
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    {budget.limit > 0
+                      ? `$${microUsdToUsd(budget.spent).toFixed(2)} / $${microUsdToUsd(budget.limit).toFixed(2)}`
+                      : `$${microUsdToUsd(budget.spent).toFixed(2)} (no budget)`}
+                  </Text>
+                </div>
+                <Progress
+                  size="small"
+                  percent={budget.limit > 0 ? Math.min(100, budget.spent / budget.limit * 100) : 0}
+                  status={budget.limit > 0 && budget.spent >= budget.limit ? 'exception' : undefined}
+                  format={(p) => `${(p ?? 0).toFixed(1)}%`}
+                />
+              </div>
+            )}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16, maxWidth: 480, marginTop: 12 }}>
               {windowTypes.map(wt => {
                 const c = detailData.counts?.[wt.key];
                 if (!c) return null;
@@ -593,26 +639,6 @@ const Providers: React.FC = () => {
                 );
               })}
             </div>
-            {/* Lifetime budget: a one-time spend cap, not a sliding window.
-                Shown on the panel so the full limit story is visible — the
-                key disables permanently once spent reaches the cap. */}
-            {budget && (
-              <div style={{ maxWidth: 480, marginTop: 12 }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                  <Text strong>Lifetime Budget</Text>
-                  <Text type="secondary" style={{ fontSize: 12 }}>
-                    {budget.limit > 0
-                      ? `$${microUsdToUsd(budget.spent).toFixed(2)} / $${microUsdToUsd(budget.limit).toFixed(2)}`
-                      : `$${microUsdToUsd(budget.spent).toFixed(2)} (no budget)`}
-                  </Text>
-                </div>
-                <Progress
-                  size="small"
-                  percent={budget.limit > 0 ? Math.min(100, budget.spent / budget.limit * 100) : 0}
-                  status={budget.limit > 0 && budget.spent >= budget.limit ? 'exception' : undefined}
-                />
-              </div>
-            )}
           </div>
         )}
       </Modal>

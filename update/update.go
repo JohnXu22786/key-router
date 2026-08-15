@@ -278,11 +278,11 @@ func (c *Client) Apply(info *UpdateInfo) error {
 		return fmt.Errorf("failed to create temp file: %w", err)
 	}
 	// The temp file becomes the installer's own once it launches (the
-	// installer reads it while running; the relaunch helper deletes it
-	// afterwards), so installed-mode keeps it on full success and removes it
-	// on every failure path; portable-mode always cleans it up here. The
-	// file is closed first: Windows cannot delete an open file, and the
-	// early-return paths (download errors) never reach tmp.Close().
+	// installer reads it while running; the startup sweep of stale downloads
+	// removes it later), so installed-mode keeps it on full success and
+	// removes it on every failure path; portable-mode always cleans it up
+	// here. The file is closed first: Windows cannot delete an open file,
+	// and the early-return paths (download errors) never reach tmp.Close().
 	keepForInstaller := false
 	defer func() {
 		if !keepForInstaller {
@@ -339,33 +339,23 @@ func (c *Client) Apply(info *UpdateInfo) error {
 //     otherwise), so it is launched via ShellExecuteEx with the "runas" verb
 //     — Windows shows the UAC prompt, and a declined prompt is reported as
 //     ErrUpdateCancelled so the app stays open (there is no update to apply).
-//   - A small detached batch helper waits for this process to exit (the
-//     installer needs the exe unlocked) and for the installer to finish,
-//     then starts the updated copy NON-elevated — the helper is a child of
-//     this process and inherits its token, whereas the installer's own
-//     children would stay elevated — and deletes the downloaded installer.
-//     Without the helper the update still applies but the app is not
-//     auto-started (the user starts it manually).
+//     The installer opens its setup wizard visibly (never /S silent — the
+//     UI button promises "Launch Installer"), so the user sees and completes
+//     the install.
 //   - The handler calls the exit hook (after responding), which closes the
-//     window and runs the normal graceful shutdown.
+//     window and runs the normal graceful shutdown. The installer waits for
+//     this process to exit before writing files (its wait loop runs in
+//     interactive mode too, not just silent installs) and starts the
+//     updated copy from its Finish page.
 func (c *Client) applyInstalled(downloadPath string, info *UpdateInfo) error {
 	if runtime.GOOS != "windows" {
 		return fmt.Errorf("installed-mode auto-update is only supported on Windows; run the %s installer manually", info.AssetName)
 	}
-	if err := launchInstaller(downloadPath, "/S"); err != nil {
+	if err := launchInstaller(downloadPath, ""); err != nil {
 		if errors.Is(err, ErrUpdateCancelled) {
 			return ErrUpdateCancelled
 		}
 		return fmt.Errorf("failed to launch installer: %w", err)
-	}
-	exe, err := os.Executable()
-	if err != nil {
-		log.Printf("[update] cannot locate running executable (no relaunch helper): %v", err)
-		return nil
-	}
-	if err := launchRelaunchHelper(installedRelaunchScript(exe, downloadPath, os.Getpid())); err != nil {
-		log.Printf("[update] failed to schedule relaunch helper (the updated app must be started manually): %v", err)
-		return nil
 	}
 	log.Printf("[update] launched installer %s (%s)", info.AssetName, downloadPath)
 	return nil
@@ -374,98 +364,6 @@ func (c *Client) applyInstalled(downloadPath string, info *UpdateInfo) error {
 // launchInstaller starts the downloaded setup exe elevated. Overridable in
 // tests.
 var launchInstaller = runAsElevated
-
-// launchRelaunchHelper writes the installed-mode relaunch batch to a unique
-// temp file (CreateTemp: no symlink following, no clobbering a still-running
-// helper from a previous attempt) and starts it detached — it must outlive
-// this process. Overridable in tests.
-var launchRelaunchHelper = func(content string) error {
-	f, err := os.CreateTemp(os.TempDir(), "keyrouter-update-relaunch-*.bat")
-	if err != nil {
-		return err
-	}
-	path := f.Name()
-	if _, err := f.WriteString(content); err != nil {
-		f.Close()
-		os.Remove(path)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(path)
-		return err
-	}
-	cmd := exec.Command("cmd", "/c", path)
-	cmd.SysProcAttr = hideWindowAttr()
-	if err := cmd.Start(); err != nil {
-		os.Remove(path)
-		return err
-	}
-	return nil
-}
-
-// installedRelaunchScript returns the .bat content that:
-//
-//  1. waits for THIS process (by PID) to exit — the installer must be able
-//     to overwrite the exe;
-//  2. waits for the installer process to APPEAR — ShellExecuteEx returns
-//     when the UAC prompt is shown, before the user answers, so the
-//     installer may not exist yet; skipping this phase would delete the
-//     installer and relaunch the old app while the prompt is still up;
-//  3. waits for the installer to EXIT;
-//  4. starts the updated copy (unless this process somehow still lives) and
-//     deletes the downloaded installer plus itself.
-//
-// Each phase gives up after ~5 minutes and proceeds anyway (declined UAC
-// prompt, hung installer, PID reuse). No parenthesized blocks are used, so
-// no delayed expansion is needed and paths containing "!" stay intact. Runs
-// as a child of the old copy, so the relaunched app is NOT elevated.
-func installedRelaunchScript(appPath, installerPath string, pid int) string {
-	return fmt.Sprintf(`@echo off
-set /a n=0
-:wait_app
-tasklist /FI "PID eq %[1]d" 2>nul | find /I "%[1]d" >nul
-if errorlevel 1 goto wait_app_done
-set /a n+=1
-if %%n%% GEQ 300 goto check_alive
-ping -n 2 127.0.0.1 >nul
-goto wait_app
-:wait_app_done
-set /a n=0
-:wait_installer_start
-tasklist /FI "IMAGENAME eq %[2]s" 2>nul | find /I "%[2]s" >nul
-if not errorlevel 1 goto found_installer
-set /a n+=1
-if %%n%% GEQ 300 goto check_alive
-ping -n 2 127.0.0.1 >nul
-goto wait_installer_start
-:found_installer
-set /a n=0
-:wait_installer_end
-tasklist /FI "IMAGENAME eq %[2]s" 2>nul | find /I "%[2]s" >nul
-if errorlevel 1 goto check_alive
-set /a n+=1
-if %%n%% GEQ 300 goto check_alive
-ping -n 2 127.0.0.1 >nul
-goto wait_installer_end
-:check_alive
-tasklist /FI "PID eq %[1]d" 2>nul | find /I "%[1]d" >nul
-if not errorlevel 1 goto cleanup
-start "" "%[3]s"
-:cleanup
-del /Q "%[4]s" >nul 2>&1
-del "%%~f0"
-`, pid, windowsBase(installerPath), appPath, installerPath)
-}
-
-// windowsBase returns the final path element treating both separators —
-// the helper bats are Windows-only, but this function must behave the same
-// when tests run on any platform (filepath.Base is OS-dependent).
-func windowsBase(p string) string {
-	if i := strings.LastIndexAny(p, `\/`); i >= 0 {
-		return p[i+1:]
-	}
-	return p
-}
 
 // applyPortable replaces the running executable. Because the process is
 // running, Windows locks the exe; the helper script renames the current exe

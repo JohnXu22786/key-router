@@ -1380,7 +1380,7 @@ func (h *AdminHandler) ApplyUpdate(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "applied", "install_mode": info.InstallMode})
 	// Flush the response, then exit so the new binary / installer can
 	// replace this one (portable: the swap script relaunches the app;
-	// installed: the relaunch helper starts the updated copy).
+	// installed: the installer's Finish page starts the updated copy).
 	c.Writer.Flush()
 	if h.ExitAfterUpdate != nil {
 		h.ExitAfterUpdate()
@@ -1405,6 +1405,27 @@ type activityAcc struct {
 	tokens   float64
 	requests float64
 	cache    float64
+}
+
+// blendedRate converts total spend/tokens into the blended $/1M rate (cost
+// per million tokens). Zero-token traffic has no rate. Rates are never
+// accumulated across rows — spend and tokens are, and the rate is derived
+// at output time, so a group's rate is ALWAYS total spend / total tokens.
+func blendedRate(spend, tokens float64) float64 {
+	if tokens <= 0 {
+		return 0
+	}
+	return spend / tokens * 1e6
+}
+
+// accValue returns the charted metric's value for one (bucket, group) cell:
+// the accumulated sum for additive metrics, the cell's derived rate for
+// blended $/1M (per-row rate sums would over-weight low-volume rows).
+func accValue(metric string, a *activityAcc) float64 {
+	if metric == "blended" {
+		return blendedRate(a.spend, a.tokens)
+	}
+	return a.sum
 }
 
 // ActivityGroupSummary is one row of the Explore-style summary table.
@@ -1470,16 +1491,20 @@ func applyActivityFilter(q *gorm.DB, filterType, filterValue string) (*gorm.DB, 
 // GetActivity aggregates consumption for the Activity page.
 // Query params:
 //
-//	metric:   spend | tokens | requests | cache   (default spend)
+//	metric:   spend | tokens | requests | cache | blended   (default spend;
+//	          blended = $/1M tokens = spend/tokens*1e6, a RATE computed per
+//	          bucket/group at output time, never summed across rows)
 //	group_by: model | key | app                    (default model)
 //	subgroup: model | key | app                    (optional second dimension,
 //	          must differ from group_by; splits each group's series into
 //	          per-subgroup stacks, e.g. spend by model, split by API key)
 //	rollup:   hour | day | week | month | total    (default day; total
 //	          collapses the whole range into a single "Total" bucket)
-//	rank_by:  current | spend | tokens | requests | cache (default current;
-//	          ranks the series Top-N (and the summary's default order) by the
-//	          given metric, which may differ from the charted one)
+//	rank_by:  current | spend | tokens | requests | cache | blended (default
+//	          current; ranks the series Top-N (and the summary's default
+//	          order) by the given metric, which may differ from the charted
+//	          one. For the blended RATE metrics the rank uses the group's
+//	          overall rate — sums of per-bucket rates are not rates)
 //	since / until: RFC3339, inclusive range
 //	filter_type / filter_value: restrict rows to one entity before
 //	          aggregating (the Activity page's filter button). filter_type is
@@ -1499,8 +1524,8 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 			topN = n
 		}
 	}
-	if metric != "spend" && metric != "tokens" && metric != "requests" && metric != "cache" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "metric must be spend|tokens|requests|cache"})
+	if metric != "spend" && metric != "tokens" && metric != "requests" && metric != "cache" && metric != "blended" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "metric must be spend|tokens|requests|cache|blended"})
 		return
 	}
 	if groupBy != "model" && groupBy != "key" && groupBy != "app" {
@@ -1521,8 +1546,8 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "rollup must be hour|day|week|month|total"})
 		return
 	}
-	if rankBy != "current" && rankBy != "spend" && rankBy != "tokens" && rankBy != "requests" && rankBy != "cache" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "rank_by must be current|spend|tokens|requests|cache"})
+	if rankBy != "current" && rankBy != "spend" && rankBy != "tokens" && rankBy != "requests" && rankBy != "cache" && rankBy != "blended" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "rank_by must be current|spend|tokens|requests|cache|blended"})
 		return
 	}
 
@@ -1598,7 +1623,9 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 		}
 	}
 
-	// valueOf extracts the metric value from a row.
+	// valueOf extracts the metric value from a row. The blended metric has no
+	// per-row value: it is a RATE derived at output time (accValue) from the
+	// cell's accumulated spend/tokens, so sum stays 0 for it.
 	valueOf := func(r *model.Consumption) float64 {
 		switch metric {
 		case "spend":
@@ -1607,6 +1634,8 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 			return float64(r.InputTokens + r.OutputTokens)
 		case "requests":
 			return float64(r.RequestCount)
+		case "blended":
+			return 0
 		default: // cache
 			return float64(r.CacheHitTokens)
 		}
@@ -1691,6 +1720,10 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 				subAgg[b][g][sg] = &activityAcc{}
 			}
 			subAgg[b][g][sg].sum += valueOf(&rows[i])
+			// Spend/tokens are always tracked so subgroup series can derive
+			// rate metrics (blended $/1M) the same way the main cells do.
+			subAgg[b][g][sg].spend += rows[i].CostUSD
+			subAgg[b][g][sg].tokens += float64(rows[i].InputTokens + rows[i].OutputTokens)
 			if !seenSubgroup[g+"\x00"+sg] {
 				seenSubgroup[g+"\x00"+sg] = true
 				subgroupOrder[g] = append(subgroupOrder[g], sg)
@@ -1736,14 +1769,38 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 			return acc.sum
 		}
 	}
+	// rateRank: the rank metric is a RATE (blended $/1M) — either explicitly
+	// via rank_by=blended, or because the charted metric is blended and
+	// rank_by is "current". Rates don't sum across buckets, so the rank uses
+	// the group's OVERALL rate (total spend / total tokens), not the sum of
+	// per-bucket rates. rankTotal's switch never sees "blended": every
+	// blended ranking goes through this branch.
+	rateRank := (metric == "blended" && rankBy == "current") || rankBy == "blended"
+	// groupSpend/groupTokens: per-group totals of spend/tokens over the whole
+	// range — the inputs for every blended-rate derivation (ranking, summary
+	// Sum). Computed once and shared by both consumers.
+	groupSpend := make(map[string]float64, len(groupOrder))
+	groupTokens := make(map[string]float64, len(groupOrder))
+	for _, g := range groupOrder {
+		for _, b := range bucketOrder {
+			if m, ok := agg[b][g]; ok {
+				groupSpend[g] += m.spend
+				groupTokens[g] += m.tokens
+			}
+		}
+	}
 	// rankTotals: per-group total of the rank metric, computed once and used
 	// by both the series ordering and the summary sort.
 	rankTotals := make(map[string]float64, len(groupOrder))
 	for _, g := range groupOrder {
 		var s float64
-		for _, b := range bucketOrder {
-			if m, ok := agg[b][g]; ok {
-				s += rankTotal(m)
+		if rateRank {
+			s = blendedRate(groupSpend[g], groupTokens[g])
+		} else {
+			for _, b := range bucketOrder {
+				if m, ok := agg[b][g]; ok {
+					s += rankTotal(m)
+				}
 			}
 		}
 		rankTotals[g] = s
@@ -1790,7 +1847,7 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 					v := float64(0)
 					if m, ok := subAgg[b][g]; ok {
 						if a, ok := m[sg]; ok {
-							v = a.sum
+							v = accValue(metric, a)
 						}
 					}
 					resp.Series = append(resp.Series, ActivitySeriesPoint{
@@ -1805,7 +1862,7 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 			}
 			v := float64(0)
 			if m, ok := agg[b][g]; ok {
-				v = m.sum
+				v = accValue(metric, m)
 			}
 			resp.Series = append(resp.Series, ActivitySeriesPoint{
 				Bucket: b,
@@ -1815,10 +1872,24 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 			})
 		}
 		if otherActive {
+			// Other folds the remaining groups' cells into one series. For
+			// the blended rate the fold combines spend AND tokens first and
+			// derives the rate at the end (a sum of rates is not a rate).
 			var ov float64
-			for _, g := range groupOrder[topN:] {
-				if m, ok := agg[b][g]; ok {
-					ov += m.sum
+			if metric == "blended" {
+				var spend, tokens float64
+				for _, g := range groupOrder[topN:] {
+					if m, ok := agg[b][g]; ok {
+						spend += m.spend
+						tokens += m.tokens
+					}
+				}
+				ov = blendedRate(spend, tokens)
+			} else {
+				for _, g := range groupOrder[topN:] {
+					if m, ok := agg[b][g]; ok {
+						ov += m.sum
+					}
 				}
 			}
 			resp.Series = append(resp.Series, ActivitySeriesPoint{
@@ -1832,39 +1903,59 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 
 	// Summary: per group Min/Max/Avg/Sum/Value/Percent. Value = sum in the
 	// LAST bucket (OpenRouter's "Value" column). Min/Max/Avg are computed
-	// over the group's NON-EMPTY buckets only (OR semantics Ã¢â‚¬â€ an idle day is
+	// over the group's NON-EMPTY buckets only (OR semantics — an idle day is
 	// not a $0 sample; a model that ran one day shows Min==Max==Avg==that
-	// day's value).
+	// day's value). For the blended rate, Sum is the group's OVERALL rate
+	// (total spend / total tokens), Min/Max/Avg span the per-bucket rates,
+	// and Percent is the group's share of total spend (rates don't sum to a
+	// meaningful total).
 	groupTotals := make(map[string]float64)
 	groupBucketCount := make(map[string]int)
+	groupRateSum := make(map[string]float64)
 	for _, g := range groupOrder {
-		var sum float64
 		for _, b := range bucketOrder {
 			if m, ok := agg[b][g]; ok {
-				sum += m.sum
+				groupTotals[g] += m.sum
 				groupBucketCount[g]++
+				if metric == "blended" {
+					groupRateSum[g] += accValue(metric, m)
+				}
 			}
 		}
-		groupTotals[g] = sum
+		if metric == "blended" {
+			groupTotals[g] = blendedRate(groupSpend[g], groupTokens[g])
+		}
 	}
 	totalSum := float64(0)
+	totalSpend := float64(0)
 	for _, v := range groupTotals {
 		totalSum += v
+	}
+	for _, v := range groupSpend {
+		totalSpend += v
 	}
 	for _, g := range groupOrder {
 		avg := float64(0)
 		if n := groupBucketCount[g]; n > 0 {
-			avg = groupTotals[g] / float64(n)
+			if metric == "blended" {
+				avg = groupRateSum[g] / float64(n)
+			} else {
+				avg = groupTotals[g] / float64(n)
+			}
 		}
 		percent := float64(0)
-		if totalSum > 0 {
+		if metric == "blended" {
+			if totalSpend > 0 {
+				percent = groupSpend[g] / totalSpend * 100
+			}
+		} else if totalSum > 0 {
 			percent = groupTotals[g] / totalSum * 100
 		}
 		var min, max float64
 		first := true
 		for _, b := range bucketOrder {
 			if m, ok := agg[b][g]; ok {
-				v := m.sum
+				v := accValue(metric, m)
 				if first {
 					min, max = v, v
 					first = false
@@ -1884,7 +1975,7 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 			Max:     max,
 			Avg:     avg,
 			Sum:     groupTotals[g],
-			Value:   lastBucketValue(agg, bucketOrder, g),
+			Value:   lastBucketValue(agg, bucketOrder, g, metric),
 			Percent: percent,
 		})
 	}
@@ -1902,14 +1993,14 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 }
 
 // lastBucketValue returns the group's value in the final bucket (or 0).
-func lastBucketValue(agg map[string]map[string]*activityAcc, bucketOrder []string, g string) float64 {
+func lastBucketValue(agg map[string]map[string]*activityAcc, bucketOrder []string, g, metric string) float64 {
 	if len(bucketOrder) == 0 {
 		return 0
 	}
 	last := bucketOrder[len(bucketOrder)-1]
 	if m, ok := agg[last]; ok {
 		if a, ok := m[g]; ok {
-			return a.sum
+			return accValue(metric, a)
 		}
 	}
 	return 0

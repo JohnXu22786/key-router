@@ -29,6 +29,7 @@ interface ExploreProps {
 
 const METRICS = [
   { key: 'spend', label: 'Total Usage ($)' },
+  { key: 'blended', label: 'Blended $/1M' },
   { key: 'tokens', label: 'Total Tokens' },
   { key: 'requests', label: 'Request Count' },
   { key: 'cache', label: 'Cache Hits' },
@@ -52,6 +53,7 @@ const ROLLUP = [
 // table's default order) by the current metric or by another metric.
 const RANK_BY = [
   { value: 'current', label: 'Current metric' },
+  { value: 'blended', label: 'Blended $/1M' },
   { value: 'spend', label: 'Total Usage ($)' },
   { value: 'tokens', label: 'Total Tokens' },
   { value: 'requests', label: 'Request Count' },
@@ -87,7 +89,7 @@ const rollupGran = (rollup: string): Granularity =>
   rollup === 'hour' ? 'hour' : rollup === 'month' ? 'month' : 'day';
 
 const fmtForTable = (metric: string) => (v: number) =>
-  metric === 'spend' ? fmt3sig(v) : metric === 'tokens' || metric === 'cache' ? fmtTokens(v) : fmtCompact(v);
+  metric === 'spend' || metric === 'blended' ? fmt3sig(v) : metric === 'tokens' || metric === 'cache' ? fmtTokens(v) : fmtCompact(v);
 
 // Numeric summary columns of the table, in display order.
 const NUM_COLS: { key: keyof ActivityGroupSummary; label: string }[] = [
@@ -223,10 +225,12 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
     return <Card><Text type="danger">Failed to load explore — check the log file.</Text></Card>;
   }
 
-  const fmtAxis = (v: number) => (metric === 'spend' ? fmtUSDInt(v) : fmtCompact(v));
+  const fmtAxis = (v: number) => (metric === 'spend' ? fmtUSDInt(v) : metric === 'blended' ? fmt3sig(v) : fmtCompact(v));
   const fmtTable = fmtForTable(metric);
   const groupLabel = GROUP_BY.find(g => g.value === groupBy)!.label;
   const subgroupOptions = SUBGROUP_OPTIONS[groupBy];
+  // Rates (blended $/1M) must never stack — stacked rates are meaningless.
+  const stackId = metric === 'blended' ? undefined : '1';
 
   // --- Legend interactions (OR: dot toggles hide, name = show only) ---
   const toggleHidden = (key: string) => {
@@ -310,7 +314,7 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
           {/* dataKey is a function accessor: recharts resolves string keys via
               lodash paths, so dots in names like "claude-3.5" would break */}
           {seriesKeys.map((sk, i) => (
-            <Bar key={sk.key} dataKey={(d: any) => d[sk.key]} name={displayFor(sk.group, sk.subgroup)} stackId="1" fill={seriesColor(i, sk.group)} maxBarSize={21} isAnimationActive={false} />
+            <Bar key={sk.key} dataKey={(d: any) => d[sk.key]} name={displayFor(sk.group, sk.subgroup)} stackId={stackId} fill={seriesColor(i, sk.group)} maxBarSize={21} isAnimationActive={false} />
           ))}
         </BarChart>
       )}
@@ -321,7 +325,7 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
           <YAxis tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} width={60} tickFormatter={fmtAxis} />
           <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(rollupGran(rollup), String(l))} />
           {seriesKeys.map((sk, i) => (
-            <Area key={sk.key} dataKey={(d: any) => d[sk.key]} name={displayFor(sk.group, sk.subgroup)} type="monotone" stackId="1" stroke={seriesColor(i, sk.group)} strokeWidth={1.5} fill={seriesColor(i, sk.group)} fillOpacity={0.35} dot={false} />
+            <Area key={sk.key} dataKey={(d: any) => d[sk.key]} name={displayFor(sk.group, sk.subgroup)} type="monotone" stackId={stackId} stroke={seriesColor(i, sk.group)} strokeWidth={1.5} fill={seriesColor(i, sk.group)} fillOpacity={0.35} dot={false} />
           ))}
         </AreaChart>
       )}
