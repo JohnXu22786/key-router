@@ -102,34 +102,6 @@ func TestWindowsSwapScript(t *testing.T) {
 	}
 }
 
-// TestInstalledRelaunchScript guards the installed-mode relaunch batch: it
-// must wait for THIS process (by PID) to exit (the installer needs the exe
-// unlocked), wait for the installer process to APPEAR (ShellExecuteEx
-// returns before the UAC prompt is answered — a premature proceed would
-// delete the installer and relaunch the old app while the prompt is up),
-// wait for it to exit, start the updated copy, and delete the downloaded
-// installer plus itself.
-func TestInstalledRelaunchScript(t *testing.T) {
-	s := installedRelaunchScript(
-		`C:\Program Files\KeyRouter\KeyRouter.exe`,
-		`C:\Users\me\AppData\Local\Temp\keyrouter-update-12345.exe`,
-		4242,
-	)
-	for _, want := range []string{
-		`PID eq 4242`,
-		`:wait_installer_start`,
-		`:wait_installer_end`,
-		`IMAGENAME eq keyrouter-update-12345.exe`,
-		`start "" "C:\Program Files\KeyRouter\KeyRouter.exe"`,
-		`del /Q "C:\Users\me\AppData\Local\Temp\keyrouter-update-12345.exe"`,
-		`del "%~f0"`,
-	} {
-		if !strings.Contains(s, want) {
-			t.Errorf("relaunch script missing %q\n---\n%s", want, s)
-		}
-	}
-}
-
 // tempUpdateFiles snapshots the updater's temp files (keyrouter-update-* in
 // the system temp dir).
 func tempUpdateFiles(t *testing.T) map[string]bool {
@@ -206,15 +178,17 @@ func TestApplyInstalledCancelCleansTemp(t *testing.T) {
 }
 
 // TestApplyInstalledKeepsTempForInstaller: on a successful launch the temp
-// installer must survive the Apply call — the running installer reads it,
-// and the relaunch helper deletes it once the installer exits.
+// installer must survive the Apply call — the running installer reads it
+// (it is cleaned up by the startup sweep of stale downloads afterwards) —
+// and the installer must be launched VISIBLY (empty args, never /S silent:
+// the silent launch was why users never saw the installer open).
 func TestApplyInstalledKeepsTempForInstaller(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("installed-mode apply is Windows-only")
 	}
 	before := tempUpdateFiles(t)
-	// Clean up whatever the apply leaves behind (a kept installer or a
-	// stray helper), even when an assertion fails mid-test.
+	// Clean up whatever the apply leaves behind (the kept installer), even
+	// when an assertion fails mid-test.
 	defer func() {
 		for p := range tempUpdateFiles(t) {
 			if !before[p] {
@@ -223,14 +197,10 @@ func TestApplyInstalledKeepsTempForInstaller(t *testing.T) {
 		}
 	}()
 
+	var launchArgs string
 	origInstaller := launchInstaller
-	origHelper := launchRelaunchHelper
-	launchInstaller = func(path, args string) error { return nil }
-	launchRelaunchHelper = func(content string) error { return nil }
-	defer func() {
-		launchInstaller = origInstaller
-		launchRelaunchHelper = origHelper
-	}()
+	launchInstaller = func(path, args string) error { launchArgs = args; return nil }
+	defer func() { launchInstaller = origInstaller }()
 
 	body := []byte("MZ fake installer")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -247,6 +217,9 @@ func TestApplyInstalledKeepsTempForInstaller(t *testing.T) {
 	}
 	if err := c.Apply(info); err != nil {
 		t.Fatalf("Apply failed: %v", err)
+	}
+	if launchArgs != "" {
+		t.Errorf("installer launched with args %q, want empty (the setup wizard must show)", launchArgs)
 	}
 
 	// Exactly one new temp file: the installer handed to the (fake) launch.
