@@ -355,6 +355,16 @@ const TrendSection: React.FC<SectionProps> = ({ title, groupBy, range, filter, o
                   <div style={{ width: 48, height: 20, flexShrink: 0 }}>
                     <ResponsiveContainer width="100%" height="100%">
                       <LineChart data={t.spark.map((v, i) => ({ i, v }))} margin={{ top: 1, right: 0, bottom: 0, left: 0 }}>
+                        {/* Hover shows the exact previous-period value; the
+                            point index maps to prev.buckets (the backend
+                            emits every bucket per group, zero-filled). */}
+                        <RTooltip
+                          formatter={(val: any) => [fmt(Number(val)), metricLabel]}
+                          labelFormatter={(l) => (prev.buckets[Number(l)] ? fmtBucket(range.granularity, prev.buckets[Number(l)]) : '')}
+                          labelStyle={{ color: AXIS }}
+                          contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID, background: token.colorBgContainer, color: token.colorText, fontSize: 12, padding: '4px 8px' }}
+                          cursor={false}
+                        />
                         <Line type="monotone" dataKey="v" stroke={color} strokeWidth={1.5} dot={false} isAnimationActive={false} />
                       </LineChart>
                     </ResponsiveContainer>
