@@ -1380,7 +1380,7 @@ func (h *AdminHandler) ApplyUpdate(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "applied", "install_mode": info.InstallMode})
 	// Flush the response, then exit so the new binary / installer can
 	// replace this one (portable: the swap script relaunches the app;
-	// installed: the relaunch helper starts the updated copy).
+	// installed: the installer's Finish page starts the updated copy).
 	c.Writer.Flush()
 	if h.ExitAfterUpdate != nil {
 		h.ExitAfterUpdate()

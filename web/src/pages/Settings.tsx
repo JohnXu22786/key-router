@@ -176,7 +176,7 @@ const Settings: React.FC = () => {
     setApplying(true);
     // The apply call blocks while the installer downloads (minutes) and the
     // UAC prompt is answered — show a persistent spinner instead of a
-    // timeout error (the per-request timeout is 10 minutes, see client.ts).
+    // timeout error (the per-request timeout is 30 minutes, see client.ts).
     const hideLoading = message.loading(
       updateInfo?.install_mode === 'installed'
         ? 'Downloading installer and preparing update…'
@@ -186,7 +186,7 @@ const Settings: React.FC = () => {
     try {
       const res = await applyUpdate();
       message.success(res.data.install_mode === 'installed'
-        ? 'Installer launched — KeyRouter will close and restart automatically.'
+        ? 'Installer launched — finish the setup wizard to complete the update and restart KeyRouter.'
         : 'Update applied — KeyRouter will restart automatically.');
       setUpdateInfo(null);
     } catch (err: any) {

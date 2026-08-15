@@ -65,7 +65,7 @@ const LayoutWithRouter: React.FC = () => {
     try {
       const res = await applyUpdate();
       message.success(res.data.install_mode === 'installed'
-        ? 'Installer launched — KeyRouter will close and restart automatically.'
+        ? 'Installer launched — finish the setup wizard to complete the update and restart KeyRouter.'
         : 'Update applied — KeyRouter will restart automatically.');
       setUpdateInfo(null);
     } catch (err: any) {
