@@ -249,12 +249,14 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
 
   // deltaFor: for the Blended $/1M KPI a RISE is negative (cost per token up
   // = bad), so the "bad" flag inverts the color.
+  // fmtValue renders one sparkline point for the hover tooltip, matching the
+  // KPI value's unit (dollars, count, tokens, percent or $/1M).
   const kpis = [
-    { label: 'Total spend', value: fmtUSD(cur.spend), delta: deltaPct(cur.spend, prev.spend), badUp: false, series: costSeries, explore: { metric: 'spend' } },
-    { label: 'Requests', value: fmtCompact(cur.requests), delta: deltaPct(cur.requests, prev.requests), badUp: false, series: reqSeries, explore: { metric: 'requests' } },
-    { label: 'Token volume', value: fmtTokensBare(cur.tokens), delta: deltaPct(cur.tokens, prev.tokens), badUp: false, series: tokenSeries, explore: { metric: 'tokens' } },
-    { label: 'Cache hit rate', value: fmtPercent(curRate), delta: deltaPct(curRate, prevRate), badUp: false, series: rateSeries, explore: { metric: 'cache' } },
-    { label: 'Blended $/1M', value: `$${blended.toFixed(2)}`, delta: deltaPct(blended, blendedPrev), badUp: true, series: blendedSeries, explore: { metric: 'spend' } },
+    { label: 'Total spend', value: fmtUSD(cur.spend), delta: deltaPct(cur.spend, prev.spend), badUp: false, series: costSeries, explore: { metric: 'spend' }, fmtValue: fmtUSD },
+    { label: 'Requests', value: fmtCompact(cur.requests), delta: deltaPct(cur.requests, prev.requests), badUp: false, series: reqSeries, explore: { metric: 'requests' }, fmtValue: fmtCompact },
+    { label: 'Token volume', value: fmtTokensBare(cur.tokens), delta: deltaPct(cur.tokens, prev.tokens), badUp: false, series: tokenSeries, explore: { metric: 'tokens' }, fmtValue: fmtTokensBare },
+    { label: 'Cache hit rate', value: fmtPercent(curRate), delta: deltaPct(curRate, prevRate), badUp: false, series: rateSeries, explore: { metric: 'cache' }, fmtValue: fmtPercent },
+    { label: 'Blended $/1M', value: `$${blended.toFixed(2)}`, delta: deltaPct(blended, blendedPrev), badUp: true, series: blendedSeries, explore: { metric: 'spend' }, fmtValue: (v: number) => `$${v.toFixed(2)}` },
   ];
 
   // --- Charts ---
@@ -363,6 +365,18 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
                   <div style={{ width: 84, height: 40 }}>
                     <ResponsiveContainer width="100%" height="100%">
                       <LineChart data={k.series} margin={{ top: 3, right: 0, bottom: 0, left: 0 }}>
+                        {/* Hover shows the exact bucket value in the KPI's
+                            unit; cursor is off so the tiny chart stays clean.
+                            The tooltip label is the point INDEX (no XAxis
+                            dataKey -> recharts uses array indices), so map it
+                            back to the bucket's label. */}
+                        <Tooltip
+                          formatter={(v: any) => [k.fmtValue(Number(v)), k.label]}
+                          labelFormatter={(l) => { const p = k.series[Number(l)]; return p ? fmtBucket(gran, p.label) : ''; }}
+                          labelStyle={{ color: AXIS }}
+                          contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID, background: token.colorBgContainer, color: token.colorText, fontSize: 12, padding: '4px 8px' }}
+                          cursor={false}
+                        />
                         <Line type="monotone" dataKey="value" stroke={kpiColors[i]} strokeWidth={1.5} dot={false} isAnimationActive={false} />
                       </LineChart>
                     </ResponsiveContainer>
