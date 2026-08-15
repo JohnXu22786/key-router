@@ -244,7 +244,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
   // goExplore opens the Explore tab seeded with a metric/grouping. The
   // reference KPI cards and section headers link to /activity/explore with
   // the matching query params; our Explore tab supports spend/tokens/
-  // requests/cache × model/key/app, so each link maps to the closest one.
+  // requests/cache/blended × model/key/app, so each link maps to its metric.
   const goExplore = (opts?: ExploreOpts) => onNavigate?.('explore', opts);
 
   // deltaFor: for the Blended $/1M KPI a RISE is negative (cost per token up
@@ -254,7 +254,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
     { label: 'Requests', value: fmtCompact(cur.requests), delta: deltaPct(cur.requests, prev.requests), badUp: false, series: reqSeries, explore: { metric: 'requests' } },
     { label: 'Token volume', value: fmtTokensBare(cur.tokens), delta: deltaPct(cur.tokens, prev.tokens), badUp: false, series: tokenSeries, explore: { metric: 'tokens' } },
     { label: 'Cache hit rate', value: fmtPercent(curRate), delta: deltaPct(curRate, prevRate), badUp: false, series: rateSeries, explore: { metric: 'cache' } },
-    { label: 'Blended $/1M', value: `$${blended.toFixed(2)}`, delta: deltaPct(blended, blendedPrev), badUp: true, series: blendedSeries, explore: { metric: 'spend' } },
+    { label: 'Blended $/1M', value: `$${blended.toFixed(2)}`, delta: deltaPct(blended, blendedPrev), badUp: true, series: blendedSeries, explore: { metric: 'blended' } },
   ];
 
   // --- Charts ---
