@@ -3,7 +3,7 @@ module key-router
 go 1.26.5
 
 require (
-	github.com/gabriel-vasile/mimetype v1.4.12
+	github.com/gabriel-vasile/mimetype v1.4.15
 	github.com/gin-gonic/gin v1.12.0
 	github.com/webview/webview_go v0.0.0-20240831120633-6173450d4dd6
 	gorm.io/driver/sqlite v1.6.0
