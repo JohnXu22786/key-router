@@ -192,10 +192,10 @@ func GetWindowConfigs() []WindowConfig {
 // Consumption records usage per key per hour
 type Consumption struct {
 	ID               int64     `gorm:"primaryKey;autoIncrement" json:"id"`
-	KeyID            int64     `gorm:"not null;index:idx_key_hour,unique" json:"key_id"`
-	HourBucket       time.Time `gorm:"not null;index:idx_key_hour,unique" json:"hour_bucket"` // truncated to hour
-	ModelName        string    `gorm:"type:varchar(255);default:'';index" json:"model_name"`  // model the CLIENT requested (the model group id); the Activity page groups by it
-	AppName          string    `gorm:"type:varchar(255);default:'';index" json:"app_name"`    // client app detected from provider attribution headers (Activity "Top Apps")
+	KeyID            int64     `gorm:"not null;index:idx_key_hour,unique,priority:1" json:"key_id"`
+	HourBucket       time.Time `gorm:"not null;index:idx_key_hour,unique,priority:2" json:"hour_bucket"`                          // truncated to hour
+	ModelName        string    `gorm:"type:varchar(255);default:'';index;index:idx_key_hour,unique,priority:3" json:"model_name"` // model the CLIENT requested (the model group id); the Activity page groups by it
+	AppName          string    `gorm:"type:varchar(255);default:'';index;index:idx_key_hour,unique,priority:4" json:"app_name"`   // client app detected from provider attribution headers (Activity "Top Apps")
 	RequestCount     int64     `gorm:"default:0" json:"request_count"`
 	InputTokens      int64     `gorm:"default:0" json:"input_tokens"`
 	OutputTokens     int64     `gorm:"default:0" json:"output_tokens"`

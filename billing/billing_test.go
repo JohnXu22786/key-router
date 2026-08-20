@@ -132,6 +132,68 @@ func TestRecordConsumptionRoutePriceOverrides(t *testing.T) {
 	}
 }
 
+// TestRecordConsumptionSeparatesModelsInSameHour pins the per-model row key:
+// one key serving SEVERAL models (and apps) within the same hour must yield
+// separate hourly rows, each accumulating its own request_count / tokens /
+// cost and keeping its own model_name and app_name. Regression: the unique
+// index used to cover only (key_id, hour_bucket), so whichever model wrote the
+// row first owned it — a second model's usage was added onto the first model's
+// row while its name stayed that of the first request. The Activity page
+// groups by model_name, so all of gpt-4o-mini's usage (and cost, and its share
+// of the cache-hit rate) silently appeared under gpt-4o.
+func TestRecordConsumptionSeparatesModelsInSameHour(t *testing.T) {
+	key := setupBillingDB(t)
+	// Distinct price rows so each model also carries a distinguishable cost.
+	db.GetDB().Create(&model.Pricing{ModelName: "up-4o", PromptPer1M: 1.0})
+	db.GetDB().Create(&model.Pricing{ModelName: "up-4o-mini", PromptPer1M: 0.25})
+
+	// 1M prompt tokens each: $1.00 for gpt-4o, $0.25 for gpt-4o-mini.
+	usage := &model.TokenUsage{PromptTokens: 1_000_000, CompletionTokens: 0, TotalTokens: 1_000_000, Format: "openai"}
+	if _, err := RecordConsumption(key.ID, "gpt-4o", "up-4o", "app-a", usage, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RecordConsumption(key.ID, "gpt-4o-mini", "up-4o-mini", "app-b", usage, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	var rows []model.Consumption
+	if err := db.GetDB().Order("id").Find(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("rows = %d, want 2 (one per model/app in the same hour)", len(rows))
+	}
+	if rows[0].ModelName != "gpt-4o" || rows[0].AppName != "app-a" || rows[0].RequestCount != 1 || rows[0].CostUSD != 1.0 {
+		t.Errorf("row 0 = %+v, want gpt-4o/app-a, 1 request, $1.00", rows[0])
+	}
+	if rows[1].ModelName != "gpt-4o-mini" || rows[1].AppName != "app-b" || rows[1].RequestCount != 1 || rows[1].CostUSD != 0.25 {
+		t.Errorf("row 1 = %+v, want gpt-4o-mini/app-b, 1 request, $0.25", rows[1])
+	}
+
+	// One more request to EACH model: each row must grow on its own, never
+	// folding the other model's usage into it.
+	for i := 0; i < 2; i++ {
+		if _, err := RecordConsumption(key.ID, "gpt-4o", "up-4o", "app-a", usage, nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := RecordConsumption(key.ID, "gpt-4o-mini", "up-4o-mini", "app-b", usage, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.GetDB().Order("id").Find(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("rows = %d, want 2 after repeats", len(rows))
+	}
+	if rows[0].RequestCount != 3 || rows[0].CostUSD != 3.0 {
+		t.Errorf("gpt-4o row = %d requests, $%v; want 3 requests, $3.00 (own usage only)", rows[0].RequestCount, rows[0].CostUSD)
+	}
+	if rows[1].RequestCount != 3 || rows[1].CostUSD != 0.75 {
+		t.Errorf("gpt-4o-mini row = %d requests, $%v; want 3 requests, $0.75 (own usage only)", rows[1].RequestCount, rows[1].CostUSD)
+	}
+}
+
 // TestRecordConsumptionCacheTokenSemantics guards the input_tokens storage
 // convention the frontend's cache-hit rate depends on. OpenAI-format
 // prompt_tokens ALREADY includes cached tokens (store as-is), while

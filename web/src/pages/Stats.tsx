@@ -171,22 +171,36 @@ const Stats: React.FC = () => {
     },
   ];
 
-  // ---- per-key table ----
+  // ---- per-key table (Max / Avg / Min) ----
   const keyRows: KeyRow[] = useMemo(() => {
-    const acc = new Map<number, { key_id: number; name: string; values: number[]; sum: number }>();
+    // Consumption rows are keyed per (key, hour, model, app), so a key serving
+    // several models (or apps) in one hour yields multiple rows for the same
+    // hour. Coalesce them back into ONE value per (key, hour) before taking
+    // Max/Avg/Min — otherwise avg divides by the model count and max/min
+    // narrow to a single model's share of the hour. Hours are the unit (not
+    // the chart's day buckets), matching the pre-split behavior of one row per
+    // key+hour so the numbers keep their old meaning on every range.
+    const byHour = new Map<string, { key_id: number; name: string; total: number }>();
     for (const c of consumptions) {
       const v = metric === 'cost' ? c.cost_usd : metric === 'tokens' ? c.input_tokens + c.output_tokens : metric === 'requests' ? c.request_count : c.cache_hit_tokens;
-      const row = acc.get(c.key_id) || { key_id: c.key_id, name: keyName(c.key_id), values: [], sum: 0 };
-      row.values.push(v);
-      row.sum += v;
-      acc.set(c.key_id, row);
+      const k = `${c.key_id}|${dayjs(c.hour_bucket).format('YYYY-MM-DD HH:00')}`;
+      const e = byHour.get(k) || { key_id: c.key_id, name: keyName(c.key_id), total: 0 };
+      e.total += v;
+      byHour.set(k, e);
     }
-    const rows = [...acc.values()].map(r => ({
+    const byKey = new Map<number, { key_id: number; name: string; hourTotals: number[]; sum: number }>();
+    for (const e of byHour.values()) {
+      const row = byKey.get(e.key_id) || { key_id: e.key_id, name: e.name, hourTotals: [], sum: 0 };
+      row.hourTotals.push(e.total);
+      row.sum += e.total;
+      byKey.set(e.key_id, row);
+    }
+    const rows = [...byKey.values()].map(r => ({
       key_id: r.key_id,
       name: r.name,
-      max: Math.max(...r.values),
-      avg: r.values.length ? r.sum / r.values.length : 0,
-      min: Math.min(...r.values),
+      max: Math.max(...r.hourTotals),
+      avg: r.hourTotals.length ? r.sum / r.hourTotals.length : 0,
+      min: Math.min(...r.hourTotals),
       sum: r.sum,
     }));
     rows.sort((a, b) => b.sum - a.sum);

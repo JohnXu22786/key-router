@@ -2,6 +2,7 @@ package db
 
 import (
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -319,6 +320,186 @@ func TestMigrateConsumptionModelToIngress(t *testing.T) {
 	dbc.First(&back, got[5].ID)
 	if back.ModelName != "up-model-3" {
 		t.Errorf("re-run rewrote a post-migration row to %q, want it untouched", back.ModelName)
+	}
+}
+
+// indexColumns returns the columns (in order) of the named index on the
+// consumptions table, or nil if the index does not exist.
+func indexColumns(t *testing.T, dbc *gorm.DB, name string) []string {
+	t.Helper()
+	var cols []string
+	if err := dbc.Raw("SELECT name FROM pragma_index_info(?) ORDER BY seqno", name).Scan(&cols).Error; err != nil {
+		t.Fatal(err)
+	}
+	return cols
+}
+
+// TestMigrateConsumptionIndexPerModel upgrades a legacy consumptions schema
+// whose unique index covers only (key_id, hour_bucket) to the per-model
+// composite (key_id, hour_bucket, model_name, app_name). The old constraint
+// conflated every model (and app) a key served in one hour into whichever row
+// was written first; the fix must make a same-hour different-model INSERT
+// legal while still rejecting an exact (key, hour, model, app) duplicate, and
+// be idempotent on re-run.
+func TestMigrateConsumptionIndexPerModel(t *testing.T) {
+	dbc := migrateTestDB(t)
+
+	// Sabotage: replace the current per-model index with the LEGACY
+	// (key_id, hour_bucket)-only one, exactly as older builds created it.
+	if err := dbc.Migrator().DropIndex(&model.Consumption{}, "idx_key_hour"); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbc.Exec("CREATE UNIQUE INDEX idx_key_hour ON consumptions (key_id, hour_bucket)").Error; err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().Truncate(time.Hour)
+	legacy := &model.Consumption{KeyID: 1, HourBucket: now, ModelName: "gpt-4o", AppName: "app-a", RequestCount: 1, CostUSD: 1}
+	if err := dbc.Create(legacy).Error; err != nil {
+		t.Fatal(err)
+	}
+	// Under the legacy index a same-hour different-model row is rejected:
+	// this is the conflation bug being fixed.
+	if err := dbc.Create(&model.Consumption{KeyID: 1, HourBucket: now, ModelName: "gpt-4o-mini", AppName: "app-b", RequestCount: 1}).Error; err == nil {
+		t.Fatal("legacy index unexpectedly accepted a same-hour second model — fixture is not reproducing the bug")
+	}
+
+	if err := migrateConsumptionIndexPerModel(dbc); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, want := indexColumns(t, dbc, "idx_key_hour"), []string{"key_id", "hour_bucket", "model_name", "app_name"}; !slices.Equal(got, want) {
+		t.Errorf("idx_key_hour = %v, want %v", got, want)
+	}
+
+	// Existing rows survive the rebuild untouched.
+	var kept model.Consumption
+	if err := dbc.First(&kept, legacy.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if kept.ModelName != "gpt-4o" || kept.AppName != "app-a" || kept.RequestCount != 1 || kept.CostUSD != 1 {
+		t.Errorf("legacy row = %+v, want intact gpt-4o/app-a row", kept)
+	}
+
+	// The previously-rejected same-key same-hour second model now inserts.
+	second := &model.Consumption{KeyID: 1, HourBucket: now, ModelName: "gpt-4o-mini", AppName: "app-b", RequestCount: 1}
+	if err := dbc.Create(second).Error; err != nil {
+		t.Errorf("same-hour second model rejected after migration: %v", err)
+	}
+
+	// An exact duplicate (key, hour, model, app) is still rejected.
+	if err := dbc.Create(&model.Consumption{KeyID: 1, HourBucket: now, ModelName: "gpt-4o", AppName: "app-a", RequestCount: 1}).Error; err == nil {
+		t.Error("exact (key, hour, model, app) duplicate accepted after migration")
+	}
+
+	// Idempotent: a second run must leave everything as-is.
+	if err := migrateConsumptionIndexPerModel(dbc); err != nil {
+		t.Fatal(err)
+	}
+	if got := indexColumns(t, dbc, "idx_key_hour"); !slices.Equal(got, []string{"key_id", "hour_bucket", "model_name", "app_name"}) {
+		t.Errorf("after re-run idx_key_hour = %v, want composite", got)
+	}
+	var n int64
+	dbc.Model(&model.Consumption{}).Count(&n)
+	if n != 2 {
+		t.Errorf("row count = %d, want 2 after re-run", n)
+	}
+}
+
+// TestMigrateConsumptionIndexPerModelRejectsNonUnique pins the migration's
+// UNIQUE check: an idx_key_hour that covers the right four columns but is NOT
+// unique must still be rebuilt, because RecordConsumption's ON CONFLICT
+// matches a UNIQUE index — a non-unique one would reject every upsert.
+func TestMigrateConsumptionIndexPerModelRejectsNonUnique(t *testing.T) {
+	dbc := migrateTestDB(t)
+
+	if err := dbc.Migrator().DropIndex(&model.Consumption{}, "idx_key_hour"); err != nil {
+		t.Fatal(err)
+	}
+	// Right columns, missing UNIQUE — the dangerous configuration.
+	if err := dbc.Exec("CREATE INDEX idx_key_hour ON consumptions (key_id, hour_bucket, model_name, app_name)").Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if err := migrateConsumptionIndexPerModel(dbc); err != nil {
+		t.Fatal(err)
+	}
+	if got := indexColumns(t, dbc, "idx_key_hour"); !slices.Equal(got, []string{"key_id", "hour_bucket", "model_name", "app_name"}) {
+		t.Fatalf("idx_key_hour = %v, want composite columns", got)
+	}
+	var unique int
+	if err := dbc.Raw(`SELECT "unique" FROM pragma_index_list('consumptions') WHERE name = 'idx_key_hour'`).Scan(&unique).Error; err != nil {
+		t.Fatal(err)
+	}
+	if unique != 1 {
+		t.Error("idx_key_hour still non-unique after migration")
+	}
+}
+
+// TestInitRebuildsLegacyConsumptionIndex exercises the REAL upgrade path for
+// existing installs: a DB file whose consumption unique index still covers
+// only (key_id, hour_bucket) must have it rebuilt to the per-model composite
+// when db.Init re-opens that file. This pins the Init wiring (the migration
+// being CALLED), not just the migration function in isolation.
+func TestInitRebuildsLegacyConsumptionIndex(t *testing.T) {
+	tmp := t.TempDir()
+	dataDir := filepath.Join(tmp, "data")
+
+	// Start from a normal current-schema DB...
+	if err := Init(dataDir); err != nil {
+		t.Fatal(err)
+	}
+	// ...weaken its index to the LEGACY (key_id, hour_bucket)-only shape and
+	// seed a pre-fix row. (Init's AutoMigrate never rebuilds a changed index,
+	// so the stale constraint persists exactly as in a pre-upgrade install.)
+	if err := GetDB().Migrator().DropIndex(&model.Consumption{}, "idx_key_hour"); err != nil {
+		t.Fatal(err)
+	}
+	if err := GetDB().Exec("CREATE UNIQUE INDEX idx_key_hour ON consumptions (key_id, hour_bucket)").Error; err != nil {
+		t.Fatal(err)
+	}
+	hour := time.Date(2026, 8, 1, 15, 0, 0, 0, time.Local)
+	if err := GetDB().Create(&model.Consumption{KeyID: 1, HourBucket: hour, ModelName: "gpt-4o", AppName: "app-a", RequestCount: 1, CostUSD: 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+	// A same-hour second model is impossible under the legacy index (the bug).
+	if err := GetDB().Create(&model.Consumption{KeyID: 1, HourBucket: hour, ModelName: "gpt-4o-mini", AppName: "app-b", RequestCount: 1}).Error; err == nil {
+		t.Fatal("legacy fixture unexpectedly accepted a same-hour second model — not reproducing the bug")
+	}
+	if sqlDB, err := GetDB().DB(); err == nil {
+		sqlDB.Close()
+	}
+
+	// Re-launch: the upgrade path must rebuild the index.
+	if err := Init(dataDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if sqlDB, err := GetDB().DB(); err == nil {
+			sqlDB.Close()
+		}
+	})
+
+	if got := indexColumns(t, GetDB(), "idx_key_hour"); !slices.Equal(got, []string{"key_id", "hour_bucket", "model_name", "app_name"}) {
+		t.Errorf("Init left idx_key_hour = %v, want per-model composite", got)
+	}
+
+	// The pre-existing row survived untouched.
+	var kept model.Consumption
+	if err := GetDB().Where("model_name = ?", "gpt-4o").First(&kept).Error; err != nil {
+		t.Fatal(err)
+	}
+	if kept.RequestCount != 1 || kept.CostUSD != 1 {
+		t.Errorf("legacy row = %+v, want intact gpt-4o/app-a row", kept)
+	}
+
+	// The previously-impossible same-hour second model now records its own row.
+	if err := GetDB().Create(&model.Consumption{KeyID: 1, HourBucket: hour, ModelName: "gpt-4o-mini", AppName: "app-b", RequestCount: 1}).Error; err != nil {
+		t.Errorf("same-hour second model still rejected after Init: %v", err)
+	}
+	// Exact duplicates remain impossible.
+	if err := GetDB().Create(&model.Consumption{KeyID: 1, HourBucket: hour, ModelName: "gpt-4o", AppName: "app-a", RequestCount: 1}).Error; err == nil {
+		t.Error("exact (key, hour, model, app) duplicate accepted after Init")
 	}
 }
 
