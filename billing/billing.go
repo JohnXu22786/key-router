@@ -1,6 +1,7 @@
 package billing
 
 import (
+	"errors"
 	"log"
 	"sync"
 	"time"
@@ -103,6 +104,64 @@ func (c *Calculator) CalculateCost(modelName string, usage *model.TokenUsage) fl
 	return cost
 }
 
+// lookupPricing fetches the pricing rule for a model name. It returns
+// (nil, nil) when no rule exists for the name (a definitive "not found")
+// and (nil, err) when the query itself fails, so callers can tell the
+// legitimate unpriced-model case apart from a real query error such as a
+// transient SQLite locked/busy read.
+func lookupPricing(modelName string) (*model.Pricing, error) {
+	var p model.Pricing
+	err := db.GetDB().Where("model_name = ?", modelName).First(&p).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &p, nil
+}
+
+// resolvePricing returns the effective pricing rule for priceModel: its exact
+// Pricing-table rule, else the "*" wildcard rule, else nil.
+//
+// A genuine query error is NOT treated as an absence of pricing. The exact
+// lookup and the wildcard lookup both used to discard their error, so when
+// both failed — e.g. a brief SQLite locked/busy read during a relay response
+// — the code fell through to zeroed rates and RecordConsumption wrote the row
+// at $0, silently under-billing an otherwise-priced request. When the answer
+// is unknown (a lookup errored instead of returning a definitive result), the
+// error is logged and the cached Calculator price is used as the best
+// available estimate. Only a definitive no-rule (no exact rule and no
+// wildcard) yields nil, which makes the caller charge zero — the intended
+// price for an unpriced model.
+func resolvePricing(calc *Calculator, priceModel string) *model.Pricing {
+	exact, exactErr := lookupPricing(priceModel)
+	if exact != nil {
+		return exact
+	}
+
+	// No exact rule (or its lookup failed): fall back to the "*" wildcard.
+	wildcard, wildcardErr := lookupPricing("*")
+	if wildcard != nil {
+		if exactErr != nil {
+			log.Printf("[billing] exact pricing lookup failed for %q: %v; using wildcard price", priceModel, exactErr)
+		}
+		return wildcard
+	}
+
+	// Neither lookup produced its rule. If one of them errored, the absence
+	// is unproven — fall back to the cached price instead of billing $0.
+	if exactErr != nil || wildcardErr != nil {
+		log.Printf("[billing] pricing lookup unavailable for %q (exact: %v, wildcard: %v); falling back to cached price", priceModel, exactErr, wildcardErr)
+		if calc != nil {
+			if p := calc.GetPricing(priceModel); p != nil {
+				return p
+			}
+		}
+	}
+	return nil
+}
+
 // RecordConsumption writes a consumption record to the database.
 // modelName is the model the CLIENT requested (the model group id) — it is
 // what the Activity page groups by. priceModel is the model actually served
@@ -114,7 +173,11 @@ func (c *Calculator) CalculateCost(modelName string, usage *model.TokenUsage) fl
 // routePrice, when non-nil and non-zero, overrides the Pricing table (each
 // route can carry its own per-1M rates — e.g. a cheap and a premium key for
 // the same model).
-func RecordConsumption(keyID int64, modelName, priceModel, appName string, usage *model.TokenUsage, routePrice *model.Route) (*model.Consumption, error) {
+// calc, when non-nil, is the in-memory pricing cache (the engine's
+// Calculator). It backs the Pricing-table lookup: if that query genuinely
+// errors, the cached price is used so a transient DB hiccup does not bill an
+// otherwise-priced request at $0.
+func RecordConsumption(keyID int64, modelName, priceModel, appName string, usage *model.TokenUsage, routePrice *model.Route, calc *Calculator) (*model.Consumption, error) {
 	// Truncate to the LOCAL hour: time.Truncate aligns to UTC hours, which
 	// misaligns buckets in non-whole-hour-offset zones (e.g. +05:30).
 	nowT := time.Now()
@@ -132,16 +195,11 @@ func RecordConsumption(keyID int64, modelName, priceModel, appName string, usage
 			prompt, completion = routePrice.PromptPer1M, routePrice.CompletionPer1M
 			cacheRead, cacheWrite = routePrice.CacheReadPer1M, routePrice.CacheWritePer1M
 		} else {
-			// Try to find pricing — exact model name first, then the "*" wildcard.
 			// Keyed on priceModel (the upstream model actually served): the
-			// provider bills at that price even though the activity page shows
-			// the client-requested model name.
-			var p model.Pricing
-			exact := db.GetDB().Where("model_name = ?", priceModel).First(&p).Error
-			if exact != nil {
-				db.GetDB().Where("model_name = ?", "*").First(&p)
-			}
-			if exact == nil || p.ID > 0 {
+			// provider bills at that price even though the activity page
+			// shows the client-requested model name. nil means no rule (or a
+			// priced model the fallback could not resolve) — rates stay 0.
+			if p := resolvePricing(calc, priceModel); p != nil {
 				prompt, completion = p.PromptPer1M, p.CompletionPer1M
 				cacheRead, cacheWrite = p.CacheReadPer1M, p.CacheWritePer1M
 			}
