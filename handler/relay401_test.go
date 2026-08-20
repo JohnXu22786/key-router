@@ -84,6 +84,67 @@ func TestRelay401ModelProblemCoolsNotDisables(t *testing.T) {
 	}
 }
 
+// TestRelay401KeyValidModelInvalidCoolsNotDisables: a gateway that answers
+// 401 with "Your API key is valid, but the model gpt-4o-mini is invalid"
+// (the KEY is fine; the requested model is not) must cool the key, never
+// disable it — the same classification as the health probe, so no
+// disable -> recover -> disable flap. Before the valence fix the "key ...
+// invalid" chain marked the key auth_failed and a second hit disabled it.
+func TestRelay401KeyValidModelInvalidCoolsNotDisables(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprint(w, `{"error":{"message":"Your API key is valid, but the model gpt-4o-mini is invalid."}}`)
+	}))
+	defer upstream.Close()
+
+	tmp := t.TempDir()
+	if err := db.Init(filepath.Join(tmp, "data")); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if sqlDB, err := db.GetDB().DB(); err == nil {
+			sqlDB.Close()
+		}
+	})
+	db.SetSetting(model.SettingPort, "9999")
+	db.GetDB().Create(&model.Provider{Name: "mock", Type: "openai", BaseURL: upstream.URL})
+	var prov model.Provider
+	db.GetDB().First(&prov)
+	db.GetDB().Create(&model.Key{ProviderID: prov.ID, KeyValue: "sk-test", Name: "k1", RecoveryStrategy: model.RecoveryImmediate})
+	var key model.Key
+	db.GetDB().First(&key)
+	db.GetDB().Create(&model.ModelGroup{GroupID: "mock-model", Name: "Mock", Enabled: true})
+	var g model.ModelGroup
+	db.GetDB().First(&g)
+	db.GetDB().Create(&model.Route{ModelGroupID: g.ID, ProviderID: prov.ID, Enabled: true, Priority: 0})
+
+	engine := selector.NewEngine()
+	checker := health.NewChecker()
+	e := router.Setup(embed.FS{}, engine, checker, events.NewHub())
+
+	body, _ := json.Marshal(map[string]interface{}{"model": "mock-model", "messages": []map[string]string{{"role": "user", "content": "hi"}}})
+	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body))
+	req.Host = "localhost:9999"
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	// The gateway 401s naming a model problem (the key is valid); the relay
+	// must cool the key (model-problem 401, 403-style), NOT disable it.
+	var after model.Key
+	db.GetDB().First(&after, key.ID)
+	if after.Status == model.KeyStatusDisabled {
+		t.Fatalf("key %d disabled by a key-valid/model-invalid 401 — must cool, not disable (valid key taken out of rotation)", key.ID)
+	}
+	if after.DisabledReason == "auth_failed" {
+		t.Errorf("disabled_reason = %q, want anything but auth_failed for a key-valid/model-invalid 401", after.DisabledReason)
+	}
+	if after.Status != model.KeyStatusRateLimited {
+		t.Errorf("key status = %q, want rate_limited (key-valid/model-invalid 401 must cool the key)", after.Status)
+	}
+}
+
 // TestRelay401BadKeyCoolsThenDisables: a 401 whose body blames the KEY must
 // mark the key once and fail over (rate_limited + auth_failed reason), and
 // only a SECOND consecutive 401 disables it — the "2 consecutive failures

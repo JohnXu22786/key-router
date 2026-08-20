@@ -565,12 +565,15 @@ func (h *AdminHandler) UpdateKey(c *gin.Context) {
 
 	// A deliberate admin disable (explicit "status":"disabled" in the payload)
 	// must clear a stale auto-recovery reason: the engine's state machine
-	// only auto-recovers disabled keys whose disabled_reason is non-empty
-	// (system-set: auth_failed / insufficient_quota), so an empty reason
-	// keeps the key out of rotation until an admin re-enables it. This
-	// applies even when the key is already disabled (re-affirming the
-	// disable).
-	if statusInPayload && k.Status == model.KeyStatusDisabled {
+	// only auto-recovers disabled keys whose disabled_reason is a SYSTEM-set
+	// reason (auth_failed / insufficient_quota / spend_limit_exhausted, see
+	// model.IsSystemDisabledReason), so clearing a stale system reason keeps
+	// the key out of rotation until an admin re-enables it. This applies
+	// even when the key is already disabled (re-affirming the disable), but
+	// only when the caller did NOT supply a reason of their own — an
+	// explicit non-null disabled_reason in the same payload must survive
+	// (it is the admin's recorded justification).
+	if statusInPayload && k.Status == model.KeyStatusDisabled && !reasonInPayload {
 		k.DisabledReason = ""
 	}
 	if err := db.GetDB().Save(&k).Error; err != nil {

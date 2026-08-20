@@ -65,7 +65,11 @@ func ClassifyErrorBody(body []byte) ErrorBodySignals {
 			// Key-invalidity signals win (fail-closed): a dead key stays
 			// dead even when the word "model" appears in the same body —
 			// and a key signal in ANY sentence suppresses model readings.
-			if matchAny(tokens, keyInvalidSignals) || matchAnyString(compact, keyInvalidChineseSignals) {
+			// The valence guard rejects a "key ... invalid" chain when a
+			// positive qualifier frames the key as valid ("Your API key is
+			// valid, but the model gpt-4o-mini is invalid" — the words would
+			// otherwise chain under the generous gap budget).
+			if matchKeyInvalid(tokens) || matchAnyString(compact, keyInvalidChineseSignals) {
 				keyAny = true
 			}
 
@@ -213,6 +217,21 @@ var keyInvalidSignals = [][]string{
 	{"credentials", "invalid"},
 }
 
+// keyPositiveQualifiers are words that FRAME THE KEY as valid/working. When a
+// key-invalid signal ({"key","invalid"}, {"api","key","invalid"}, {"key",
+// "not","valid"}, ...) would chain with the negative word LATE in the
+// sentence, a positive qualifier sitting between the key word and that
+// negative word shows the negative word is not about the key — it usually
+// qualifies the MODEL: "Your API key is valid, but the model gpt-4o-mini is
+// invalid" must not read as a key error. The signal's own words (the "valid"
+// in "key not valid") are never in this span because seqMatchValence only
+// inspects the foreign tokens BETWEEN the signal's first and last words.
+var keyPositiveQualifiers = map[string]bool{
+	"valid": true, "fine": true, "ok": true, "okay": true,
+	"correct": true, "good": true, "active": true, "working": true,
+	"works": true, "usable": true,
+}
+
 // modelProblemSignals are token sequences that prove the key authenticated
 // and only the probe's MODEL is unavailable/denied. Kept fail-open ONLY for
 // phrasings that name the model and its denial — the key signal list above
@@ -227,6 +246,7 @@ var modelProblemSignals = [][]string{
 	{"model", "not", "supported"},
 	{"model", "not", "entitled"},
 	{"model", "not", "valid"},
+	{"model", "invalid"}, // "Your API key is valid, but the model is invalid." / "model gpt-4o is invalid"
 	{"model", "not", "enabled"},
 	{"model", "no", "access"},
 	{"model", "access", "denied"},
@@ -402,6 +422,18 @@ func matchAny(tokens []string, signals [][]string) bool {
 	return false
 }
 
+// matchKeyInvalid matches keyInvalidSignals through seqMatchValence — a key
+// reading is only committed when the negative word directly qualifies the
+// key (no positive qualifier about the key in between). See seqMatchValence.
+func matchKeyInvalid(tokens []string) bool {
+	for _, sig := range keyInvalidSignals {
+		if seqMatchValence(tokens, sig) {
+			return true
+		}
+	}
+	return false
+}
+
 func matchAnyString(text string, phrases []string) bool {
 	for _, p := range phrases {
 		if strings.Contains(text, p) {
@@ -417,6 +449,32 @@ func matchAnyString(text string, phrases []string) bool {
 // never matches inside "invalidate keys" — but "api key sk-123 is invalid"
 // DOES match [key invalid] (the echoed key ID sits between the words).
 func seqMatch(tokens []string, sig []string) bool {
+	return seqMatchGap(tokens, sig, false)
+}
+
+// seqMatchValence is seqMatch plus the key-valence guard. A candidate match
+// is rejected when a keyPositiveQualifiers word sits between the signal's
+// first and last words: "Your API key is valid, but the model gpt-4o-mini is
+// invalid" chains [api@1 key@2 ... invalid@12] under the generous gap budget
+// and would otherwise read as a KEY error even though the sentence asserts
+// the key is valid. Each occurrence of the first word is still tried, so a
+// genuine key-blaming clause later in the sentence ("... the key provided is
+// invalid") matches via its own clean occurrence. Used only for
+// keyInvalidSignals.
+//
+// The guard is one-directional: it inspects the tokens between the key word
+// and a LATER negative word. The mirror phrasing ("The model gpt-4o-mini is
+// invalid while your API key remains valid") is NOT guarded, because a
+// positive word AFTER the matched key ("The key is invalid but the model is
+// valid" — a genuinely bad key) must never reject the match; distinguishing
+// the two orderings word-locally is not tractable without clause parsing.
+// Gateways phrase the reported case key-first ("Your API key is valid, but
+// the model is invalid"), which this guard covers.
+func seqMatchValence(tokens []string, sig []string) bool {
+	return seqMatchGap(tokens, sig, true)
+}
+
+func seqMatchGap(tokens []string, sig []string, applyValence bool) bool {
 	if len(sig) == 0 {
 		return false
 	}
@@ -428,6 +486,8 @@ func seqMatch(tokens []string, sig []string) bool {
 		}
 		pos := i + 1
 		matched := true
+		first := i
+		last := i
 		for _, w := range sig[1:] {
 			found := -1
 			for j := pos; j < len(tokens) && j-pos <= maxGapUnmatched; j++ {
@@ -440,9 +500,28 @@ func seqMatch(tokens []string, sig []string) bool {
 				matched = false
 				break
 			}
+			last = found
 			pos = found + 1
 		}
-		if matched {
+		if !matched {
+			continue
+		}
+		if applyValence && hasPositiveQualifier(tokens, first, last) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// hasPositiveQualifier reports whether any FOREIGN token strictly between
+// first and last (exclusive) — the words the signal skipped over — is a
+// positive qualifier framing the subject as valid/working. The signal's own
+// words are excluded: the "valid" in "key not valid" is the matched last
+// word (outside the span), and "not" is not a qualifier.
+func hasPositiveQualifier(tokens []string, first, last int) bool {
+	for i := first + 1; i < last; i++ {
+		if keyPositiveQualifiers[tokens[i]] {
 			return true
 		}
 	}

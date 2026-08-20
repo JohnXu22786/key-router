@@ -193,7 +193,8 @@ func budgetExhausted(key *model.Key) bool {
 // shouldProbeKey decides whether a key is due for a probe this pass.
 //   - Keys whose lifetime spend budget is exhausted are admin-capped — never
 //     probed.
-//   - Disabled keys with an empty reason are admin-disabled — never probed.
+//   - Disabled keys not carrying a system-set reason (empty reason, or a
+//     custom admin justification) are admin-disabled — never probed.
 //   - Disabled (system) / rate-limited keys: every pass, EXCEPT a
 //     rate-limited key whose cooldown is still running — probing it can't
 //     change its state (recovery is blocked during the cooldown) and each
@@ -203,8 +204,8 @@ func (c *Checker) shouldProbeKey(key *model.Key) bool {
 	if budgetExhausted(key) {
 		return false // lifetime budget cap reached — never probe nor recover
 	}
-	if key.Status == model.KeyStatusDisabled && key.DisabledReason == "" {
-		return false // deliberately disabled by an admin
+	if key.Status == model.KeyStatusDisabled && !model.IsSystemDisabledReason(key.DisabledReason) {
+		return false // deliberately disabled by an admin (custom or no justification)
 	}
 	if key.Status == model.KeyStatusRateLimited &&
 		key.RateLimitedUntil != nil && time.Now().Before(*key.RateLimitedUntil) {
@@ -270,10 +271,11 @@ func (c *Checker) checkKey(key *model.Key) {
 
 	// Disabled keys are only ever auto-recovered by the engine's state
 	// machine when the disabled_reason was set by the system
-	// (auth_failed / insufficient_quota / ...). A key disabled deliberately
-	// by an admin has an empty reason (UpdateKey clears it) and stays out
-	// of rotation — it must not even be probed (each probe is billable).
-	if key.Status == model.KeyStatusDisabled && key.DisabledReason == "" {
+	// (auth_failed / insufficient_quota / spend_limit_exhausted). A key
+	// disabled deliberately by an admin has an empty or custom reason and
+	// stays out of rotation — it must not even be probed (each probe is
+	// billable).
+	if key.Status == model.KeyStatusDisabled && !model.IsSystemDisabledReason(key.DisabledReason) {
 		return
 	}
 

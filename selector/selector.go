@@ -339,8 +339,12 @@ func (e *Engine) MarkKeyDisabled(keyID int64, reason string) {
 //     (status != active, a lingering reason, or a stale cooldown), so an
 //     already-active key produces no write, no memory update and no SSE
 //     event — every 2nd success on a healthy key is a no-op.
-//   - Deliberately-disabled keys (empty disabled_reason) are never
-//     re-admitted — only an explicit admin action can re-enable them.
+//   - Deliberately-disabled keys are never re-admitted: a disabled key is
+//     only recoverable when its disabled_reason is a SYSTEM-set reason
+//     (auth_failed / insufficient_quota / spend_limit_exhausted) proving a
+//     fault the key can outgrow. A custom (admin justification) or empty
+//     reason marks an admin-disable that only an explicit admin action can
+//     re-enable.
 //   - Budget-capped keys (spend_limit_exhausted) are never re-admitted:
 //     the lifetime cap is an administrative limit, not an upstream health
 //     condition.
@@ -349,8 +353,10 @@ func (e *Engine) MarkKeyDisabled(keyID int64, reason string) {
 //     key and the status ping-pongs).
 func (e *Engine) MarkKeyActive(keyID int64) {
 	res := db.GetDB().Model(&model.Key{}).
-		Where("id = ? AND (status <> ? OR (disabled_reason IS NOT NULL AND disabled_reason <> '') OR rate_limited_until IS NOT NULL) AND (status <> ? OR (disabled_reason IS NOT NULL AND disabled_reason <> '')) AND (total_spend_limit IS NULL OR total_spend_limit = 0 OR total_spent < total_spend_limit) AND (rate_limited_until IS NULL OR rate_limited_until <= ?)",
-			keyID, model.KeyStatusActive, model.KeyStatusDisabled, time.Now()).
+		Where("id = ? AND (status <> ? OR (disabled_reason IS NOT NULL AND disabled_reason <> '') OR rate_limited_until IS NOT NULL) AND (status <> ? OR disabled_reason IN (?, ?, ?)) AND (total_spend_limit IS NULL OR total_spend_limit = 0 OR total_spent < total_spend_limit) AND (rate_limited_until IS NULL OR rate_limited_until <= ?)",
+			keyID, model.KeyStatusActive, model.KeyStatusDisabled,
+			model.ReasonAuthFailed, model.ReasonInsufficientQuota, model.KeyDisabledReasonSpendLimit,
+			time.Now()).
 		Updates(map[string]interface{}{
 			"status":             model.KeyStatusActive,
 			"rate_limited_until": nil,

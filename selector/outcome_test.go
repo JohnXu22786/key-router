@@ -256,6 +256,40 @@ func TestRecordResultNeverRecoversAdminDisabledKey(t *testing.T) {
 	}
 }
 
+// TestRecordResultNeverRecoversCustomReasonDisabledKey: a key disabled by an
+// admin WITH a recorded justification (custom non-empty reason) must never
+// be re-admitted by observations — exactly like an empty-reason admin
+// disable. Only system-set reasons (auth_failed / insufficient_quota /
+// spend_limit_exhausted) leave auto-recovery open; without this guard the 2
+// successful observations after the fix would silently re-enable the key AND
+// erase the justification the admin just supplied.
+func TestRecordResultNeverRecoversCustomReasonDisabledKey(t *testing.T) {
+	e := newTestEngine(t)
+	k := mustKey(t, e, &model.Key{ProviderID: 1, Status: model.KeyStatusActive})
+	db.GetDB().Model(&model.Key{}).Where("id = ?", k.ID).Updates(map[string]interface{}{
+		"status":          model.KeyStatusDisabled,
+		"disabled_reason": "Suspended due to abuse",
+	})
+	e.Refresh() // sync the engine's memory cache
+
+	var got []string
+	e.SetOnStatusChanged(func(_ int64, status string) { got = append(got, status) })
+
+	e.RecordResult(k.ID, true, "", 0)
+	e.RecordResult(k.ID, true, "", 0)
+
+	after := loadKey(t, k.ID)
+	if after.Status != model.KeyStatusDisabled {
+		t.Errorf("status = %q, want disabled (custom-reason admin-disable must never auto-recover)", after.Status)
+	}
+	if after.DisabledReason != "Suspended due to abuse" {
+		t.Errorf("disabled_reason = %q, want %q (admin justification must survive 2 successful observations)", after.DisabledReason, "Suspended due to abuse")
+	}
+	if len(got) != 0 {
+		t.Errorf("events = %v, want none for a custom-reason disabled key", got)
+	}
+}
+
 // TestRecordResultNeverRecoversBudgetCappedKey: the lifetime spend cap is an
 // administrative limit — 2 successful observations must not revive a
 // spend_limit_exhausted key.

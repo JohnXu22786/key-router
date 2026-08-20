@@ -126,14 +126,15 @@ func TestAnthropicResponseToResponses(t *testing.T) {
 	if len(output) != 3 {
 		t.Fatalf("output = %d, want 3: %v", len(output), output)
 	}
-	// block order preserved: reasoning first, then message, then function_call
+	// block order preserved: reasoning first, then message, then function_call;
+	// ids carry the per-type sequence (msg_<seed>_1, rs_<seed>_1)
 	rs := output[0].(map[string]interface{})
-	if rs["type"] != "reasoning" {
-		t.Errorf("output[0] = %v", rs)
+	if rs["type"] != "reasoning" || rs["id"] != "rs_msg_1_1" {
+		t.Errorf("output[0] = %v, want reasoning rs_msg_1_1", rs)
 	}
 	msg := output[1].(map[string]interface{})
-	if msg["type"] != "message" {
-		t.Errorf("output[1] = %v", msg)
+	if msg["type"] != "message" || msg["id"] != "msg_msg_1_1" {
+		t.Errorf("output[1] = %v, want message msg_msg_1_1", msg)
 	}
 	fc := output[2].(map[string]interface{})
 	if fc["type"] != "function_call" || fc["call_id"] != "toolu_1" || fc["arguments"] != `{"q":"x"}` {
@@ -164,6 +165,73 @@ func TestAnthropicResponseToResponsesMaxTokens(t *testing.T) {
 	json.Unmarshal(out, &resp)
 	if resp["status"] != "incomplete" {
 		t.Errorf("status = %v, want incomplete", resp["status"])
+	}
+}
+
+// TestAnthropicResponseToResponsesUniqueItemIDs guards the Responses API
+// item-id uniqueness contract: a response carrying several text blocks (split
+// by tool_use/thinking) or several thinking blocks must not stamp the bare
+// response seed on every item of a type — clients key output items by id, so
+// two message items sharing msg_<seed> (or two reasoning items sharing
+// rs_<seed>) breaks correlation. Each item of a type gets the seed plus that
+// type's running sequence; tool ids keep coming from the upstream block id.
+func TestAnthropicResponseToResponsesUniqueItemIDs(t *testing.T) {
+	body := `{
+		"id": "msg_abc", "type": "message", "model": "claude",
+		"stop_reason": "tool_use",
+		"content": [
+			{"type": "thinking", "thinking": "first..."},
+			{"type": "text", "text": "Let me check."},
+			{"type": "tool_use", "id": "toolu_1", "name": "search", "input": {"q": "x"}},
+			{"type": "thinking", "thinking": "second..."},
+			{"type": "text", "text": "Done."}
+		]
+	}`
+	out, err := AnthropicResponseToResponses([]byte(body), "claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(out, &resp); err != nil {
+		t.Fatal(err)
+	}
+	output := resp["output"].([]interface{})
+	if len(output) != 5 {
+		t.Fatalf("output = %d items, want 5: %v", len(output), output)
+	}
+
+	// no two output items may share an id
+	seen := map[string]int{}
+	for i, item := range output {
+		m := item.(map[string]interface{})
+		id := m["id"].(string)
+		if prev, dup := seen[id]; dup {
+			t.Errorf("output[%d] id %q duplicates output[%d] (type %v)", i, id, prev, m["type"])
+		}
+		seen[id] = i
+	}
+
+	// per-type sequence disambiguates same-type items; tool id stays stable
+	wantTypes := []string{"reasoning", "message", "function_call", "reasoning", "message"}
+	for i, item := range output {
+		if item.(map[string]interface{})["type"] != wantTypes[i] {
+			t.Errorf("output[%d] type = %v, want %s", i, item.(map[string]interface{})["type"], wantTypes[i])
+		}
+	}
+	if got := output[0].(map[string]interface{})["id"]; got != "rs_msg_abc_1" {
+		t.Errorf("first reasoning id = %v, want rs_msg_abc_1", got)
+	}
+	if got := output[1].(map[string]interface{})["id"]; got != "msg_msg_abc_1" {
+		t.Errorf("first message id = %v, want msg_msg_abc_1", got)
+	}
+	if got := output[2].(map[string]interface{})["id"]; got != "toolu_1" {
+		t.Errorf("function_call id = %v, want toolu_1 (stable from block id)", got)
+	}
+	if got := output[3].(map[string]interface{})["id"]; got != "rs_msg_abc_2" {
+		t.Errorf("second reasoning id = %v, want rs_msg_abc_2", got)
+	}
+	if got := output[4].(map[string]interface{})["id"]; got != "msg_msg_abc_2" {
+		t.Errorf("second message id = %v, want msg_msg_abc_2", got)
 	}
 }
 

@@ -73,7 +73,7 @@ func TestRecordConsumptionStoresIngressModel(t *testing.T) {
 	key := setupBillingDB(t)
 	usage := &model.TokenUsage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15, Format: "openai"}
 
-	consumption, err := RecordConsumption(key.ID, "client-model", "upstream-real", "app", usage, nil)
+	consumption, err := RecordConsumption(key.ID, "client-model", "upstream-real", "app", usage, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func TestRecordConsumptionPricesByTargetModel(t *testing.T) {
 	db.GetDB().Create(&model.Pricing{ModelName: "upstream-real", PromptPer1M: 1.0, CompletionPer1M: 2.0})
 	usage := &model.TokenUsage{PromptTokens: 1_000_000, CompletionTokens: 500_000, TotalTokens: 1_500_000, Format: "openai"}
 
-	consumption, err := RecordConsumption(key.ID, "client-model", "upstream-real", "app", usage, nil)
+	consumption, err := RecordConsumption(key.ID, "client-model", "upstream-real", "app", usage, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +120,7 @@ func TestRecordConsumptionRoutePriceOverrides(t *testing.T) {
 	route := &model.Route{PromptPer1M: 4.0}
 	usage := &model.TokenUsage{PromptTokens: 1_000_000, CompletionTokens: 0, TotalTokens: 1_000_000, Format: "openai"}
 
-	consumption, err := RecordConsumption(key.ID, "client-model", "upstream-real", "app", usage, route)
+	consumption, err := RecordConsumption(key.ID, "client-model", "upstream-real", "app", usage, route, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,10 +149,10 @@ func TestRecordConsumptionSeparatesModelsInSameHour(t *testing.T) {
 
 	// 1M prompt tokens each: $1.00 for gpt-4o, $0.25 for gpt-4o-mini.
 	usage := &model.TokenUsage{PromptTokens: 1_000_000, CompletionTokens: 0, TotalTokens: 1_000_000, Format: "openai"}
-	if _, err := RecordConsumption(key.ID, "gpt-4o", "up-4o", "app-a", usage, nil); err != nil {
+	if _, err := RecordConsumption(key.ID, "gpt-4o", "up-4o", "app-a", usage, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := RecordConsumption(key.ID, "gpt-4o-mini", "up-4o-mini", "app-b", usage, nil); err != nil {
+	if _, err := RecordConsumption(key.ID, "gpt-4o-mini", "up-4o-mini", "app-b", usage, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -173,10 +173,10 @@ func TestRecordConsumptionSeparatesModelsInSameHour(t *testing.T) {
 	// One more request to EACH model: each row must grow on its own, never
 	// folding the other model's usage into it.
 	for i := 0; i < 2; i++ {
-		if _, err := RecordConsumption(key.ID, "gpt-4o", "up-4o", "app-a", usage, nil); err != nil {
+		if _, err := RecordConsumption(key.ID, "gpt-4o", "up-4o", "app-a", usage, nil, nil); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := RecordConsumption(key.ID, "gpt-4o-mini", "up-4o-mini", "app-b", usage, nil); err != nil {
+		if _, err := RecordConsumption(key.ID, "gpt-4o-mini", "up-4o-mini", "app-b", usage, nil, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -227,7 +227,7 @@ func TestRecordConsumptionCacheTokenSemantics(t *testing.T) {
 		CompletionTokens: 10,
 		CacheHitTokens:   98,
 		Format:           "openai",
-	}, nil); err != nil {
+	}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -240,7 +240,7 @@ func TestRecordConsumptionCacheTokenSemantics(t *testing.T) {
 		CacheHitTokens:   98,
 		CacheWriteTokens: 10,
 		Format:           "anthropic",
-	}, nil); err != nil {
+	}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -256,5 +256,93 @@ func TestRecordConsumptionCacheTokenSemantics(t *testing.T) {
 	}
 	if rows[1].InputTokens != 208 || rows[1].CacheHitTokens != 98 || rows[1].CacheWriteTokens != 10 {
 		t.Errorf("anthropic row: input_tokens = %d (want 208), cache_hit_tokens = %d (want 98), cache_write_tokens = %d (want 10)", rows[1].InputTokens, rows[1].CacheHitTokens, rows[1].CacheWriteTokens)
+	}
+}
+
+// TestRecordConsumptionPricingLookupErrorFallsBackToCache guards the billing
+// default when the Pricing-table lookup itself fails: a genuine query error
+// must not be indistinguishable from "no pricing rule". Before the fix the
+// exact-model lookup AND the "*" wildcard lookup both discarded their error,
+// so when both failed — e.g. a transient SQLite locked/busy read during a
+// relay response — the rates fell through to zero and RecordConsumption wrote
+// the row at $0, silently under-billing an otherwise-priced request. The fix
+// logs the error and falls back to the price already in the in-memory
+// Calculator, so the recorded cost stays correct even while the DB read
+// hiccups.
+func TestRecordConsumptionPricingLookupErrorFallsBackToCache(t *testing.T) {
+	key := setupBillingDB(t)
+	db.GetDB().Create(&model.Pricing{ModelName: "upstream-real", PromptPer1M: 2.0})
+
+	// Seed the in-memory cache while the DB is healthy, then take the DB
+	// down: both pricing lookups now fail with a genuine error ("sql:
+	// database is closed") instead of a definitive not-found. The remaining
+	// tests each re-initialize the global db.DB via setupBillingDB/db.Init,
+	// so the closed handle never leaks into them.
+	calc := NewCalculator()
+	sqlDB, err := db.GetDB().DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlDB.Close()
+
+	usage := &model.TokenUsage{PromptTokens: 1_000_000, CompletionTokens: 0, TotalTokens: 1_000_000, Format: "openai"}
+	consumption, recErr := RecordConsumption(key.ID, "client-model", "upstream-real", "app", usage, nil, calc)
+	if recErr == nil {
+		t.Fatalf("RecordConsumption returned no error with the DB closed, want one")
+	}
+	// 1M prompt × $2 — from the cache, not the unreachable DB — must not be
+	// silently billed at $0.
+	if consumption.CostUSD != 2.0 {
+		t.Fatalf("CostUSD = %v, want 2 (cached-price fallback, not 0)", consumption.CostUSD)
+	}
+}
+
+// TestRecordConsumptionWildcardRulesFallback: a priceModel with no exact
+// Pricing row but a "*" wildcard row must bill at the wildcard rate. This is
+// the fallback the error-handling fix must preserve, not replace.
+func TestRecordConsumptionWildcardRulesFallback(t *testing.T) {
+	key := setupBillingDB(t)
+	db.GetDB().Create(&model.Pricing{ModelName: "*", PromptPer1M: 4.0})
+	usage := &model.TokenUsage{PromptTokens: 1_000_000, CompletionTokens: 0, TotalTokens: 1_000_000, Format: "openai"}
+
+	consumption, err := RecordConsumption(key.ID, "client-model", "no-exact-rule", "app", usage, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No exact rule for "no-exact-rule" -> the "*" wildcard's $4 applies.
+	if consumption.CostUSD != 4.0 {
+		t.Fatalf("CostUSD = %v, want 4 (wildcard rate for a model without an exact rule)", consumption.CostUSD)
+	}
+	var saved model.Consumption
+	if err := db.GetDB().First(&saved, consumption.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if saved.CostUSD != 4.0 {
+		t.Errorf("DB CostUSD = %v, want 4 (computed cost persisted)", saved.CostUSD)
+	}
+}
+
+// TestRecordConsumptionUnpricedModelStaysZero: a model with no pricing rule
+// (no exact rule, no "*" wildcard) must still record at $0, even when the
+// cache happens to hold a stale price for it. Zero rates is the intended
+// price for an unpriced model; the cache fallback applies only when the
+// lookup ERRORS, never when it definitively finds nothing.
+func TestRecordConsumptionUnpricedModelStaysZero(t *testing.T) {
+	key := setupBillingDB(t)
+	calc := &Calculator{
+		pricing: map[string]*model.Pricing{
+			// Stale cache entry: the rule was deleted from the Pricing table
+			// but the engine's cache has not been refreshed yet.
+			"no-rule-anywhere": {PromptPer1M: 9.0},
+		},
+	}
+	usage := &model.TokenUsage{PromptTokens: 1_000_000, CompletionTokens: 0, TotalTokens: 1_000_000, Format: "openai"}
+
+	consumption, err := RecordConsumption(key.ID, "client-model", "no-rule-anywhere", "app", usage, nil, calc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if consumption.CostUSD != 0.0 {
+		t.Fatalf("CostUSD = %v, want 0 (definitive no-rule must not charge the stale cached price)", consumption.CostUSD)
 	}
 }

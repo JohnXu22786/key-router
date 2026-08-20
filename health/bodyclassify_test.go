@@ -98,6 +98,62 @@ func TestClassifyKeySignalWins(t *testing.T) {
 	}
 }
 
+// TestClassifyKeyValidModelInvalid: when a sentence FRAMES the key as valid
+// and blames the MODEL ("Your API key is valid, but the model gpt-4o-mini is
+// invalid", "the key is fine, but the model is invalid"), the classifier must
+// NOT read "key ... invalid" as a key error — the words chain under the
+// generous gap budget ("key @2 ... invalid @9") even though the message
+// asserts the key is fine. The body must be a ModelProblem, never a
+// KeyInvalid: the health probe and the relay rely on this to keep a
+// healthy-but-not-entitled key in rotation instead of marking it auth_failed.
+func TestClassifyKeyValidModelInvalid(t *testing.T) {
+	bodies := []string{
+		`{"error":{"message":"Your API key is valid, but the model gpt-4o-mini is invalid."}}`,
+		`{"error":{"message":"Your API key is valid, but the model is invalid."}}`,
+		`{"error":{"message":"The API key is fine, however the model gpt-4o is invalid for this account."}}`,
+		`{"error":{"message":"Your API key is ok, but the model is invalid."}}`,
+		// Sentence boundaries (period / semicolon) split the clauses — the
+		// model clause is still a model problem on its own.
+		`{"error":{"message":"Your API key is valid. The model is invalid."}}`,
+		`{"error":{"message":"Your API key is valid. However, the model gpt-4o-mini is invalid."}}`,
+	}
+	for _, b := range bodies {
+		sig := ClassifyErrorBody([]byte(b))
+		if sig.KeyInvalid {
+			t.Errorf("body %q: KeyInvalid=true, want false (message frames the KEY as valid)", b)
+		}
+		if !sig.ModelProblem {
+			t.Errorf("body %q: ModelProblem=false, want true (message says the MODEL is invalid)", b)
+		}
+	}
+}
+
+// TestClassifyKeyInvalidValenceGuardNotOverRejecting: the valence guard must
+// not reject GENUINE key-invalid sentences just because a positive qualifier
+// or a model word appears somewhere. A real key-blaming clause ("the key
+// provided is invalid") still matches via its own clean key occurrence, and
+// "key ... invalid" with only auxiliary words between still qualifies the key.
+func TestClassifyKeyInvalidValenceGuardNotOverRejecting(t *testing.T) {
+	bodies := []string{
+		// "the key provided is invalid" matches at the second key occurrence;
+		// the first clause's "valid" must not swallow it.
+		`{"error":{"message":"Please ensure the API key is valid, the key provided is invalid."}}`,
+		// Only auxiliary words between key and invalid — the key IS invalid.
+		`{"error":{"message":"The API key sk-123 with the long id here is invalid."}}`,
+		// A later model clause must not let a bad key off the hook.
+		`{"error":{"message":"The api key sk-123 is invalid. Model gpt-4o-mini is not available."}}`,
+	}
+	for _, b := range bodies {
+		sig := ClassifyErrorBody([]byte(b))
+		if !sig.KeyInvalid {
+			t.Errorf("body %q: KeyInvalid=false, want true (genuine key-invalid clause)", b)
+		}
+		if sig.ModelProblem {
+			t.Errorf("body %q: ModelProblem=true, want false (key signal wins)", b)
+		}
+	}
+}
+
 // TestClassifyChinese: Chinese error messages from domestic gateways.
 // Contiguous-phrase matching preserves word order: "密钥对应的模型不存在"
 // (the model for the key is missing) is a MODEL problem, while "模型对应的
