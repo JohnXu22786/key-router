@@ -75,8 +75,8 @@ type subclassCtx struct {
 // subclassRefs maps the uIdSubclass value back to the context. The subclass
 // callback receives dwRefData as a plain uintptr; converting it back to a Go
 // pointer trips vet's unsafe checks, so we keep the mapping in a table keyed
-// by the subclass id instead (the window lives as long as the app, so this
-// never leaks).
+// by the subclass id instead. Entries are dropped on WM_DESTROY (see
+// traySubclassProc), so the table never outlives a window.
 var (
 	subclassRefs   = make(map[uintptr]*subclassCtx)
 	subclassRefsMu sync.Mutex
@@ -112,7 +112,14 @@ func traySubclassProc(hwnd, msg, wParam, lParam, uIdSubclass, dwRefData uintptr)
 	case wmDestroy:
 		// Window is really going away (app quit): clean up the subclass and
 		// release the window icons (nothing can query them anymore).
-		removeWindowSubclass.Call(hwnd, syscall.NewCallback(traySubclassProc), dwRefData)
+		// SetWindowSubclass registered the handler under uIdSubclass (see
+		// installTrayCloseHandler); RemoveWindowSubclass must be given that
+		// same id — dwRefData (always 0) would never match and the removal
+		// would be a no-op. Drop the map entry too so state does not leak.
+		removeWindowSubclass.Call(hwnd, syscall.NewCallback(traySubclassProc), uIdSubclass)
+		subclassRefsMu.Lock()
+		delete(subclassRefs, uIdSubclass)
+		subclassRefsMu.Unlock()
 		if windowIconBig != 0 {
 			destroyIcon.Call(windowIconBig)
 			windowIconBig = 0
