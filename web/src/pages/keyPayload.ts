@@ -15,8 +15,31 @@ export const windowTypes = [
 
 export interface KeyBuildContext {
   editing: boolean;
-  isTouched: (name: string) => boolean;
-  statusTouched: boolean;
+  // The prefilled values the form was opened with (after USD display
+  // conversion), used to diff against the values at save time. Only fields
+  // whose value actually changed are sent — see the edit rule below. Ignored
+  // on create (sends everything); required on edit. Defensive only: if a
+  // caller edits without a baseline, changedFields falls back to treating
+  // every field as changed (a full resend) so no user edit is lost.
+  baseline: Record<string, any> | null;
+}
+
+// The fields whose value differs between `current` (the form store at save
+// time) and `baseline` (the form store when the edit dialog opened). This — a
+// real value comparison — decides what an edit sends. antd's isFieldTouched
+// cannot be used: its setFieldsValue marks every prefilled field touched
+// (ant-design/ant-design#53981), so "touched" is true for the whole form the
+// moment an edit opens and would filter nothing, re-sending the entire key.
+export function changedFields(
+  current: Record<string, any>,
+  baseline: Record<string, any>,
+): Set<string> {
+  const names = new Set<string>([...Object.keys(current), ...Object.keys(baseline)]);
+  const changed = new Set<string>();
+  for (const name of names) {
+    if (current[name] !== baseline[name]) changed.add(name);
+  }
+  return changed;
 }
 
 // Build the create/update payload for a key from the full form store `values`.
@@ -27,10 +50,12 @@ export interface KeyBuildContext {
 // (A missing conversion here once stored a "$30" budget as 30 micro-USD,
 // disabling the key the moment its next request pushed total_spent past it.)
 //
-// Edit rule: editing must NOT reset fields the user did not touch — only send
-// the fields actually modified, so a name-only edit leaves the limits exactly
-// as they were. The exception: a window's metric and limit are reconciled
-// together (see the loop below), because the limit's unit depends on the metric.
+// Edit rule: editing must NOT reset fields the user did not change — diff the
+// save-time values against the baseline snapshot taken when the dialog opened
+// and send only the fields whose value differs, so a name-only edit leaves the
+// limits exactly as they are. The exception: a window's metric and limit are
+// reconciled together (see the loop below), because the limit's unit depends
+// on the metric.
 export function buildKeyPayload(values: Record<string, any>, ctx: KeyBuildContext): Record<string, any> {
   const out: any = { ...values };
   for (const wt of windowTypes) {
@@ -44,11 +69,12 @@ export function buildKeyPayload(values: Record<string, any>, ctx: KeyBuildContex
   }
   if (!ctx.editing) return out;
   const payload: any = { ...out };
+  const changed = changedFields(values, ctx.baseline ?? {});
   for (const key of Object.keys(out)) {
-    if (!ctx.isTouched(key)) delete payload[key];
+    if (!changed.has(key)) delete payload[key];
   }
   // Metric-only edits: a window's metric and limit must travel together.
-  // The untouched-deletion above drops a limit the user did not retype, but
+  // The change-filter above drops a limit the user did not retype, but
   // if the metric column IS being sent its unit drives how the stored limit
   // is interpreted — dropping the limit leaves the server's raw integer with
   // the NEW unit (e.g. a daily "5000" flipped to cost becomes 5000 micro-USD
@@ -71,7 +97,6 @@ export function buildKeyPayload(values: Record<string, any>, ctx: KeyBuildContex
     if (!Number.isInteger(limit)) { delete payload[wt.limitField]; continue; }
     payload[wt.limitField] = limit;
   }
-  if (!ctx.statusTouched) delete payload.status;
   if (payload.provider_id == null) delete payload.provider_id;
   return payload;
 }

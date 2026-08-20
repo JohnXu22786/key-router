@@ -67,7 +67,12 @@ const Providers: React.FC = () => {
   const [activeProviders, setActiveProviders] = useState<string[]>([]);
   const [provForm] = Form.useForm();
   const [keyForm] = Form.useForm();
-  const statusTouched = useRef(false);
+  // Snapshot of the key form the moment an edit opens, so saveKey can send
+  // only the fields the user actually changed. antd's isFieldTouched is NOT
+  // usable for this: setFieldsValue marks every prefilled field touched
+  // (ant-design/ant-design#53981), so after openEditKey it would report the
+  // whole form as edited and re-send the entire key on every save.
+  const keyFormBaselineRef = useRef<Record<string, any> | null>(null);
   // Number of drag orders committed but not yet persisted: the background
   // poll must not overwrite the local order with pre-persist server state.
   // Mirror (assigned during render, Models.tsx pattern) so the SSE handler
@@ -228,7 +233,7 @@ const Providers: React.FC = () => {
 
   // ---- Key CRUD ----
   // buildKeyPayload (keyPayload.ts) does the save-payload work: USD->micro-USD
-  // conversion plus the only-send-touched-fields edit rule, which force-pairs
+  // conversion plus the only-send-changed-fields edit rule, which force-pairs
   // a window's limit with its metric so a metric-only edit cannot leave the
   // stored limit in the wrong unit.
   const saveKey = async () => {
@@ -236,12 +241,11 @@ const Providers: React.FC = () => {
       const values = await keyForm.validateFields();
       const payload = buildKeyPayload(values, {
         editing: !!editingKey,
-        isTouched: (name) => keyForm.isFieldTouched(name),
-        statusTouched: statusTouched.current,
+        baseline: editingKey ? keyFormBaselineRef.current : null,
       });
       if (editingKey) { await updateKey(editingKey.id, payload); message.success('Key updated'); }
       else { await createKey(payload); message.success('Key created'); }
-      statusTouched.current = false;
+      keyFormBaselineRef.current = null;
       setKeyModal(false); setEditingKey(null); keyForm.resetFields(); fetch();
     } catch { message.error('Failed to save key'); }
   };
@@ -262,7 +266,6 @@ const Providers: React.FC = () => {
 
   const openEditKey = (k: Key) => {
     setEditingKey(k);
-    statusTouched.current = false;
     const values: any = { ...k, provider_id: k.provider_id };
     for (const wt of windowTypes) {
       if (wt.metricField) {
@@ -273,6 +276,15 @@ const Providers: React.FC = () => {
     // Lifetime budget is stored in micro-USD; the form's field is in USD.
     values.total_spend_limit = microUsdToUsd(k.total_spend_limit || 0);
     keyForm.setFieldsValue(values);
+    // Baseline for saveKey's change-diff: the prefilled values (in the same
+    // display units the form holds at save time). Snapshot `values`, not
+    // keyForm.getFieldsValue() — the modal's Form.Items are not mounted until
+    // the modal first opens, so getFieldsValue() would return {} on the first
+    // edit and the diff would mark every field changed, re-sending the whole
+    // key (the exact bug being fixed). Only deviations from this snapshot are
+    // sent, so a rename re-transmits neither key_value nor limits the app may
+    // have live-updated since opening.
+    keyFormBaselineRef.current = { ...values };
     setKeyModal(true);
   };
 
@@ -378,7 +390,7 @@ const Providers: React.FC = () => {
           Add Provider
         </Button>
         <Button type="primary" icon={<PlusOutlined />} onClick={() => {
-          setEditingKey(null); keyForm.resetFields();
+          setEditingKey(null); keyForm.resetFields(); keyFormBaselineRef.current = null;
           const firstId = activeProviders.length
             ? parseInt(activeProviders[0], 10)
             : (providers[0]?.id || undefined);
@@ -468,7 +480,7 @@ const Providers: React.FC = () => {
         title={editingKey ? 'Edit Key' : 'Add Key'}
         open={keyModal}
         onOk={saveKey}
-        onCancel={() => { setKeyModal(false); setEditingKey(null); }}
+        onCancel={() => { setKeyModal(false); setEditingKey(null); keyFormBaselineRef.current = null; }}
         width={680}
         centered
         // The form is taller than the desktop window (1000x580): center the
@@ -477,7 +489,7 @@ const Providers: React.FC = () => {
         // scrolling the body instead of being cut off.
         styles={{ body: { maxHeight: 'calc(100vh - 200px)', overflowY: 'auto' } }}
       >
-        <Form form={keyForm} layout="vertical" onValuesChange={(changed) => { if ('status' in changed) statusTouched.current = true; }}>
+        <Form form={keyForm} layout="vertical">
           <Form.Item name="provider_id" label="Provider" rules={[{ required: true }]}>
             <Select placeholder="Select a provider" showSearch options={providers.map(p => ({ value: p.id, label: `${p.name} (${p.type})` }))} />
           </Form.Item>
