@@ -81,6 +81,119 @@ func TestFindAsset(t *testing.T) {
 	})
 }
 
+// TestFindAssetPortableVsInstalled is the regression test for the portable
+// asset-resolution bug: the portable patterns ("-linux-amd64", "-darwin-<arch>")
+// are also substrings of the installed artifacts ("-linux-amd64.deb",
+// "-linux-amd64.tar.gz", "-darwin-<arch>.dmg"), so a bare substring match
+// could resolve an installer/archive as the portable binary when it happens to
+// precede the raw binary in the GitHub asset list. Portable matching must skip
+// those artifacts, and installed matching must still find them, in ANY order.
+// findAssetFor is exercised directly so every OS/arch is covered on any host.
+func TestFindAssetPortableVsInstalled(t *testing.T) {
+	tests := []struct {
+		name         string
+		goos, goarch string
+		mode         string
+		assets       []Asset
+		want         string // "" = no match expected
+	}{
+		{
+			name: "linux portable skips .deb/.tar.gz that precede the raw binary",
+			goos: "linux", goarch: "amd64", mode: "portable",
+			assets: []Asset{
+				{Name: "KeyRouter-v0.3.2-linux-amd64.tar.gz"},
+				{Name: "KeyRouter-v0.3.2-linux-amd64.deb"},
+				{Name: "KeyRouter-v0.3.2-linux-amd64"},
+			},
+			want: "KeyRouter-v0.3.2-linux-amd64",
+		},
+		{
+			name: "linux portable still finds the raw binary when it is listed first",
+			goos: "linux", goarch: "amd64", mode: "portable",
+			assets: []Asset{
+				{Name: "KeyRouter-v0.3.2-linux-amd64"},
+				{Name: "KeyRouter-v0.3.2-linux-amd64.deb"},
+			},
+			want: "KeyRouter-v0.3.2-linux-amd64",
+		},
+		{
+			name: "linux installed still finds the .deb when the raw binary precedes it",
+			goos: "linux", goarch: "amd64", mode: "installed",
+			assets: []Asset{
+				{Name: "KeyRouter-v0.3.2-linux-amd64"},
+				{Name: "KeyRouter-v0.3.2-linux-amd64.tar.gz"},
+				{Name: "KeyRouter-v0.3.2-linux-amd64.deb"},
+			},
+			want: "KeyRouter-v0.3.2-linux-amd64.deb",
+		},
+		{
+			name: "darwin arm64 portable skips the .dmg that precedes the raw binary",
+			goos: "darwin", goarch: "arm64", mode: "portable",
+			assets: []Asset{
+				{Name: "KeyRouter-v0.3.2-darwin-arm64.dmg"},
+				{Name: "KeyRouter-v0.3.2-darwin-arm64"},
+			},
+			want: "KeyRouter-v0.3.2-darwin-arm64",
+		},
+		{
+			name: "darwin amd64 portable skips the .dmg that precedes the raw binary",
+			goos: "darwin", goarch: "amd64", mode: "portable",
+			assets: []Asset{
+				{Name: "KeyRouter-v0.3.2-darwin-amd64.dmg"},
+				{Name: "KeyRouter-v0.3.2-darwin-amd64"},
+			},
+			want: "KeyRouter-v0.3.2-darwin-amd64",
+		},
+		{
+			name: "darwin installed still finds the .dmg when the raw binary precedes it",
+			goos: "darwin", goarch: "arm64", mode: "installed",
+			assets: []Asset{
+				{Name: "KeyRouter-v0.3.2-darwin-arm64"},
+				{Name: "KeyRouter-v0.3.2-darwin-arm64.dmg"},
+			},
+			want: "KeyRouter-v0.3.2-darwin-arm64.dmg",
+		},
+		{
+			name: "windows portable does not pick the setup exe that precedes the raw exe",
+			goos: "windows", goarch: "amd64", mode: "portable",
+			assets: []Asset{
+				{Name: "KeyRouter-v0.3.2-windows-amd64-setup.exe"},
+				{Name: "KeyRouter-v0.3.2-windows-amd64.exe"},
+			},
+			want: "KeyRouter-v0.3.2-windows-amd64.exe",
+		},
+		{
+			name: "windows installed still finds the setup exe when the raw exe precedes it",
+			goos: "windows", goarch: "amd64", mode: "installed",
+			assets: []Asset{
+				{Name: "KeyRouter-v0.3.2-windows-amd64.exe"},
+				{Name: "KeyRouter-v0.3.2-windows-amd64-setup.exe"},
+			},
+			want: "KeyRouter-v0.3.2-windows-amd64-setup.exe",
+		},
+		{
+			name: "unknown platform matches nothing",
+			goos: "plan9", goarch: "amd64", mode: "portable",
+			assets: []Asset{{Name: "KeyRouter-v0.3.2-linux-amd64"}},
+			want:   "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a, ok := findAssetFor(tt.assets, tt.goos, tt.goarch, tt.mode)
+			if tt.want == "" {
+				if ok {
+					t.Fatalf("findAssetFor matched %q, want no match", a.Name)
+				}
+				return
+			}
+			if !ok || a.Name != tt.want {
+				t.Errorf("findAssetFor = (%q, %v), want (%q, true)", a.Name, ok, tt.want)
+			}
+		})
+	}
+}
+
 // TestWindowsSwapScript guards the portable swap batch: it must wait for
 // THIS process (by PID) to exit (the exe is locked while the process
 // lives), swap the staged exe into place, relaunch, and delete itself.
