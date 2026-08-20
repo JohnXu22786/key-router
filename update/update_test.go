@@ -81,6 +81,57 @@ func TestFindAsset(t *testing.T) {
 	})
 }
 
+// TestMakeExecutable reproduces the portable-update exec-bit bug: the
+// download lands in a file with no execute permissions (os.CreateTemp uses
+// 0600; copyFile's os.Create yields 0644) and rename preserves that mode, so
+// a POSIX portable update would install a non-executable binary and the
+// relaunch's `exec` would fail with EACCES. makeExecutable must give the
+// staged file the running binary's permissions (guaranteed executable) for
+// both staging paths.
+func TestMakeExecutable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("execute permissions are POSIX-only; Windows binaries run by extension")
+	}
+	dir := t.TempDir()
+	ref := filepath.Join(dir, "ref")
+	staged := filepath.Join(dir, "staged")
+	if err := os.WriteFile(ref, []byte("bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// umask may narrow the write above, so stat the file for the exact mode.
+	fi, err := os.Stat(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refPerm := fi.Mode().Perm()
+
+	// The two staging paths that produce a non-executable file: the rename
+	// path inherits os.CreateTemp's 0600, the cross-device fallback inherits
+	// copyFile's os.Create 0644 (0666 & umask). Remove the file each
+	// iteration so WriteFile re-creates it with the given mode (the mode is
+	// only applied on creation).
+	for _, srcMode := range []os.FileMode{0o600, 0o644} {
+		if err := os.Remove(staged); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(staged, []byte("bin"), srcMode); err != nil {
+			t.Fatalf("create staged at %o: %v", srcMode, err)
+		}
+		if err := makeExecutable(ref, staged); err != nil {
+			t.Fatalf("makeExecutable from %o: %v", srcMode, err)
+		}
+		fi, err := os.Stat(staged)
+		if err != nil {
+			t.Fatal(err)
+		}
+		perm := fi.Mode().Perm()
+		want := refPerm | 0o111
+		if perm != want {
+			t.Errorf("staged file mode = %o, want %o (executable, keeping reference perms)", perm, want)
+		}
+	}
+}
+
 // TestWindowsSwapScript guards the portable swap batch: it must wait for
 // THIS process (by PID) to exit (the exe is locked while the process
 // lives), swap the staged exe into place, relaunch, and delete itself.

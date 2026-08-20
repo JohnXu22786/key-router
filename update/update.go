@@ -404,6 +404,15 @@ func (c *Client) applyPortable(downloadPath string, info *UpdateInfo) error {
 	if err := os.Remove(oldPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to clear stale backup file: %w", err)
 	}
+	// Grant the staged file the running binary's permissions before it
+	// replaces the app: the download has no execute bits (CreateTemp's 0600,
+	// or the copy fallback's 0644) and rename preserves that mode, so without
+	// this the relaunch below execs a non-executable file (EACCES) and the
+	// app never starts again. Done before touching the running exe: a failure
+	// here leaves the app exactly as it was.
+	if err := makeExecutable(exe, newPath); err != nil {
+		return fmt.Errorf("failed to make new executable runnable: %w", err)
+	}
 	if err := os.Rename(exe, oldPath); err != nil {
 		return fmt.Errorf("failed to rename running executable: %w", err)
 	}
@@ -530,6 +539,23 @@ func parseVersion(v string) [3]int {
 		fmt.Sscanf(num, "%d", &out[i])
 	}
 	return out
+}
+
+// makeExecutable gives the staged update file the same permissions as the
+// running (therefore executable) binary, with the execute bits force-set, so
+// the file that replaces the app can be exec'd. os.Rename preserves the
+// source mode, and neither os.CreateTemp (0600) nor copyFile's os.Create
+// (0644) produces an executable file — without this the post-update exec
+// would fail with EACCES, leaving a non-executable binary where the app
+// should be. Only the permission bits (not setuid/setgid/sticky) are copied;
+// the |0o111 guarantees the result is runnable even if the reference only
+// had, say, group-execute.
+func makeExecutable(reference, staged string) error {
+	fi, err := os.Stat(reference)
+	if err != nil {
+		return err
+	}
+	return os.Chmod(staged, fi.Mode().Perm()|0o111)
 }
 
 // copyFile copies src to dst (used when rename fails across volumes).
