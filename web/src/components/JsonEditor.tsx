@@ -1,4 +1,4 @@
-import React, { useRef, useCallback } from 'react';
+import React, { useRef, useCallback, useEffect } from 'react';
 import { Typography, theme } from 'antd';
 
 const { Text } = Typography;
@@ -143,12 +143,20 @@ const JsonEditor: React.FC<JsonEditorProps> = ({
     }
   };
 
-  // Live validation.
+  // Live validation. `result` feeds both the inline error UI below and the
+  // validity notification. The notification runs as an effect (never during
+  // render): onValid hands the parent a setter (e.g. Models' extraError guard)
+  // and React forbids updating a component while a different one renders, so
+  // a render-phase call could defer/drop the update and leave that guard stale
+  // relative to the value on screen. lastValid guards the effect so onValid
+  // fires exactly once per valid/invalid transition.
   const result = parseJSON(value);
-  if (result.ok !== lastValid.current) {
-    lastValid.current = result.ok;
-    onValid?.(result.ok);
-  }
+  useEffect(() => {
+    if (result.ok !== lastValid.current) {
+      lastValid.current = result.ok;
+      onValid?.(result.ok);
+    }
+  }, [result.ok, onValid]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
