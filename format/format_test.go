@@ -1751,3 +1751,73 @@ func TestOpenAIToolsToAnthropic_MissingParameters(t *testing.T) {
 		t.Errorf("input_schema = %v, want {type:object}", schema)
 	}
 }
+
+func TestOpenAIToAnthropic_NullUserContent(t *testing.T) {
+	// Anthropic's Messages API rejects null content with a 400 — both
+	// content:null at the message level and a null text string inside a
+	// text block. A user message whose content is null, absent, an empty
+	// array, an array with no representable parts, or an array whose text
+	// parts carry no/missing/null text must normalize to a single empty
+	// text block (regression: the user role lacked the null/empty guard
+	// the tool and assistant paths have).
+	tests := []struct {
+		name     string
+		userMsg  string // JSON message object injected into messages
+		wantText string
+	}{
+		{"explicit null content", `{"role":"user","content":null}`, ""},
+		{"absent content", `{"role":"user"}`, ""},
+		{"empty content array", `{"role":"user","content":[]}`, ""},
+		// file_id-only references can't be represented — the whole array
+		// must still yield one valid block (never content:null)
+		{"unrepresentable parts only", `{"role":"user","content":[{"type":"file","file":{"file_id":"file-abc123"}}]}`, ""},
+		// text parts lacking a string text field must not emit text:null
+		{"text part without text field", `{"role":"user","content":[{"type":"text"}]}`, ""},
+		{"text part with null text", `{"role":"user","content":[{"type":"text","text":null}]}`, ""},
+		{"normal string content", `{"role":"user","content":"hi"}`, "hi"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			oaiReq := fmt.Sprintf(`{"model":"gpt-4o","messages":[%s]}`, tt.userMsg)
+			anthReq, err := OpenAIRequestToAnthropic([]byte(oaiReq), "claude-sonnet-4")
+			if err != nil {
+				t.Fatalf("conversion failed: %v", err)
+			}
+
+			if strings.Contains(string(anthReq), `"content":null`) {
+				t.Fatalf("output still contains content:null: %s", anthReq)
+			}
+			if strings.Contains(string(anthReq), `"text":null`) {
+				t.Fatalf("output still contains text:null: %s", anthReq)
+			}
+
+			var result map[string]interface{}
+			if err := json.Unmarshal(anthReq, &result); err != nil {
+				t.Fatalf("invalid JSON result: %v", err)
+			}
+			msgs, ok := result["messages"].([]interface{})
+			if !ok || len(msgs) != 1 {
+				t.Fatalf("messages = %v, want 1", result["messages"])
+			}
+			userMsg := msgs[0].(map[string]interface{})
+			if userMsg["role"] != "user" {
+				t.Fatalf("role = %v, want user", userMsg["role"])
+			}
+			content, ok := userMsg["content"].([]interface{})
+			if !ok || len(content) != 1 {
+				t.Fatalf("content = %v (%T), want a single text block", userMsg["content"], userMsg["content"])
+			}
+			block := content[0].(map[string]interface{})
+			if block["type"] != "text" {
+				t.Fatalf("block type = %v, want text", block["type"])
+			}
+			// The text field must be a real string — a nil/missing value
+			// would ship text:null and 400 upstream.
+			got, ok := block["text"].(string)
+			if !ok || got != tt.wantText {
+				t.Errorf("text = %v (%T), want %q", block["text"], block["text"], tt.wantText)
+			}
+		})
+	}
+}
