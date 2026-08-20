@@ -13,7 +13,8 @@ import {
 } from '../api/client';
 import { subscribeEvents, jsonEqual } from '../api/events';
 import { useDragSort } from '../hooks/useDragSort';
-import { usdToMicroUsd, microUsdToUsd } from './keyLimits';
+import { microUsdToUsd } from './keyLimits';
+import { windowTypes, buildKeyPayload } from './keyPayload';
 
 const { Title, Text } = Typography;
 
@@ -43,15 +44,6 @@ const metricOptions = [
   { value: 'requests', label: 'Requests' },
   { value: 'tokens', label: 'Tokens' },
   { value: 'cost', label: 'Cost (USD)' },
-];
-
-const windowTypes = [
-  { key: 'rpm', label: 'RPM', limitField: 'rpm_limit' },
-  { key: 'tpm', label: 'TPM', limitField: 'tpm_limit' },
-  { key: 'rp5h', label: '5 Hour', limitField: 'rp5h_limit', metricField: 'rp5h_metric' },
-  { key: 'rpd', label: 'Daily', limitField: 'rpd_limit', metricField: 'rpd_metric' },
-  { key: 'rpw', label: 'Weekly', limitField: 'rpw_limit', metricField: 'rpw_metric' },
-  { key: 'rpmo', label: 'Monthly', limitField: 'rpm_month_limit', metricField: 'rpm_metric' },
 ];
 
 // fmtPercent: short display, full-precision storage.
@@ -235,38 +227,20 @@ const Providers: React.FC = () => {
   };
 
   // ---- Key CRUD ----
+  // buildKeyPayload (keyPayload.ts) does the save-payload work: USD->micro-USD
+  // conversion plus the only-send-touched-fields edit rule, which force-pairs
+  // a window's limit with its metric so a metric-only edit cannot leave the
+  // stored limit in the wrong unit.
   const saveKey = async () => {
     try {
       const values = await keyForm.validateFields();
-      // Unit conversion: cost-metric windows and the lifetime budget are
-      // entered in USD but stored in micro-USD (1e6 per $1). Convert on
-      // `values` so BOTH the create and edit paths send stored units — the
-      // create path sends `values` directly. (A missing conversion here once
-      // stored a "$30" budget as 30 micro-USD, disabling the key the moment
-      // its next request pushed total_spent past it.)
-      for (const wt of windowTypes) {
-        if (values[wt.limitField] == null || values[wt.limitField] === 0) continue;
-        if (wt.metricField && values[wt.metricField] === 'cost') {
-          values[wt.limitField] = usdToMicroUsd(values[wt.limitField]);
-        }
-      }
-      if (values.total_spend_limit != null && values.total_spend_limit !== 0) {
-        values.total_spend_limit = usdToMicroUsd(values.total_spend_limit);
-      }
-      // Editing must NOT reset fields the user did not touch: only send the
-      // fields actually modified (rate-limit values, strategy, ...) so a
-      // name-only edit leaves the limits exactly as they were. Creating
-      // sends everything.
-      const payload: any = { ...values };
-      if (editingKey) {
-        for (const key of Object.keys(values)) {
-          if (!keyForm.isFieldTouched(key)) delete payload[key];
-        }
-        if (!statusTouched.current) delete payload.status;
-        if (payload.provider_id == null) delete payload.provider_id;
-      }
+      const payload = buildKeyPayload(values, {
+        editing: !!editingKey,
+        isTouched: (name) => keyForm.isFieldTouched(name),
+        statusTouched: statusTouched.current,
+      });
       if (editingKey) { await updateKey(editingKey.id, payload); message.success('Key updated'); }
-      else { await createKey(values); message.success('Key created'); }
+      else { await createKey(payload); message.success('Key created'); }
       statusTouched.current = false;
       setKeyModal(false); setEditingKey(null); keyForm.resetFields(); fetch();
     } catch { message.error('Failed to save key'); }
