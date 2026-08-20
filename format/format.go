@@ -1401,7 +1401,7 @@ func convertOpenAIContentArray(content []interface{}) []interface{} {
 		case "text":
 			anthContent = append(anthContent, map[string]interface{}{
 				"type": "text",
-				"text": p["text"],
+				"text": safeStringOrDefault(p, "text", ""),
 			})
 		case "image_url":
 			// Some gateways send the URL as a bare string instead of the

@@ -699,6 +699,61 @@ func TestAttachmentsInToolResults(t *testing.T) {
 		}
 	})
 
+	t.Run("openai tool text part with null/missing text becomes empty text block", func(t *testing.T) {
+		// The shared convertOpenAIContentArray also feeds the tool path —
+		// a text part with null/missing text must not ship text:null
+		// inside tool_result.content. The block survives as an empty text
+		// block (not the "" string fallback, since len > 0).
+		for _, content := range []string{
+			`[{"type":"text","text":null}]`,
+			`[{"type":"text"}]`,
+		} {
+			anthReq, err := OpenAIRequestToAnthropic([]byte(`{"model":"gpt-4o","messages":[`+
+				`{"role":"assistant","content":"reading","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}]},`+
+				`{"role":"tool","tool_call_id":"call_1","content":`+content+`}]}`), "claude-sonnet-4")
+			if err != nil {
+				t.Fatalf("conversion failed: %v", err)
+			}
+			if strings.Contains(string(anthReq), `"text":null`) {
+				t.Fatalf("output still contains text:null for content %s: %s", content, anthReq)
+			}
+			var result map[string]interface{}
+			if err := json.Unmarshal(anthReq, &result); err != nil {
+				t.Fatalf("invalid JSON: %v", err)
+			}
+			msgs := result["messages"].([]interface{})
+			var userMsg map[string]interface{}
+			for _, m := range msgs {
+				if mm, ok := m.(map[string]interface{}); ok && mm["role"] == "user" {
+					userMsg = mm
+					break
+				}
+			}
+			if userMsg == nil {
+				t.Fatal("no user message in converted request")
+			}
+			blocks := userMsg["content"].([]interface{})
+			if len(blocks) != 1 {
+				t.Fatalf("expected 1 block, got %d", len(blocks))
+			}
+			tr := blocks[0].(map[string]interface{})
+			if tr["type"] != "tool_result" {
+				t.Fatalf("block type = %v, want tool_result", tr["type"])
+			}
+			trContent, ok := tr["content"].([]interface{})
+			if !ok || len(trContent) != 1 {
+				t.Fatalf("tool_result content = %v (%T), want a single text block array", tr["content"], tr["content"])
+			}
+			textBlock := trContent[0].(map[string]interface{})
+			if textBlock["type"] != "text" {
+				t.Fatalf("inner block type = %v, want text", textBlock["type"])
+			}
+			if got, ok := textBlock["text"].(string); !ok || got != "" {
+				t.Errorf("inner text = %v (%T), want empty string", textBlock["text"], textBlock["text"])
+			}
+		}
+	})
+
 	t.Run("all-dropped anthropic tool_result content becomes empty string", func(t *testing.T) {
 		oaiReq, err := AnthropicRequestToOpenAI([]byte(anthUserMsg(
 			`{"type":"tool_result","tool_use_id":"call_1","content":`+
