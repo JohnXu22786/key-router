@@ -138,6 +138,39 @@ export function exclusiveUntil(until: dayjs.Dayjs, granularity: Granularity): da
   return floorWindowUntil(until, granularity).subtract(1, 'second');
 }
 
+// ROLLUP_GRAN maps each API rollup to the granularity to align `until` to.
+// Hour and total cut per hour (the server shapes both windows hourly — see
+// activityWindow in admin.go); day and week cut per day (the week bucket is
+// anchored to Monday, and the day floor never lands before `since`); month
+// cuts per month.
+const ROLLUP_GRAN: Record<string, 'hour' | 'day' | 'month'> = {
+  hour: 'hour',
+  day: 'day',
+  week: 'day',
+  month: 'month',
+  total: 'hour',
+};
+
+// queryWindowUntil returns the `until` the activity server should receive
+// for a range's current-period query. Sub-hour ranges pass the raw (live)
+// time: their rows live in the current hour and are the data source the
+// client re-samples onto its minute axis. Every other range passes one
+// second before the ROLLUP bucket floor ONLY when range.until lies exactly
+// on that boundary — the endpoint then excludes its live bucket cleanly
+// (stable rolling views). A mid-bucket until (custom ranges, or a rollup
+// coarser than the range, e.g. Explore's default day rollup on an
+// hour-granularity 1d/today range) must NOT be floored to the rollup
+// boundary: the endpoint widens the window to the bucket containing until
+// (see activityWindow in admin.go), so flooring would amputate the whole
+// in-progress day/week/month the range covers. Those ranges pass range.until
+// as-is, letting the widened window keep every in-range bucket.
+export function queryWindowUntil(range: Pick<DateRange, 'granularity' | 'until'>, rollup: string): dayjs.Dayjs {
+  if (range.granularity === 'minute' || range.granularity === 'min15') return range.until;
+  const gran = ROLLUP_GRAN[rollup] ?? 'hour';
+  if (floorWindowUntil(range.until, gran).isSame(range.until)) return exclusiveUntil(range.until, gran);
+  return range.until;
+}
+
 // customRange wraps a user-picked from/to window; the bucket granularity is
 // derived from the window's length.
 export function customRange(since: dayjs.Dayjs, until: dayjs.Dayjs): DateRange {
