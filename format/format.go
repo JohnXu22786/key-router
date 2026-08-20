@@ -1363,19 +1363,27 @@ func convertOpenAIUserMessage(m map[string]interface{}) map[string]interface{} {
 		"role": "user",
 	}
 
+	var blocks []interface{}
 	switch c := content.(type) {
 	case string:
-		result["content"] = []interface{}{
+		blocks = []interface{}{
 			map[string]interface{}{
 				"type": "text",
 				"text": c,
 			},
 		}
 	case []interface{}:
-		result["content"] = convertOpenAIContentArray(c)
-	default:
-		result["content"] = content
+		blocks = convertOpenAIContentArray(c)
 	}
+	if len(blocks) == 0 {
+		// Null/absent content, or a content array with no representable
+		// parts, must not ship as content:null — Anthropic's Messages API
+		// rejects it with a 400, failing the whole request. An empty text
+		// block is the accepted shape (mirrors the assistant guard and
+		// responsesAssistantContent).
+		blocks = []interface{}{map[string]interface{}{"type": "text", "text": ""}}
+	}
+	result["content"] = blocks
 
 	return result
 }

@@ -1751,3 +1751,62 @@ func TestOpenAIToolsToAnthropic_MissingParameters(t *testing.T) {
 		t.Errorf("input_schema = %v, want {type:object}", schema)
 	}
 }
+
+func TestOpenAIToAnthropic_NullUserContent(t *testing.T) {
+	// Anthropic's Messages API rejects content:null with a 400. A user
+	// message whose content is null, absent, an empty array, or an array
+	// with no representable parts must normalize to a single empty text
+	// block instead of shipping content:null (regression: the user role
+	// lacked the null/empty guard the tool and assistant paths have).
+	tests := []struct {
+		name     string
+		userMsg  string // JSON message object injected into messages
+		wantText string
+	}{
+		{"explicit null content", `{"role":"user","content":null}`, ""},
+		{"absent content", `{"role":"user"}`, ""},
+		{"empty content array", `{"role":"user","content":[]}`, ""},
+		// file_id-only references can't be represented — the whole array
+		// must still yield one valid block (never content:null)
+		{"unrepresentable parts only", `{"role":"user","content":[{"type":"file","file":{"file_id":"file-abc123"}}]}`, ""},
+		{"normal string content", `{"role":"user","content":"hi"}`, "hi"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			oaiReq := fmt.Sprintf(`{"model":"gpt-4o","messages":[%s]}`, tt.userMsg)
+			anthReq, err := OpenAIRequestToAnthropic([]byte(oaiReq), "claude-sonnet-4")
+			if err != nil {
+				t.Fatalf("conversion failed: %v", err)
+			}
+
+			if strings.Contains(string(anthReq), `"content":null`) {
+				t.Fatalf("output still contains content:null: %s", anthReq)
+			}
+
+			var result map[string]interface{}
+			if err := json.Unmarshal(anthReq, &result); err != nil {
+				t.Fatalf("invalid JSON result: %v", err)
+			}
+			msgs, ok := result["messages"].([]interface{})
+			if !ok || len(msgs) != 1 {
+				t.Fatalf("messages = %v, want 1", result["messages"])
+			}
+			userMsg := msgs[0].(map[string]interface{})
+			if userMsg["role"] != "user" {
+				t.Fatalf("role = %v, want user", userMsg["role"])
+			}
+			content, ok := userMsg["content"].([]interface{})
+			if !ok || len(content) != 1 {
+				t.Fatalf("content = %v (%T), want a single text block", userMsg["content"], userMsg["content"])
+			}
+			block := content[0].(map[string]interface{})
+			if block["type"] != "text" {
+				t.Errorf("block type = %v, want text", block["type"])
+			}
+			if got, _ := block["text"].(string); got != tt.wantText {
+				t.Errorf("text = %q, want %q", block["text"], tt.wantText)
+			}
+		})
+	}
+}
