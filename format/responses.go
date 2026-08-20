@@ -757,6 +757,26 @@ type ResponsesStreamConverter struct {
 	chatTools map[int]*responsesItem
 	// anthropic mode: content block index → function_call/reasoning item
 	blockTools map[int]*responsesItem
+	// Some gateways omit a tool_call fragment's "index". The array position
+	// is only meaningful inside a single chunk — it is not a stable per-tool
+	// identity across chunks (the standard streaming shape sends one fragment
+	// per chunk, so every position would be 0 and two different tools would
+	// collide into one item). Index-less fragments are therefore keyed by the
+	// fragment's "id" when present — a genuine per-tool identity, so
+	// continuation fragments of the same tool rejoin the same item while
+	// different tools stay apart — and by a fresh, never-reused anonymous key
+	// otherwise. Either way fragments from different chunks never merge purely
+	// on position; cross-chunk reconstruction otherwise requires a conforming
+	// "index". Negative anonymous keys cannot collide with conforming
+	// streams' always non-negative tool_call index values.
+	anonKey int
+	// idToKey maps the per-tool id of an index-less fragment to the anonymous
+	// key assigned to its tool (see anonToolKey), so fragments of the same
+	// tool in later chunks resolve to the same item. Ids are only adopted
+	// from the fragment that carries them, so an index-less tool's FIRST
+	// fragment must already bear the id — an id appearing only later does not
+	// retroactively join the earlier item.
+	idToKey map[string]int
 
 	// usage (Responses semantics: input_tokens INCLUDES cached tokens)
 	inputTokens  int64
@@ -800,6 +820,7 @@ func NewResponsesStreamConverter(upstream string) *ResponsesStreamConverter {
 		createdAt:  time.Now().Unix(),
 		chatTools:  make(map[int]*responsesItem),
 		blockTools: make(map[int]*responsesItem),
+		idToKey:    make(map[string]int),
 	}
 }
 
@@ -951,8 +972,8 @@ func (c *ResponsesStreamConverter) chatChunk(ev map[string]interface{}) ([][]byt
 			events = append(events, c.textDelta(content)...)
 		}
 		if tcs, ok := safeArr(delta, "tool_calls"); ok {
-			for i, tc := range tcs {
-				events = append(events, c.chatToolDelta(i, tc)...)
+			for _, tc := range tcs {
+				events = append(events, c.chatToolDelta(tc)...)
 			}
 		}
 	}
@@ -1335,19 +1356,46 @@ func (c *ResponsesStreamConverter) textDelta(content string) [][]byte {
 	return append(events, ev)
 }
 
+// chatToolKey returns the chat-mode map key for one tool_calls fragment. A
+// fragment carrying "index" (the conforming OpenAI shape) is keyed by that
+// value unchanged. Index-less fragments are keyed by anonToolKey — never by
+// position — so fragments of different tools in different chunks stay apart.
+func (c *ResponsesStreamConverter) chatToolKey(m map[string]interface{}) int {
+	if f, has := m["index"].(float64); has {
+		return int(f)
+	}
+	return c.anonToolKey(m)
+}
+
+// anonToolKey returns the identity key for an index-less tool_calls fragment
+// (see chatTools): a fragment carrying a non-empty "id" maps to a stable key
+// across chunks so its continuation fragments rejoin the same item, while an
+// id-less fragment gets a fresh, never-reused key so it can never merge with
+// a fragment from another chunk on position alone. The key is derived only
+// from the fragment's own fields, so a tool whose id arrives only on a later
+// fragment cannot be joined to the earlier id-less one (see idToKey).
+func (c *ResponsesStreamConverter) anonToolKey(m map[string]interface{}) int {
+	if id, ok := m["id"].(string); ok && id != "" {
+		if k, ok := c.idToKey[id]; ok {
+			return k
+		}
+		c.anonKey--
+		c.idToKey[id] = c.anonKey
+		return c.anonKey
+	}
+	c.anonKey--
+	return c.anonKey
+}
+
 // chatToolDelta handles one chat tool_calls fragment: the first fragment for
 // a tool emits output_item.added (function_call), later fragments emit
 // response.function_call_arguments.delta.
-func (c *ResponsesStreamConverter) chatToolDelta(arrIdx int, tc interface{}) [][]byte {
+func (c *ResponsesStreamConverter) chatToolDelta(tc interface{}) [][]byte {
 	m, ok := safeMap(tc)
 	if !ok {
 		return nil
 	}
-	// Some gateways omit "index"; fall back to the array position
-	idx := arrIdx
-	if f, has := m["index"].(float64); has {
-		idx = int(f)
-	}
+	idx := c.chatToolKey(m)
 	it := c.chatTools[idx]
 	if it == nil {
 		it = c.newItem("function_call")
