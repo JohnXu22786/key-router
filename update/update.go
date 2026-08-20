@@ -158,43 +158,72 @@ func (c *Client) Check() (*UpdateInfo, error) {
 //   - installed (Windows): the NSIS setup .exe
 //   - portable: the raw binary (or setup exe as a fallback for installed mode)
 func (c *Client) findAsset(assets []Asset) (Asset, bool) {
-	tagSuffix := "" // the version appears in asset names; we just match patterns
-	_ = tagSuffix
+	return findAssetFor(assets, runtime.GOOS, runtime.GOARCH, c.installMode())
+}
 
-	want := c.platformAssetPattern()
+// findAssetFor selects the first asset that matches the artifact pattern for
+// the given OS/arch/install mode.
+func findAssetFor(assets []Asset, goos, goarch, installMode string) (Asset, bool) {
 	for _, a := range assets {
-		if strings.Contains(a.Name, want) {
+		if matchesAssetPattern(goos, goarch, installMode, a.Name) {
 			return a, true
 		}
 	}
 	return Asset{}, false
 }
 
-// platformAssetPattern returns the asset-name fragment for this platform.
-func (c *Client) platformAssetPattern() string {
-	switch runtime.GOOS {
+// matchesAssetPattern reports whether an asset name matches the artifact
+// pattern for the given OS/arch/install mode. Matching is a SUFFIX test, not
+// a bare substring: released names always end with the artifact fragment, so
+// "-linux-amd64" (portable) must never also match "-linux-amd64.deb" or
+// "-linux-amd64.tar.gz", in the same way "-darwin-<arch>" must never match
+// "-darwin-<arch>.dmg" — otherwise a portable update could download the
+// installer or archive as its binary when that asset precedes the raw binary
+// in the GitHub asset list. An unknown platform has no pattern and matches
+// nothing.
+func matchesAssetPattern(goos, goarch, installMode, name string) bool {
+	p := assetPattern(goos, goarch, installMode)
+	if p == "" {
+		return false
+	}
+	return strings.HasSuffix(name, p)
+}
+
+// assetPattern returns the asset-name suffix that identifies the artifact
+// for the given OS/arch/install mode. Portable and installed patterns are
+// deliberately distinct so neither mode can resolve the other's artifact:
+// "-linux-amd64" vs "-linux-amd64.deb", "-darwin-<arch>" vs
+// "-darwin-<arch>.dmg", and "-windows-amd64.exe" vs "-windows-amd64-setup.exe".
+func assetPattern(goos, goarch, installMode string) string {
+	switch goos {
 	case "windows":
-		if c.installMode() == "installed" {
+		if installMode == "installed" {
 			return "-windows-amd64-setup.exe"
 		}
 		return "-windows-amd64.exe"
 	case "darwin":
 		arch := "arm64"
-		if runtime.GOARCH == "amd64" {
+		if goarch == "amd64" {
 			arch = "amd64"
 		}
-		if c.installMode() == "installed" {
-			return fmt.Sprintf("-darwin-%s.dmg", arch)
+		if installMode == "installed" {
+			return "-darwin-" + arch + ".dmg"
 		}
-		return fmt.Sprintf("-darwin-%s", arch)
+		return "-darwin-" + arch
 	case "linux":
-		if c.installMode() == "installed" {
+		if installMode == "installed" {
 			return "-linux-amd64.deb"
 		}
 		return "-linux-amd64"
 	default:
 		return ""
 	}
+}
+
+// platformAssetPattern returns the asset-name fragment for this platform,
+// used for the "no asset for this platform" error message in Check.
+func (c *Client) platformAssetPattern() string {
+	return assetPattern(runtime.GOOS, runtime.GOARCH, c.installMode())
 }
 
 // installMode determines whether the running copy is an installed build
