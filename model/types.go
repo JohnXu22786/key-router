@@ -70,6 +70,24 @@ func DisableClassReason(reason string) bool {
 	return reason == ReasonAuthFailed || reason == ReasonInsufficientQuota
 }
 
+// IsSystemDisabledReason reports whether a disabled key's disabled_reason was
+// set by the system's own state machine — the relay/failure path
+// (auth_failed / insufficient_quota) or the spend cap
+// (spend_limit_exhausted) — rather than by an admin's explicit justification.
+// The health checker and the engine's recovery path use this to decide
+// whether a DISABLED key may be probed and auto-recovered: only system-set
+// reasons may (a successful probe proves the fault cleared). Any other
+// reason — a custom admin justification or an empty reason — marks an
+// admin-disable that must stay out of rotation (each probe is a billable
+// chat completion) until an admin re-enables or resets it.
+func IsSystemDisabledReason(reason string) bool {
+	switch reason {
+	case ReasonAuthFailed, ReasonInsufficientQuota, KeyDisabledReasonSpendLimit:
+		return true
+	}
+	return false
+}
+
 // RecoveryStrategy constants
 const (
 	RecoveryImmediate = "immediate"

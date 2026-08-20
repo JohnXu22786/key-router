@@ -252,6 +252,66 @@ func TestCheckKeyDoesNotRecoverSpendLimitExhausted(t *testing.T) {
 	}
 }
 
+// TestCheckKeyDoesNotProbeCustomReasonDisabledKey: an admin-disable that
+// carries a recorded justification (custom non-empty reason) must not be
+// probed AT ALL and never auto-recovered — each probe is a billable chat
+// completion, and auto-recovery is reserved for genuine system reasons
+// (auth_failed / insufficient_quota / spend_limit_exhausted). The upstream
+// handler must see zero requests and the reason + disabled status must
+// survive. (The empty-reason admin-disable case is covered by the upstream
+// shouldProbeKey guard and the engine tests.)
+func TestCheckKeyDoesNotProbeCustomReasonDisabledKey(t *testing.T) {
+	hits := 0
+	c, k, _ := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		okUpstream(w, r)
+	})
+	db.GetDB().Model(&model.Key{}).Where("id = ?", k.ID).Updates(map[string]interface{}{
+		"status":          model.KeyStatusDisabled,
+		"disabled_reason": "Suspended due to abuse",
+	})
+	db.GetDB().First(k)
+
+	if c.shouldProbeKey(k) {
+		t.Error("shouldProbeKey returned true for a custom-reason disabled key (it would be probed every pass)")
+	}
+
+	c.checkKey(k)
+
+	var after model.Key
+	db.GetDB().First(&after, k.ID)
+	if after.Status != model.KeyStatusDisabled {
+		t.Errorf("status = %q, want disabled (custom-reason admin-disable must not auto-recover)", after.Status)
+	}
+	if after.DisabledReason != "Suspended due to abuse" {
+		t.Errorf("disabled_reason = %q, want %q (admin justification must survive)", after.DisabledReason, "Suspended due to abuse")
+	}
+	if hits != 0 {
+		t.Errorf("upstream probed %d time(s), want 0 (custom-reason admin-disabled keys must not be probed)", hits)
+	}
+}
+
+// TestShouldProbeKeyKeepsSystemReasonsEligible: genuine SYSTEM reasons keep
+// today's probe behavior — a disabled key carrying auth_failed or
+// insufficient_quota is still probe-eligible, so recovery remains gated on
+// the key actually being usable again (not a permanent exclusion). Guard
+// against over-tightening the system-reason whitelist.
+func TestShouldProbeKeyKeepsSystemReasonsEligible(t *testing.T) {
+	c, k, _ := newTestEnv(t, okUpstream)
+	// spend_limit_exhausted has no budget set, so the eligibility rests on
+	// IsSystemDisabledReason alone (budget-capped keys are tested separately).
+	for _, reason := range []string{model.ReasonAuthFailed, model.ReasonInsufficientQuota, model.KeyDisabledReasonSpendLimit} {
+		db.GetDB().Model(&model.Key{}).Where("id = ?", k.ID).Updates(map[string]interface{}{
+			"status":          model.KeyStatusDisabled,
+			"disabled_reason": reason,
+		})
+		db.GetDB().First(k)
+		if !c.shouldProbeKey(k) {
+			t.Errorf("shouldProbeKey = false for system reason %q, want true (system-set reasons stay probe-eligible)", reason)
+		}
+	}
+}
+
 // TestCheckKeyDoesNotRecoverSpendLimitSetMidProbe covers the race the
 // pre-pass guard can't see: the pass loads a healthy-looking key, and while
 // the probe is in flight the relay crosses the budget and disables it with

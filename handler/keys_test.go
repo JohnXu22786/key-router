@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -171,4 +172,90 @@ func TestCreateKeyAppendsAtEndOfProvider(t *testing.T) {
 func jsonInt(v int64) string {
 	b, _ := json.Marshal(v)
 	return string(b)
+}
+
+// TestUpdateKeyPreservesExplicitDisabledReason: an admin who disables a key
+// WITH a justification (PUT {"status":"disabled","disabled_reason":"..."})
+// must have that reason persisted. The explicit-status wipe of DisabledReason
+// must not clobber a reason the caller just supplied in the same payload —
+// the payload-honoring convention (a non-null disabled_reason survives
+// binding) must win over the stale-reason cleanup, or the admin's recorded
+// justification is silently lost.
+func TestUpdateKeyPreservesExplicitDisabledReason(t *testing.T) {
+	e := bootstrapKeys(t)
+	closeTestDB(t)
+
+	prov := model.Provider{Name: "A", Type: "openai", BaseURL: "http://a"}
+	if err := db.GetDB().Create(&prov).Error; err != nil {
+		t.Fatal(err)
+	}
+	k := model.Key{ProviderID: prov.ID, Name: "a1", KeyValue: "ka1", Status: model.KeyStatusActive}
+	if err := db.GetDB().Create(&k).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	payload := `{"status":"disabled","disabled_reason":"Suspended due to abuse"}`
+	req := httptest.NewRequest("PUT", "/api/keys/"+strconv.FormatInt(k.ID, 10), strings.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Host = "localhost:9999"
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT /api/keys/%d status = %d: %s", k.ID, rec.Code, rec.Body.String())
+	}
+
+	var after model.Key
+	if err := db.GetDB().First(&after, k.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if after.Status != model.KeyStatusDisabled {
+		t.Errorf("status = %q, want disabled", after.Status)
+	}
+	if after.DisabledReason != "Suspended due to abuse" {
+		t.Errorf("disabled_reason = %q, want %q (caller-supplied reason must survive the disable)", after.DisabledReason, "Suspended due to abuse")
+	}
+}
+
+// TestUpdateKeyClearsStaleAutoRecoveryReasonOnDisable: a bare
+// PUT {"status":"disabled"} (no disabled_reason) on a key auto-disabled by
+// the relay (reason "auth_failed") must clear the stale reason. A non-empty
+// system reason would let the engine auto-recover an admin's deliberately
+// disabled key, so the cleanup only yields when the caller did NOT provide a
+// reason of their own.
+func TestUpdateKeyClearsStaleAutoRecoveryReasonOnDisable(t *testing.T) {
+	e := bootstrapKeys(t)
+	closeTestDB(t)
+
+	prov := model.Provider{Name: "A", Type: "openai", BaseURL: "http://a"}
+	if err := db.GetDB().Create(&prov).Error; err != nil {
+		t.Fatal(err)
+	}
+	k := model.Key{
+		ProviderID:     prov.ID,
+		Name:           "a1",
+		KeyValue:       "ka1",
+		Status:         model.KeyStatusDisabled,
+		DisabledReason: model.ReasonAuthFailed,
+	}
+	if err := db.GetDB().Create(&k).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	payload := `{"status":"disabled"}`
+	req := httptest.NewRequest("PUT", "/api/keys/"+strconv.FormatInt(k.ID, 10), strings.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Host = "localhost:9999"
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT /api/keys/%d status = %d: %s", k.ID, rec.Code, rec.Body.String())
+	}
+
+	var after model.Key
+	if err := db.GetDB().First(&after, k.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if after.DisabledReason != "" {
+		t.Errorf("disabled_reason = %q, want cleared (a bare disable must not inherit the stale auth_failed reason)", after.DisabledReason)
+	}
 }
