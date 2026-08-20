@@ -1326,6 +1326,196 @@ func TestAnthropicStreamConverterDelayedToolID(t *testing.T) {
 	}
 }
 
+// toolBlock is the reduced view of a single emitted tool_use block that the
+// index-fallback tests inspect: the tool name and the concatenated
+// input_json_delta fragments addressed to that block's index.
+type toolBlock struct {
+	name string
+	args string
+}
+
+// collectToolUseBlocks folds converter events into toolBlock records keyed
+// by content block index, appending each input_json_delta fragment to its
+// block's args. Events without an "index" (message_start, ...) are ignored.
+func collectToolUseBlocks(blocks map[int]toolBlock, evs [][]byte) {
+	for _, ev := range evs {
+		var e map[string]interface{}
+		json.Unmarshal(ev, &e)
+		idx, hasIdx := e["index"].(float64)
+		if !hasIdx {
+			continue
+		}
+		switch e["type"] {
+		case "content_block_start":
+			cb := e["content_block"].(map[string]interface{})
+			if cb["type"] == "tool_use" {
+				blocks[int(idx)] = toolBlock{name: cb["name"].(string)}
+			}
+		case "content_block_delta":
+			d := e["delta"].(map[string]interface{})
+			if d["type"] == "input_json_delta" {
+				b := blocks[int(idx)]
+				b.args += d["partial_json"].(string)
+				blocks[int(idx)] = b
+			}
+		}
+	}
+}
+
+func TestAnthropicStreamConverterNoIndexToolsDoNotMergeAcrossChunks(t *testing.T) {
+	// A gateway that omits the tool_call fragment's "index" and streams one
+	// fragment per chunk must NOT merge two different tools just because
+	// both landed at array position 0. Regression: the index-less fallback
+	// keyed every such fragment by its array position (0), so the second
+	// tool hit the already-seen block — its name was dropped and its
+	// arguments were appended to the first tool's block (concatenated,
+	// unparseable JSON).
+	conv := NewAnthropicStreamConverter()
+	blocks := map[int]toolBlock{}
+
+	// first tool, array position 0, no index
+	evs, err := conv.Convert([]byte(`{"choices":[{"delta":{"tool_calls":[{"id":"call_weather","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\""}}]}}]}`), "m")
+	if err != nil && err != ErrSkipChunk {
+		t.Fatal(err)
+	}
+	collectToolUseBlocks(blocks, evs)
+	// second, DIFFERENT tool, also array position 0, no index
+	evs, err = conv.Convert([]byte(`{"choices":[{"delta":{"tool_calls":[{"id":"call_stock","type":"function","function":{"name":"get_stock","arguments":"{\"ticker\":\""}}]}}]}`), "m")
+	if err != nil && err != ErrSkipChunk {
+		t.Fatal(err)
+	}
+	collectToolUseBlocks(blocks, evs)
+
+	if len(blocks) != 2 {
+		t.Fatalf("expected 2 distinct tool_use blocks, got %d: %+v", len(blocks), blocks)
+	}
+	var weather, stock bool
+	for _, b := range blocks {
+		switch b.name {
+		case "get_weather":
+			weather = true
+			if b.args != `{"city":"` {
+				t.Errorf("get_weather args = %q, want %q (no foreign fragments appended)", b.args, `{"city":"`)
+			}
+		case "get_stock":
+			stock = true
+			if b.args != `{"ticker":"` {
+				t.Errorf("get_stock args = %q, want %q", b.args, `{"ticker":"`)
+			}
+		}
+	}
+	if !weather || !stock {
+		t.Fatalf("missing blocks: weather=%v stock=%v, blocks=%+v", weather, stock, blocks)
+	}
+}
+
+func TestAnthropicStreamConverterNoIndexSameChunkStaysDistinct(t *testing.T) {
+	// Two tools as separate fragments in ONE chunk (positions 0 and 1, no
+	// index) must still become two distinct blocks — index-less fragments
+	// keep serving the simultaneous multi-tool case within a single chunk.
+	conv := NewAnthropicStreamConverter()
+	evs, err := conv.Convert([]byte(`{"choices":[{"delta":{"tool_calls":[
+		{"id":"call_0","type":"function","function":{"name":"f0","arguments":"{\"a\":"}},
+		{"id":"call_1","type":"function","function":{"name":"f1","arguments":"{\"b\":"}}
+	]}}]}`), "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocks := map[int]toolBlock{}
+	collectToolUseBlocks(blocks, evs)
+	if blocks[0].name != "f0" || blocks[0].args != `{"a":` {
+		t.Fatalf("block 0 = %+v, want {f0, {\"a\":}", blocks[0])
+	}
+	if blocks[1].name != "f1" || blocks[1].args != `{"b":` {
+		t.Fatalf("block 1 = %+v, want {f1, {\"b\":}", blocks[1])
+	}
+	if len(blocks) != 2 {
+		t.Fatalf("expected exactly 2 blocks, got %d: %+v", len(blocks), blocks)
+	}
+}
+
+func TestAnthropicStreamConverterNoIndexSameIdArgumentsRejoin(t *testing.T) {
+	// An index-less fragment carrying an "id" uses that id as its per-tool
+	// identity: a continuation fragment of the SAME tool (same id, name only
+	// on the first fragment) must rejoin the same block, so split arguments
+	// reconstruct into one complete tool call rather than being dropped or
+	// split across blocks.
+	conv := NewAnthropicStreamConverter()
+	blocks := map[int]toolBlock{}
+	// same logical tool (id call_1), streaming its arguments across two
+	// chunks, no index in either — the shape a single-tool index-less
+	// gateway produces
+	for _, frag := range []string{
+		`{"choices":[{"delta":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\""}}]}}]}`,
+		`{"choices":[{"delta":{"tool_calls":[{"id":"call_1","type":"function","function":{"arguments":"Tokyo\"}"}}]}}]}`,
+	} {
+		evs, err := conv.Convert([]byte(frag), "m")
+		if err != nil && err != ErrSkipChunk {
+			t.Fatal(err)
+		}
+		collectToolUseBlocks(blocks, evs)
+	}
+	if len(blocks) != 1 {
+		t.Fatalf("expected 1 merged tool_use block, got %d: %+v", len(blocks), blocks)
+	}
+	for _, b := range blocks {
+		if b.name != "get_weather" {
+			t.Errorf("block name = %q, want get_weather", b.name)
+		}
+		if b.args != `{"city":"Tokyo"}` {
+			t.Errorf("block args = %q, want {\"city\":\"Tokyo\"} (same-id continuation rejoined)", b.args)
+		}
+	}
+}
+
+func TestAnthropicStreamConverterNoIndexWithoutIdNeverMergesAcrossChunks(t *testing.T) {
+	// Index-less fragments with NO id have no stable per-tool identity, so
+	// they must never merge across chunks on array position alone — each
+	// starts its own block (the documented fallback for id-less gateways).
+	conv := NewAnthropicStreamConverter()
+	blocks := map[int]toolBlock{}
+	for _, frag := range []string{
+		`{"choices":[{"delta":{"tool_calls":[{"type":"function","function":{"name":"get_weather","arguments":"{\"city\":\""}}]}}]}`,
+		`{"choices":[{"delta":{"tool_calls":[{"type":"function","function":{"name":"get_stock","arguments":"{\"ticker\":\""}}]}}]}`,
+	} {
+		evs, err := conv.Convert([]byte(frag), "m")
+		if err != nil && err != ErrSkipChunk {
+			t.Fatal(err)
+		}
+		collectToolUseBlocks(blocks, evs)
+	}
+	// both starts are held (no id) until the stream ends — flush them
+	collectToolUseBlocks(blocks, conv.CloseStream())
+	if len(blocks) != 2 {
+		t.Fatalf("expected 2 separate blocks (never merge on position alone), got %d: %+v", len(blocks), blocks)
+	}
+}
+
+func TestAnthropicStreamConverterNoIndexNamelessToolDroppedCleanly(t *testing.T) {
+	// An index-less tool whose name never arrives is deferred at stream
+	// end and must be dropped cleanly — no spurious text/thinking block, no
+	// orphan content_block_stop (regression: deferred index-less tools were
+	// keyed with negative anonymous keys, which the sentinel-based
+	// flushAllPendingStarts dispatch could misroute into bogus empty
+	// text/thinking blocks).
+	conv := NewAnthropicStreamConverter()
+	// args-only fragment, no index → deferred under an anonymous key
+	_, err := conv.Convert([]byte(`{"choices":[{"delta":{"tool_calls":[{"id":"call_1","type":"function","function":{"arguments":"{\"a\":1}"}}]}}]}`), "m")
+	if err != nil && err != ErrSkipChunk {
+		t.Fatal(err)
+	}
+	for _, ev := range conv.CloseStream() {
+		var e map[string]interface{}
+		json.Unmarshal(ev, &e)
+		switch e["type"] {
+		case "content_block_start":
+			t.Fatalf("nameless tool emitted a start: %s", ev)
+		case "content_block_stop":
+			t.Fatalf("orphan content_block_stop for dropped tool: %s", ev)
+		}
+	}
+}
+
 func TestAnthropicStreamConverterDeferredStartsAscendingOrder(t *testing.T) {
 	// Two tools whose id/name arrive late must have their
 	// content_block_start events flushed in ascending block-index order,

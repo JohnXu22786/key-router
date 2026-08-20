@@ -514,8 +514,28 @@ type AnthropicStreamConverter struct {
 	// Some gateways delay a tool call's id/name to a later fragment. The
 	// content_block_start (which must carry both) is held back until they
 	// are known, buffering argument deltas in the meantime; pendingStarts
-	// is keyed by the openai tool_call index.
+	// is keyed by the tool identity (the openai tool_call index, or a
+	// negative anonKey for index-less fragments).
 	pendingStarts map[int]*pendingToolStart
+	// Some gateways omit a tool_call fragment's "index". The array position
+	// is only meaningful inside a single chunk — it is not a stable per-tool
+	// identity across chunks (the standard streaming shape is one fragment
+	// per chunk, so every position would be 0 and two different tools would
+	// collide into one block). Index-less fragments are therefore keyed by
+	// the fragment's "id" when present — a genuine per-tool identity, so
+	// continuation fragments of the same tool rejoin the same block while
+	// different tools stay apart — and by a fresh, never-reused anonymous
+	// key otherwise. Either way fragments from different chunks never merge
+	// purely on position; cross-chunk reconstruction otherwise requires a
+	// conforming "index".
+	anonKey int
+	// idToKey maps the per-tool id of an index-less fragment to the
+	// anonymous key assigned to its tool (see anonKey), so fragments of the
+	// same tool in later chunks resolve to the same block. Ids are only
+	// adopted from the fragment that carries them, so an index-less tool's
+	// FIRST fragment must already bear the id — an id appearing only later
+	// does not retroactively join the earlier block.
+	idToKey map[string]int
 	// OpenAI sends usage in a chunk AFTER the finish chunk (with
 	// include_usage). message_delta/message_stop are therefore deferred until
 	// that chunk arrives (or the stream ends) so the synthesized
@@ -539,7 +559,29 @@ func NewAnthropicStreamConverter() *AnthropicStreamConverter {
 	return &AnthropicStreamConverter{
 		toolBlocks:    make(map[int]int),
 		pendingStarts: make(map[int]*pendingToolStart),
+		idToKey:       make(map[string]int),
 	}
+}
+
+// anonToolKey returns the tool identity key for an index-less tool_call
+// fragment. If the fragment carries a non-empty "id" it is a genuine
+// per-tool identity: the same id maps to the same key across chunks, so
+// continuation fragments of one tool rejoin the same block. Fragments
+// without an id get a fresh, never-reused key — they can never merge with a
+// fragment from another chunk on position alone. The key is derived only
+// from the fragment's own fields: a tool whose id arrives only on a later
+// fragment cannot be joined to the earlier id-less one (see idToKey).
+func (c *AnthropicStreamConverter) anonToolKey(tcMap map[string]interface{}) int {
+	if id, ok := tcMap["id"].(string); ok && id != "" {
+		if k, ok := c.idToKey[id]; ok {
+			return k
+		}
+		c.anonKey--
+		c.idToKey[id] = c.anonKey
+		return c.anonKey
+	}
+	c.anonKey--
+	return c.anonKey
 }
 
 // allPendingResolved reports whether every deferred tool start has both id
@@ -582,8 +624,15 @@ func (c *AnthropicStreamConverter) flushPendingStart(ti int) [][]byte {
 // dropped entirely — Anthropic rejects a nameless tool_use block, and an
 // unusable tool call must not 400 the whole stream.
 func (c *AnthropicStreamConverter) flushAllPendingStarts() [][]byte {
+	type entryKind int
+	const (
+		entryTool entryKind = iota
+		entryText
+		entryThinking
+	)
 	type entry struct {
-		ti     int // >=0 tool call index; -1 text block; -2 thinking block
+		kind   entryKind
+		ti     int // openai tool_call index (negative for index-less fragments)
 		block  int
 		id     string
 		name   string
@@ -591,36 +640,36 @@ func (c *AnthropicStreamConverter) flushAllPendingStarts() [][]byte {
 	}
 	entries := make([]entry, 0, len(c.pendingStarts)+2)
 	for ti, ps := range c.pendingStarts {
-		entries = append(entries, entry{ti, ps.blockIdx, ps.id, ps.name, ps.deltas})
+		entries = append(entries, entry{kind: entryTool, ti: ti, block: ps.blockIdx, id: ps.id, name: ps.name, deltas: ps.deltas})
 	}
 	if c.textPending {
-		entries = append(entries, entry{ti: -1, block: c.textBlockIdx})
+		entries = append(entries, entry{kind: entryText, block: c.textBlockIdx})
 	}
 	if c.thinkingPending {
-		entries = append(entries, entry{ti: -2, block: c.thinkingBlockIdx})
+		entries = append(entries, entry{kind: entryThinking, block: c.thinkingBlockIdx})
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].block < entries[j].block })
 	var events [][]byte
 	for _, e := range entries {
-		if e.ti < 0 {
-			if e.ti == -2 {
-				// held thinking block: emit its start, then the buffered deltas
-				c.thinkingPending = false
-				c.thinkingOpened = true
-				startEv, _ := json.Marshal(map[string]interface{}{
-					"type":  "content_block_start",
-					"index": e.block,
-					"content_block": map[string]interface{}{
-						"type":      "thinking",
-						"thinking":  "",
-						"signature": "",
-					},
-				})
-				events = append(events, startEv)
-				events = append(events, c.thinkingDeltas...)
-				c.thinkingDeltas = nil
-				continue
-			}
+		switch e.kind {
+		case entryThinking:
+			// held thinking block: emit its start, then the buffered deltas
+			c.thinkingPending = false
+			c.thinkingOpened = true
+			startEv, _ := json.Marshal(map[string]interface{}{
+				"type":  "content_block_start",
+				"index": e.block,
+				"content_block": map[string]interface{}{
+					"type":      "thinking",
+					"thinking":  "",
+					"signature": "",
+				},
+			})
+			events = append(events, startEv)
+			events = append(events, c.thinkingDeltas...)
+			c.thinkingDeltas = nil
+			continue
+		case entryText:
 			// held text block: emit its start, then the buffered deltas
 			c.textPending = false
 			c.textOpened = true
@@ -832,17 +881,26 @@ func (c *AnthropicStreamConverter) Convert(chunk []byte, modelName string) ([][]
 
 		// Tool call fragments (delta.tool_calls[i].function.arguments)
 		if toolCalls, ok := safeArr(delta, "tool_calls"); ok {
-			for j, tc := range toolCalls {
+			for _, tc := range toolCalls {
 				tcMap, ok := safeMap(tc)
 				if !ok {
 					continue
 				}
-				// Some gateways omit "index"; fall back to the array position
-				// so multiple tools in one chunk stay distinct
+				// Some gateways omit "index". The array position only
+				// disambiguates simultaneous tools WITHIN one chunk — it is
+				// not a stable per-tool identity across chunks (the standard
+				// streaming shape sends one fragment per chunk, so every
+				// position would be 0 and two different tools would merge
+				// into one block). Index-less fragments are keyed by the
+				// fragment's "id" when present (a real per-tool identity, so
+				// same-tool continuations rejoin the same block) and by a
+				// fresh anonymous key otherwise — never purely by position.
 				toolIdx, hasIdx := tcMap["index"].(float64)
-				ti := j
+				var ti int
 				if hasIdx {
 					ti = int(toolIdx)
+				} else {
+					ti = c.anonToolKey(tcMap)
 				}
 				blockIdx, seen := c.toolBlocks[ti]
 				if !seen {
