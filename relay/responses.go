@@ -198,6 +198,15 @@ func AnthropicResponseToResponses(body []byte, modelName string) ([]byte, error)
 		}
 	}
 
+	// Per-item-type sequence counters: one response can hold several message
+	// items (text blocks split by tool_use/thinking) and several reasoning
+	// items (multiple thinking blocks). The Responses API requires unique item
+	// ids — clients key output items by id and correlate response.completed
+	// output with output_item events — so each item of a type stamps the
+	// type's running sequence on the response seed (msg_<seed>_1, msg_<seed>_2,
+	// rs_<seed>_n). Tool ids stay stable: they come from the upstream block id.
+	var msgSeq, rsSeq int
+
 	var output []interface{}
 	var textParts []interface{}
 	for _, c := range anth.Content {
@@ -214,7 +223,8 @@ func AnthropicResponseToResponses(body []byte, modelName string) ([]byte, error)
 			// Flush pending text first so output items keep block order
 			// (a thinking block precedes the text in Anthropic responses)
 			if len(textParts) > 0 {
-				output = append(output, anthMessageItem(anth.ID, textParts))
+				msgSeq++
+				output = append(output, anthMessageItem(anth.ID, msgSeq, textParts))
 				textParts = nil
 			}
 			if block["type"] == "tool_use" {
@@ -233,9 +243,10 @@ func AnthropicResponseToResponses(body []byte, modelName string) ([]byte, error)
 				})
 			} else {
 				// thinking block â†’ reasoning item (summary text)
+				rsSeq++
 				text, _ := block["thinking"].(string)
 				output = append(output, map[string]interface{}{
-					"id":     responsesID("rs", anth.ID),
+					"id":     responsesID("rs", fmt.Sprintf("%s_%d", anth.ID, rsSeq)),
 					"type":   "reasoning",
 					"status": "completed",
 					"summary": []interface{}{map[string]interface{}{
@@ -247,7 +258,8 @@ func AnthropicResponseToResponses(body []byte, modelName string) ([]byte, error)
 		}
 	}
 	if len(textParts) > 0 {
-		output = append(output, anthMessageItem(anth.ID, textParts))
+		msgSeq++
+		output = append(output, anthMessageItem(anth.ID, msgSeq, textParts))
 	}
 	resp["output"] = output
 
@@ -274,10 +286,11 @@ func AnthropicResponseToResponses(body []byte, modelName string) ([]byte, error)
 	return json.Marshal(resp)
 }
 
-// anthMessageItem builds a message output item from accumulated text parts.
-func anthMessageItem(seed string, parts []interface{}) map[string]interface{} {
+// anthMessageItem builds a message output item from accumulated text parts;
+// seq disambiguates multiple message items within one response.
+func anthMessageItem(seed string, seq int, parts []interface{}) map[string]interface{} {
 	return map[string]interface{}{
-		"id":      responsesID("msg", seed),
+		"id":      responsesID("msg", fmt.Sprintf("%s_%d", seed, seq)),
 		"type":    "message",
 		"status":  "completed",
 		"role":    "assistant",
