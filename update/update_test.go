@@ -81,6 +81,57 @@ func TestFindAsset(t *testing.T) {
 	})
 }
 
+// TestMakeExecutable reproduces the portable-update exec-bit bug: the
+// download lands in a file with no execute permissions (os.CreateTemp uses
+// 0600; copyFile's os.Create yields 0644) and rename preserves that mode, so
+// a POSIX portable update would install a non-executable binary and the
+// relaunch's `exec` would fail with EACCES. makeExecutable must give the
+// staged file the running binary's permissions (guaranteed executable) for
+// both staging paths.
+func TestMakeExecutable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("execute permissions are POSIX-only; Windows binaries run by extension")
+	}
+	dir := t.TempDir()
+	ref := filepath.Join(dir, "ref")
+	staged := filepath.Join(dir, "staged")
+	if err := os.WriteFile(ref, []byte("bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// umask may narrow the write above, so stat the file for the exact mode.
+	fi, err := os.Stat(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refPerm := fi.Mode().Perm()
+
+	// The two staging paths that produce a non-executable file: the rename
+	// path inherits os.CreateTemp's 0600, the cross-device fallback inherits
+	// copyFile's os.Create 0644 (0666 & umask). Remove the file each
+	// iteration so WriteFile re-creates it with the given mode (the mode is
+	// only applied on creation).
+	for _, srcMode := range []os.FileMode{0o600, 0o644} {
+		if err := os.Remove(staged); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(staged, []byte("bin"), srcMode); err != nil {
+			t.Fatalf("create staged at %o: %v", srcMode, err)
+		}
+		if err := makeExecutable(ref, staged); err != nil {
+			t.Fatalf("makeExecutable from %o: %v", srcMode, err)
+		}
+		fi, err := os.Stat(staged)
+		if err != nil {
+			t.Fatal(err)
+		}
+		perm := fi.Mode().Perm()
+		want := refPerm | 0o111
+		if perm != want {
+			t.Errorf("staged file mode = %o, want %o (executable, keeping reference perms)", perm, want)
+		}
+	}
+}
+
 // TestFindAssetPortableVsInstalled is the regression test for the portable
 // asset-resolution bug: the portable patterns ("-linux-amd64", "-darwin-<arch>")
 // are also substrings of the installed artifacts ("-linux-amd64.deb",
@@ -228,7 +279,7 @@ func tempUpdateFiles(t *testing.T) map[string]bool {
 }
 
 // TestApplyDownloadFailureLeavesNoTempFiles: a failed apply must clean up its
-// temp file in BOTH install modes — a leaked installer exe in installed mode
+// temp file in BOTH install modes ΓÇö a leaked installer exe in installed mode
 // is exactly the kind of leftover this guards against.
 func TestApplyDownloadFailureLeavesNoTempFiles(t *testing.T) {
 	before := tempUpdateFiles(t)
@@ -291,8 +342,8 @@ func TestApplyInstalledCancelCleansTemp(t *testing.T) {
 }
 
 // TestApplyInstalledKeepsTempForInstaller: on a successful launch the temp
-// installer must survive the Apply call — the running installer reads it
-// (it is cleaned up by the startup sweep of stale downloads afterwards) —
+// installer must survive the Apply call ΓÇö the running installer reads it
+// (it is cleaned up by the startup sweep of stale downloads afterwards) ΓÇö
 // and the installer must be launched VISIBLY (empty args, never /S silent:
 // the silent launch was why users never saw the installer open).
 func TestApplyInstalledKeepsTempForInstaller(t *testing.T) {
@@ -348,7 +399,7 @@ func TestApplyInstalledKeepsTempForInstaller(t *testing.T) {
 }
 
 // TestCleanupStaleDownloads: the startup cleanup removes only old updater
-// and restart-helper temp files — never fresh ones or unrelated files.
+// and restart-helper temp files ΓÇö never fresh ones or unrelated files.
 func TestCleanupStaleDownloads(t *testing.T) {
 	dir := t.TempDir()
 	old := filepath.Join(dir, "keyrouter-update-1.exe")
