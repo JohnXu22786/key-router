@@ -199,6 +199,10 @@ func main() {
 	// Remove leftover updater temp files (interrupted downloads, cancelled
 	// installers) from previous runs. Best-effort — never fails startup.
 	update.CleanupStaleDownloads()
+	// Surface a portable update that was staged but never applied (the
+	// detached swap helper aborted because the old process was still running
+	// or the swap failed). Best-effort — logs only, never fails startup.
+	update.ReportUnappliedPortableUpdate()
 
 	// Start HTTP server in background
 	app := server.New(r)

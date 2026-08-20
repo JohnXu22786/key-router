@@ -409,8 +409,16 @@ func (c *Client) applyPortable(downloadPath string, info *UpdateInfo) error {
 
 	// Move the downloaded file into the app dir under a temp name, then run
 	// the swap script. A stale .new from a failed previous attempt would
-	// make the rename fail forever, so clear it first.
+	// make the rename fail forever, so clear it first — surfacing the fact
+	// instead of silently retrying.
 	newPath := filepath.Join(dir, exeName+".new")
+	if _, err := os.Stat(newPath); err == nil {
+		// A leftover .new means a previous portable update staged its exe but
+		// the swap never completed (the old process was still alive past the
+		// helper's wait, or the move failed). That update was reported applied
+		// but never took effect — log it rather than swallowing it.
+		log.Printf("[update] clearing unapplied staged update %s (the previous portable update did not complete)", newPath)
+	}
 	if err := os.Remove(newPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to clear stale staging file: %w", err)
 	}
@@ -421,8 +429,25 @@ func (c *Client) applyPortable(downloadPath string, info *UpdateInfo) error {
 		}
 	}
 
+	// Verify the staged executable before touching the swap script: a broken
+	// staging (missing or wrong-sized .new, e.g. from the cross-device copy
+	// fallback) must fail HERE, cleanly, before the detached swap helper is
+	// launched and armed — not be silently reported as a successful update.
+	if err := verifyStagedSwap(newPath, info.AssetSize); err != nil {
+		os.Remove(newPath)
+		return err
+	}
+
 	if runtime.GOOS == "windows" {
-		return c.launchWindowsSwap(dir, exeName, newPath)
+		// The swap itself runs in a detached helper only AFTER this process
+		// exits (the running exe is locked while we live), so the swap cannot
+		// be observed synchronously here. Launching it is the point of no
+		// return, so this MUST come after the staging is verified above.
+		if err := c.launchWindowsSwap(dir, exeName, newPath); err != nil {
+			os.Remove(newPath)
+			return err
+		}
+		return nil
 	}
 
 	// POSIX: rename the running exe aside, move the new one in. The new
@@ -510,9 +535,13 @@ func (c *Client) launchWindowsSwap(dir, exeName, newPath string) error {
 // windowsSwapScript returns the .bat content that waits for THIS process (by
 // PID) to exit (the exe is locked while the process lives), swaps the staged
 // exe into place, relaunches it, and deletes itself. The wait gives up after
-// ~5 minutes (PID reuse) and proceeds anyway — by then the old process is
-// gone either way. No parenthesized blocks are used, so no delayed expansion
-// is needed and paths containing "!" stay intact.
+// ~5 minutes (300 iterations — PID reuse) and then RE-CHECKS whether the
+// process is actually gone: proceeding against a still-running exe makes the
+// move fail and start spawns a duplicate old instance (the "silent failed
+// update" bug), so the script aborts (exit /b 1) instead. It also refuses to
+// relaunch when the move itself failed (errorlevel check) — only a confirmed
+// swap is followed by the start. No parenthesized blocks are used, so no
+// delayed expansion is needed and paths containing "!" stay intact.
 func windowsSwapScript(newPath, exePath string, pid int) string {
 	return fmt.Sprintf(`@echo off
 set /a n=0
@@ -520,14 +549,36 @@ set /a n=0
 tasklist /FI "PID eq %[1]d" 2>nul | find /I "%[1]d" >nul
 if errorlevel 1 goto proceed
 set /a n+=1
-if %%n%% GEQ 300 goto proceed
+if %%n%% GEQ 300 goto finalcheck
 ping -n 2 127.0.0.1 >nul
 goto wait
+:finalcheck
+tasklist /FI "PID eq %[1]d" 2>nul | find /I "%[1]d" >nul
+if errorlevel 1 goto proceed
+del "%%~f0" & exit /b 1
 :proceed
 move /Y "%[2]s" "%[3]s" >nul
+if errorlevel 1 del "%%~f0" & exit /b 1
 start "" "%[3]s"
 del "%%~f0"
 `, pid, newPath, exePath)
+}
+
+// verifyStagedSwap reports an error when the staged executable about to be
+// swapped into place is missing or is not the downloaded asset (size
+// mismatch). applyPortable calls it right after staging and BEFORE arming
+// the detached swap helper: a broken staging must surface as a normal apply
+// error (helper never launched, no update reported) rather than a silent
+// failure or a wrong-sized binary being moved in later.
+func verifyStagedSwap(newPath string, wantSize int64) error {
+	fi, err := os.Stat(newPath)
+	if err != nil {
+		return fmt.Errorf("staged executable %s is gone before the swap could run: %w", newPath, err)
+	}
+	if wantSize > 0 && fi.Size() != wantSize {
+		return fmt.Errorf("staged executable %s is %d bytes, want %d — the swap would replace the app with a wrong file", newPath, fi.Size(), wantSize)
+	}
+	return nil
 }
 
 // compareVersions compares two version strings of the form vX.Y.Z (or
@@ -610,6 +661,24 @@ func copyFile(src, dst string) error {
 // running mid-update).
 func CleanupStaleDownloads() {
 	cleanupStaleDownloads(os.TempDir(), 24*time.Hour)
+}
+
+// ReportUnappliedPortableUpdate logs when a stale staged update (.new next to
+// the running executable) shows a previous portable update never applied: the
+// detached swap helper aborted leaving the staged exe behind (the old process
+// was still running past the wait, or the move failed), so that update was
+// reported applied but never took effect. Called at startup — best-effort, it
+// must never fail the app. The signal is exact: .new is only created right
+// before a swap and removed (moved into place) only by a completed swap.
+func ReportUnappliedPortableUpdate() {
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	newPath := filepath.Join(filepath.Dir(exe), filepath.Base(exe)+".new")
+	if _, err := os.Stat(newPath); err == nil {
+		log.Printf("[update] staged update %s was never applied — the previous portable update did not complete; run the update again", newPath)
+	}
 }
 
 func cleanupStaleDownloads(dir string, olderThan time.Duration) {
