@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import dayjs from 'dayjs';
 import {
   makeRanges, customRange, granularityFor, series, stackedData, bucketAxis,
-  bucketWindowShare, groupTotals, floorWindowUntil, exclusiveUntil,
+  bucketWindowShare, groupTotals, floorWindowUntil, exclusiveUntil, queryWindowUntil,
   fmtTick, fmtBucket, fmtDayLabel, CUSTOM_KEY,
   computeTrending, toChartData, cacheHitRate, resampleResponse,
 } from './activityShared';
@@ -275,6 +275,85 @@ describe('floorWindowUntil — rolling windows end at the last complete bucket',
     // the floored bucket, so the server excludes the live bucket itself.
     expect(exclusiveUntil(dayjs('2026-08-13T16:00:00'), 'hour').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-13 15:59:59');
     expect(exclusiveUntil(dayjs('2026-08-13T00:00:00'), 'day').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-12 23:59:59');
+  });
+});
+
+describe('queryWindowUntil — the query keeps every in-range bucket', () => {
+  // Mirrors Activity.tsx: presets snap BOTH bounds before reaching the page.
+  const snapped = (r: { key: string; since: dayjs.Dayjs; until: dayjs.Dayjs; granularity: Granularity }) => ({
+    ...r,
+    since: floorWindowUntil(r.since, r.granularity),
+    until: floorWindowUntil(r.until, r.granularity),
+  });
+  const NOW = dayjs('2026-08-13T16:05:30'); // Thursday
+  const byKey = new Map(makeRanges(NOW).map(r => [r.key, snapped(r)]));
+  const w = (k: string) => byKey.get(k)!;
+
+  it('an hour-granularity range mid-day keeps the in-progress day (default 1d + day rollup)', () => {
+    // Past 24 Hours snapped to the hour grid is [Aug 12 16:00, Aug 13 16:00).
+    // The old code floored until to the ROLLUP (day) granularity and sent Aug
+    // 12 23:59:59, dropping today's complete hours from the day buckets; the
+    // query must send the range's until as-is so the day rollup keeps today.
+    expect(w('1d').granularity).toBe('hour');
+    expect(queryWindowUntil(w('1d'), 'day').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-13 16:00:00');
+  });
+
+  it('a today range mid-day is not empty', () => {
+    // Old behavior sent yesterday 23:59:59, so the endpoint's day window
+    // [today 00:00, today 00:00) was EMPTY and Explore rendered "No usage in
+    // this period" for a day that has traffic.
+    expect(queryWindowUntil(w('today'), 'day').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-13 16:00:00');
+  });
+
+  it('a day-granularity range keeps the in-progress month for a coarser month rollup', () => {
+    // This Week ends at the live day's start (day grid). A month rollup whose
+    // until is floored to the month boundary would send July 31 23:59:59 for
+    // an August week, amputating the whole in-progress month; the query must
+    // send the day boundary as-is so the month bucket stays.
+    expect(w('week').granularity).toBe('day');
+    expect(queryWindowUntil(w('week'), 'month').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-13 00:00:00');
+  });
+
+  it('week and total rollups align by their server-shaped cuts (week->day, total->hour)', () => {
+    // The week bucket is anchored to Monday, so it cuts per day: a day-aligned
+    // until on the week rollup excludes the live day the same way the day
+    // rollup does.
+    expect(queryWindowUntil(w('week'), 'week').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-12 23:59:59');
+    // The total bucket aggregates over the hour-shaped window (same as the
+    // hour rollup on the server), so an hour-aligned until excludes exactly
+    // the live hour — today's total is never empty.
+    expect(queryWindowUntil(w('today'), 'total').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-13 15:59:59');
+  });
+
+  it('a boundary-aligned range still excludes exactly the live bucket (no auto-refresh creep)', () => {
+    // A 24h window ending at 09:00 sharp aligns with the hour rollup's
+    // boundary, so the query ends one second before the 09:00 bucket and the
+    // live hour cannot creep into the response between auto-refreshes.
+    const r = { key: 'c', label: '', badge: '', since: dayjs('2026-08-12T09:00:00'), until: dayjs('2026-08-13T09:00:00'), granularity: 'hour' as Granularity };
+    expect(queryWindowUntil(r, 'hour').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-13 08:59:59');
+  });
+
+  it('day-aligned and month-aligned ranges still exclude exactly the live bucket', () => {
+    // Prev month ends at Aug 1 00:00 (day AND month boundary): the live bucket
+    // drops out, unchanged from the pre-regression behaviour.
+    expect(queryWindowUntil(w('prevmonth'), 'day').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-07-31 23:59:59');
+    // This year ends at Aug 1 00:00 on the month grid: only the live month
+    // drops out of the month buckets.
+    expect(queryWindowUntil(w('year'), 'month').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-07-31 23:59:59');
+  });
+
+  it('a mid-bucket CUSTOM range keeps its trailing partial day for a finer rollup', () => {
+    // Custom ranges are never snapped: the user picked an until of 16:05.
+    // Flooring it to the day would amputate the final day they selected; the
+    // query must send it as-is (the hour rollup's containing bucket 16:00 —
+    // part of the picked range — is then included rather than cut off).
+    const r = { key: 'c', label: '', badge: '', since: dayjs('2026-08-08T10:00:00'), until: dayjs('2026-08-13T16:05:00'), granularity: 'day' as Granularity };
+    expect(queryWindowUntil(r, 'hour').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-13 16:05:00');
+  });
+
+  it('sub-hour ranges pass the raw range.until (the re-sampling source)', () => {
+    expect(w('15m').granularity).toBe('minute');
+    expect(queryWindowUntil(w('15m'), 'hour').toISOString()).toBe(w('15m').until.toISOString());
   });
 });
 
