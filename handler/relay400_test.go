@@ -109,3 +109,23 @@ func TestRelay400ModelProblemPassesThrough(t *testing.T) {
 		t.Errorf("key status = %q reason = %q, want untouched active key (model problem is not a key problem)", after.Status, after.DisabledReason)
 	}
 }
+
+// TestRelay400KeyValidModelInvalidPassesThrough: a 400 whose body says the
+// KEY is valid but the MODEL is invalid must NOT mark the key auth_failed —
+// before the valence fix the "key ... invalid" chain classified it
+// key-invalid and the relay cooled/marked the key on real traffic. Now the
+// body passes through untouched and the key stays active.
+func TestRelay400KeyValidModelInvalidPassesThrough(t *testing.T) {
+	_, e, keyID := bootstrap400(t, `{"error":{"message":"Your API key is valid, but the model gpt-4o-mini is invalid."}}`)
+
+	rec := sendRelay(e, `{"model":"mock-model","messages":[{"role":"user","content":"hi"}]}`)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("client status = %d, want 400 passthrough", rec.Code)
+	}
+	var after model.Key
+	db.GetDB().First(&after, keyID)
+	if after.Status != model.KeyStatusActive || after.DisabledReason != "" {
+		t.Errorf("key status = %q reason = %q, want untouched active key (key valid, model invalid is not a key problem)", after.Status, after.DisabledReason)
+	}
+}

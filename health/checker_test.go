@@ -606,6 +606,32 @@ func TestClassifyOpenAIProbe401InvalidKeyIsAuthFailed(t *testing.T) {
 	}
 }
 
+// TestClassifyOpenAIProbeKeyValidModelInvalidIsAlive: a 401 (or 400) whose
+// body says the KEY is valid but the MODEL is invalid ("Your API key is
+// valid, but the model gpt-4o-mini is invalid") proves the key
+// authenticated — only the probe's model / the requested model is the
+// problem, so the key must be ALIVE. Before the valence fix the "key ...
+// invalid" chain matched and classified these bodies as key-invalid,
+// disabling every usable key whose account merely lacks the model.
+func TestClassifyOpenAIProbeKeyValidModelInvalidIsAlive(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		body   string
+	}{
+		{http.StatusUnauthorized, `{"error":{"message":"Your API key is valid, but the model gpt-4o-mini is invalid."}}`},
+		{http.StatusBadRequest, `{"error":{"message":"Your API key is valid, but the model gpt-4o-mini is invalid."}}`},
+		{http.StatusUnauthorized, `{"error":{"message":"The API key is fine, but the model is invalid."}}`},
+	} {
+		resp := &http.Response{
+			StatusCode: tc.status,
+			Body:       io.NopCloser(strings.NewReader(tc.body)),
+		}
+		if result := classifyOpenAIProbe(resp); !result.Alive {
+			t.Errorf("%d + key-valid/model-invalid body = %+v, want alive (the KEY is valid, the model is the problem)", tc.status, result)
+		}
+	}
+}
+
 // TestClassifyOpenAIProbe401EmptyBodyIsAuthFailed: a bare 401 (no body, or
 // an unparseable body) stays fail-closed: an ambiguous 401 is treated as an
 // auth failure, since a gateway with a real model problem normally includes
