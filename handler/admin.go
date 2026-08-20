@@ -2058,7 +2058,13 @@ func activityBucketLabel(t time.Time, rollup string) string {
 func activityWindow(since, until time.Time, rollup string) (from, to time.Time) {
 	loc := since.Location()
 	switch rollup {
-	case "hour":
+	case "hour", "total":
+		// total aggregates the whole range into one bucket, so its window is
+		// the same as hour: since..until widened to the LOCAL-hour bucket
+		// boundaries of the endpoints (billing truncates hour_bucket to the
+		// local hour). The month branch below would widen a mid-month range
+		// to whole containing months and pull out-of-range usage into the
+		// single Total bucket.
 		from = time.Date(since.Year(), since.Month(), since.Day(), since.Hour(), 0, 0, 0, loc)
 		to = time.Date(until.Year(), until.Month(), until.Day(), until.Hour(), 0, 0, 0, loc).Add(time.Hour)
 	case "day":

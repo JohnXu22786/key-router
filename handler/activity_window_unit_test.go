@@ -56,6 +56,36 @@ func TestActivityWindow(t *testing.T) {
 		!to.Equal(time.Date(2026, 8, 13, 17, 0, 0, 0, loc)) {
 		t.Fatalf("hour window at exact boundary = %v..%v, want 15:00..17:00", from, to)
 	}
+
+	// Total: the whole range collapses into one "Total" bucket, so its window
+	// is [since, until] widened to the LOCAL-hour bucket boundaries of the
+	// endpoints — the same floor/ceil as the hour branch. (Without the
+	// explicit case it fell through to the month branch and widened a
+	// mid-month range to a whole month.)
+	from, to = activityWindow(since, until, "total")
+	if !from.Equal(time.Date(2026, 8, 13, 15, 0, 0, 0, loc)) ||
+		!to.Equal(time.Date(2026, 8, 13, 18, 0, 0, 0, loc)) {
+		t.Fatalf("total window = %v..%v, want 15:00..18:00 (same as hour)", from, to)
+	}
+}
+
+// TestActivityWindowTotalSpansRange pins the reported rollup=total bug
+// (default 7-day window): the total window must span exactly the requested
+// since..until (widened to the endpoint hour buckets), NOT the whole
+// containing months. Before the fix, rollup=total fell through to the month
+// branch and widened since=2026-08-13 .. until=2026-08-20 to
+// 2026-08-01 .. 2026-09-01, pulling out-of-range usage into the Total bucket.
+func TestActivityWindowTotalSpansRange(t *testing.T) {
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	since := time.Date(2026, 8, 13, 5, 30, 0, 0, loc)
+	until := time.Date(2026, 8, 20, 16, 5, 0, 0, loc)
+	from, to := activityWindow(since, until, "total")
+	if wantF, wantT := time.Date(2026, 8, 13, 5, 0, 0, 0, loc), time.Date(2026, 8, 20, 17, 0, 0, 0, loc); !from.Equal(wantF) || !to.Equal(wantT) {
+		t.Fatalf("total window = %v..%v, want %v..%v (the requested range, not Aug 1..Sep 1)", from, to, wantF, wantT)
+	}
 }
 
 // TestActivityWindowLocalHourFloor: the hour floor must follow the LOCAL

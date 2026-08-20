@@ -335,6 +335,86 @@ func TestActivityTotalRollup(t *testing.T) {
 	}
 }
 
+// TestActivityTotalRollupExactRange pins that rollup=total aggregates ONLY
+// the requested since..until (widened to the endpoint local-hour bucket
+// boundaries) into the single "Total" bucket: consumption rows inside the
+// same calendar month but OUTSIDE the range must NOT leak in. Regression
+// for activityWindow treating total as the month rollup, which widened the
+// query to the whole containing month(s) and inflated the Total bucket with
+// out-of-range usage. The window is pinned to 2020-01 so no wall-clock
+// fixture row (yesterday/today noon) can land in it — assertions are exact.
+func TestActivityTotalRollupExactRange(t *testing.T) {
+	e := bootstrapActivity(t)
+	t.Cleanup(func() {
+		if sqlDB, err := db.GetDB().DB(); err == nil {
+			sqlDB.Close()
+		}
+	})
+	loc := time.Local
+	since := time.Date(2020, 1, 13, 0, 0, 0, 0, loc)
+	until := time.Date(2020, 1, 20, 23, 59, 59, 0, loc)
+	var key model.Key
+	if err := db.GetDB().Where("name = ?", "k1").First(&key).Error; err != nil {
+		t.Fatal(err)
+	}
+	// In-range rows (distinct hours satisfy the (key_id, hour_bucket) key).
+	db.GetDB().Create(&model.Consumption{KeyID: key.ID, HourBucket: time.Date(2020, 1, 15, 12, 0, 0, 0, loc), ModelName: "g1", RequestCount: 1, CostUSD: 0.10})
+	db.GetDB().Create(&model.Consumption{KeyID: key.ID, HourBucket: time.Date(2020, 1, 16, 12, 0, 0, 0, loc), ModelName: "g3", RequestCount: 1, CostUSD: 0.20})
+	// OUT-OF-RANGE rows in the SAME month: the buggy month-widened window
+	// (Jan 1..Feb 1) would pull these into the Total bucket too.
+	db.GetDB().Create(&model.Consumption{KeyID: key.ID, HourBucket: time.Date(2020, 1, 5, 12, 0, 0, 0, loc), ModelName: "g1", RequestCount: 1, CostUSD: 0.50})
+	db.GetDB().Create(&model.Consumption{KeyID: key.ID, HourBucket: time.Date(2020, 1, 25, 12, 0, 0, 0, loc), ModelName: "g1", RequestCount: 1, CostUSD: 1.00})
+
+	qs := fmt.Sprintf("metric=spend&group_by=model&rollup=total&since=%s&until=%s",
+		url.QueryEscape(since.Format(time.RFC3339)), url.QueryEscape(until.Format(time.RFC3339)))
+	req := httptest.NewRequest("GET", "/api/stats/activity?"+qs, nil)
+	req.Host = "localhost:9999"
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Totals  map[string]float64 `json:"totals"`
+		Buckets []string           `json:"buckets"`
+		Series  []struct {
+			Group string  `json:"group"`
+			Value float64 `json:"value"`
+		} `json:"series"`
+		Summary []struct {
+			Group string  `json:"group"`
+			Sum   float64 `json:"sum"`
+		} `json:"summary"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("bad json: %v\n%s", err, rec.Body.String())
+	}
+	if len(out.Buckets) != 1 || out.Buckets[0] != "Total" {
+		t.Fatalf("buckets = %v, want [Total]", out.Buckets)
+	}
+	// Only the in-range rows (0.10 + 0.20) may contribute — the out-of-range
+	// January rows (0.50 + 1.00) must stay out even though the buggy
+	// month-widened window contained them.
+	if math.Abs(out.Totals["spend"]-0.30) > 0.000001 {
+		t.Fatalf("totals.spend = %v, want 0.30 (in-range rows only, not 1.80)", out.Totals["spend"])
+	}
+	series := map[string]float64{}
+	for _, s := range out.Series {
+		series[s.Group] += s.Value
+	}
+	if series["g1"] != 0.10 || series["g3"] != 0.20 {
+		t.Fatalf("total-bucket series = %v, want g1=0.10 g3=0.20", series)
+	}
+	for _, s := range out.Summary {
+		if s.Group == "g1" && s.Sum != 0.10 {
+			t.Fatalf("g1 summary Sum = %v, want 0.10", s.Sum)
+		}
+		if s.Group == "g3" && s.Sum != 0.20 {
+			t.Fatalf("g3 summary Sum = %v, want 0.20", s.Sum)
+		}
+	}
+}
+
 // TestActivityRankBy pins the rank_by param: series (top-N + Other folding)
 // and the summary's default order are ranked by the requested METRIC, which
 // may differ from the charted metric. An extra high-request/low-spend g2 row
