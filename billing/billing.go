@@ -193,13 +193,19 @@ func RecordConsumption(keyID int64, modelName, priceModel, appName string, usage
 		consumption.CacheWriteTokens = usage.CacheWriteTokens
 	}
 
-	// Atomic upsert: INSERT or increment the hourly row.
+	// Atomic upsert: INSERT or increment the hourly row. The row key is
+	// (key, hour, model, app) — a single provider key legitimately serves
+	// several model groups, and each must keep its own hourly row (the
+	// Activity page aggregates by model_name and app_name). Conflating every
+	// model a key served within an hour into whichever row was written first
+	// would fold the second model's usage (and cost, and cache tokens) into
+	// the first model's row while keeping the first model's name.
 	// Using a real ON CONFLICT avoids the FirstOrCreate SELECT+INSERT race
-	// where concurrent requests for the same (key, hour) could both INSERT
-	// and one would hit the unique index error and be lost.
+	// where concurrent requests for the same (key, hour, model, app) could
+	// both INSERT and one would hit the unique index error and be lost.
 	consumption.ID = 0
 	err := db.GetDB().Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "key_id"}, {Name: "hour_bucket"}},
+		Columns: []clause.Column{{Name: "key_id"}, {Name: "hour_bucket"}, {Name: "model_name"}, {Name: "app_name"}},
 		DoUpdates: clause.Assignments(map[string]interface{}{
 			"request_count":      gorm.Expr("request_count + 1"),
 			"input_tokens":       gorm.Expr("input_tokens + ?", consumption.InputTokens),

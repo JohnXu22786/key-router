@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -49,6 +50,17 @@ func Init(dataDir string) error {
 		&model.Pricing{},
 		&model.Setting{},
 	); err != nil {
+		return err
+	}
+
+	// Rebuild the consumption unique index so an hourly row is keyed per
+	// (key, hour, model, app), not per (key, hour) — see
+	// migrateConsumptionIndexPerModel. Runs before the data migrations below
+	// so the enforcing index is already in place when
+	// migrateConsumptionModelToIngress re-attributes model_name on legacy
+	// rows (each (key, hour) still has at most one row then, so its UPDATEs
+	// cannot trip the new unique index).
+	if err := migrateConsumptionIndexPerModel(db); err != nil {
 		return err
 	}
 
@@ -153,6 +165,68 @@ func migratePricingPer1KToPer1M(db *gorm.DB) error {
 // GetDB returns the database instance
 func GetDB() *gorm.DB {
 	return DB
+}
+
+// migrateConsumptionIndexPerModel rebuilds the consumptions unique index so it
+// covers (key_id, hour_bucket, model_name, app_name) instead of only
+// (key_id, hour_bucket). A single provider key legitimately serves several
+// model groups, and each model (and app) must keep its own hourly row — the
+// Activity page aggregates by model_name (and app_name). Older builds keyed
+// the hour row by (key, hour) alone, so whichever model wrote the row first
+// owned it: a second model's usage (tokens, cost, cache) in the same hour was
+// added onto the first model's row while the name stayed the first's, silently
+// mis-attributing that hour's usage (per-model cost, Top-Models, the
+// cache-hit rate) to the wrong model.
+//
+// The new constraint is a COLUMN SUPERSET of the old one, so any data valid
+// under the old index stays valid under the new — dropping and recreating can
+// never reject existing rows. GORM's AutoMigrate is not enough here: it
+// checks indexes by name only, so on an existing database it silently skips
+// the changed index and the stale (key_id, hour_bucket) constraint would keep
+// rejecting same-hour second-model inserts forever. This drops the stale
+// index and recreates it from the struct definition. Idempotent: the index is
+// rebuilt only when its current columns or UNIQUEness differ; a fresh DB
+// (AutoMigrate already created the right index) and a second launch (already
+// rebuilt) are no-ops. The drop+create runs in one transaction.
+//
+// Rows already conflated by an old build are NOT split here (the original
+// model/app of the merged usage is gone); only future writes get per-model
+// rows.
+func migrateConsumptionIndexPerModel(db *gorm.DB) error {
+	var cols []string
+	if err := db.Raw("SELECT name FROM pragma_index_info('idx_key_hour') ORDER BY seqno").Scan(&cols).Error; err != nil {
+		return err
+	}
+	if len(cols) == 0 {
+		// idx_key_hour does not exist. Unreachable through Init (the
+		// preceding AutoMigrate guarantees it, either from the struct on a
+		// fresh table or by leaving a legacy one in place), but if it ever
+		// happens there is nothing to migrate.
+		return nil
+	}
+	// Require the index to be a full UNIQUE index as well as correctly shaped:
+	// the RecordConsumption ON CONFLICT targets this index, so a non-unique or
+	// PARTIAL idx_key_hour (SQLite rejects a partial index as an ON CONFLICT
+	// arbiter) would reject every upsert.
+	var flags struct {
+		Unique  int
+		Partial int
+	}
+	if err := db.Raw(`SELECT "unique", "partial" FROM pragma_index_list('consumptions') WHERE name = 'idx_key_hour'`).Scan(&flags).Error; err != nil {
+		return err
+	}
+	if slices.Equal(cols, []string{"key_id", "hour_bucket", "model_name", "app_name"}) && flags.Unique == 1 && flags.Partial == 0 {
+		// Already the per-model full UNIQUE composite (fresh DB, or a previous
+		// launch): nothing to fix.
+		return nil
+	}
+	log.Println("[db] rebuilding consumption index: hourly rows keyed per (key_id, hour_bucket, model_name, app_name)")
+	return db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Migrator().DropIndex(&model.Consumption{}, "idx_key_hour"); err != nil {
+			return err
+		}
+		return tx.Migrator().CreateIndex(&model.Consumption{}, "idx_key_hour")
+	})
 }
 
 // migrationInputTokensInclCache is the settings flag that gates

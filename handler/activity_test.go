@@ -348,8 +348,9 @@ func TestActivityRankBy(t *testing.T) {
 	})
 
 	// g2 gains 100 requests at negligible cost on day1 (a distinct hour so
-	// the (key_id, hour_bucket) unique constraint is satisfied), so request
-	// rank (g2 >= 100 > g1 12) opposes spend rank (g1 0.03 > g2 ~0.0051).
+	// the (key_id, hour_bucket, model_name, app_name) unique index is
+	// satisfied), so request rank (g2 >= 100 > g1 12) opposes spend rank
+	// (g1 0.03 > g2 ~0.0051).
 	var k1 model.Key
 	db.GetDB().Where("name = ?", "k1").First(&k1)
 	now := time.Now()
@@ -492,7 +493,8 @@ func TestActivityBlended(t *testing.T) {
 	day2 := time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, now.Location())
 	day1Label := day1.Format("2006-01-02")
 	day2Label := day2.Format("2006-01-02")
-	// Distinct hours satisfy the (key_id, hour_bucket) unique constraint.
+	// Distinct hours satisfy the (key_id, hour_bucket, model_name, app_name)
+	// unique index.
 	db.GetDB().Create(&model.Consumption{KeyID: k1.ID, HourBucket: day2.Add(2 * time.Hour), ModelName: "g2", RequestCount: 1, InputTokens: 50, OutputTokens: 10, CacheHitTokens: 0, CostUSD: 0.006})
 	db.GetDB().Create(&model.Consumption{KeyID: k1.ID, HourBucket: day2.Add(3 * time.Hour), ModelName: "g1", RequestCount: 1, InputTokens: 25, OutputTokens: 5, CacheHitTokens: 0, CostUSD: 0.003})
 	db.GetDB().Create(&model.Consumption{KeyID: k2.ID, HourBucket: day1.Add(4 * time.Hour), ModelName: "g1", RequestCount: 2, InputTokens: 80, OutputTokens: 20, CacheHitTokens: 0, CostUSD: 0.04})

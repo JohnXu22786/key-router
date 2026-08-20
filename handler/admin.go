@@ -1215,8 +1215,10 @@ func (h *AdminHandler) GetStatsConsumptions(c *gin.Context) {
 		}
 	}
 
-	// Generous cap: 24h Ãƒâ€” 7d = 168 rows per key, so this covers hundreds of
-	// keys without truncating the Stats page charts.
+	// Generous cap. Rows are hourly per (key, model, app): 24h × 7d is 168
+	// per (key, model, app), so a key serving several model/app combos emits
+	// multiples of that. 100000 still covers hundreds of keys without
+	// truncating the Stats page charts.
 	if err := query.Order("hour_bucket DESC").Limit(100000).Find(&consumptions).Error; err != nil {
 		log.Printf("[admin] GetStatsConsumptions error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load consumptions"})
