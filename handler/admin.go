@@ -643,6 +643,20 @@ func (h *AdminHandler) CreateModelGroup(c *gin.Context) {
 	if !enabledProvided {
 		mg.Enabled = true
 	}
+	// Creating a group with an already-used group_id must be a 400, not a
+	// raw SQLite UNIQUE constraint 500 (same as CreateRoute/UpdatePricing).
+	var dup int64
+	if err := db.GetDB().Model(&model.ModelGroup{}).
+		Where("group_id = ?", mg.GroupID).
+		Count(&dup).Error; err != nil {
+		log.Printf("[admin] CreateModelGroup uniqueness check error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to validate model group"})
+		return
+	}
+	if dup > 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "a model group with this group_id already exists"})
+		return
+	}
 	if err := db.GetDB().Create(&mg).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -664,6 +678,21 @@ func (h *AdminHandler) UpdateModelGroup(c *gin.Context) {
 		return
 	}
 	mg.ID = id
+	// Renaming group_id to an existing value must be a 400, not a raw
+	// SQLite constraint 500 (same as CreateModelGroup/UpdatePricing). The
+	// edited group itself is excluded so an unchanged group_id round-trips.
+	var dup int64
+	if err := db.GetDB().Model(&model.ModelGroup{}).
+		Where("group_id = ? AND id <> ?", mg.GroupID, id).
+		Count(&dup).Error; err != nil {
+		log.Printf("[admin] UpdateModelGroup uniqueness check error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to validate model group"})
+		return
+	}
+	if dup > 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "a model group with this group_id already exists"})
+		return
+	}
 	if err := db.GetDB().Save(&mg).Error; err != nil {
 		log.Printf("[admin] UpdateModelGroup save error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
