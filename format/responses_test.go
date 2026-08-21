@@ -801,6 +801,199 @@ func TestResponsesStreamConverterDelayedToolID(t *testing.T) {
 	}
 }
 
+func TestResponsesStreamConverterIndexlessToolCallsAcrossChunks(t *testing.T) {
+	// A gateway omitting the tool_call "index" streams one fragment per chunk
+	// (every one at array position 0). Two different tools in consecutive
+	// chunks must NOT merge into one function_call item — each is its own
+	// output item with its own call_id/name/arguments.
+	conv := NewResponsesStreamConverter("openai")
+
+	// chunk 1: call_A, function f, arguments {"a": — the first Convert brings
+	// the created/in_progress lifecycle events, then output_item.added
+	evs, err := conv.Convert([]byte(`{"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_A","type":"function","function":{"name":"f","arguments":"{\"a\":"}}]}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if types := eventTypes(t, evs); strings.Join(types, ",") != "response.created,response.in_progress,response.output_item.added,response.function_call_arguments.delta" {
+		t.Fatalf("chunk 1 events = %v", types)
+	}
+	addedA := decodeEvents(t, evs)[2]["item"].(map[string]interface{})
+	if addedA["call_id"] != "call_A" || addedA["name"] != "f" {
+		t.Errorf("call_A item = %v", addedA)
+	}
+	itemIDA := addedA["id"].(string)
+
+	// chunk 2: call_B, function g, arguments {b:1} — must key to a NEW item
+	evs, err = conv.Convert([]byte(`{"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_B","type":"function","function":{"name":"g","arguments":"{b:1}"}}]}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if types := eventTypes(t, evs); strings.Join(types, ",") != "response.output_item.added,response.function_call_arguments.delta" {
+		t.Fatalf("chunk 2 events = %v", types)
+	}
+	addedB := decodeEvents(t, evs)[0]["item"].(map[string]interface{})
+	if addedB["call_id"] != "call_B" || addedB["name"] != "g" {
+		t.Errorf("call_B item = %v, want distinct call_B/g (bug: merged onto call_A)", addedB)
+	}
+	itemIDB := addedB["id"].(string)
+	if itemIDB == itemIDA {
+		t.Fatalf("call_B reused call_A's item id %v — the two tools merged", itemIDB)
+	}
+	// call_B's arguments delta must target call_B's own item
+	if deltaEv := decodeEvents(t, evs)[1]; deltaEv["item_id"] != itemIDB {
+		t.Errorf("call_B arguments delta item_id = %v, want %v", deltaEv["item_id"], itemIDB)
+	}
+
+	// finish
+	if _, err := conv.Convert([]byte(`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`)); err != nil {
+		t.Fatal(err)
+	}
+	evs = conv.CloseStream()
+	completed := decodeEvents(t, evs)[len(evs)-1]
+	output := completed["response"].(map[string]interface{})["output"].([]interface{})
+	if len(output) != 2 {
+		t.Fatalf("completed output has %d items, want 2: %v", len(output), output)
+	}
+	fcA := output[0].(map[string]interface{})
+	if fcA["call_id"] != "call_A" || fcA["name"] != "f" || fcA["arguments"] != `{"a":` {
+		t.Errorf("call_A output = %v", fcA)
+	}
+	fcB := output[1].(map[string]interface{})
+	if fcB["call_id"] != "call_B" || fcB["name"] != "g" || fcB["arguments"] != "{b:1}" {
+		t.Errorf("call_B output = %v (bug: args concatenated onto call_A)", fcB)
+	}
+}
+
+func TestResponsesStreamConverterIndexlessToolCallContinueByID(t *testing.T) {
+	// Index-less fragments of the SAME tool (id present on each) across
+	// chunks must rejoin the same function_call item, accumulating arguments.
+	conv := NewResponsesStreamConverter("openai")
+
+	evs, err := conv.Convert([]byte(`{"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_X","type":"function","function":{"name":"f"}}]}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if types := eventTypes(t, evs); strings.Join(types, ",") != "response.created,response.in_progress,response.output_item.added" {
+		t.Fatalf("first fragment events = %v", types)
+	}
+	added := decodeEvents(t, evs)[2]["item"].(map[string]interface{})
+	if added["call_id"] != "call_X" || added["name"] != "f" {
+		t.Fatalf("first fragment item = %v", added)
+	}
+	itemID := added["id"].(string)
+
+	// continuation 1
+	evs, err = conv.Convert([]byte(`{"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_X","function":{"arguments":"{\"a\":"}}]}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if types := eventTypes(t, evs); len(types) != 1 || types[0] != "response.function_call_arguments.delta" {
+		t.Fatalf("continuation fragment events = %v", types)
+	}
+	if deltaEv := decodeEvents(t, evs)[0]; deltaEv["item_id"] != itemID {
+		t.Errorf("delta item_id = %v, want rejoined item %v", deltaEv["item_id"], itemID)
+	}
+	// continuation 2
+	evs, err = conv.Convert([]byte(`{"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_X","function":{"arguments":"1}"}}]}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if types := eventTypes(t, evs); len(types) != 1 || types[0] != "response.function_call_arguments.delta" {
+		t.Fatalf("second continuation events = %v", types)
+	}
+
+	if _, err := conv.Convert([]byte(`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`)); err != nil {
+		t.Fatal(err)
+	}
+	evs = conv.CloseStream()
+	completed := decodeEvents(t, evs)[len(evs)-1]
+	output := completed["response"].(map[string]interface{})["output"].([]interface{})
+	if len(output) != 1 {
+		t.Fatalf("completed output has %d items, want 1: %v", len(output), output)
+	}
+	fc := output[0].(map[string]interface{})
+	if fc["call_id"] != "call_X" || fc["name"] != "f" || fc["arguments"] != `{"a":1}` {
+		t.Errorf("function_call output = %v, want accumulated args", fc)
+	}
+}
+
+func TestResponsesStreamConverterIndexlessAnonymousToolCallsDoNotMerge(t *testing.T) {
+	// Index-less fragments WITHOUT an id in consecutive chunks must not merge
+	// purely on their (identical) array position — each gets a fresh anonymous
+	// identity, so they become distinct output items.
+	conv := NewResponsesStreamConverter("openai")
+
+	// chunk 1: index-less, no id (first Convert brings the lifecycle events)
+	evs, err := conv.Convert([]byte(`{"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"name":"f","arguments":"{\"a\":"}}]}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if types := eventTypes(t, evs); strings.Join(types, ",") != "response.created,response.in_progress,response.output_item.added,response.function_call_arguments.delta" {
+		t.Fatalf("chunk 1 events = %v", types)
+	}
+	itemIDA := decodeEvents(t, evs)[2]["item"].(map[string]interface{})["id"].(string)
+
+	evs, err = conv.Convert([]byte(`{"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"name":"g","arguments":"{b:1}"}}]}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if types := eventTypes(t, evs); strings.Join(types, ",") != "response.output_item.added,response.function_call_arguments.delta" {
+		t.Fatalf("chunk 2 events = %v", types)
+	}
+	itemIDB := decodeEvents(t, evs)[0]["item"].(map[string]interface{})["id"].(string)
+	if itemIDB == itemIDA {
+		t.Fatalf("anonymous tools merged into item %v", itemIDB)
+	}
+
+	if _, err := conv.Convert([]byte(`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`)); err != nil {
+		t.Fatal(err)
+	}
+	evs = conv.CloseStream()
+	completed := decodeEvents(t, evs)[len(evs)-1]
+	output := completed["response"].(map[string]interface{})["output"].([]interface{})
+	if len(output) != 2 {
+		t.Fatalf("completed output has %d items, want 2: %v", len(output), output)
+	}
+	if n := output[0].(map[string]interface{})["name"]; n != "f" {
+		t.Errorf("output[0] name = %v, want f", n)
+	}
+	if n := output[1].(map[string]interface{})["name"]; n != "g" {
+		t.Errorf("output[1] name = %v, want g", n)
+	}
+}
+
+func TestResponsesStreamConverterIndexlessSameChunkStaysDistinct(t *testing.T) {
+	// Two tools as separate fragments in ONE chunk (positions 0 and 1, no
+	// index) must still become two distinct function_call items — index-less
+	// fragments keep serving the simultaneous multi-tool case within a chunk.
+	conv := NewResponsesStreamConverter("openai")
+	evs, err := conv.Convert([]byte(`{"choices":[{"index":0,"delta":{"tool_calls":[
+		{"id":"call_0","type":"function","function":{"name":"f0","arguments":"{\"a\":"}},
+		{"id":"call_1","type":"function","function":{"name":"f1","arguments":"{\"b\":"}}
+	]}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	types := eventTypes(t, evs)
+	want := "response.created,response.in_progress,response.output_item.added,response.function_call_arguments.delta,response.output_item.added,response.function_call_arguments.delta"
+	if strings.Join(types, ",") != want {
+		t.Fatalf("same-chunk events = %v\nwant %v", types, want)
+	}
+	dec := decodeEvents(t, evs)
+	itemIDA := dec[2]["item"].(map[string]interface{})["id"].(string)
+	itemIDB := dec[4]["item"].(map[string]interface{})["id"].(string)
+	if itemIDA == itemIDB {
+		t.Fatalf("same-chunk tools merged into item %v", itemIDA)
+	}
+	// each tool's arguments delta targets its own item
+	if dec[3]["item_id"] != itemIDA {
+		t.Errorf("f0 delta item_id = %v, want %v", dec[3]["item_id"], itemIDA)
+	}
+	if dec[5]["item_id"] != itemIDB {
+		t.Errorf("f1 delta item_id = %v, want %v", dec[5]["item_id"], itemIDB)
+	}
+}
+
 func TestResponsesStreamConverterAnthropicEOFMidText(t *testing.T) {
 	// EOF in the middle of a text block: CloseStream closes the open part
 	// (part events first) then the item, then completes
