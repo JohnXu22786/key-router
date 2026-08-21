@@ -57,10 +57,13 @@ func launchWindowsRelaunch(exe string) error {
 
 // windowsRelaunchScript returns the .bat content that waits for THIS
 // process (by PID) to exit, starts a fresh instance of the exe, and
-// deletes itself. The wait gives up after ~5 minutes (PID reuse) and
-// proceeds anyway — by then the old process is gone either way. No
-// parenthesized blocks are used, so no delayed expansion is needed and
-// paths containing "!" stay intact.
+// deletes itself. The wait gives up after ~5 minutes (300 iterations — PID
+// reuse) and then RE-CHECKS whether the process is actually gone: since the
+// new instance would fail to bind the server port while the old one still
+// lives, the script aborts (exit /b 1) instead of racing a still-running
+// process — that was the "second instance" bug. No parenthesized blocks are
+// used, so no delayed expansion is needed and paths containing "!" stay
+// intact.
 func windowsRelaunchScript(exePath string, pid int) string {
 	return fmt.Sprintf(`@echo off
 set /a n=0
@@ -68,9 +71,13 @@ set /a n=0
 tasklist /FI "PID eq %[1]d" 2>nul | find /I "%[1]d" >nul
 if errorlevel 1 goto proceed
 set /a n+=1
-if %%n%% GEQ 300 goto proceed
+if %%n%% GEQ 300 goto finalcheck
 ping -n 2 127.0.0.1 >nul
 goto wait
+:finalcheck
+tasklist /FI "PID eq %[1]d" 2>nul | find /I "%[1]d" >nul
+if errorlevel 1 goto proceed
+del "%%~f0" & exit /b 1
 :proceed
 start "" "%[2]s"
 del "%%~f0"

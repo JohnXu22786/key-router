@@ -248,6 +248,9 @@ func TestFindAssetPortableVsInstalled(t *testing.T) {
 // TestWindowsSwapScript guards the portable swap batch: it must wait for
 // THIS process (by PID) to exit (the exe is locked while the process
 // lives), swap the staged exe into place, relaunch, and delete itself.
+// The wait is capped (300 iterations, PID-reuse guard) but must NEVER
+// proceed against a still-running process or after a failed move: those
+// were the "silent failed update + second instance" bugs.
 func TestWindowsSwapScript(t *testing.T) {
 	s := windowsSwapScript(
 		`D:\apps\KeyRouter\KeyRouter.exe.new`,
@@ -256,13 +259,106 @@ func TestWindowsSwapScript(t *testing.T) {
 	)
 	for _, want := range []string{
 		`PID eq 4242`,
+		// Success path unchanged: swap the staged exe in and relaunch.
 		`move /Y "D:\apps\KeyRouter\KeyRouter.exe.new" "D:\apps\KeyRouter\KeyRouter.exe"`,
 		`start "" "D:\apps\KeyRouter\KeyRouter.exe"`,
 		`del "%~f0"`,
+		// The 300-iteration cap must go to a FINAL PID re-check, not straight
+		// to the swap: proceeding while the exe is still running makes the
+		// move fail and start spawns a duplicate old instance.
+		`if %n% GEQ 300 goto finalcheck`,
+		`:finalcheck`,
+		`if errorlevel 1 goto proceed`,
+		// Still alive after the final check → abort, never swap/relaunch.
+		`del "%~f0" & exit /b 1`,
+		// Only relaunch after the move succeeded: a failed move (exe locked)
+		// would otherwise silently launch the old binary.
+		`if errorlevel 1 del "%~f0" & exit /b 1`,
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("swap script missing %q\n---\n%s", want, s)
 		}
+	}
+	// The %n% iteration variable must keep its batch escaping after the
+	// final-check rework (%%n%% in the Go template → %n% in the .bat).
+	if strings.Contains(s, "%%n%%") {
+		t.Errorf("swap script still contains double-escaped %%n%% (must be %%%%n%%%% in Go source, %%n%% in the .bat)\n---\n%s", s)
+	}
+	// Ordering: the final PID re-check MUST precede the swap — a `:finalcheck`
+	// emitted after `:proceed` would be dead code and silently re-open the
+	// still-running-proceed bug. The standalone abort line
+	// (`del "%~f0" & exit /b 1`, not the move-fail guard) must sit between them
+	// so it is reached only by a still-alive final check.
+	proceedAt := strings.Index(s, ":proceed")
+	finalcheckAt := strings.Index(s, ":finalcheck")
+	if proceedAt < 0 || finalcheckAt < 0 || finalcheckAt > proceedAt {
+		t.Errorf("script ordering wrong: :finalcheck (%d) must come before :proceed (%d)\n---\n%s", finalcheckAt, proceedAt, s)
+	} else {
+		standaloneAbort := `del "%~f0" & exit /b 1`
+		abortAt := strings.Index(s, standaloneAbort)
+		if abortAt < 0 || abortAt < finalcheckAt || abortAt > proceedAt {
+			t.Errorf("still-alive abort (%q) must sit between :finalcheck and :proceed\n---\n%s", standaloneAbort, s)
+		}
+	}
+}
+
+// TestVerifyStagedSwap: the staged executable must be present and match the
+// downloaded asset before the swap helper is armed — a broken staging (missing
+// or wrong-sized .new) must fail applyPortable cleanly instead of being
+// reported as a successful update (or later swapping in a wrong binary).
+func TestVerifyStagedSwap(t *testing.T) {
+	dir := t.TempDir()
+	staged := filepath.Join(dir, "app.exe.new")
+	if err := os.WriteFile(staged, []byte("MZ123"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyStagedSwap(staged, 5); err != nil {
+		t.Errorf("present, correctly-sized staged file must verify: %v", err)
+	}
+	// wantSize 0 = no size known (AssetSize unset); presence is all that is
+	// checked.
+	if err := verifyStagedSwap(staged, 0); err != nil {
+		t.Errorf("present staged file with unknown size must verify: %v", err)
+	}
+	if err := verifyStagedSwap(staged, 999); err == nil {
+		t.Error("staged file with a size mismatch must NOT verify")
+	}
+	if err := os.Remove(staged); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyStagedSwap(staged, 0); err == nil {
+		t.Error("missing staged file must NOT verify")
+	}
+}
+
+// TestApplyPortableRejectsWrongSizedStage: a staged executable that is not the
+// downloaded asset must fail applyPortable cleanly, BEFORE any detached swap /
+// relaunch helper is armed, and must not leave the misleading .new behind.
+// (The swap is otherwise asynchronous — it only runs after this process exits —
+// so catching a broken staging here is the only synchronous guard against a
+// "silent success".) The download content is made 4 bytes while AssetSize says
+// 999, so verifyStagedSwap rejects it on every platform.
+func TestApplyPortableRejectsWrongSizedStage(t *testing.T) {
+	dl := filepath.Join(t.TempDir(), "download.exe")
+	if err := os.WriteFile(dl, []byte("XXXX"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	newPath := filepath.Join(filepath.Dir(exe), filepath.Base(exe)+".new")
+	if err := os.Remove(newPath); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+
+	c := NewClient("v0.1.8")
+	c.SetInstallMode("portable")
+	if err := c.applyPortable(dl, &UpdateInfo{AssetSize: 999}); err == nil {
+		t.Fatal("applyPortable succeeded with a wrong-sized staged executable, want an error")
+	}
+	if _, err := os.Stat(newPath); !os.IsNotExist(err) {
+		t.Errorf("staged .new was left behind after a rejected swap: %s", newPath)
 	}
 }
 
