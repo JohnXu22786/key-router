@@ -14,9 +14,9 @@
   },
   "dependencies": {
     "@ant-design/icons": "^6.3.2",
-    "antd": "^6.6.0",
+    "antd": "^6.6.1",
     "axios": "^1.7.9",
-    "dayjs": "^1.11.13",
+    "dayjs": "^1.11.23",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "react-router-dom": "^7.18.2",
@@ -31,6 +31,6 @@
     "jsdom": "^28.1.0",
     "typescript": "^7.0.2",
     "vite": "^8.2.1",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.11"
   }
 }
