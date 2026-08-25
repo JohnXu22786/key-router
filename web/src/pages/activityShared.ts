@@ -572,7 +572,21 @@ function rowCoverageEnd(start: dayjs.Dayjs, rowUnit: 'hour' | 'day' | 'month', c
     // floors to the unit start and would drop a row that demonstrably holds
     // data — read at least the first whole minute then (a cutoff at or
     // before the unit start still reads as no recorded data).
-    covEnd = cutoff.startOf('minute');
+    //
+    // The floor must NOT go through dayjs's startOf('minute'): on the
+    // fall-back's repeated hour a second-occurrence cutoff (01:15:45 EST)
+    // floors to 01:15 EST — wall-clock fields that ALSO exist in the first
+    // occurrence — and the ambiguous-local reconstruction inside the JS
+    // Date setter re-anchors the instant to the FIRST occurrence (01:15
+    // EDT, one hour earlier). The coverage would then end before a live
+    // window's start and the whole recent usage reads 0 (the "#135 line
+    // ends at the real last in-window value" contract), prorated wrong
+    // everywhere else. Whole-minute offsets keep the epoch and the local
+    // minute grids on the same boundaries, so flooring on the epoch
+    // (subtracting the local second+ms fields) preserves the instant:
+    // 01:15:45 EST floors to 01:15 EST = its real minute.
+    const floor = cutoff.valueOf() - (cutoff.second() * 1000 + cutoff.millisecond());
+    covEnd = dayjs(floor);
     const minEnd = start.add(1, 'minute');
     if (covEnd.isBefore(minEnd) && cutoff.isAfter(start)) covEnd = minEnd;
   }
@@ -618,14 +632,25 @@ function overlapFractions(
   if (coverage <= 0) return [];
   const perMin = 1 / coverage;
   const out: Array<[number, number]> = [];
-  if (isRepeatHour(h)) {
-    // DST fall-back: the row's repeated wall-clock hour covers two elapsed
-    // hours, but the axis is a MONOTONIC wall-clock grid — bucketStarts
-    // dropped the second occurrence's labels, so those minutes fold onto
-    // the same-label first-occurrence buckets (the repeated hour's usage
-    // lands on its first occurrence, like the hour-granularity axis). Each
-    // covered MILLISECOND of the row inside the window counts once, under
-    // its wall-clock cell's label (partial edge minutes are split at the
+  if (isRepeatHour(h) || isRepeatHour(h.subtract(1, 'hour'))) {
+    // DST fall-back: the repeated wall-clock hour covers two elapsed hours.
+    // isRepeatHour(h) = the row anchors on the FIRST occurrence; the
+    // subtract(1,'hour') variant catches a row SERIALIZED with the second
+    // occurrence's offset (hour_bucket "01:00 EST" — today's server
+    // truncates to the local hour and merges both occurrences into the
+    // first's row, but a future backend or serialization variant could
+    // keep the -05:00 row). dayjs's startOf('hour') above re-anchors the
+    // second row onto the first on current engines (ambiguous wall-clock —
+    // the same setter disambiguation the cutoff floor must dodge), which
+    // makes the variant a safety net for engines without the re-anchor —
+    // either way the row must take this path: the axis is a MONOTONIC
+    // wall-clock grid — bucketStarts dropped the second occurrence's
+    // labels (their sort keys sort below the already-emitted
+    // first-occurrence cells), so those minutes fold onto the same-label
+    // first-occurrence buckets (the repeated hour's usage lands on its
+    // first occurrence, like the hour-granularity axis). Each covered
+    // MILLISECOND of the row inside the window counts once, under its
+    // wall-clock cell's label (partial edge minutes are split at the
     // wall-clock minute boundaries, so second-precision fetch times stay
     // exact). Milliseconds whose label the window's axis does not contain
     // (the transition's fringe — a window starting mid-hour and ending in
@@ -663,6 +688,19 @@ function overlapFractions(
       const per = Math.floor(lost / counts.size);
       let rem = lost % counts.size;
       for (const [i, c] of counts) counts.set(i, c + per + (rem-- > 0 ? 1 : 0));
+    } else if (lost > 0 && starts.length > 0) {
+      // Total-safety arm: on runtimes where dayjs keeps the second
+      // occurrence's offset (no startOf re-anchor — the V8 setter
+      // disambiguation is engine-dependent), or for any row whose covered
+      // slice's wall-clock labels the axis lacks ENTIRELY, the old
+      // counts.size > 0 gate dropped the row's whole value while
+      // bucketWindowShare's KPI proration counted it — the chart total
+      // fell below the KPI by exactly the row's in-window slice. Spread
+      // the covered ms evenly over the visible buckets instead, mirroring
+      // the KPI's uniform-within-hour semantics; the total stays equal.
+      const per = Math.floor(lost / starts.length);
+      let rem = lost % starts.length;
+      for (let i = 0; i < starts.length; i++) counts.set(i, per + (rem-- > 0 ? 1 : 0));
     }
     const coverageMs = covEnd.valueOf() - h.valueOf();
     for (const [i, c] of counts) out.push([i, c / coverageMs]);
