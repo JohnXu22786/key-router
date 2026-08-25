@@ -32,6 +32,11 @@ func TestExtractAppName(t *testing.T) {
 		{"Claude Code anthropic-beta", hdr("anthropic-beta", "claude-code-20250219,oauth-2025-04-20"), nil, "Claude Code"},
 		{"x-app cli alone is not Claude Code", hdr("x-app", "cli"), nil, ""},
 		{"x-app CLI uppercase is generic too", hdr("x-app", "CLI"), nil, ""},
+		{"Claude Code x-app cli-bg + session", hdr("x-app", "cli-bg", "X-Claude-Code-Session-Id", "8f4a-2b1c-d3e5-6a7b"), nil, "Claude Code"},
+		{"Claude Code x-app cli-bg + UA", hdr("x-app", "cli-bg", "User-Agent", "claude-cli/2.1.96 (external, cli)"), nil, "Claude Code"},
+		{"x-app cli-bg alone is Claude Code", hdr("x-app", "cli-bg"), nil, "Claude Code"},
+		{"x-app CLI-BG uppercase is Claude Code", hdr("x-app", "CLI-BG"), nil, "Claude Code"},
+		{"x-app cli-bg-pro passthrough intact", hdr("x-app", "cli-bg-pro"), nil, "cli-bg-pro"},
 
 		// Provider-specific identifying headers.
 		{"Cursor X-Cursor-Mode", hdr("X-Cursor-Mode", "agent", "User-Agent", "axios/1.7"), nil, "Cursor"},
