@@ -23,10 +23,10 @@ import (
 )
 
 // bootstrapResponses sets up the app with one provider/group/route and
-// returns the router plus the created provider (whose BaseURL the test's
-// upstream must replace before wiring — simplest is to point BaseURL at the
-// httptest server directly).
-func bootstrapResponses(t *testing.T, providerType, baseURL string) *gin.Engine {
+// returns the router. groupID is the model group id clients must send; the
+// route has an EMPTY target_model (pass-through, the default for all callers
+// here). Point BaseURL at the caller's httptest server directly.
+func bootstrapResponses(t *testing.T, providerType, groupID, baseURL string) *gin.Engine {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	tmp := t.TempDir()
@@ -45,7 +45,7 @@ func bootstrapResponses(t *testing.T, providerType, baseURL string) *gin.Engine 
 	db.GetDB().Create(&model.Key{ProviderID: prov.ID, KeyValue: "sk-test", Name: "k1", RecoveryStrategy: model.RecoveryImmediate})
 	var key model.Key
 	db.GetDB().First(&key)
-	db.GetDB().Create(&model.ModelGroup{GroupID: "mock-model", Name: "Mock", Enabled: true})
+	db.GetDB().Create(&model.ModelGroup{GroupID: groupID, Name: "Mock", Enabled: true})
 	var g model.ModelGroup
 	db.GetDB().First(&g)
 	db.GetDB().Create(&model.Route{ModelGroupID: g.ID, ProviderID: prov.ID, Enabled: true, Priority: 0})
@@ -84,7 +84,7 @@ func TestResponsesNativePassthrough(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	e := bootstrapResponses(t, "openai", upstream.URL)
+	e := bootstrapResponses(t, "openai", "mock-model", upstream.URL)
 	rec := postResponses(t, e, `{"model":"mock-model","input":"hi","stream":false}`)
 
 	if rec.Code != http.StatusOK {
@@ -127,7 +127,7 @@ func TestResponsesFallbackToChatCompletions(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	e := bootstrapResponses(t, "openai", upstream.URL)
+	e := bootstrapResponses(t, "openai", "mock-model", upstream.URL)
 	rec := postResponses(t, e, `{"model":"mock-model","input":"hello","max_output_tokens":64,"stream":false}`)
 
 	if rec.Code != http.StatusOK {
@@ -140,6 +140,13 @@ func TestResponsesFallbackToChatCompletions(t *testing.T) {
 	var sent map[string]interface{}
 	if err := json.Unmarshal(chatBody, &sent); err != nil {
 		t.Fatalf("upstream chat body invalid: %v\n%s", err, chatBody)
+	}
+	// Empty target_model pass-through contract: the chat body must carry the
+	// client-provided incoming model name, not a substituted/derived value
+	// (the fallback call site in relay.ForwardRequest is a substitution point
+	// no other test asserts).
+	if sent["model"] != "mock-model" {
+		t.Errorf("upstream chat body model = %v, want mock-model (empty target_model pass-through)", sent["model"])
 	}
 	if sent["max_tokens"] != float64(64) {
 		t.Errorf("upstream max_tokens = %v, want 64 (from max_output_tokens)", sent["max_tokens"])
@@ -190,7 +197,7 @@ func TestResponsesToAnthropicProvider(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	e := bootstrapResponses(t, "anthropic", upstream.URL)
+	e := bootstrapResponses(t, "anthropic", "mock-model", upstream.URL)
 	rec := postResponses(t, e, `{"model":"mock-model","input":"hello","stream":false}`)
 
 	if rec.Code != http.StatusOK {
@@ -245,7 +252,7 @@ func TestResponsesStreamFallback(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	e := bootstrapResponses(t, "openai", upstream.URL)
+	e := bootstrapResponses(t, "openai", "mock-model", upstream.URL)
 	rec := postResponses(t, e, `{"model":"mock-model","input":"hi","stream":true}`)
 
 	if rec.Code != http.StatusOK {
@@ -326,7 +333,7 @@ func TestResponsesStreamFallbackNonSSE(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	e := bootstrapResponses(t, "openai", upstream.URL)
+	e := bootstrapResponses(t, "openai", "mock-model", upstream.URL)
 	rec := postResponses(t, e, `{"model":"mock-model","input":"hi","stream":true}`)
 
 	if rec.Code != http.StatusOK {
@@ -371,7 +378,7 @@ func TestResponsesNativeFailedIsTerminal(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	e := bootstrapResponses(t, "openai", upstream.URL)
+	e := bootstrapResponses(t, "openai", "mock-model", upstream.URL)
 	rec := postResponses(t, e, `{"model":"mock-model","input":"hi","stream":true}`)
 
 	body := rec.Body.String()
@@ -405,7 +412,7 @@ func TestResponsesNativeStreamPassthrough(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	e := bootstrapResponses(t, "openai", upstream.URL)
+	e := bootstrapResponses(t, "openai", "mock-model", upstream.URL)
 	rec := postResponses(t, e, `{"model":"mock-model","input":"hi","stream":true}`)
 
 	if rec.Code != http.StatusOK {
