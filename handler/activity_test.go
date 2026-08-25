@@ -845,7 +845,9 @@ func summarySumOf(rows []struct {
 
 // TestActivityFilter exercises the entity filter (filter_type/filter_value)
 // on the activity endpoint: rows outside the filter must not contribute to
-// totals or summary, and "Unknown" matches rows with an empty name.
+// totals or summary, and "Unknown" matches rows with an empty name plus any
+// name literally "Unknown" (both display as one group; this fixture has no
+// literal-"Unknown" rows, so the empty-name rows are the whole Unknown set).
 // Fixture (bootstrapActivity): g1 spend $0.03 via k1 ($0.01) + k2 ($0.02,
 // app "testapp"); g2 spend $0.005 via k1; one empty-model_name row ($0).
 func TestActivityFilter(t *testing.T) {
@@ -980,5 +982,112 @@ func TestConsumptionsFilter(t *testing.T) {
 	}
 	if code, _ := get("filter_type=nope"); code != 400 {
 		t.Fatalf("bad filter_type status = %d, want 400", code)
+	}
+}
+
+// TestActivityUnknownFilterCollision pins the sentinel collision: a row
+// whose model_name/app_name is LITERALLY "Unknown" (an admin-created model
+// group named Unknown, or a client sending X-OpenRouter-Title: Unknown)
+// aggregates into the SAME "Unknown" group as empty-name rows, so the
+// Unknown filter must return both together — otherwise the literal row's
+// usage silently drops out of the filtered view. Fixture rows added here:
+// one model row named "Unknown" (11 requests) and one app row attributed
+// "Unknown" (13 requests), both distinct from the fixture's empty-name rows.
+func TestActivityUnknownFilterCollision(t *testing.T) {
+	e := bootstrapActivity(t)
+	t.Cleanup(func() {
+		if sqlDB, err := db.GetDB().DB(); err == nil {
+			sqlDB.Close()
+		}
+	})
+
+	var key1, key2 model.Key
+	if err := db.GetDB().Where("name = ?", "k1").First(&key1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GetDB().Where("name = ?", "k2").First(&key2).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	// Rows with names LITERALLY "Unknown", on (key, hour, model, app) tuples
+	// distinct from the fixture's rows (that tuple carries a unique index).
+	now := time.Now()
+	hour := time.Date(now.Year(), now.Month(), now.Day()-1, 12, 0, 0, 0, now.Location())
+	db.GetDB().Create(&model.Consumption{KeyID: key1.ID, HourBucket: hour.Add(time.Hour), ModelName: "Unknown", RequestCount: 11})
+	db.GetDB().Create(&model.Consumption{KeyID: key2.ID, HourBucket: hour.Add(2 * time.Hour), ModelName: "g1", AppName: "Unknown", RequestCount: 13})
+
+	since := time.Date(now.Year(), now.Month(), now.Day()-1, 0, 0, 0, 0, now.Location())
+	until := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
+	rangeQS := fmt.Sprintf("since=%s&until=%s",
+		url.QueryEscape(since.Format(time.RFC3339)), url.QueryEscape(until.Format(time.RFC3339)))
+
+	// Chart (no filter), group_by=model: the literal-"Unknown" model row must
+	// merge with the empty-model_name row into one "Unknown" group
+	// (1 + 11 = 12) — the chart already merges them, the filter must agree.
+	code, totals, rows := activityGet(t, e, "metric=requests&group_by=model&rollup=day&"+rangeQS)
+	if code != 200 {
+		t.Fatalf("model chart status = %d", code)
+	}
+	if totals["requests"] != 40 {
+		t.Fatalf("model chart totals.requests = %v, want 40 (all six rows)", totals["requests"])
+	}
+	if summarySumOf(rows, "Unknown") != 12 {
+		t.Fatalf("model chart Unknown group = %v, want 12 (empty-name 1 + literal 'Unknown' 11)", summarySumOf(rows, "Unknown"))
+	}
+
+	// filter_type=model&filter_value=Unknown must return BOTH the empty-name
+	// row AND the literal-"Unknown" row together (the same merged set).
+	code, totals, rows = activityGet(t, e, "metric=requests&group_by=model&rollup=day&filter_type=model&filter_value=Unknown&"+rangeQS)
+	if code != 200 {
+		t.Fatalf("model=Unknown filter status = %d", code)
+	}
+	if totals["requests"] != 12 || summarySumOf(rows, "Unknown") != 12 {
+		t.Fatalf("model=Unknown filter totals=%v rows=%+v, want 12 (empty-name + literal 'Unknown')", totals, rows)
+	}
+
+	// Chart (no filter), group_by=app: the literal-"Unknown" app row merges
+	// with all empty-app_name rows: 5+3+1 (fixture) + 11 (the model-"Unknown"
+	// row has no app) + 13 (literal app) = 33.
+	code, totals, rows = activityGet(t, e, "metric=requests&group_by=app&rollup=day&"+rangeQS)
+	if code != 200 {
+		t.Fatalf("app chart status = %d", code)
+	}
+	if summarySumOf(rows, "Unknown") != 33 {
+		t.Fatalf("app chart Unknown group = %v, want 33 (empty apps 20 + literal 'Unknown' 13)", summarySumOf(rows, "Unknown"))
+	}
+
+	// filter_type=app&filter_value=Unknown must return the same merged set.
+	code, totals, rows = activityGet(t, e, "metric=requests&group_by=app&rollup=day&filter_type=app&filter_value=Unknown&"+rangeQS)
+	if code != 200 {
+		t.Fatalf("app=Unknown filter status = %d", code)
+	}
+	if totals["requests"] != 33 || summarySumOf(rows, "Unknown") != 33 {
+		t.Fatalf("app=Unknown filter totals=%v rows=%+v, want 33 (empty-name + literal 'Unknown')", totals, rows)
+	}
+
+	// GetStatsConsumptions shares applyActivityFilter: the raw endpoint must
+	// return the empty-name and the literal-"Unknown" rows together too.
+	get := func(qs string) (int, []model.Consumption) {
+		t.Helper()
+		req := httptest.NewRequest("GET", "/api/stats/consumptions?"+qs, nil)
+		req.Host = "localhost:9999"
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			return rec.Code, nil
+		}
+		var out []model.Consumption
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("bad json: %v\n%s", err, rec.Body.String())
+		}
+		return rec.Code, out
+	}
+	code, raw := get("filter_type=model&filter_value=Unknown&" + rangeQS)
+	if code != 200 || len(raw) != 2 {
+		t.Fatalf("consumptions model=Unknown: code=%d rows=%d, want 2 (empty-name + literal 'Unknown')", code, len(raw))
+	}
+	code, raw = get("filter_type=app&filter_value=Unknown&" + rangeQS)
+	if code != 200 || len(raw) != 5 {
+		t.Fatalf("consumptions app=Unknown: code=%d rows=%d, want 5 (4 empty-app + literal 'Unknown')", code, len(raw))
 	}
 }
