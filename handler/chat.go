@@ -947,8 +947,11 @@ func isClaudeCodeAppID(t string) bool {
 
 // stripHostPort removes a trailing ":port" from a host string
 // ("example.com:8080" -> "example.com"). Bracketed IPv6 literals keep
-// their colons and brackets ("[2001:db8::1]:8080" -> "[2001:db8::1]");
-// unbracketed IPv6 is left untouched because its colons are
+// their colons and brackets — including compressed single-colon forms
+// ("[2001:db8]" -> "[2001:db8]", "[2001:db8::1]:8080" ->
+// "[2001:db8::1]") — and unbracketed IPv6 is left untouched too,
+// including its compressed single-colon forms ("2001:db8", "a:b" —
+// RFC 4291 zero-group omission) whose single colon is otherwise
 // indistinguishable from a port separator. RFC 3986 userinfo
 // ("user:pass@") precedes the host; it is dropped before the port split
 // so its colon is never mistaken for a port separator and credentials
@@ -957,12 +960,28 @@ func stripHostPort(host string) string {
 	if i := strings.LastIndexByte(host, '@'); i >= 0 {
 		host = host[i+1:]
 	}
-	if i := strings.LastIndexByte(host, ':'); i > 0 && !strings.Contains(host[:i], ":") {
-		return host[:i]
-	}
+	// Bracketed forms are unambiguous: everything through the closing
+	// bracket is the host, and a port, if any, follows the bracket. This
+	// branch must run before the colon strip below — a bracketed
+	// compressed literal ("[2001:db8]", "[a:b]") has exactly one colon
+	// and none before it, so the strip branch would read it as host:port,
+	// and the ParseIP gate cannot veto that (brackets never parse as part
+	// of an IP string).
 	if strings.HasPrefix(host, "[") {
 		if i := strings.IndexByte(host, ']'); i >= 0 {
 			return host[:i+1]
+		}
+	}
+	if i := strings.LastIndexByte(host, ':'); i > 0 && !strings.Contains(host[:i], ":") {
+		// One colon only, so this is host:port unless it is a compressed
+		// single-colon IPv6 literal: net.ParseIP rejects the bare two-group
+		// form, but completing the omitted zero groups ("2001:db8" ->
+		// "2001:db8::") makes the literal parse, and only hex groups do —
+		// real host:port pairs stay unparseable and are still stripped. (A
+		// hex-word hostname with a port, e.g. "cafe:8080", is structurally
+		// indistinguishable and is kept intact too.)
+		if net.ParseIP(host+"::") == nil {
+			return host[:i]
 		}
 	}
 	return host

@@ -64,6 +64,14 @@ func TestExtractAppName(t *testing.T) {
 		{"Referer www and port stripped", hdr("HTTP-Referer", "https://www.myapp.example.com:8443/chat"), nil, "myapp.example.com"},
 		{"IPv6 referer port stripped, literal kept", hdr("HTTP-Referer", "http://[2001:db8::1]:3000/chat"), nil, "[2001:db8::1]"},
 		{"unbracketed IPv6 referer kept intact", hdr("HTTP-Referer", "http://2001:db8::1/chat"), nil, "2001:db8::1"},
+		// Regression (#130): a single-colon compressed IPv6 literal
+		// ("2001:db8", "a:b") must survive the port strip and become the
+		// app name itself, not the truncated fragment ("2001", "a").
+		{"single-colon IPv6 referer kept", hdr("HTTP-Referer", "https://2001:db8/chat"), nil, "2001:db8"},
+		{"single-colon IPv6 referer kept a:b", hdr("HTTP-Referer", "https://a:b/chat"), nil, "a:b"},
+		// The bracketed form is what browsers actually emit for IPv6 URLs;
+		// it must survive the referer path end to end, port included.
+		{"bracketed single-colon IPv6 referer kept with port", hdr("HTTP-Referer", "https://[a:b]:3000/chat"), nil, "[a:b]"},
 		{"LAN IP referer port stripped", hdr("HTTP-Referer", "http://192.168.1.5:3000"), nil, "192.168.1.5"},
 		{"Referer userinfo kept out of host", hdr("HTTP-Referer", "https://user@example.com/x"), nil, "example.com"},
 		{"Referer userinfo with password kept out of host", hdr("HTTP-Referer", "https://user:pass@example.com/x"), nil, "example.com"},
@@ -134,9 +142,30 @@ func TestStripHostPort(t *testing.T) {
 		{"host with port", "example.com:8080", "example.com"},
 		{"IPv6 literal with port", "[2001:db8::1]:3000", "[2001:db8::1]"},
 		{"IPv6 loopback with port", "[::1]:8787", "[::1]"},
+		// Bracketed single-colon literals (the form browsers emit for IPv6):
+		// the bracket branch must be evaluated before the colon strip, or
+		// the strip branch sees one colon with none before it and truncates
+		// ("[2001:db8]" -> "[2001").
+		{"bracketed single-colon IPv6 literal", "[2001:db8]", "[2001:db8]"},
+		{"bracketed single-colon IPv6 literal a:b", "[a:b]", "[a:b]"},
+		{"bracketed single-colon IPv6 literal with port", "[a:b]:3000", "[a:b]"},
 		// Unbracketed IPv6 is left untouched: its colons are indistinguishable
 		// from a port separator.
 		{"unbracketed IPv6", "2001:db8::1", "2001:db8::1"},
+		// Single-colon compressed forms are valid unbracketed IPv6 literals
+		// too (RFC 4291 zero-group omission: "2001:db8" is 2001:db8::, and
+		// "a:b" is a:b::). Their one colon must not be read as a port
+		// separator — regression: they used to be truncated to "2001" / "a".
+		{"single-colon IPv6 literal", "2001:db8", "2001:db8"},
+		{"single-colon IPv6 literal a:b", "a:b", "a:b"},
+		// The deliberately documented flip side: a hex-word hostname with an
+		// all-hex-digit port ("cafe" and "8080" are both hex) is structurally
+		// identical to a compressed literal, and the parse favors the literal
+		// — kept whole. Pinned so the trade-off cannot drift silently.
+		{"hex-word host with hex port kept as literal", "cafe:8080", "cafe:8080"},
+		// net.ParseIP is case-insensitive in hex groups; the recognition must
+		// survive a future reimplementation.
+		{"uppercase single-colon IPv6 literal", "Ab:Cd", "Ab:Cd"},
 		// RFC 3986 userinfo precedes the host; credentials must never become
 		// the host identity.
 		{"userinfo", "user@example.com", "example.com"},
