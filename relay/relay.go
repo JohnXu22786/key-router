@@ -131,8 +131,14 @@ func ForwardRequest(meta *model.RequestMetadata, key *model.Key, provider *model
 	// hop-by-hop headers (forwarding Connection: close would disable
 	// connection reuse for that client's requests)
 	for k, vals := range meta.Headers {
-		// Skip local-only headers that shouldn't leak upstream
-		if k == "Authorization" || k == "X-Api-Key" || k == "Cookie" || k == "Origin" || k == "Referer" {
+		// Skip local-only headers that shouldn't leak upstream. Referer must be
+		// dropped under BOTH client spellings: the RFC-standard "Referer" and
+		// OpenRouter's documented "HTTP-Referer", which Go's server
+		// canonicalizes into the map key "Http-Referer" (the literal comparison
+		// used to miss it, leaking the client's app-identity URL — often a
+		// private LAN address or internal dashboard — to the upstream provider).
+		if k == "Authorization" || k == "X-Api-Key" || k == "Cookie" || k == "Origin" ||
+			strings.EqualFold(k, "Referer") || strings.EqualFold(k, "HTTP-Referer") {
 			continue
 		}
 		// Skip hop-by-hop headers (Connection, Keep-Alive, TE, Trailer,

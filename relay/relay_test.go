@@ -1,9 +1,15 @@
 package relay
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"key-router/model"
 )
@@ -304,5 +310,116 @@ func TestConvertAnthropicResponseToOpenAIThinkingMultipleBlocks(t *testing.T) {
 	msg := choice["message"].(map[string]interface{})
 	if rc, ok := msg["reasoning_content"].(string); !ok || rc != "think A\nthink B" {
 		t.Errorf("reasoning_content = %q, want 'think A\\nthink B'", msg["reasoning_content"])
+	}
+}
+
+// TestForwardRequestDropsRefererAttribution guards the outbound privacy
+// contract for the Referer signal: the client's app-identity URL — which can
+// be a private LAN address or internal dashboard — is consumed locally for
+// app-name attribution (extractAppNameUnchecked) and must NEVER reach the
+// upstream provider, under either spelling clients send: the RFC-standard
+// "Referer" and OpenRouter's documented "HTTP-Referer" (which Go's server
+// canonicalizes into the map key "Http-Referer"). Regression: the forwarding
+// skip list compared against the literal "Referer", so the canonicalized
+// "Http-Referer" spelling leaked the attribution URL upstream verbatim. The
+// value deliberately mirrors the LAN-IP case the attribution tests support.
+func TestForwardRequestDropsRefererAttribution(t *testing.T) {
+	cases := []struct {
+		name string
+		key  string
+	}{
+		// The canonicalized form of the wire name "HTTP-Referer" (OpenRouter's
+		// documented attribution spelling) — exactly the map key the live
+		// server pipeline produces.
+		{"HTTP-Referer (OpenRouter spelling, canonicalized to Http-Referer)", "Http-Referer"},
+		{"Referer (RFC standard spelling)", "Referer"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			const attributionURL = "http://192.168.1.5:3000"
+			hdr := http.Header{}
+			hdr.Set(tc.key, attributionURL)
+			got := relayHeadersWith(t, hdr)
+			for k := range got {
+				if strings.EqualFold(k, "Referer") || strings.EqualFold(k, "HTTP-Referer") {
+					t.Errorf("outbound request carries leaked referer header %q = %q", k, got.Get(k))
+				}
+			}
+			// Pin the VALUE-level property too: the private attribution URL
+			// must not reach the upstream under ANY header name (or inside
+			// a rewritten value).
+			for k, vals := range got {
+				for _, v := range vals {
+					if strings.Contains(v, attributionURL) {
+						t.Errorf("outbound request leaks private attribution URL under header %q", k)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestForwardRequestForwardsOtherHeaders guards the other half of the skip
+// list contract: dropping the local-only headers must not swallow the
+// headers that ARE meant to reach the upstream (attribution titles, app
+// identity, multi-value headers etc.).
+func TestForwardRequestForwardsOtherHeaders(t *testing.T) {
+	hdr := http.Header{}
+	hdr.Set("X-Title", "MyApp")
+	hdr.Set("X-OpenRouter-Title", "MyApp")
+	hdr.Set("User-Agent", "opencode/1.0")
+	hdr.Add("X-Multi", "a")
+	hdr.Add("X-Multi", "b")
+	got := relayHeadersWith(t, hdr)
+	if got.Get("X-Title") != "MyApp" {
+		t.Errorf("X-Title = %q, want %q (attribution headers must still be forwarded)", got.Get("X-Title"), "MyApp")
+	}
+	if got.Get("X-OpenRouter-Title") != "MyApp" {
+		t.Errorf("X-OpenRouter-Title = %q, want %q", got.Get("X-OpenRouter-Title"), "MyApp")
+	}
+	if got.Get("User-Agent") != "opencode/1.0" {
+		t.Errorf("User-Agent = %q, want %q", got.Get("User-Agent"), "opencode/1.0")
+	}
+	if vals := got.Values("X-Multi"); len(vals) != 2 || vals[0] != "a" || vals[1] != "b" {
+		t.Errorf("X-Multi = %v, want [a b] (multi-value forwarding)", vals)
+	}
+}
+
+// relayHeadersWith forwards a request carrying the given headers through a
+// local upstream and returns the header map the upstream actually received.
+func relayHeadersWith(t *testing.T, in http.Header) http.Header {
+	t.Helper()
+	received := make(chan http.Header, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, "{}")
+	}))
+	defer upstream.Close()
+
+	meta := &model.RequestMetadata{
+		Format:      "openai",
+		RequestPath: "/v1/chat/completions",
+		RequestBody: []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":false}`),
+		Headers:     in,
+		Ctx:         context.Background(),
+	}
+	key := &model.Key{KeyValue: "sk-test"}
+	provider := &model.Provider{Type: "openai", BaseURL: upstream.URL}
+	resp, err := ForwardRequest(meta, key, provider)
+	if err != nil {
+		t.Fatalf("ForwardRequest failed: %v", err)
+	}
+	defer resp.Resp.Body.Close()
+	io.Copy(io.Discard, resp.Resp.Body)
+	select {
+	case got := <-received:
+		return got
+	case <-time.After(10 * time.Second):
+		// Fail fast if ForwardRequest returned but no request reached the
+		// handler (a silent relay-side drop would otherwise hang the test
+		// for the full 300s client timeout).
+		t.Fatal("upstream handler never received a request")
+		return nil
 	}
 }
