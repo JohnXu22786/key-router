@@ -399,6 +399,45 @@ describe('queryWindowUntil — the query keeps every in-range bucket', () => {
     expect(queryWindowUntil(w('year'), 'month').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-01 00:00:00');
   });
 
+  it('week rollup on a past preset excludes the whole boundary week (week-grid alignment)', () => {
+    // A week rollup anchors buckets to MONDAY (activityWindow's week
+    // branch), so the day-aligned exclusion (until-1s) still lies INSIDE
+    // the boundary week [mondayOf(until), +7d): the server widens the query
+    // into that whole week, its bucket renders on the axis labeled with the
+    // boundary Monday, and the CURRENT period's rows (up to the next
+    // Monday) aggregate into it — the #137 violation (Prev Month + Weekly
+    // shows next month's first days in its last bucket). Flooring the
+    // exclusion to the WEEK grid instead (one second before the boundary
+    // week's Monday) makes the widened server window end exactly AT the
+    // boundary week and drop it entirely, keeping the Monday-anchored grid.
+    expect(queryWindowUntil(w('prevmonth'), 'week').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-07-26 23:59:59');
+    expect(queryWindowUntil(w('prevyear'), 'week').format('YYYY-MM-DD HH:mm:ss')).toBe('2025-12-28 23:59:59');
+    // Prev Week ends ON a Monday: the week floor coincides with the day
+    // floor there, so the result is unchanged (see the Monday-alignment
+    // test above).
+    expect(queryWindowUntil(w('prevweek'), 'week').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-09 23:59:59');
+  });
+
+  it('a range living wholly inside the boundary week keeps the day-aligned exclusion (Yesterday + Weekly)', () => {
+    // Yesterday [Aug 12, Aug 13) sits INSIDE the boundary week [Aug 10,
+    // Aug 17): aligning the exclusion to the week grid would put the
+    // widened server window entirely BEFORE the range and return an EMPTY
+    // response for a day that has usage. The week-grid exclusion applies
+    // only when the boundary week starts inside the range; this window
+    // keeps the day-aligned exclusion unchanged.
+    expect(queryWindowUntil(w('yesterday'), 'week').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-12 23:59:59');
+  });
+
+  it('a custom range on a day boundary keeps the day-aligned exclusion for week rollups', () => {
+    // Custom picks are never re-aligned: a midnight-ending custom range
+    // keeps the day-floor exclusion even under a week rollup — the boundary
+    // week's in-range days (Aug 10-12 here) are the user's own chosen data,
+    // and sending the week-grid exclusion would amputate them from the
+    // response.
+    const r = { key: CUSTOM_KEY, label: '', badge: '', since: dayjs('2026-08-03T00:00:00'), until: dayjs('2026-08-13T00:00:00'), granularity: 'day' as Granularity };
+    expect(queryWindowUntil(r, 'week').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-12 23:59:59');
+  });
+
   it('a mid-bucket CUSTOM range keeps its trailing partial day for a finer rollup', () => {
     // Custom ranges are never snapped: the user picked an until of 16:05.
     // Flooring it to the day would amputate the final day they selected; the

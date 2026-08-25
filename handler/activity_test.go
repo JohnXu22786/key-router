@@ -804,6 +804,112 @@ func TestActivityWeekRollupMondayAlignment(t *testing.T) {
 	}
 }
 
+// TestActivityWeekRollupPastPeriodExcludesBoundaryWeek pins the week-rollup
+// boundary contract the client fix (queryWindowUntil's week-grid exclusion)
+// relies on: for a PAST-period range (Prev Month) + rollup=week, the whole
+// boundary week — the Monday-anchored week containing the range's end — must
+// stay out of the response (buckets and totals), so the current period's
+// rows never appear inside the previous period's chart (#137).
+//
+// The fixed client sends until = mondayOf(range.until) - 1s (one second
+// before the boundary week's Monday, e.g. Jun 28 23:59:59 when the range
+// ends Jul 1); the widened window then ends exactly AT the boundary week.
+// With that until, rows in the boundary week are NOT returned even though
+// some of them (Jun 29-30) are in-range days — the contract is full-week
+// exclusion, never a partial week.
+//
+// The second half re-runs the same query with the PRE-FIX day-aligned until
+// (range.until - 1s, which lies INSIDE the boundary week): the current
+// period's rows (Jul 1-2) leak into the visible boundary bucket and the
+// totals — the exact symptom the client-side fix closes. It also guards
+// activityWindow's Monday anchoring: if the server windowing ever changed,
+// this pin breaks.
+//
+// All rows use a unique model name ("gtest") with filter_type=model so the
+// fixture rows bootstrapActivity seeds at the real clock can never land in
+// the fixed windows, whatever date the suite runs on.
+func TestActivityWeekRollupPastPeriodExcludesBoundaryWeek(t *testing.T) {
+	e := bootstrapActivity(t)
+	t.Cleanup(func() {
+		if sqlDB, err := db.GetDB().DB(); err == nil {
+			sqlDB.Close()
+		}
+	})
+	var key model.Key
+	if err := db.GetDB().Where("name = ?", "k1").First(&key).Error; err != nil {
+		t.Fatal(err)
+	}
+	loc := time.Local
+	// Prev Month fixture ending Jul 1 2026 (Jun 1 2026 is a Monday; the
+	// boundary week of Jul 1 is [Jun 29, Jul 6)). Costs are binary-exact so
+	// equality comparisons are safe.
+	insert := func(hour time.Time, cost float64) {
+		db.GetDB().Create(&model.Consumption{KeyID: key.ID, HourBucket: hour, ModelName: "gtest", RequestCount: 1, InputTokens: 10, OutputTokens: 0, CostUSD: cost})
+	}
+	insert(time.Date(2026, 6, 10, 12, 0, 0, 0, loc), 0.5)  // prev month, axis bucket Jun 8
+	insert(time.Date(2026, 6, 29, 12, 0, 0, 0, loc), 0.25) // prev month, INSIDE the boundary week
+	insert(time.Date(2026, 7, 2, 12, 0, 0, 0, loc), 1.0)   // current month, inside the boundary week
+	insert(time.Date(2026, 7, 15, 12, 0, 0, 0, loc), 2.0)  // current month, after the boundary week
+
+	fetch := func(until time.Time) ([]string, map[string]float64) {
+		t.Helper()
+		qs := fmt.Sprintf("metric=spend&group_by=model&rollup=week&filter_type=model&filter_value=gtest&since=%s&until=%s",
+			url.QueryEscape(time.Date(2026, 6, 1, 0, 0, 0, 0, loc).Format(time.RFC3339)),
+			url.QueryEscape(until.Format(time.RFC3339)))
+		req := httptest.NewRequest("GET", "/api/stats/activity?"+qs, nil)
+		req.Host = "localhost:9999"
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+		}
+		var out struct {
+			Buckets []string           `json:"buckets"`
+			Totals  map[string]float64 `json:"totals"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("bad json: %v\n%s", err, rec.Body.String())
+		}
+		return out.Buckets, out.Totals
+	}
+
+	// Week-aligned until (fixed client): mondayOf(Jul 1) - 1s. The boundary
+	// week [Jun 29, Jul 6) is excluded: only the Jun 10 row (0.5) survives,
+	// the Jun 29 row drops with the boundary week, and the current period's
+	// rows never appear in totals or buckets.
+	buckets, totals := fetch(time.Date(2026, 6, 28, 23, 59, 59, 0, loc))
+	wantBuckets := []string{"2026-06-01", "2026-06-08", "2026-06-15", "2026-06-22"}
+	if len(buckets) != len(wantBuckets) {
+		t.Fatalf("buckets = %v, want %v (boundary week off the axis)", buckets, wantBuckets)
+	}
+	for i, b := range wantBuckets {
+		if buckets[i] != b {
+			t.Fatalf("buckets = %v, want %v (boundary week off the axis)", buckets, wantBuckets)
+		}
+	}
+	if totals["spend"] != 0.5 {
+		t.Fatalf("week-aligned until totals.spend = %v, want 0.5 (only the Jun 10 row; boundary week + current period excluded)", totals["spend"])
+	}
+
+	// Day-aligned until (pre-fix client): Jun 30 23:59:59 lies INSIDE the
+	// boundary week, so the server widens into [Jun 29, Jul 6): the Jul 2
+	// row (current period) leaks into the visible "2026-06-29" bucket and
+	// the totals — the symptom the client fix closes.
+	buckets, totals = fetch(time.Date(2026, 6, 30, 23, 59, 59, 0, loc))
+	if totals["spend"] != 1.75 {
+		t.Fatalf("day-aligned until totals.spend = %v, want 1.75 (0.5 + 0.25 + 1.0 — the current period leaks in)", totals["spend"])
+	}
+	found := false
+	for _, b := range buckets {
+		if b == "2026-06-29" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("buckets = %v, want the boundary bucket 2026-06-29 present (it holds the leaked Jul 2 row)", buckets)
+	}
+}
+
 // activityGet issues an activity request and decodes totals + summary rows.
 func activityGet(t *testing.T, e *gin.Engine, qs string) (int, map[string]float64, []struct {
 	Group string  `json:"group"`
