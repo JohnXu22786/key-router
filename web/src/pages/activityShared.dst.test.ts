@@ -110,6 +110,16 @@ describe('bucketStarts — DST axes under the half-open window', () => {
 // repeat divides by the row's true 120-minute coverage, never 60 — a
 // hard-coded 60 would double every tick's value and inflate the chart total
 // away from bucketWindowShare's proration for the same window and rows.
+// These windows are past-shaped by design (their cutoff lies well AFTER
+// `until`, like a previous period's fetch) and pin the coverage math, not
+// the live-cell append — so the series() calls below pass liveExtend=false
+// exactly like the pages do for past windows; with the live cell's
+// alignment now judged from the range's own until (see hasLiveCell), the
+// old default-gated shapes would otherwise append a boundary cell —
+// VALUED where the row's coverage extends past `until` (the KPI's
+// hour-granular mirror cannot count it, breaking chart-total == KPI
+// conservation) or EMPTY where the coverage ends AT `until` (a trailing
+// zero tick breaking the exact-shape assertions).
 describe('series — DST fall-back on sub-hour axes', () => {
   const ROW = '2026-11-01T01:00:00'; // 01:00 EDT -> 01:00 EST: covers 120 elapsed minutes
   // NOTE: cutoff must be parsed INSIDE each test — a describe-level
@@ -125,7 +135,7 @@ describe('series — DST fall-back on sub-hour axes', () => {
     const out = series(
       [{ hour_bucket: ROW }],
       () => 1200,
-      dayjs('2026-11-01T01:00:00'), dayjs('2026-11-01T01:30:00'), cutoff, 'minute',
+      dayjs('2026-11-01T01:00:00'), dayjs('2026-11-01T01:30:00'), cutoff, 'minute', false,
     );
     expect(out.map(p => p.value)).toEqual([...Array(30).fill(10)]);
     const kpi = bucketWindowShare(ROW, dayjs('2026-11-01T01:00:00'), dayjs('2026-11-01T01:30:00'), cutoff, 'hour');
@@ -139,7 +149,7 @@ describe('series — DST fall-back on sub-hour axes', () => {
     const out = series(
       [{ hour_bucket: ROW }],
       () => 1200,
-      dayjs('2026-11-01T01:00:00'), dayjs('2026-11-01T01:45:00'), cutoff, 'min15',
+      dayjs('2026-11-01T01:00:00'), dayjs('2026-11-01T01:45:00'), cutoff, 'min15', false,
     );
     expect(out.map(p => p.value)).toEqual([150, 150, 150]);
     const kpi = bucketWindowShare(ROW, dayjs('2026-11-01T01:00:00'), dayjs('2026-11-01T01:45:00'), cutoff, 'hour');
@@ -152,7 +162,7 @@ describe('series — DST fall-back on sub-hour axes', () => {
     const out = series(
       [{ hour_bucket: '2026-10-31T01:00:00' }],
       () => 600,
-      dayjs('2026-10-31T01:00:00'), dayjs('2026-10-31T01:30:00'), dayjs('2026-10-31T03:00:00'), 'minute',
+      dayjs('2026-10-31T01:00:00'), dayjs('2026-10-31T01:30:00'), dayjs('2026-10-31T03:00:00'), 'minute', false,
     );
     expect(out.map(p => p.value)).toEqual([...Array(30).fill(10)]);
     expect(out.reduce((a, p) => a + p.value, 0)).toBeCloseTo(300, 10);
@@ -171,7 +181,7 @@ describe('series — DST fall-back on sub-hour axes', () => {
     const out = series(
       [{ hour_bucket: ROW }],
       () => 1200,
-      dayjs('2026-11-01T01:00:00'), dayjs('2026-11-01T02:00:00'), cutoff, 'minute',
+      dayjs('2026-11-01T01:00:00'), dayjs('2026-11-01T02:00:00'), cutoff, 'minute', false,
     );
     expect(out.map(p => p.value)).toEqual([...Array(60).fill(20)]);
     const kpi = bucketWindowShare(ROW, dayjs('2026-11-01T01:00:00'), dayjs('2026-11-01T02:00:00'), cutoff, 'hour');
@@ -192,7 +202,7 @@ describe('series — DST fall-back on sub-hour axes', () => {
       () => 1200,
       dayjs('2026-11-01T02:00:00').subtract(30, 'minute'),
       dayjs('2026-11-01T02:00:00').subtract(15, 'minute'),
-      cutoff, 'minute',
+      cutoff, 'minute', false, // past-shaped (cutoff well after until), like the pages' past windows
     );
     const vals = out.map(p => p.value);
     expect(vals.filter(v => v === 10)).toHaveLength(15);
@@ -212,7 +222,7 @@ describe('series — DST fall-back on sub-hour axes', () => {
     const out = series(
       [{ hour_bucket: ROW }],
       () => 1200,
-      dayjs('2026-11-01T01:50:00'), dayjs('2026-11-01T02:05:00'), cutoff, 'minute',
+      dayjs('2026-11-01T01:50:00'), dayjs('2026-11-01T02:05:00'), cutoff, 'minute', false,
     );
     expect(out.map(p => p.value)).toEqual([...Array(10).fill(70), ...Array(5).fill(0)]);
     const kpi = bucketWindowShare(ROW, dayjs('2026-11-01T01:50:00'), dayjs('2026-11-01T02:05:00'), cutoff, 'hour');
@@ -222,13 +232,15 @@ describe('series — DST fall-back on sub-hour axes', () => {
   it('never appends a live cell whose label already exists (the repeated hour second occurrence)', () => {
     // A live 3h window ending at 01:30 EST (the FALL-BACK's second
     // occurrence), cutoff 01:33 EST INSIDE the live cell [01:30, 01:45):
-    // the alignment and the recorded extent both pass, but the axis already
-    // carries the FIRST occurrence's 01:30 label — the append must be
-    // skipped (appending would duplicate the tick and fold the second
-    // occurrence's minutes onto the wrong cell). The axis stays monotonic
-    // and the chart total still equals the KPI proration (both exclude the
-    // second occurrence's tail).
-    const since = dayjs('2026-11-01T02:00:00').subtract(3, 'hour'); // 22:30 EDT
+    // the append must be skipped — the axis already carries the FIRST
+    // occurrence's 01:30 label, and the dayjs startOf('minute') re-anchor
+    // (an ambiguous local 01:30 resolves to the first occurrence, 01:30
+    // EDT — the documented quirk) makes the range-derived alignment gate
+    // fail first for second-occurrence untils anyway. Either way, no
+    // duplicate tick is appended: the axis stays monotonic and the chart
+    // total still equals the KPI proration (both exclude the second
+    // occurrence's tail).
+    const since = dayjs('2026-11-01T02:00:00').subtract(3, 'hour'); // 00:00 EDT
     const until = dayjs('2026-11-01T02:00:00').subtract(30, 'minute'); // 01:30 EST
     const cutoff = dayjs('2026-11-01T02:00:00').subtract(27, 'minute'); // 01:33 EST
     const out = series(
