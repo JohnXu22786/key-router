@@ -281,4 +281,103 @@ describe('series — DST fall-back on sub-hour axes', () => {
     expect(out[1].value).toBeCloseTo(1200 * (60000 / 1800000), 10);
     expect(out[30].value).toBe(0);
   });
+
+  // On a window crossing the transition from mid-first-occurrence,
+  // bucketStarts dedups every second-occurrence label off the axis (their
+  // sort keys sort below the already-emitted first-occurrence cells —
+  // "01:59" then "01:00"), so a row anchored on the second occurrence (a
+  // "'…-05:00'" hour_bucket — e.g. if a serialization ever keeps the two
+  // occurrences separate; the current server's local-hour truncation
+  // merges them into the first occurrence's row, Go resolving the
+  // ambiguous local hour to the earlier offset) reaches the visible cells
+  // only through the repeat branch's fold (current engines: dayjs's
+  // startOf('hour') re-anchors the second row onto the first occurrence,
+  // so it folds like the first row) or its counts-empty spread arm
+  // (engines without that re-anchor — the drop report). Either way the
+  // chart total must equal bucketWindowShare's KPI proration for the same
+  // window and rows — the second row's newest usage must never vanish from
+  // the line while the KPI counts it.
+  it('keeps the second-occurrence row when a 30m window crosses the transition mid-first-occurrence (both rows)', () => {
+    // A 30m preset viewed at 01:15 EST = [01:45 EDT .. 01:15 EST): 30
+    // elapsed minutes crossing the transition, starting mid-first-
+    // occurrence. Both bounds anchored to the unambiguous 02:00 EST (the
+    // file's established idiom — 01:xx parses to the first occurrence).
+    const since = dayjs('2026-11-01T02:00:00').subtract(75, 'minute'); // 01:45 EDT
+    const until = dayjs('2026-11-01T02:00:00').subtract(45, 'minute'); // 01:15 EST
+    const cutoff = dayjs('2026-11-01T03:00:00');
+    // First-occurrence row: 01:00 EDT (05:00Z), 120-minute coverage
+    // (rowCoverageEnd's repeat walk). Second-occurrence row: its own 01:00
+    // EST instant (06:00Z), 60-minute real extent — re-anchored to the
+    // first occurrence's 120-minute view by startOf('hour') where the
+    // engine disambiguates the ambiguous wall-clock, covered by the
+    // counts-empty arm where it does not; both prorations of its in-window
+    // slice coincide (30/120 ≡ 15/60).
+    const rows = [
+      { hour_bucket: '2026-11-01T01:00:00-04:00', v: 1200 },
+      { hour_bucket: '2026-11-01T01:00:00-05:00', v: 600 },
+    ];
+    const out = series(rows, r => r.v, since, until, cutoff, 'minute', false);
+    // The axis holds 01:45..01:59 EDT (15 cells; every second-occurrence
+    // label sorts below the emitted "01:59" and was dropped). The first
+    // row folds 30 of its 120 minutes onto them (2 min per cell); the
+    // second row contributes its in-window slice the same way (its
+    // re-anchored fold also lands 2 min per cell of its 120-minute view,
+    // or 1 min per cell of its real 60 via the spread arm) — 3 min per
+    // cell total.
+    expect(out.map(p => p.value)).toEqual([...Array(15).fill(30)]);
+    const kpi1 = bucketWindowShare(rows[0].hour_bucket, since, until, cutoff, 'hour');
+    const kpi2 = bucketWindowShare(rows[1].hour_bucket, since, until, cutoff, 'hour');
+    expect(out.reduce((a, p) => a + p.value, 0)).toBeCloseTo(1200 * kpi1 + 600 * kpi2, 10);
+    expect(1200 * kpi1).toBeCloseTo(300, 10);  // 30/120 of the first row
+    expect(600 * kpi2).toBeCloseTo(150, 10);   // the second row's in-window slice (30/120 folded or 15/60 spread)
+  });
+
+  it('shows the second-occurrence row alone (the chart is not flat 0)', () => {
+    const since = dayjs('2026-11-01T02:00:00').subtract(75, 'minute'); // 01:45 EDT
+    const until = dayjs('2026-11-01T02:00:00').subtract(45, 'minute'); // 01:15 EST
+    const cutoff = dayjs('2026-11-01T03:00:00');
+    // Only the second occurrence recorded usage (the newest traffic — the
+    // #135 "line ends at the real last in-window value" contract): the
+    // chart must surface it instead of dropping to a flat 0 — whether the
+    // engine re-anchors the row onto the first occurrence (fold, 2 min per
+    // cell of a 120-minute view) or keeps its offset (counts-empty spread,
+    // 1 min per cell of its real 60) — both land 10 per cell.
+    const out = series(
+      [{ hour_bucket: '2026-11-01T01:00:00-05:00', v: 600 }],
+      r => r.v, since, until, cutoff, 'minute', false,
+    );
+    expect(out.map(p => p.value)).toEqual([...Array(15).fill(10)]);
+    const kpi = bucketWindowShare('2026-11-01T01:00:00-05:00', since, until, cutoff, 'hour');
+    expect(out.reduce((a, p) => a + p.value, 0)).toBeCloseTo(600 * kpi, 10);
+    expect(600 * kpi).toBeCloseTo(150, 10); // the second row's in-window slice
+  });
+
+  it('reads the real floored recorded extent when the fetch falls inside the second occurrence', () => {
+    // The live-window shape: a 30m preset window ending at 01:15 EST whose
+    // fetch resolves ~30 min into the repeated hour (cutoff 01:45 EST —
+    // inside the second occurrence, on the same wall-clock minute grid as
+    // the first). The row's recorded extent floors to the second
+    // occurrence's minute grid (01:45 EST = 105 whole minutes from 01:00
+    // EDT), never to the first occurrence (01:45 EDT, 60 minutes earlier):
+    // the window holds 30 of those 105 minutes, so the row's value is
+    // prorated by 30/105 — the chart and the KPI must both show it. (The
+    // pre-fix floor re-anchored the cutoff's ambiguous wall-clock to the
+    // first occurrence, ending the coverage BEFORE the window's start —
+    // whole recent usage read 0.)
+    const since = dayjs('2026-11-01T02:00:00').subtract(75, 'minute'); // 01:45 EDT
+    const until = dayjs('2026-11-01T02:00:00').subtract(45, 'minute'); // 01:15 EST
+    const cutoff = dayjs('2026-11-01T02:00:00').subtract(15, 'minute'); // 01:45 EST
+    const row = '2026-11-01T01:00:00-04:00';
+    const out = series(
+      [{ hour_bucket: row, v: 1050 }],
+      r => r.v, since, until, cutoff, 'minute', false,
+    );
+    // Covered minutes 01:45..01:59 EDT land on their cells, the
+    // second-occurrence minutes 01:00..01:14 fold onto them (2 min per
+    // cell), for 30/105 of the row's value.
+    out.forEach(p => expect(p.value).toBeCloseTo(20, 10));
+    const kpi = bucketWindowShare(row, since, until, cutoff, 'hour');
+    expect(out.reduce((a, p) => a + p.value, 0)).toBeCloseTo(1050 * kpi, 10);
+    expect(1050 * kpi).toBeCloseTo(300, 10); // 30/105 of the row
+  });
 });
