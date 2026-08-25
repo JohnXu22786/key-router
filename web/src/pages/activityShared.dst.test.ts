@@ -5,7 +5,7 @@
 // leaks into the other suites (which run in the machine's local zone).
 import { describe, it, expect, vi, beforeAll } from 'vitest';
 import dayjs from 'dayjs';
-import { bucketWindowShare, bucketAxis, series } from './activityShared';
+import { bucketWindowShare, bucketAxis, series, floorWindowUntil } from './activityShared';
 
 beforeAll(() => {
   vi.stubEnv('TZ', 'America/New_York');
@@ -233,13 +233,12 @@ describe('series — DST fall-back on sub-hour axes', () => {
     // A live 3h window ending at 01:30 EST (the FALL-BACK's second
     // occurrence), cutoff 01:33 EST INSIDE the live cell [01:30, 01:45):
     // the append must be skipped — the axis already carries the FIRST
-    // occurrence's 01:30 label, and the dayjs startOf('minute') re-anchor
-    // (an ambiguous local 01:30 resolves to the first occurrence, 01:30
-    // EDT — the documented quirk) makes the range-derived alignment gate
-    // fail first for second-occurrence untils anyway. Either way, no
-    // duplicate tick is appended: the axis stays monotonic and the chart
-    // total still equals the KPI proration (both exclude the second
-    // occurrence's tail).
+    // occurrence's 01:30 label (the epoch-grid floor aligns the window, so
+    // the interesting gate here is the label collision, not the alignment).
+    // The cell's recorded slice [01:30 EST, 01:33 EST) still counts: the
+    // fold maps it onto the existing 01:30 tick (overlapFractions), so the
+    // axis stays monotonic and the chart total equals the KPI proration
+    // (both cover the full 93-minute recorded extent).
     const since = dayjs('2026-11-01T02:00:00').subtract(3, 'hour'); // 00:00 EDT
     const until = dayjs('2026-11-01T02:00:00').subtract(30, 'minute'); // 01:30 EST
     const cutoff = dayjs('2026-11-01T02:00:00').subtract(27, 'minute'); // 01:33 EST
@@ -251,7 +250,9 @@ describe('series — DST fall-back on sub-hour axes', () => {
     const labels = out.map(p => p.label);
     expect(labels).toEqual([...new Set(labels)]);   // no duplicated tick
     expect(labels.every((s, i) => i === 0 || s > labels[i - 1])).toBe(true); // monotonic
-    const kpi = bucketWindowShare('2026-11-01T01:00:00', since, until, cutoff, 'hour');
+    // The KPI mirror uses the RANGE's granularity — like the pages' KPI
+    // cards — so its live-cell gate aligns on the same grid as the chart's.
+    const kpi = bucketWindowShare('2026-11-01T01:00:00', since, until, cutoff, 'min15');
     expect(out.reduce((a, p) => a + p.value, 0)).toBeCloseTo(1200 * kpi, 10);
   });
 
@@ -379,5 +380,103 @@ describe('series — DST fall-back on sub-hour axes', () => {
     const kpi = bucketWindowShare(row, since, until, cutoff, 'hour');
     expect(out.reduce((a, p) => a + p.value, 0)).toBeCloseTo(1050 * kpi, 10);
     expect(1050 * kpi).toBeCloseTo(300, 10); // 30/105 of the row
+  });
+});
+
+// The WINDOW-side floors must sit on the EPOCH grid like rowCoverageEnd's
+// cutoff clamp (#143): dayjs's startOf floors reconstruct the local
+// wall-clock fields, and on the fall-back's repeated hour those fields are
+// ambiguous — 01:20:30 EST reconstructs as the FIRST occurrence (01:20:30
+// EDT, one hour earlier) — so every window floor in floorWindowUntil's
+// minute/min15/hour branches and the hasLiveCell extent re-anchored
+// second-occurrence windows to the first-occurrence grid while the coverage
+// read the true extent (80 min [01:00 EDT, 01:20 EST)). The window then
+// amputated the newest minutes (the whole second occurrence up to the
+// fetch): a 3h preset at 01:20:30 EST prorated 30/80 of the row (its min15
+// floor landed at 01:15 EDT), 1d/2d presets 60/80 (until at 01:00 EDT, the
+// live hour sliced before the second occurrence). These tests pin the epoch
+// floor: the window keeps the second occurrence's grid, the live cell reads
+// its real recorded slice, and the KPI and the chart share the whole row.
+describe('window-side floors on the fall-back night — epoch grid', () => {
+  const ROW = '2026-11-01T01:00:00'; // 01:00 EDT, both occurrences merged (120-min row, 80 recorded)
+
+  // NOTE: every time must be parsed INSIDE the tests (a describe-level
+  // dayjs() would parse in the machine's local zone, before the TZ stub).
+  const nowEst = () => dayjs('2026-11-01T02:00:00').subtract(39, 'minute').subtract(30, 'second'); // 01:20:30 EST
+
+  it('3h preset (min15) shares the whole repeated-hour row at 01:20:30 EST', () => {
+    const since = floorWindowUntil(nowEst().subtract(3, 'hour'), 'min15'); // 23:15 EDT Oct 31
+    const until = floorWindowUntil(nowEst(), 'min15');
+    // The floor keeps the second occurrence's grid: 01:15 EST (06:15Z) —
+    // dayjs's startOf('minute') would re-anchor it to 01:15 EDT (05:15Z).
+    expect(until.toISOString()).toBe('2026-11-01T06:15:00.000Z');
+    // The window holds 75 of the row's 80 recorded minutes and the live
+    // cell holds the other 5 ([01:15 EST, 01:20 EST)): the share is the
+    // whole row, not 30/80 from a first-occurrence-placed window.
+    const share = bucketWindowShare(ROW, since, until, nowEst(), 'min15');
+    expect(share).toBeCloseTo(1, 10);
+    // Chart: no duplicate tick is appended (01:15 EST would collide with
+    // the axis's 01:15 EDT tick), but the cell's 5 recorded minutes still
+    // fold onto that tick, so the line total equals the KPI share.
+    const out = series([{ hour_bucket: ROW }], () => 1200, since, until, nowEst(), 'min15');
+    expect(out.map(p => p.value)).toEqual([0, 0, 0, 0, 0, 0, 0, 450, 300, 225, 225]);
+    expect(out.reduce((a, p) => a + p.value, 0)).toBeCloseTo(1200 * share, 10);
+  });
+
+  it('1d/2d presets (hour) count the live cell on the second occurrence (share 1)', () => {
+    const now = nowEst();
+    const until = floorWindowUntil(now, 'hour'); // 01:00 EST (06:00Z), not 01:00 EDT
+    expect(until.toISOString()).toBe('2026-11-01T06:00:00.000Z');
+    for (const hours of [24, 48]) {
+      const since = floorWindowUntil(now.subtract(hours, 'hour'), 'hour');
+      // The row's whole recorded extent [01:00 EDT, 01:20 EST) lies inside
+      // the live hour [01:00 EST, 02:00 EST): share must be 1, not the
+      // 60/80 a first-occurrence-anchored cell reads.
+      expect(bucketWindowShare(ROW, since, until, now, 'hour')).toBeCloseTo(1, 10);
+    }
+  });
+
+  it('30m and 1h presets (minute) keep the chart equal to the KPI inside the repeat', () => {
+    const now = nowEst();
+    // 30m: window [01:50 EDT, 01:20 EST) — its slice of the row's 80
+    // recorded minutes is the first occurrence's tail (01:50..01:59 EDT,
+    // 10 min) plus the whole second occurrence up to the fetch
+    // (01:00..01:19 EST, 20 min): share 30/80. The axis only carries the
+    // 01:50..01:59 EDT ticks (every second-occurrence label sorts below the
+    // emitted "01:59"); the 20 second-occurrence minutes fold onto them via
+    // the spread arm (3 recorded minutes per tick, 45 each) — the newest
+    // usage is on the line, not amputated.
+    const since30 = floorWindowUntil(now.subtract(30, 'minute'), 'minute'); // 01:50 EDT (05:50Z)
+    const until30 = floorWindowUntil(now, 'minute'); // 01:20 EST (06:20Z)
+    expect(until30.toISOString()).toBe('2026-11-01T06:20:00.000Z');
+    const out30 = series([{ hour_bucket: ROW }], () => 1200, since30, until30, now, 'minute');
+    expect(out30.map(p => p.value)).toEqual([...Array(10).fill(45)]);
+    const kpi30 = bucketWindowShare(ROW, since30, until30, now, 'minute');
+    expect(kpi30).toBeCloseTo(30 / 80, 10);
+    expect(out30.reduce((a, p) => a + p.value, 0)).toBeCloseTo(1200 * kpi30, 10);
+    // 1h: window [01:20 EDT, 01:20 EST) covers the first occurrence's last
+    // 40 minutes plus the second occurrence's first 20: share 60/80 =
+    // 0.75, shown equally by the chart and the KPI.
+    const since60 = floorWindowUntil(now.subtract(1, 'hour'), 'minute'); // 01:20 EDT (05:20Z)
+    const out60 = series([{ hour_bucket: ROW }], () => 1200, since60, until30, now, 'minute');
+    const kpi60 = bucketWindowShare(ROW, since60, until30, now, 'minute');
+    expect(kpi60).toBeCloseTo(0.75, 10);
+    expect(out60.reduce((a, p) => a + p.value, 0)).toBeCloseTo(1200 * kpi60, 10);
+  });
+
+  it('keeps non-DST floors bit-identical and a normal-day live window unchanged (control)', () => {
+    // Oct 31 01:20:30 EDT is unambiguous: the epoch floor must return the
+    // exact instants startOf did.
+    const t = dayjs('2026-10-31T01:20:30');
+    expect(floorWindowUntil(t, 'minute').valueOf()).toBe(dayjs('2026-10-31T01:20:00').valueOf());
+    expect(floorWindowUntil(t, 'min15').valueOf()).toBe(dayjs('2026-10-31T01:15:00').valueOf());
+    expect(floorWindowUntil(t, 'hour').valueOf()).toBe(dayjs('2026-10-31T01:00:00').valueOf());
+    // Same 1d-live-window shape as the DST test, on a normal day: the live
+    // cell holds the row's whole recorded slice (the cutoff 01:20:30 clamps
+    // the coverage to 20 minutes) — share 1, exactly as before the fix.
+    const since = floorWindowUntil(dayjs('2026-10-31T01:20:30').subtract(24, 'hour'), 'hour'); // 01:00 EDT Oct 30
+    const until = floorWindowUntil(dayjs('2026-10-31T01:20:30'), 'hour'); // 01:00 EDT Oct 31
+    const share = bucketWindowShare('2026-10-31T01:00:00', since, until, dayjs('2026-10-31T01:20:30'), 'hour');
+    expect(share).toBeCloseTo(1, 10);
   });
 });

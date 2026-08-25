@@ -109,6 +109,20 @@ export function makeRanges(now: dayjs.Dayjs): DateRange[] {
 export const CUSTOM_KEY = 'custom';
 export const CUSTOM_LABEL = 'Custom range';
 
+// floorMinute floors a time to the start of its LOCAL minute on the EPOCH
+// grid — subtracting the local second+ms fields, never through dayjs's
+// startOf('minute'), whose local-field reconstruction re-anchors an
+// ambiguous wall-clock to the FIRST occurrence on the fall-back's repeated
+// hour (01:20:30 EST reconstructs as 01:20:30 EDT, one hour earlier — the
+// same setter disambiguation rowCoverageEnd's clamp must dodge). On
+// unambiguous times both give the same instant: the subtraction is exactly
+// what startOf does to the fields, minus the ambiguous reconstruction.
+// Shared by the window-side floors (floorWindowUntil, hasLiveCell) and the
+// coverage clamp (rowCoverageEnd) so every grid snaps to the same epochs.
+function floorMinute(t: dayjs.Dayjs): dayjs.Dayjs {
+  return dayjs(t.valueOf() - (t.second() * 1000 + t.millisecond()));
+}
+
 // floorWindowUntil snaps a time to the START of the bucket that contains it
 // at the given granularity. Preset windows snap BOTH bounds to the bucket
 // grid so the window keeps its exact nominal length and the COMPLETED cells
@@ -121,9 +135,17 @@ export const CUSTOM_LABEL = 'Custom range';
 // own step (min15 -> the 15-minute clock cell). Custom ranges keep their
 // exact user-picked bounds — never snapped.
 export function floorWindowUntil(until: dayjs.Dayjs, granularity: Granularity): dayjs.Dayjs {
-  if (granularity === 'minute') return until.startOf('minute');
-  if (granularity === 'min15') return until.subtract(until.minute() % 15, 'minute').startOf('minute');
-  if (granularity === 'hour') return until.startOf('hour');
+  // The sub-hour floors must land on the EPOCH minute grid, not dayjs's
+  // startOf: on the fall-back's repeated hour a second-occurrence until
+  // (01:20:30 EST) would be re-anchored to the FIRST occurrence (01:20:00
+  // EDT, one hour earlier — see floorMinute), snapping the whole window one
+  // hour too early while the coverage reads the true extent — amputating
+  // the newest usage (the entire second occurrence up to the fetch) from
+  // the KPI and the chart. The day/month floors reconstruct unambiguous
+  // fields (midnight / the 1st) and stay on startOf.
+  if (granularity === 'minute') return floorMinute(until);
+  if (granularity === 'min15') return floorMinute(until).subtract(until.minute() % 15, 'minute');
+  if (granularity === 'hour') return floorMinute(until).subtract(until.minute(), 'minute');
   if (granularity === 'day') return until.startOf('day');
   return until.startOf('month');
 }
@@ -513,33 +535,25 @@ function hasLiveCell(
   if (!floorWindowUntil(until, granularity).isSame(until)) return false;
   if (!floorWindowUntil(since, granularity).isSame(since)) return false;
   const unit = granularity === 'day' ? 'day' : granularity === 'month' ? 'month' : 'hour';
+  // The recorded extent reads the whole-minute floor on the EPOCH grid
+  // (floorMinute — a second-occurrence cutoff must keep its true minute,
+  // never the first-occurrence re-anchor startOf would give), so a live
+  // cell with data on the repeated hour's second grid is never mistaken
+  // for an empty one.
   const extent = (granularity === 'minute' || granularity === 'min15')
-    ? cutoff.startOf('minute').diff(until, 'minute', true)
+    ? floorMinute(cutoff).diff(until, 'minute', true)
     : rowCoverageEnd(until, unit, cutoff).diff(until, 'minute', true);
   return extent > 0;
-}
-
-// liveLabelCollides is true when the live cell's wall-clock label already
-// occurred inside the same window: on a DST fall-back the axis holds the
-// FIRST occurrence's labels, so a live cell landing on the repeated hour's
-// second occurrence (e.g. the 3h preset viewed at 01:30 EST) would
-// duplicate an existing tick. Mirrors livePoint's axis-based dedup so the
-// KPI share never counts the slice of a cell the chart did not append.
-// The check mirrors isRepeatHour's support boundary (whole-hour DST shifts
-// — the half-hour repeat zones are outside the coverage machinery's scope).
-function liveLabelCollides(until: dayjs.Dayjs, since: dayjs.Dayjs, granularity: Granularity): boolean {
-  const earlier = until.subtract(1, 'hour');
-  return !earlier.isBefore(since) && bucketLabel(granularity, earlier).label === bucketLabel(granularity, until).label;
 }
 
 // livePoint builds the CURRENT window's live-bucket SeriesPoint, or null
 // when the window must not extend (see hasLiveCell) or the point's label
 // would collide with a bucket already on the axis (on a DST fall-back the
 // axis holds the FIRST occurrence's labels, so a live cell landing on the
-// repeated hour's second occurrence would duplicate a tick — the repeat's
-// usage then stays on the first occurrence and the chart total keeps
-// agreeing with bucketWindowShare's proration, which excludes the second
-// occurrence's tail the same way).
+// repeated hour's second occurrence would duplicate a tick — the point is
+// skipped, but the cell's recorded slice still counts: overlapFractions
+// folds it onto the existing same-label tick, so the chart total keeps
+// agreeing with the KPI's proration, which counts the slice the same way).
 function livePoint(
   until: dayjs.Dayjs,
   since: dayjs.Dayjs,
@@ -612,12 +626,11 @@ function rowCoverageEnd(start: dayjs.Dayjs, rowUnit: 'hour' | 'day' | 'month', c
     // EDT, one hour earlier). The coverage would then end before a live
     // window's start and the whole recent usage reads 0 (the "#135 line
     // ends at the real last in-window value" contract), prorated wrong
-    // everywhere else. Whole-minute offsets keep the epoch and the local
-    // minute grids on the same boundaries, so flooring on the epoch
-    // (subtracting the local second+ms fields) preserves the instant:
-    // 01:15:45 EST floors to 01:15 EST = its real minute.
-    const floor = cutoff.valueOf() - (cutoff.second() * 1000 + cutoff.millisecond());
-    covEnd = dayjs(floor);
+    // everywhere else. Floor on the epoch instead (floorMinute): whole-
+    // minute offsets keep the epoch and the local minute grids on the same
+    // boundaries, preserving the instant — 01:15:45 EST floors to 01:15
+    // EST, its real minute.
+    covEnd = floorMinute(cutoff);
     const minEnd = start.add(1, 'minute');
     if (covEnd.isBefore(minEnd) && cutoff.isAfter(start)) covEnd = minEnd;
   }
@@ -656,6 +669,7 @@ function overlapFractions(
   cutoff: dayjs.Dayjs,
   starts: dayjs.Dayjs[],
   stepMin: number,
+  liveCell: boolean,
 ): Array<[number, number]> {
   const h = dayjs(hourBucket).startOf('hour');
   const covEnd = rowCoverageEnd(h, 'hour', cutoff);
@@ -691,12 +705,15 @@ function overlapFractions(
     const idx = new Map<string, number>();
     for (let i = 0; i < starts.length; i++) idx.set(starts[i].format('YYYY-MM-DD HH:mm'), i);
     const lo = Math.max(h.valueOf(), since.valueOf());
-    // The appended live cell (see livePoint) lies past until: the row's
-    // coverage extends into it, so the fold must cover up to the cell's end
-    // there (never past it — beyond the cell the row belongs to the next
-    // window's data, and the KPI clamps the same way).
-    const appended = starts.length > 0 && starts[starts.length - 1].valueOf() === until.valueOf();
-    const hi = appended
+    // The live cell (see hasLiveCell) lies past until: the row's coverage
+    // extends into it, so the fold must cover up to the cell's end there
+    // (never past it — beyond the cell the row belongs to the next
+    // window's data, and the KPI clamps the same way). The cell counts even
+    // when livePoint appended no point: on the repeated hour its wall-clock
+    // label duplicates a first-occurrence tick, so the point is skipped and
+    // the cell's minutes fold onto that existing tick — the same coverage
+    // bucketWindowShare counts for the KPI.
+    const hi = liveCell
       ? Math.min(covEnd.valueOf(), until.add(stepMin, 'minute').valueOf())
       : Math.min(covEnd.valueOf(), until.valueOf());
     const counts = new Map<number, number>(); // axis index -> covered ms
@@ -788,9 +805,11 @@ function overlapFractions(
 // would persist in the totals. The cell's alignment comes from the range's
 // own until (see hasLiveCell) — never from the fetch-time `cutoff`, whose
 // only role is the recorded-extent proration. The gate is the SAME as
-// livePoint's (a current-aligned preset window with at least one whole
-// recorded minute, plus liveLabelCollides here since no axis is available),
-// so the KPI and the chart can never disagree about whether the cell exists.
+// hasLiveCell's (a current-aligned preset window with at least one whole
+// recorded minute) — the chart appends the cell as a point when its label
+// is free and folds its slice onto the existing tick when it is not (see
+// overlapFractions), so the KPI and the chart can never disagree about the
+// cell's coverage.
 export function bucketWindowShare(
   hourBucket: string,
   since: dayjs.Dayjs,
@@ -807,14 +826,15 @@ export function bucketWindowShare(
   const covEnd = rowCoverageEnd(start, rowUnit, cutoff);
   const coverage = covEnd.diff(start, 'minute', true);
   if (coverage <= 0) return 0;
-  // The live cell exists when the CHART appended it (the gate is the SAME as
-  // livePoint's: a current-aligned preset window with at least one whole
-  // recorded minute and no DST label collision — collision checked via
-  // liveLabelCollides here since no axis is available). liveExtend=false
+  // The live cell exists when the row's recorded slice reaches past `until`
+  // — the gate is the SAME hasLiveCell the chart side uses. On the repeated
+  // hour the cell's slice still counts even though its wall-clock label
+  // duplicates a first-occurrence tick: livePoint skips the duplicate point,
+  // but overlapFractions folds the slice onto that existing tick, so the
+  // KPI and the chart always count the same coverage. liveExtend=false
   // marks a PAST-window share (previous period): the live bucket's data
   // belongs to the current period there.
-  const liveCell = hasLiveCell(until, since, cutoff, granularity, liveExtend)
-    && !liveLabelCollides(until, since, granularity);
+  const liveCell = hasLiveCell(until, since, cutoff, granularity, liveExtend);
   const stepMin = STEP_MIN[granularity];
   let overlap = Math.max(0, Math.min(covEnd.valueOf(), until.valueOf()) - Math.max(start.valueOf(), since.valueOf()));
   if (liveCell) {
@@ -858,8 +878,9 @@ export function series<T extends BucketedRow>(
     // over the minute buckets overlapping its hour.
     const starts = bucketStarts(since, until, granularity);
     if (liveP) starts.push(until);
+    const liveCell = hasLiveCell(until, since, cutoff, granularity, liveExtend);
     for (const r of list) {
-      for (const [i, f] of overlapFractions(r.hour_bucket, since, until, cutoff, starts, stepMin)) {
+      for (const [i, f] of overlapFractions(r.hour_bucket, since, until, cutoff, starts, stepMin, liveCell)) {
         axis[i].value += valFn(r) * f;
       }
     }
@@ -907,10 +928,11 @@ export function stackedData<T extends BucketedRow>(
     // minute buckets (see series).
     const starts = bucketStarts(since, until, granularity);
     if (liveP) starts.push(until);
+    const liveCell = hasLiveCell(until, since, cutoff, granularity, liveExtend);
     for (const r of list) {
       const g = keyFn(r);
       const v = valFn(r);
-      for (const [i, f] of overlapFractions(r.hour_bucket, since, until, cutoff, starts, stepMin)) {
+      for (const [i, f] of overlapFractions(r.hour_bucket, since, until, cutoff, starts, stepMin, liveCell)) {
         rows[i][g] = (rows[i][g] ?? 0) + v * f;
       }
     }
@@ -964,11 +986,12 @@ export function resampleResponse(
   const groups = Array.from(new Set(resp.series.map(s => s.group)));
   // group -> bucket label -> value
   const acc = new Map<string, Map<string, number>>();
+  const liveCell = hasLiveCell(until, since, cutoff, granularity, liveExtend);
   for (const p of resp.series) {
     if (p.value === 0) continue;
     let base = acc.get(p.group);
     if (!base) { base = new Map(); acc.set(p.group, base); }
-    for (const [i, f] of overlapFractions(p.bucket, since, until, cutoff, starts, stepMin)) {
+    for (const [i, f] of overlapFractions(p.bucket, since, until, cutoff, starts, stepMin, liveCell)) {
       const b = buckets[i];
       base.set(b, (base.get(b) ?? 0) + p.value * f);
     }
