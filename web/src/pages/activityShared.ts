@@ -143,8 +143,9 @@ export function exclusiveUntil(until: dayjs.Dayjs, granularity: Granularity): da
 // ROLLUP_GRAN maps each API rollup to the granularity to align `until` to.
 // Hour and total cut per hour (the server shapes both windows hourly — see
 // activityWindow in admin.go); day and week cut per day (the week bucket is
-// anchored to Monday, and the day floor never lands before `since`); month
-// cuts per month.
+// anchored to Monday, and the day floor never lands before `since` — the
+// week rollup's boundary EXCLUSION then aligns to the week grid for
+// past-period presets, see queryWindowUntil); month cuts per month.
 const ROLLUP_GRAN: Record<string, 'hour' | 'day' | 'month'> = {
   hour: 'hour',
   day: 'day',
@@ -165,7 +166,11 @@ const ROLLUP_GRAN: Record<string, 'hour' | 'day' | 'month'> = {
 // boundary: the endpoint widens the window to the bucket containing until
 // (see activityWindow in admin.go), so flooring would amputate the whole
 // in-progress day/week/month the range covers. Those ranges pass range.until
-// as-is, letting the widened window keep every in-range bucket.
+// as-is, letting the widened window keep every in-range bucket. (A WEEK
+// rollup adds one exception for past-period presets: its buckets cut on the
+// Monday grid, so the day-floor exclusion is aligned to the week grid — one
+// second before the boundary week's Monday — excluding the whole boundary
+// week; see the exclusion branch below.)
 //
 // A CURRENT-aligned PRESET range (its snapped until lies exactly on its own
 // bucket grid — the live hour/day/month, i.e. the bucket that contained the
@@ -194,7 +199,33 @@ export function queryWindowUntil(range: Pick<DateRange, 'key' | 'granularity' | 
   if (liveExtensionEligible(range)
     && floorWindowUntil(range.until, range.granularity).isSame(range.until)
     && floorWindowUntil(range.since, range.granularity).isSame(range.since)) return range.until;
-  if (floorWindowUntil(range.until, gran).isSame(range.until)) return exclusiveUntil(range.until, gran);
+  if (floorWindowUntil(range.until, gran).isSame(range.until)) {
+    // A WEEK rollup anchors its buckets to MONDAY (activityWindow's week
+    // branch), so whenever `until` is not itself a Monday a day-grid
+    // exclusion (until-1s) still lies INSIDE the boundary week
+    // [mondayOf(until), +7d): the widened server window then
+    // includes that whole week, its bucket renders on the axis labeled with
+    // the boundary Monday, and the CURRENT period's rows (everything after
+    // range.until up to the next Monday) aggregate into it — the #137
+    // "the previous period never picks up the current period's buckets"
+    // violation (Prev Month + Weekly shows the next month's first days in
+    // its last bucket; 1-6 days of leakage). PAST-period presets floor the
+    // exclusion to the WEEK grid instead: one second before the boundary
+    // week's Monday makes the server's widened window end exactly AT the
+    // boundary week, excluding it entirely while the axis stays
+    // Monday-anchored. (The day floor and the week floor coincide when
+    // until IS a Monday — Prev Week — so those ranges are unchanged, as is
+    // a range that lives wholly INSIDE the boundary week — the week starts
+    // before range.since, e.g. a 24h Yesterday window: dropping the week
+    // would amputate the entire range.) Custom ranges keep the day-aligned
+    // exclusion: their picked bounds are never re-aligned, and the boundary
+    // week's in-range days are their own chosen data (the leak past a
+    // mid-week custom end is the inherent atomic-bucket trade-off).
+    if (rollup === 'week' && PAST_RANGE_KEYS.has(range.key) && mondayOf(range.until).isAfter(range.since)) {
+      return mondayOf(range.until).subtract(1, 'second');
+    }
+    return exclusiveUntil(range.until, gran);
+  }
   return range.until;
 }
 
