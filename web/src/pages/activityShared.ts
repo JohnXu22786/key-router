@@ -409,11 +409,59 @@ export function bucketAxis(since: dayjs.Dayjs, until: dayjs.Dayjs, granularity: 
   });
 }
 
+// isRepeatHour is true when `start`..`start+1h` crosses a DST fall-back: the
+// wall-clock hour repeats (01:00 EDT then 01:00 EST), so an hourly row
+// starting at `start` records two elapsed hours of usage.
+function isRepeatHour(start: dayjs.Dayjs): boolean {
+  return start.add(1, 'hour').hour() === start.hour();
+}
+
+// rowCoverageEnd returns the instant an hourly row's recorded value extends
+// to: one row unit after its start, extended through a DST fall-back repeat,
+// and capped at `cutoff` read as WHOLE MINUTES (the minute-grid floor with
+// the first-minute rescue — see overlapFractions). Shared by
+// bucketWindowShare and overlapFractions so the KPI proration and the
+// sub-hour chart split divide by the SAME coverage.
+//
+// DST fall-back repeats a wall-clock hour (01:00 EDT then 01:00 EST) and
+// both occurrences truncate to the SAME hourly row, so its recorded value
+// covers two elapsed hours. The elapsed +1h step lands on the same
+// wall-clock hour exactly then (spring-forward skips an hour and lands
+// two ahead; half-hour zones like Lord Howe land on :30) — walk minute by
+// minute to the first instant whose wall-clock hour differs, which is the
+// second occurrence's end in every transition shape. A window crossing
+// the repeat hour must divide by this real coverage, never by 60 minutes
+// (that would inflate the share up to 2x). The walk runs BEFORE the
+// whole-minute cutoff clamp, so a repeated hour whose cutoff is patched
+// early reads its floored extent like any other row.
+function rowCoverageEnd(start: dayjs.Dayjs, rowUnit: 'hour' | 'day' | 'month', cutoff: dayjs.Dayjs): dayjs.Dayjs {
+  let covEnd = start.add(1, rowUnit);
+  if (rowUnit === 'hour' && isRepeatHour(start)) {
+    while (covEnd.hour() === start.hour() && covEnd.diff(start, 'minute', true) < 180) {
+      covEnd = covEnd.add(1, 'minute');
+    }
+  }
+  if (covEnd.isAfter(cutoff)) {
+    // Whole-minute extent (see overlapFractions): cutoff floors to the
+    // minute grid, so the coverage is a function of the window, not the
+    // refresh clock (the raw fetch time would shrink every window total
+    // between 30s auto-refreshes). A cutoff inside the unit's FIRST minute
+    // floors to the unit start and would drop a row that demonstrably holds
+    // data — read at least the first whole minute then (a cutoff at or
+    // before the unit start still reads as no recorded data).
+    covEnd = cutoff.startOf('minute');
+    const minEnd = start.add(1, 'minute');
+    if (covEnd.isBefore(minEnd) && cutoff.isAfter(start)) covEnd = minEnd;
+  }
+  return covEnd;
+}
+
 // overlapFractions splits ONE hourly row across the sub-hour axis buckets
 // overlapping the WINDOW [since, until), returning [axisIndex, fraction]
-// pairs. A row covers [hour, hour+1h) but only up to `cutoff` — the time
-// its value was recorded: the current hour accumulates live usage, so a
-// PAST window (previous period, calendar preset) shares its boundary hour
+// pairs. A row covers [hour, hour+1h) — the repeated hour's 120 minutes on
+// a DST fall-back night (see rowCoverageEnd) — but only up to `cutoff`: the
+// time its value was recorded: the current hour accumulates live usage, so
+// a PAST window (previous period, calendar preset) shares its boundary hour
 // with the live window, and that hour's value must be divided by its real
 // coverage (cutoff - hour), not by (until - hour). The coverage reads the
 // recorded extent as WHOLE MINUTES (cutoff floored to the minute grid):
@@ -442,23 +490,54 @@ function overlapFractions(
   stepMin: number,
 ): Array<[number, number]> {
   const h = dayjs(hourBucket).startOf('hour');
-  let covEnd = h.add(1, 'hour');
-  if (covEnd.isAfter(cutoff)) {
-    // Whole-minute extent: the row's exact last event time is unknowable
-    // (the value is a per-request accumulation), so clamping to the raw
-    // fetch clock would shrink every window total between 30s refreshes
-    // (see the docstring above). A cutoff inside the row's FIRST minute
-    // floors to the row start and would drop a row that demonstrably holds
-    // data — read at least the first whole minute in that case (a cutoff at
-    // or before the row start still reads as no recorded data).
-    covEnd = cutoff.startOf('minute');
-    const minEnd = h.add(1, 'minute');
-    if (covEnd.isBefore(minEnd) && cutoff.isAfter(h)) covEnd = minEnd;
-  }
+  const covEnd = rowCoverageEnd(h, 'hour', cutoff);
   const coverage = covEnd.diff(h, 'minute', true);
   if (coverage <= 0) return [];
   const perMin = 1 / coverage;
   const out: Array<[number, number]> = [];
+  if (isRepeatHour(h)) {
+    // DST fall-back: the row's repeated wall-clock hour covers two elapsed
+    // hours, but the axis is a MONOTONIC wall-clock grid — bucketStarts
+    // dropped the second occurrence's labels, so those minutes fold onto
+    // the same-label first-occurrence buckets (the repeated hour's usage
+    // lands on its first occurrence, like the hour-granularity axis). Each
+    // covered MILLISECOND of the row inside the window counts once, under
+    // its wall-clock cell's label (partial edge minutes are split at the
+    // wall-clock minute boundaries, so second-precision fetch times stay
+    // exact). Milliseconds whose label the window's axis does not contain
+    // (the transition's fringe — a window starting mid-hour and ending in
+    // the repeat) are spread evenly over the row's visible buckets, so the
+    // chart total still equals bucketWindowShare's KPI proration for the
+    // same window and rows.
+    const idx = new Map<string, number>();
+    for (let i = 0; i < starts.length; i++) idx.set(starts[i].format('YYYY-MM-DD HH:mm'), i);
+    const lo = Math.max(h.valueOf(), since.valueOf());
+    const hi = Math.min(covEnd.valueOf(), until.valueOf());
+    const counts = new Map<number, number>(); // axis index -> covered ms
+    let lost = 0; // ms whose wall-clock label the axis cannot show
+    for (let t = lo; t < hi; ) {
+      // Next WALL-clock minute boundary (TZ-aware — half-hour zones like
+      // Lord Howe do not align with epoch minutes); on a boundary the
+      // whole minute counts.
+      const wallMs = new Date(t).getSeconds() * 1000 + new Date(t).getMilliseconds();
+      const next = Math.min(t + (wallMs === 0 ? 60000 : 60000 - wallMs), hi);
+      const minute = new Date(t).getMinutes();
+      const cellMs = stepMin === 15 ? t - (minute % 15) * 60000 : t;
+      const i = idx.get(dayjs(cellMs).format('YYYY-MM-DD HH:mm'));
+      const ms = next - t;
+      if (i !== undefined) counts.set(i, (counts.get(i) ?? 0) + ms);
+      else lost += ms;
+      t = next;
+    }
+    if (lost > 0 && counts.size > 0) {
+      const per = Math.floor(lost / counts.size);
+      let rem = lost % counts.size;
+      for (const [i, c] of counts) counts.set(i, c + per + (rem-- > 0 ? 1 : 0));
+    }
+    const coverageMs = covEnd.valueOf() - h.valueOf();
+    for (const [i, c] of counts) out.push([i, c / coverageMs]);
+    return out;
+  }
   for (let i = 0; i < starts.length; i++) {
     const s = starts[i];
     const e = s.add(stepMin, 'minute');
@@ -473,22 +552,23 @@ function overlapFractions(
 // lies inside [since, until]. hour_bucket rows are truncated to the LOCAL
 // hour; the "bucket" is the containing hour/day/month for the corresponding
 // granularity — sub-hour windows (minute/min15) still have HOURLY rows, so
-// they share the 'hour' math (rowWindowShare's coverage, generalized).
+// they share the 'hour' math (rowCoverageEnd's coverage, generalized).
 //
 // A bucket covers [start, start+unit); its recorded value only covers up to
 // `cutoff` (the fetch time) — the bucket containing cutoff accumulates live
-// usage, so its value is divided by the real coverage, never by a window
-// boundary (a past window sharing that hour must not inflate it). The
-// coverage reads the recorded extent as WHOLE MINUTES (cutoff floored to
-// the minute grid — see overlapFractions): the row value is a per-request
-// accumulation whose last event time is unknowable, so the raw fetch clock
-// would shrink every window total between 30s auto-refreshes even when the
-// rows are unchanged. Whole-minute coverage stays put while the fetch
-// clock slides, so identical windows + identical rows render identical
-// values for minute-granularity presets (whose snapped until IS the
-// floored cutoff; min15/custom re-read at each minute roll — see
-// overlapFractions), and every window sharing the live boundary hour
-// divides by the same coverage (their shares still sum to the whole row).
+// usage, so its value is divided by the real coverage (rowCoverageEnd, which
+// also spans a DST fall-back's repeated hour), never by a window boundary (a
+// past window sharing that hour must not inflate it). The coverage reads the
+// recorded extent as WHOLE MINUTES (cutoff floored to the minute grid — see
+// overlapFractions): the row value is a per-request accumulation whose last
+// event time is unknowable, so the raw fetch clock would shrink every window
+// total between 30s auto-refreshes even when the rows are unchanged.
+// Whole-minute coverage stays put while the fetch clock slides, so identical
+// windows + identical rows render identical values for minute-granularity
+// presets (whose snapped until IS the floored cutoff; min15/custom re-read
+// at each minute roll — see overlapFractions), and every window sharing the
+// live boundary hour divides by the same coverage (their shares still sum to
+// the whole row).
 //
 // Interior buckets lie fully inside the window and keep share 1; boundary
 // buckets are prorated to the overlap, so a rolling window shows exactly
@@ -506,31 +586,7 @@ export function bucketWindowShare(
   // calendar unit, sub-hour (minute/min15) stays on the hour.
   const rowUnit = granularity === 'day' ? 'day' : granularity === 'month' ? 'month' : 'hour';
   const start = rowUnit === 'hour' ? h.startOf('hour') : rowUnit === 'day' ? h.startOf('day') : h.startOf('month');
-  let covEnd = start.add(1, rowUnit);
-  // DST fall-back repeats a wall-clock hour (01:00 EDT then 01:00 EST) and
-  // both occurrences truncate to the SAME hourly row, so its recorded value
-  // covers two elapsed hours. The elapsed +1h step lands on the same
-  // wall-clock hour exactly then (spring-forward skips an hour and lands
-  // two ahead; half-hour zones like Lord Howe land on :30) — walk minute by
-  // minute to the first instant whose wall-clock hour differs, which is the
-  // second occurrence's end in every transition shape. A window crossing
-  // the repeat hour must divide by this real coverage, never by 60 minutes
-  // (that would inflate the share up to 2x).
-  if (rowUnit === 'hour' && covEnd.hour() === start.hour()) {
-    while (covEnd.hour() === start.hour() && covEnd.diff(start, 'minute', true) < 180) {
-      covEnd = covEnd.add(1, 'minute');
-    }
-  }
-  if (covEnd.isAfter(cutoff)) {
-    // Whole-minute extent (see overlapFractions): the raw fetch clock would
-    // shrink every window total between 30s refreshes. A cutoff inside the
-    // unit's FIRST minute floors to the unit start and would drop a row
-    // that demonstrably holds data — read at least the first whole minute
-    // then (a cutoff at or before the unit start still reads as no data).
-    covEnd = cutoff.startOf('minute');
-    const minEnd = start.add(1, 'minute');
-    if (covEnd.isBefore(minEnd) && cutoff.isAfter(start)) covEnd = minEnd;
-  }
+  const covEnd = rowCoverageEnd(start, rowUnit, cutoff);
   const coverage = covEnd.diff(start, 'minute', true);
   if (coverage <= 0) return 0;
   const overlap = Math.min(covEnd.valueOf(), until.valueOf()) - Math.max(start.valueOf(), since.valueOf());

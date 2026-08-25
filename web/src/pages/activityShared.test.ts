@@ -704,9 +704,10 @@ describe('sub-hour coverage — stable between refreshes (cutoff semantics)', ()
     // the row — never the raw-cutoff share (2.5777 at 14:20:22, which
     // shrank further on every refresh).
     const out = series([row], r => r.v, since, until, dayjs('2026-08-13T14:20:22'), 'minute');
-    expect(out).toHaveLength(16); // 14:05..14:20, the last bucket 0
-    expect(out.slice(0, 15).every(p => Math.abs(p.value - 0.175) < 1e-12)).toBe(true);
-    expect(out[15].value).toBe(0);
+    // 14:05..14:19 — the bucket starting AT until (14:20) is excluded from
+    // the half-open axis.
+    expect(out).toHaveLength(15);
+    expect(out.every(p => Math.abs(p.value - 0.175) < 1e-12)).toBe(true);
     expect(out.reduce((a, p) => a + p.value, 0)).toBeCloseTo(3.5 * (15 / 20), 10);
   });
 
