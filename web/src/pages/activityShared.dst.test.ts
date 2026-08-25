@@ -5,7 +5,7 @@
 // leaks into the other suites (which run in the machine's local zone).
 import { describe, it, expect, vi, beforeAll } from 'vitest';
 import dayjs from 'dayjs';
-import { bucketWindowShare, bucketAxis } from './activityShared';
+import { bucketWindowShare, bucketAxis, series } from './activityShared';
 
 beforeAll(() => {
   vi.stubEnv('TZ', 'America/New_York');
@@ -102,5 +102,147 @@ describe('bucketStarts — DST axes under the half-open window', () => {
     const sorts = bucketAxis(since, until, 'minute').map(p => p.sort);
     expect(sorts).toEqual([...new Set(sorts)]);
     expect(sorts.every((s, i) => i === 0 || s > sorts[i - 1])).toBe(true);
+  });
+});
+
+// series() on a sub-hour axis must split the repeated row with the SAME real
+// coverage as the KPI proration: a minute/min15 axis crossing the fall-back
+// repeat divides by the row's true 120-minute coverage, never 60 — a
+// hard-coded 60 would double every tick's value and inflate the chart total
+// away from bucketWindowShare's proration for the same window and rows.
+describe('series — DST fall-back on sub-hour axes', () => {
+  const ROW = '2026-11-01T01:00:00'; // 01:00 EDT -> 01:00 EST: covers 120 elapsed minutes
+  // NOTE: cutoff must be parsed INSIDE each test — a describe-level
+  // dayjs() would parse in the machine's local zone, before the TZ stub.
+
+  it('spreads the repeated hour over its real 120-minute coverage on a minute axis', () => {
+    // Window [01:00 EDT .. 01:30 EDT): 30 elapsed minutes of the 120-minute
+    // row. Each minute bucket gets value/120 (a divide by 60 would show
+    // value/60 = 2x per tick), and the total matches the KPI proration. The
+    // axis holds 01:00..01:29 — the bucket starting AT until is excluded by
+    // the half-open window.
+    const cutoff = dayjs('2026-11-01T03:00:00');
+    const out = series(
+      [{ hour_bucket: ROW }],
+      () => 1200,
+      dayjs('2026-11-01T01:00:00'), dayjs('2026-11-01T01:30:00'), cutoff, 'minute',
+    );
+    expect(out.map(p => p.value)).toEqual([...Array(30).fill(10)]);
+    const kpi = bucketWindowShare(ROW, dayjs('2026-11-01T01:00:00'), dayjs('2026-11-01T01:30:00'), cutoff, 'hour');
+    expect(out.reduce((a, p) => a + p.value, 0)).toBeCloseTo(1200 * kpi, 10);
+  });
+
+  it('spreads the repeated hour over its real 120-minute coverage on a min15 axis', () => {
+    // Window [01:00 EDT .. 01:45 EDT): 45 elapsed minutes; 15-minute cells
+    // get value * 15/120 each, and the total matches the KPI proration.
+    const cutoff = dayjs('2026-11-01T03:00:00');
+    const out = series(
+      [{ hour_bucket: ROW }],
+      () => 1200,
+      dayjs('2026-11-01T01:00:00'), dayjs('2026-11-01T01:45:00'), cutoff, 'min15',
+    );
+    expect(out.map(p => p.value)).toEqual([150, 150, 150]);
+    const kpi = bucketWindowShare(ROW, dayjs('2026-11-01T01:00:00'), dayjs('2026-11-01T01:45:00'), cutoff, 'hour');
+    expect(out.reduce((a, p) => a + p.value, 0)).toBeCloseTo(1200 * kpi, 10);
+  });
+
+  it('keeps a normal single-hour row at 60-minute coverage (unchanged)', () => {
+    // The day before fall-back: the walk must not trigger, so the row is
+    // still split over exactly 60 minutes.
+    const out = series(
+      [{ hour_bucket: '2026-10-31T01:00:00' }],
+      () => 600,
+      dayjs('2026-10-31T01:00:00'), dayjs('2026-10-31T01:30:00'), dayjs('2026-10-31T03:00:00'), 'minute',
+    );
+    expect(out.map(p => p.value)).toEqual([...Array(30).fill(10)]);
+    expect(out.reduce((a, p) => a + p.value, 0)).toBeCloseTo(300, 10);
+  });
+
+  it('folds the repeated hour onto its first occurrence for a window spanning the whole repeat', () => {
+    // Window [01:00 EDT .. 02:00 EST): the whole 120-minute row lies inside,
+    // so the KPI share is 1 — the second occurrence's 60 minutes fold onto
+    // the same-label first-occurrence buckets (2 real minutes per tick), and
+    // the chart total still equals the KPI proration. Note this window does
+    // NOT discriminate the fix: the pre-fix ÷60 happened to give the same
+    // 20 per tick here (full-coverage windows compensated the missing walk).
+    // The discriminating tests are the second-occurrence window below and
+    // the crossing one after it; this one pins the folded axis as a spec.
+    const cutoff = dayjs('2026-11-01T03:00:00');
+    const out = series(
+      [{ hour_bucket: ROW }],
+      () => 1200,
+      dayjs('2026-11-01T01:00:00'), dayjs('2026-11-01T02:00:00'), cutoff, 'minute',
+    );
+    expect(out.map(p => p.value)).toEqual([...Array(60).fill(20)]);
+    const kpi = bucketWindowShare(ROW, dayjs('2026-11-01T01:00:00'), dayjs('2026-11-01T02:00:00'), cutoff, 'hour');
+    expect(out.reduce((a, p) => a + p.value, 0)).toBeCloseTo(1200 * kpi, 10);
+  });
+
+  it('shows a window inside the second occurrence at its real share', () => {
+    // Window [01:30 EST .. 01:45 EST): 15 elapsed minutes of the 120-minute
+    // row, on the SECOND occurrence's own buckets (01:30 was ambiguous, so
+    // both bounds are anchored to 02:00 EST, which is unambiguous). The
+    // axis's exact bucket shape is not pinned: bucketStarts' startOf floor
+    // re-anchors second-occurrence instants to the first occurrence (a
+    // dayjs DST quirk, pre-existing), which pads the axis with trailing
+    // zero buckets; the 15 in-window minutes and the total are what matter.
+    const cutoff = dayjs('2026-11-01T03:00:00');
+    const out = series(
+      [{ hour_bucket: ROW }],
+      () => 1200,
+      dayjs('2026-11-01T02:00:00').subtract(30, 'minute'),
+      dayjs('2026-11-01T02:00:00').subtract(15, 'minute'),
+      cutoff, 'minute',
+    );
+    const vals = out.map(p => p.value);
+    expect(vals.filter(v => v === 10)).toHaveLength(15);
+    expect(vals.every(v => v === 10 || v === 0)).toBe(true);
+    const kpi = bucketWindowShare(ROW, dayjs('2026-11-01T02:00:00').subtract(30, 'minute'), dayjs('2026-11-01T02:00:00').subtract(15, 'minute'), cutoff, 'hour');
+    expect(out.reduce((a, p) => a + p.value, 0)).toBeCloseTo(1200 * kpi, 10);
+  });
+
+  it('keeps the chart total equal to the KPI proration on a window crossing the transition', () => {
+    // Window [01:50 EDT .. 02:05 EST] (the KPI suite's crossing window): 70
+    // elapsed minutes of the row are inside. The axis holds 01:50..01:59 and
+    // 02:00..02:04 — the 02:05 bucket starts AT until and is excluded. It
+    // cannot show the second occurrence's 01:00..01:49 labels (their first
+    // occurrence lies before the window), so those minutes are spread evenly
+    // over the visible buckets — the total still equals the KPI proration.
+    const cutoff = dayjs('2026-11-01T03:00:00');
+    const out = series(
+      [{ hour_bucket: ROW }],
+      () => 1200,
+      dayjs('2026-11-01T01:50:00'), dayjs('2026-11-01T02:05:00'), cutoff, 'minute',
+    );
+    expect(out.map(p => p.value)).toEqual([...Array(10).fill(70), ...Array(5).fill(0)]);
+    const kpi = bucketWindowShare(ROW, dayjs('2026-11-01T01:50:00'), dayjs('2026-11-01T02:05:00'), cutoff, 'hour');
+    expect(out.reduce((a, p) => a + p.value, 0)).toBeCloseTo(1200 * kpi, 10);
+  });
+
+  it('stays exact with second-precision bounds (the live fetch shape)', () => {
+    // A live 30m window fetched 30s into 01:30 EDT: since/until/cutoff all
+    // carry seconds. The cutoff floors to the minute grid, so the row's
+    // recorded extent reads 30 WHOLE minutes, and the covered milliseconds
+    // inside the window must be attributed exactly — the 01:00 tick gets
+    // only the 30s of its minute inside the window. Whole-minute counting
+    // would hand the partial edge minutes to full minutes and break the
+    // total; the ms-exact fold keeps the chart total equal to the KPI
+    // proration.
+    const since = dayjs('2026-11-01T01:00:30'); // 01:00:30 EDT (ambiguous 01:00 parses first)
+    const until = dayjs('2026-11-01T01:30:30'); // 01:30:30 EDT
+    const out = series(
+      [{ hour_bucket: ROW }],
+      () => 1200,
+      since, until, until, 'minute',
+    );
+    // Coverage = 30 whole minutes (floored cutoff 01:30:00 EDT); the window
+    // holds 1,770,000 of the row's 1,800,000 covered ms.
+    const kpi = bucketWindowShare(ROW, since, until, until, 'hour');
+    expect(out.reduce((a, p) => a + p.value, 0)).toBeCloseTo(1200 * kpi, 10);
+    // Partial edge minute: 30s on the 01:00 tick, full minutes in between,
+    // nothing on the 01:30 tick (its minute starts AT the floored extent).
+    expect(out[0].value).toBeCloseTo(1200 * (30000 / 1800000), 10);
+    expect(out[1].value).toBeCloseTo(1200 * (60000 / 1800000), 10);
+    expect(out[30].value).toBe(0);
   });
 });
