@@ -682,6 +682,86 @@ describe('series — sub-hour distribution of hourly rows', () => {
   });
 });
 
+describe('sub-hour coverage — stable between refreshes (cutoff semantics)', () => {
+  // A 'Past 15 Minutes' window lying INSIDE one hour: the 14:00 row's value
+  // is a per-request accumulation over [14:00, fetchTime). Dividing by the
+  // raw fetch time makes every 30s auto-refresh divide the SAME row value by
+  // a LARGER coverage — the window's total shrinks on every refresh while
+  // the row is unchanged (verified decay 2.5777 -> 2.5160 -> 2.4571 at
+  // 14:20:22 / 14:20:52 / 14:21:22), violating the 'perfectly stable between
+  // refreshes' contract (Activity.tsx). The coverage denominator reads the
+  // row's recorded extent as WHOLE MINUTES (cutoff floored to the minute
+  // grid): an unchanged row renders identical values between refreshes, and
+  // a snapped preset window's until IS the floored cutoff, so its coverage
+  // is exactly its own span.
+  const since = dayjs('2026-08-13T14:05:00');
+  const until = dayjs('2026-08-13T14:20:00');
+  const row = { hour_bucket: '2026-08-13T14:00:00', v: 3.5 };
+
+  it('a window inside one hour renders stable per-bucket values (stable-value case)', () => {
+    // Coverage = 20 whole minutes (until − hour start), so every in-window
+    // minute bucket carries 3.5/20 = 0.175 and the total is exactly 15/20 of
+    // the row — never the raw-cutoff share (2.5777 at 14:20:22, which
+    // shrank further on every refresh).
+    const out = series([row], r => r.v, since, until, dayjs('2026-08-13T14:20:22'), 'minute');
+    expect(out).toHaveLength(16); // 14:05..14:20, the last bucket 0
+    expect(out.slice(0, 15).every(p => Math.abs(p.value - 0.175) < 1e-12)).toBe(true);
+    expect(out[15].value).toBe(0);
+    expect(out.reduce((a, p) => a + p.value, 0)).toBeCloseTo(3.5 * (15 / 20), 10);
+  });
+
+  it('an unchanged row renders identical values between 30s refreshes', () => {
+    // Two refreshes 30s apart with the SAME row and the SAME window: the raw
+    // cutoff grows (14:20:22 -> 14:20:52) but the whole-minute coverage does
+    // not, so every bar, the window total and the KPI share stay identical.
+    const r1 = series([row], r => r.v, since, until, dayjs('2026-08-13T14:20:22'), 'minute');
+    const r2 = series([row], r => r.v, since, until, dayjs('2026-08-13T14:20:52'), 'minute');
+    expect(r1.map(p => p.value)).toEqual(r2.map(p => p.value));
+    expect(r1.reduce((a, p) => a + p.value, 0)).toBeCloseTo(2.625, 10);
+    expect(r2.reduce((a, p) => a + p.value, 0)).toBeCloseTo(2.625, 10);
+    // The KPI cards use bucketWindowShare with the same cutoff — stable too.
+    const s1 = bucketWindowShare('2026-08-13T14:00:00', since, until, dayjs('2026-08-13T14:20:22'), 'minute');
+    const s2 = bucketWindowShare('2026-08-13T14:00:00', since, until, dayjs('2026-08-13T14:20:52'), 'minute');
+    expect(s1).toBeCloseTo(15 / 20, 10);
+    expect(s2).toBe(s1);
+  });
+
+  it('keeps the shared boundary hour conserved between the prev and current windows', () => {
+    // Both the prev window [13:50, 14:05) and the current window [14:05,
+    // 14:20) receive the same floored coverage for the shared 14:00 row, so
+    // their shares still sum to exactly 1 — the fix must not double-count
+    // (clamping coverage to each window's own until would split the row
+    // 5/5 + 15/20 = 1.75).
+    const cur = bucketWindowShare('2026-08-13T14:00:00', since, until, dayjs('2026-08-13T14:20:22'), 'minute');
+    const prev = bucketWindowShare('2026-08-13T14:00:00', dayjs('2026-08-13T13:50:00'), since, dayjs('2026-08-13T14:20:22'), 'minute');
+    expect(cur).toBeCloseTo(15 / 20, 10);
+    expect(prev).toBeCloseTo(5 / 20, 10);
+    expect(cur + prev).toBeCloseTo(1, 10);
+  });
+
+  it('a window sliding to the next minute re-anchors cleanly instead of decaying', () => {
+    // At 14:21:22 the snapped window slid to [14:06, 14:21): its coverage is
+    // 21 whole minutes, so the total is 3.5 × 15/21 = 2.5 — NOT the raw
+    // cutoff's 2.4571 (which read a 21.37-minute extent and shrank the
+    // unchanged row's share).
+    const out = series([row], r => r.v, dayjs('2026-08-13T14:06:00'), dayjs('2026-08-13T14:21:00'), dayjs('2026-08-13T14:21:22'), 'minute');
+    expect(out.reduce((a, p) => a + p.value, 0)).toBeCloseTo(3.5 * (15 / 21), 10);
+  });
+
+  it('a row recorded within its first minute is not dropped by the whole-minute floor', () => {
+    // cutoff 14:00:30 floors to 14:00:00 = the row's own start, which would
+    // read zero recorded minutes and drop a row that demonstrably holds
+    // data; the floor reads at least the first whole minute there, so the
+    // row's value lands on its first bucket (the pre-fix behavior).
+    const out = series(
+      [{ hour_bucket: '2026-08-13T14:00:00', v: 2 }], r => r.v,
+      dayjs('2026-08-13T14:00:00'), dayjs('2026-08-13T14:10:00'), dayjs('2026-08-13T14:00:30'), 'minute',
+    );
+    expect(out[0].value).toBe(2);
+    expect(out.reduce((a, p) => a + p.value, 0)).toBe(2);
+  });
+});
+
 describe('stackedData — sub-hour distribution per group', () => {
   it('distributes each group over the minute buckets without dropping or NaN', () => {
     const since = dayjs('2026-08-13T15:50:00');
