@@ -989,9 +989,10 @@ func isLocalHostname(host string) bool {
 		strings.HasSuffix(lower, ".localhost.localdomain") || strings.HasSuffix(lower, ".localhost.localdomain.") {
 		return true
 	}
-	// 0.0.0.0 is the any-address (not loopback per net.IP.IsLoopback), and
-	// the loopback ranges 127.0.0.0/8 and ::1 are handled by ParseIP below.
-	if lower == "0.0.0.0" {
+	// 0.0.0.0 and :: (and its bracketed form) are the IPv4/IPv6
+	// any-addresses (not loopback per net.IP.IsLoopback), and the loopback
+	// ranges 127.0.0.0/8 and ::1 are handled by ParseIP below.
+	if lower == "0.0.0.0" || lower == "::" || lower == "[::]" {
 		return true
 	}
 	ip := net.ParseIP(strings.Trim(lower, "[]"))
