@@ -219,6 +219,30 @@ describe('series — DST fall-back on sub-hour axes', () => {
     expect(out.reduce((a, p) => a + p.value, 0)).toBeCloseTo(1200 * kpi, 10);
   });
 
+  it('never appends a live cell whose label already exists (the repeated hour second occurrence)', () => {
+    // A live 3h window ending at 01:30 EST (the FALL-BACK's second
+    // occurrence), cutoff 01:33 EST INSIDE the live cell [01:30, 01:45):
+    // the alignment and the recorded extent both pass, but the axis already
+    // carries the FIRST occurrence's 01:30 label — the append must be
+    // skipped (appending would duplicate the tick and fold the second
+    // occurrence's minutes onto the wrong cell). The axis stays monotonic
+    // and the chart total still equals the KPI proration (both exclude the
+    // second occurrence's tail).
+    const since = dayjs('2026-11-01T02:00:00').subtract(3, 'hour'); // 22:30 EDT
+    const until = dayjs('2026-11-01T02:00:00').subtract(30, 'minute'); // 01:30 EST
+    const cutoff = dayjs('2026-11-01T02:00:00').subtract(27, 'minute'); // 01:33 EST
+    const out = series(
+      [{ hour_bucket: '2026-11-01T01:00:00' }],
+      () => 1200,
+      since, until, cutoff, 'min15',
+    );
+    const labels = out.map(p => p.label);
+    expect(labels).toEqual([...new Set(labels)]);   // no duplicated tick
+    expect(labels.every((s, i) => i === 0 || s > labels[i - 1])).toBe(true); // monotonic
+    const kpi = bucketWindowShare('2026-11-01T01:00:00', since, until, cutoff, 'hour');
+    expect(out.reduce((a, p) => a + p.value, 0)).toBeCloseTo(1200 * kpi, 10);
+  });
+
   it('stays exact with second-precision bounds (the live fetch shape)', () => {
     // A live 30m window fetched 30s into 01:30 EDT: since/until/cutoff all
     // carry seconds. The cutoff floors to the minute grid, so the row's

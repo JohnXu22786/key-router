@@ -89,11 +89,12 @@ const Activity: React.FC = () => {
   const range = useMemo<DateRange>(() => {
     if (rangeKey === CUSTOM_KEY && custom) return customRange(custom.since, custom.until);
     const r = ranges.find(r => r.key === rangeKey) ?? ranges.find(r => r.key === '1d') ?? ranges[0];
-    // Preset windows snap BOTH bounds to the bucket grid: the live partial
-    // bucket keeps accumulating usage, so showing it makes every 30s
-    // auto-refresh read as "accumulating" instead of rolling. Snapped, the
-    // window is exactly the preset length, perfectly stable between
-    // refreshes, and slides by one bucket when the grid rolls over.
+    // Preset windows snap BOTH bounds to the bucket grid: the window keeps
+    // its exact nominal length and the COMPLETED cells stay identical
+    // between 30s auto-refreshes — only the current period's LIVE bucket
+    // (the one containing now) moves, and only by real usage; it is drawn
+    // as the chart's last point so the line ends at the real last in-window
+    // value (see liveExtensionEligible / livePoint in activityShared).
     // Custom ranges keep their exact picked bounds.
     return {
       ...r,
