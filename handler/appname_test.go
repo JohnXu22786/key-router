@@ -58,6 +58,7 @@ func TestExtractAppName(t *testing.T) {
 		{"localhost referer ignored", hdr("HTTP-Referer", "http://127.0.0.1:8787/dashboard"), nil, ""},
 		{"localhost.localdomain referer ignored", hdr("HTTP-Referer", "http://localhost.localdomain/x"), nil, ""},
 		{"ipv6 loopback referer ignored", hdr("HTTP-Referer", "http://[::1]:8787/x"), nil, ""},
+		{"ipv6 any-address referer ignored", hdr("HTTP-Referer", "http://[::]:3000/dashboard"), nil, ""},
 		{"localhost.com is a real domain", hdr("HTTP-Referer", "https://localhost.com/x"), nil, "localhost.com"},
 		{"Referer port stripped", hdr("HTTP-Referer", "https://myapp.example.com:8443/chat"), nil, "myapp.example.com"},
 		{"Referer www and port stripped", hdr("HTTP-Referer", "https://www.myapp.example.com:8443/chat"), nil, "myapp.example.com"},
@@ -152,6 +153,38 @@ func TestStripHostPort(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			if got := stripHostPort(c.in); got != c.want {
 				t.Errorf("stripHostPort(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+func TestIsLocalHostname(t *testing.T) {
+	cases := []struct {
+		name string
+		host string
+		want bool
+	}{
+		{"empty", "", true},
+		{"localhost", "localhost", true},
+		{"ipv4 loopback", "127.0.0.1", true},
+		{"ipv4 any-address", "0.0.0.0", true},
+		{"ipv6 loopback", "::1", true},
+		{"ipv6 loopback bracketed with port", "[::1]:8787", true},
+		// :: is the IPv6 any-address: like 0.0.0.0, it binds every
+		// interface and must be treated as local even though
+		// net.IP.IsLoopback() excludes it.
+		{"ipv6 any-address", "::", true},
+		{"ipv6 any-address bracketed", "[::]", true},
+		{"ipv6 any-address bracketed with port", "[::]:3000", true},
+		// Regression: other IPv6 literals are NOT local.
+		{"ipv6 literal still remote", "2001:db8::1", false},
+		{"ipv6 literal bracketed still remote", "[2001:db8::1]", false},
+		{"ipv6 literal with port still remote", "[2001:db8::1]:3000", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isLocalHostname(c.host); got != c.want {
+				t.Errorf("isLocalHostname(%q) = %v, want %v", c.host, got, c.want)
 			}
 		})
 	}
