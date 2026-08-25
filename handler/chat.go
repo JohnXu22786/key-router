@@ -833,14 +833,26 @@ func extractAppNameUnchecked(h http.Header, body []byte) string {
 		} else if strings.HasPrefix(lref, "http://") {
 			ref = ref[len("http://"):]
 		}
-		if strings.HasPrefix(strings.ToLower(ref), "www.") {
-			ref = ref[len("www."):]
-		}
 		if i := strings.IndexAny(ref, "/"); i > 0 {
 			ref = ref[:i]
 		}
 		if i := strings.IndexByte(ref, '?'); i >= 0 {
 			ref = ref[:i]
+		}
+		if i := strings.IndexByte(ref, '#'); i >= 0 {
+			ref = ref[:i]
+		}
+		// Drop RFC 3986 userinfo: it precedes the host and must not
+		// interfere with the www. or port normalization below. The path,
+		// query, and fragment are already cut, so for a valid referer
+		// every '@' left is a userinfo separator; the last one wins so
+		// malformed userinfo that contains a raw '@' still degrades to
+		// its host.
+		if i := strings.LastIndexByte(ref, '@'); i >= 0 {
+			ref = ref[i+1:]
+		}
+		if strings.HasPrefix(strings.ToLower(ref), "www.") {
+			ref = ref[len("www."):]
 		}
 		// Strip a trailing ":port": the port is not part of the host
 		// identity, and leaving it in would split one app's usage into
@@ -933,8 +945,14 @@ func isClaudeCodeAppID(t string) bool {
 // ("example.com:8080" -> "example.com"). Bracketed IPv6 literals keep
 // their colons and brackets ("[2001:db8::1]:8080" -> "[2001:db8::1]");
 // unbracketed IPv6 is left untouched because its colons are
-// indistinguishable from a port separator.
+// indistinguishable from a port separator. RFC 3986 userinfo
+// ("user:pass@") precedes the host; it is dropped before the port split
+// so its colon is never mistaken for a port separator and credentials
+// never become the host identity.
 func stripHostPort(host string) string {
+	if i := strings.LastIndexByte(host, '@'); i >= 0 {
+		host = host[i+1:]
+	}
 	if i := strings.LastIndexByte(host, ':'); i > 0 && !strings.Contains(host[:i], ":") {
 		return host[:i]
 	}

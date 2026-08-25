@@ -64,6 +64,17 @@ func TestExtractAppName(t *testing.T) {
 		{"IPv6 referer port stripped, literal kept", hdr("HTTP-Referer", "http://[2001:db8::1]:3000/chat"), nil, "[2001:db8::1]"},
 		{"unbracketed IPv6 referer kept intact", hdr("HTTP-Referer", "http://2001:db8::1/chat"), nil, "2001:db8::1"},
 		{"LAN IP referer port stripped", hdr("HTTP-Referer", "http://192.168.1.5:3000"), nil, "192.168.1.5"},
+		{"Referer userinfo kept out of host", hdr("HTTP-Referer", "https://user@example.com/x"), nil, "example.com"},
+		{"Referer userinfo with password kept out of host", hdr("HTTP-Referer", "https://user:pass@example.com/x"), nil, "example.com"},
+		{"Referer userinfo and port stripped", hdr("HTTP-Referer", "https://user:pass@example.com:8443/chat"), nil, "example.com"},
+		{"IPv6 referer with userinfo and port stripped", hdr("HTTP-Referer", "http://user:pass@[2001:db8::1]:3000/chat"), nil, "[2001:db8::1]"},
+		{"Referer userinfo does not hide www", hdr("HTTP-Referer", "https://user:pass@www.example.com/x"), nil, "example.com"},
+		// Userinfo is dropped only after the path/query/fragment cuts; an
+		// '@' in those parts must not be mistaken for the userinfo
+		// separator (regression guards for the cut ordering).
+		{"Referer query @ not mistaken for userinfo", hdr("HTTP-Referer", "https://user@example.com?x=a@b"), nil, "example.com"},
+		{"Referer path @ not mistaken for userinfo", hdr("HTTP-Referer", "https://user@example.com/a@b/x"), nil, "example.com"},
+		{"Referer fragment @ not mistaken for userinfo", hdr("HTTP-Referer", "https://example.com#a@b"), nil, "example.com"},
 
 		// Explicit attribution display name is capped at the DB column width.
 		{"over-long title truncated", hdr("X-OpenRouter-Title", strings.Repeat("a", 300)), nil, strings.Repeat("a", 255)},
@@ -101,6 +112,40 @@ func TestExtractAppName(t *testing.T) {
 			got := extractAppName(c.h, c.body)
 			if got != c.want {
 				t.Errorf("extractAppName = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+func TestStripHostPort(t *testing.T) {
+	cases := []struct {
+		name     string
+		in, want string
+	}{
+		{"plain host", "example.com", "example.com"},
+		// Plain host:port regression — the port is not part of the host identity.
+		{"host with port", "example.com:8080", "example.com"},
+		{"IPv6 literal with port", "[2001:db8::1]:3000", "[2001:db8::1]"},
+		{"IPv6 loopback with port", "[::1]:8787", "[::1]"},
+		// Unbracketed IPv6 is left untouched: its colons are indistinguishable
+		// from a port separator.
+		{"unbracketed IPv6", "2001:db8::1", "2001:db8::1"},
+		// RFC 3986 userinfo precedes the host; credentials must never become
+		// the host identity.
+		{"userinfo", "user@example.com", "example.com"},
+		{"userinfo with password", "user:pass@example.com", "example.com"},
+		{"userinfo with password and port", "user:pass@example.com:8443", "example.com"},
+		{"malformed userinfo with inner @", "user@name@example.com", "example.com"},
+		{"userinfo with IPv6 literal and port", "user@[2001:db8::1]:3000", "[2001:db8::1]"},
+		{"userinfo with password and IPv6 literal", "user:pass@[2001:db8::1]", "[2001:db8::1]"},
+		// localhost semantics unchanged: userinfo is dropped, loopback still
+		// detected through the brackets.
+		{"userinfo with localhost and port", "user:pass@localhost:3000", "localhost"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := stripHostPort(c.in); got != c.want {
+				t.Errorf("stripHostPort(%q) = %q, want %q", c.in, got, c.want)
 			}
 		})
 	}
