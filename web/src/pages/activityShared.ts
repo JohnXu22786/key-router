@@ -410,11 +410,24 @@ export function bucketAxis(since: dayjs.Dayjs, until: dayjs.Dayjs, granularity: 
 // its value was recorded: the current hour accumulates live usage, so a
 // PAST window (previous period, calendar preset) shares its boundary hour
 // with the live window, and that hour's value must be divided by its real
-// coverage (cutoff - hour), not by (until - hour). Each bucket gets the
-// fraction of the row proportional to its overlap with the row's data and
-// the window — the uniform-within-hour assumption needed because the
-// stored data is hourly while the axis is finer. Values outside the window
-// are never counted, so the window total is preserved.
+// coverage (cutoff - hour), not by (until - hour). The coverage reads the
+// recorded extent as WHOLE MINUTES (cutoff floored to the minute grid):
+// the row value is a per-request accumulation whose last event time is
+// unknowable, so clamping to the raw fetch clock would divide the SAME
+// value by a growing coverage on every 30s auto-refresh and shrink every
+// window total (2.5777 -> 2.5160 -> 2.4571 on an unchanged row, verified
+// at 14:20:22 / 14:20:52 / 14:21:22). Whole-minute coverage is a function
+// of the window grid instead — a snapped minute-granularity preset's until
+// IS the floored cutoff, so unchanged rows render identical values between
+// refreshes (the 'perfectly stable' contract in Activity.tsx; min15 windows
+// and custom ranges re-read the extent at each minute roll — the row's last
+// event time is unknowable, and any fixed read of it trades accuracy for
+// stability). Both windows sharing the live boundary hour divide by the same
+// coverage so their shares still sum to the whole row, never double-counted.
+// Each bucket gets the fraction of the row proportional to its overlap with
+// the row's data and the window — the uniform-within-hour assumption needed
+// because the stored data is hourly while the axis is finer. Values
+// outside the window are never counted, so the window total is preserved.
 function overlapFractions(
   hourBucket: string,
   since: dayjs.Dayjs,
@@ -425,7 +438,18 @@ function overlapFractions(
 ): Array<[number, number]> {
   const h = dayjs(hourBucket).startOf('hour');
   let covEnd = h.add(1, 'hour');
-  if (covEnd.isAfter(cutoff)) covEnd = cutoff;
+  if (covEnd.isAfter(cutoff)) {
+    // Whole-minute extent: the row's exact last event time is unknowable
+    // (the value is a per-request accumulation), so clamping to the raw
+    // fetch clock would shrink every window total between 30s refreshes
+    // (see the docstring above). A cutoff inside the row's FIRST minute
+    // floors to the row start and would drop a row that demonstrably holds
+    // data — read at least the first whole minute in that case (a cutoff at
+    // or before the row start still reads as no recorded data).
+    covEnd = cutoff.startOf('minute');
+    const minEnd = h.add(1, 'minute');
+    if (covEnd.isBefore(minEnd) && cutoff.isAfter(h)) covEnd = minEnd;
+  }
   const coverage = covEnd.diff(h, 'minute', true);
   if (coverage <= 0) return [];
   const perMin = 1 / coverage;
@@ -449,7 +473,17 @@ function overlapFractions(
 // A bucket covers [start, start+unit); its recorded value only covers up to
 // `cutoff` (the fetch time) — the bucket containing cutoff accumulates live
 // usage, so its value is divided by the real coverage, never by a window
-// boundary (a past window sharing that hour must not inflate it).
+// boundary (a past window sharing that hour must not inflate it). The
+// coverage reads the recorded extent as WHOLE MINUTES (cutoff floored to
+// the minute grid — see overlapFractions): the row value is a per-request
+// accumulation whose last event time is unknowable, so the raw fetch clock
+// would shrink every window total between 30s auto-refreshes even when the
+// rows are unchanged. Whole-minute coverage stays put while the fetch
+// clock slides, so identical windows + identical rows render identical
+// values for minute-granularity presets (whose snapped until IS the
+// floored cutoff; min15/custom re-read at each minute roll — see
+// overlapFractions), and every window sharing the live boundary hour
+// divides by the same coverage (their shares still sum to the whole row).
 //
 // Interior buckets lie fully inside the window and keep share 1; boundary
 // buckets are prorated to the overlap, so a rolling window shows exactly
@@ -482,7 +516,16 @@ export function bucketWindowShare(
       covEnd = covEnd.add(1, 'minute');
     }
   }
-  if (covEnd.isAfter(cutoff)) covEnd = cutoff;
+  if (covEnd.isAfter(cutoff)) {
+    // Whole-minute extent (see overlapFractions): the raw fetch clock would
+    // shrink every window total between 30s refreshes. A cutoff inside the
+    // unit's FIRST minute floors to the unit start and would drop a row
+    // that demonstrably holds data — read at least the first whole minute
+    // then (a cutoff at or before the unit start still reads as no data).
+    covEnd = cutoff.startOf('minute');
+    const minEnd = start.add(1, 'minute');
+    if (covEnd.isBefore(minEnd) && cutoff.isAfter(start)) covEnd = minEnd;
+  }
   const coverage = covEnd.diff(start, 'minute', true);
   if (coverage <= 0) return 0;
   const overlap = Math.min(covEnd.valueOf(), until.valueOf()) - Math.max(start.valueOf(), since.valueOf());
