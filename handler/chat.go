@@ -741,10 +741,11 @@ func extractAppName(h http.Header, body []byte) string {
 //
 //  1. X-OpenRouter-Title / X-Title — OpenRouter attribution display name
 //     (X-Title is its backwards-compatible alias). Highest trust.
-//  2. x-app                        — Anthropic-ecosystem app id; the generic
-//     value "cli" is resolved to Claude Code by the signals in 3.
+//  2. x-app                        — Anthropic-ecosystem launcher id; Claude
+//     Code's own ids ("cli", "cli-bg") are resolved by the signals in 3.
 //  3. Claude Code                  — X-Claude-Code-Session-Id (v2.1.86+),
-//     anthropic-beta: claude-code-*, or x-app: cli with a claude-cli UA.
+//     anthropic-beta: claude-code-*, a Claude Code x-app id with a
+//     claude-cli UA, or an exclusive Claude Code x-app id ("cli-bg") alone.
 //  4. Provider-specific headers    — X-Cursor-Mode (Cursor), originator
 //     (Codex CLI family), X-OpenWebUI-* (Open WebUI).
 //  5. HTTP-Referer hostname        — OpenRouter's primary attribution
@@ -763,17 +764,27 @@ func extractAppNameUnchecked(h http.Header, body []byte) string {
 		}
 	}
 
-	// 2. Anthropic ecosystem: x-app carries the app id ("cli" for Claude
-	//    Code, resolved below once the other Claude Code signals are known).
-	if t := strings.TrimSpace(h.Get("x-app")); t != "" && !strings.EqualFold(t, "cli") {
+	// 2. Anthropic ecosystem: x-app carries the Anthropic launcher id. Only
+	//    Claude Code's own ids ("cli", "cli-bg") are withheld from generic
+	//    passthrough — they are resolved by the Claude Code signals in 3.
+	if t := strings.TrimSpace(h.Get("x-app")); t != "" && !isClaudeCodeAppID(t) {
 		return t
 	}
 
-	// 3. Claude Code: session header (v2.1.86+), anthropic-beta marker, or
-	//    the generic x-app: cli paired with the claude-cli UA.
+	// 3. Claude Code: session header (v2.1.86+), anthropic-beta marker, or a
+	//    Claude Code x-app id paired with the claude-cli UA.
 	if h.Get("X-Claude-Code-Session-Id") != "" ||
 		strings.Contains(strings.ToLower(h.Get("anthropic-beta")), "claude-code") ||
-		(strings.EqualFold(strings.TrimSpace(h.Get("x-app")), "cli") && strings.HasPrefix(h.Get("User-Agent"), "claude-cli/")) {
+		(isClaudeCodeAppID(strings.TrimSpace(h.Get("x-app"))) && strings.HasPrefix(h.Get("User-Agent"), "claude-cli/")) {
+		return "Claude Code"
+	}
+
+	// The rest of the Claude Code launcher family identifies Claude Code on
+	// its own: only "cli" is shared (the legacy Claude CLI also sent x-app:
+	// cli), every other launcher id — "cli-bg" for background/agent mode
+	// (claude --bg, --exec, --agent, VS Code extension spawns, SDK batch
+	// workloads) — is exclusive to Claude Code.
+	if xApp := strings.TrimSpace(h.Get("x-app")); isClaudeCodeAppID(xApp) && !strings.EqualFold(xApp, "cli") {
 		return "Claude Code"
 	}
 
@@ -902,6 +913,20 @@ func extractAppNameUnchecked(h http.Header, body []byte) string {
 		}
 	}
 	return ""
+}
+
+// isClaudeCodeAppID reports whether t is an x-app launcher id emitted by
+// Claude Code: "cli" (interactive terminal) and "cli-bg" (background/agent
+// mode — claude --bg, --exec, --agent, VS Code extension spawns, SDK batch
+// workloads). The generic x-app passthrough (step 2) must skip the whole
+// family, not just "cli", so that every Claude Code id reaches the signal
+// resolution in step 3.
+func isClaudeCodeAppID(t string) bool {
+	switch strings.ToLower(strings.TrimSpace(t)) {
+	case "cli", "cli-bg":
+		return true
+	}
+	return false
 }
 
 // stripHostPort removes a trailing ":port" from a host string
