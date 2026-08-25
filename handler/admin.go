@@ -1500,8 +1500,13 @@ type ActivityResponse struct {
 // applyActivityFilter constrains a consumption query by the Activity page's
 // entity filter (filter_type=model|key|app + filter_value). Shared by
 // GetActivity and GetStatsConsumptions so both endpoints see the same rows.
-// "Unknown" matches empty model/app names — the label the UI shows for rows
-// without one. filter_value for filter_type=key is the key's numeric id.
+// "Unknown" matches rows with an empty model/app name AND rows whose name is
+// literally "Unknown": groupOf/subgroupOf merge both into one "Unknown" group
+// (an admin-created group named Unknown, or an attribution title of exactly
+// "Unknown", can store the label as a real name), so the filter must return
+// exactly the set the chart shows under that label — otherwise the literal
+// row's usage silently drops out of the filtered view.
+// filter_value for filter_type=key is the key's numeric id.
 func applyActivityFilter(q *gorm.DB, filterType, filterValue string) (*gorm.DB, error) {
 	if filterType == "" {
 		if filterValue != "" {
@@ -1518,7 +1523,7 @@ func applyActivityFilter(q *gorm.DB, filterType, filterValue string) (*gorm.DB, 
 	switch filterType {
 	case "model":
 		if filterValue == "Unknown" {
-			return q.Where("model_name = '' OR model_name IS NULL"), nil
+			return q.Where("model_name = '' OR model_name IS NULL OR model_name = 'Unknown'"), nil
 		}
 		return q.Where("model_name = ?", filterValue), nil
 	case "key":
@@ -1529,7 +1534,7 @@ func applyActivityFilter(q *gorm.DB, filterType, filterValue string) (*gorm.DB, 
 		return q.Where("key_id = ?", id), nil
 	default: // app
 		if filterValue == "Unknown" {
-			return q.Where("app_name = '' OR app_name IS NULL"), nil
+			return q.Where("app_name = '' OR app_name IS NULL OR app_name = 'Unknown'"), nil
 		}
 		return q.Where("app_name = ?", filterValue), nil
 	}
@@ -1556,7 +1561,8 @@ func applyActivityFilter(q *gorm.DB, filterType, filterValue string) (*gorm.DB, 
 //	filter_type / filter_value: restrict rows to one entity before
 //	          aggregating (the Activity page's filter button). filter_type is
 //	          model|key|app; filter_value is the model/app name or a key id.
-//	          "Unknown" matches rows with an empty model/app name.
+//	          "Unknown" matches rows with an empty model/app name plus any
+//	          name literally "Unknown" (the chart merges both into one group).
 func (h *AdminHandler) GetActivity(c *gin.Context) {
 	metric := c.DefaultQuery("metric", "spend")
 	groupBy := c.DefaultQuery("group_by", "model")
