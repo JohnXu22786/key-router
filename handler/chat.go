@@ -819,6 +819,11 @@ func extractAppNameUnchecked(h http.Header, body []byte) string {
 		if i := strings.IndexByte(ref, '?'); i >= 0 {
 			ref = ref[:i]
 		}
+		// Strip a trailing ":port": the port is not part of the host
+		// identity, and leaving it in would split one app's usage into
+		// different app_name values depending on which port its clients
+		// use (app_name is part of the consumption row's unique key).
+		ref = stripHostPort(ref)
 		if !isLocalHostname(ref) {
 			return ref
 		}
@@ -887,6 +892,23 @@ func extractAppNameUnchecked(h http.Header, body []byte) string {
 	return ""
 }
 
+// stripHostPort removes a trailing ":port" from a host string
+// ("example.com:8080" -> "example.com"). Bracketed IPv6 literals keep
+// their colons and brackets ("[2001:db8::1]:8080" -> "[2001:db8::1]");
+// unbracketed IPv6 is left untouched because its colons are
+// indistinguishable from a port separator.
+func stripHostPort(host string) string {
+	if i := strings.LastIndexByte(host, ':'); i > 0 && !strings.Contains(host[:i], ":") {
+		return host[:i]
+	}
+	if strings.HasPrefix(host, "[") {
+		if i := strings.IndexByte(host, ']'); i >= 0 {
+			return host[:i+1]
+		}
+	}
+	return host
+}
+
 // isLocalHostname reports whether the host is the local machine — such
 // referers are meaningless for app attribution (OpenRouter requires
 // X-OpenRouter-Title to accompany localhost URLs).
@@ -894,15 +916,10 @@ func isLocalHostname(host string) bool {
 	if host == "" {
 		return true
 	}
-	lower := strings.ToLower(host)
-	// Strip a trailing port; IPv6 literals keep their colons and brackets.
-	if i := strings.LastIndexByte(lower, ':'); i > 0 && !strings.Contains(lower[:i], ":") {
-		lower = lower[:i]
-	} else if strings.HasPrefix(lower, "[") {
-		if i := strings.IndexByte(lower, ']'); i >= 0 {
-			lower = lower[:i+1]
-		}
-	}
+	// A port is not part of the host identity; ignore it so the same
+	// client matches on any port (IPv6 literals keep their colons and
+	// brackets).
+	lower := strings.ToLower(stripHostPort(host))
 	// "localhost" itself, its FQDN forms, and the reserved subdomains
 	// .localhost (RFC 6761) and .localhost.localdomain (RFC 6762, the
 	// macOS/BSD hostname). Suffix matching avoids swallowing real domains

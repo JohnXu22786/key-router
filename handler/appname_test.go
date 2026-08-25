@@ -54,6 +54,11 @@ func TestExtractAppName(t *testing.T) {
 		{"localhost.localdomain referer ignored", hdr("HTTP-Referer", "http://localhost.localdomain/x"), nil, ""},
 		{"ipv6 loopback referer ignored", hdr("HTTP-Referer", "http://[::1]:8787/x"), nil, ""},
 		{"localhost.com is a real domain", hdr("HTTP-Referer", "https://localhost.com/x"), nil, "localhost.com"},
+		{"Referer port stripped", hdr("HTTP-Referer", "https://myapp.example.com:8443/chat"), nil, "myapp.example.com"},
+		{"Referer www and port stripped", hdr("HTTP-Referer", "https://www.myapp.example.com:8443/chat"), nil, "myapp.example.com"},
+		{"IPv6 referer port stripped, literal kept", hdr("HTTP-Referer", "http://[2001:db8::1]:3000/chat"), nil, "[2001:db8::1]"},
+		{"unbracketed IPv6 referer kept intact", hdr("HTTP-Referer", "http://2001:db8::1/chat"), nil, "2001:db8::1"},
+		{"LAN IP referer port stripped", hdr("HTTP-Referer", "http://192.168.1.5:3000"), nil, "192.168.1.5"},
 
 		// Explicit attribution display name is capped at the DB column width.
 		{"over-long title truncated", hdr("X-OpenRouter-Title", strings.Repeat("a", 300)), nil, strings.Repeat("a", 255)},
