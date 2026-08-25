@@ -111,13 +111,15 @@ export const CUSTOM_LABEL = 'Custom range';
 
 // floorWindowUntil snaps a time to the START of the bucket that contains it
 // at the given granularity. Preset windows snap BOTH bounds to the bucket
-// grid: the live (current partial) bucket keeps accumulating usage, so
-// showing it makes every 30s auto-refresh read as "accumulating" instead of
-// rolling. Snapped, the window is exactly the preset length, perfectly
-// stable between refreshes, and slides by one bucket when the bucket grid
-// rolls over. Sub-hour granularities snap to their own step (min15 -> the
-// 15-minute clock cell). Custom ranges keep their exact user-picked bounds
-// — never snapped.
+// grid so the window keeps its exact nominal length and the COMPLETED cells
+// stay identical between 30s auto-refreshes (the current period's LIVE cell
+// — where it holds recorded whole minutes — is then added back as the
+// chart's last point with its real accumulated value, see hasLiveCell;
+// between refreshes only that cell moves, and only by real usage — the
+// snapped minute-granularity windows read 0 whole recorded minutes for it,
+// see the #131 whole-minute coverage). Sub-hour granularities snap to their
+// own step (min15 -> the 15-minute clock cell). Custom ranges keep their
+// exact user-picked bounds — never snapped.
 export function floorWindowUntil(until: dayjs.Dayjs, granularity: Granularity): dayjs.Dayjs {
   if (granularity === 'minute') return until.startOf('minute');
   if (granularity === 'min15') return until.subtract(until.minute() % 15, 'minute').startOf('minute');
@@ -164,12 +166,40 @@ const ROLLUP_GRAN: Record<string, 'hour' | 'day' | 'month'> = {
 // (see activityWindow in admin.go), so flooring would amputate the whole
 // in-progress day/week/month the range covers. Those ranges pass range.until
 // as-is, letting the widened window keep every in-range bucket.
-export function queryWindowUntil(range: Pick<DateRange, 'granularity' | 'until'>, rollup: string): dayjs.Dayjs {
+//
+// A CURRENT-aligned PRESET range (its until is the start of the bucket
+// containing now — the live hour/day/month) also passes range.until as-is:
+// the endpoint's widened window then keeps the live bucket's recorded rows
+// — the chart's real last in-window value. Amputating them (the old
+// exclusiveUntil path) made the line always fall to 0 at its end whenever
+// the traffic lives in the current bucket — the normal state when checking
+// the dashboard. `now` defaults to the current time so the live alignment
+// is judged against the present, not the window's own boundary. Past-period
+// presets (Yesterday/Prev Week/Month/Year) and custom ranges are NOT
+// eligible (see liveExtensionEligible): their boundary data belongs to the
+// current period, so they keep excluding it. (A rollup FINER than the live
+// unit — Explore's hour rollup over a day-granularity range — widens to the
+// live bucket's first unit only; the default rollups keep the whole bucket.)
+export function queryWindowUntil(range: Pick<DateRange, 'key' | 'granularity' | 'since' | 'until'>, rollup: string, now: dayjs.Dayjs = dayjs()): dayjs.Dayjs {
   if (range.granularity === 'minute' || range.granularity === 'min15') return range.until;
   const gran = ROLLUP_GRAN[rollup] ?? 'hour';
+  if (liveExtensionEligible(range)
+    && floorWindowUntil(now, range.granularity).isSame(range.until)
+    && floorWindowUntil(range.since, range.granularity).isSame(range.since)) return range.until;
   if (floorWindowUntil(range.until, gran).isSame(range.until)) return exclusiveUntil(range.until, gran);
   return range.until;
 }
+
+// Past-period presets (Yesterday, Prev Week/Month/Year) end at a CHOSEN
+// boundary (midnight / Monday / the 1st) — the data after it belongs to the
+// current period. liveExtensionEligible gates the live-bucket extension (see
+// hasLiveCell): only CURRENT-period presets (the rolling windows and
+// today/week/month/year) may draw the bucket that contains the fetch time as
+// their last point; a past preset or a user-picked custom range keeps the
+// clean half-open exclusion (its end is a chosen cutoff, not "now").
+const PAST_RANGE_KEYS = new Set(['yesterday', 'prevweek', 'prevmonth', 'prevyear']);
+export const liveExtensionEligible = (range: Pick<DateRange, 'key'>): boolean =>
+  range.key !== CUSTOM_KEY && !PAST_RANGE_KEYS.has(range.key);
 
 // customRange wraps a user-picked from/to window; the bucket granularity is
 // derived from the window's length.
@@ -369,11 +399,12 @@ function bucketLabel(granularity: Granularity, t: dayjs.Dayjs): { label: string;
 // window [since, until) at the granularity's step (sub-hour granularities
 // advance by STEP_MIN minutes and the min15 axis is floored to the
 // 15-minute clock cell; the others advance by their calendar unit). The
-// bucket starting AT `until` is excluded: it can never receive data — the
-// overlap clamps in overlapFractions / bucketWindowShare yield 0 for it —
-// so it would only render an always-empty trailing tick (and would make
-// resampleResponse's summary `value` — the LAST bucket — read 0 for every
-// grid-aligned window). Buckets are kept only while their sort key strictly
+// bucket starting AT `until` is excluded from this list: it lies outside the
+// window, and the overlap clamps in overlapFractions / bucketWindowShare
+// yield 0 for it — so it would only render an always-empty trailing tick
+// (the CURRENT window's live bucket is added back explicitly by the callers
+// on top of this axis — see livePoint — where it holds the user's newest
+// recorded usage). Buckets are kept only while their sort key strictly
 // increases: DST fall-back repeats wall-clock times (dayjs steps in elapsed
 // time) — for hour granularity the repeat is consecutive ("01:00" twice),
 // for minute steps the whole repeated hour re-appears non-consecutively
@@ -398,6 +429,78 @@ function bucketStarts(since: dayjs.Dayjs, until: dayjs.Dayjs, granularity: Granu
     cur = stepMin != null ? cur.add(stepMin, 'minute') : cur.add(1, unit);
   }
   return out;
+}
+
+// hasLiveCell is true when the CURRENT window's live bucket — the bucket
+// that starts exactly AT `until` and contains the fetch time — must join the
+// chart as an extra trailing point. A current-aligned window (its until is
+// the start of the bucket containing cutoff) extends one bucket past the
+// half-open [since, until): that live bucket holds the user's newest
+// RECORDED usage (the accumulated row) and must be the chart's last point —
+// without it the line always fell to 0 at its end while the traffic lives
+// in the current hour/day/month. The extension applies ONLY to current-
+// period presets (`liveExtend` from liveExtensionEligible): a past preset
+// or custom pick ends at a CHOSEN boundary whose post-boundary data belongs
+// to a later period — a window ending at the current unit's start by
+// coincidence (Prev Week viewed on a Monday) must not absorb the current
+// unit. Windows whose since starts mid-cell are also excluded, and a live
+// bucket with no recorded whole minute yet stays absent so the axis never
+// carries an artificial always-zero tick: for the sub-hour cells the
+// recorded extent reads the minute-floored coverage (`until` IS the floored
+// cutoff for a snapped window, so the live minute cell reads 0 — the #131
+// whole-minute read), for the calendar cells it reads rowCoverageEnd (a
+// cutoff inside the unit's first minute still reads at least one whole
+// minute, like the KPI proration).
+function hasLiveCell(
+  until: dayjs.Dayjs,
+  since: dayjs.Dayjs,
+  cutoff: dayjs.Dayjs,
+  granularity: Granularity,
+  liveExtend: boolean,
+): boolean {
+  if (!liveExtend) return false;
+  if (!floorWindowUntil(cutoff, granularity).isSame(until)) return false;
+  if (!floorWindowUntil(since, granularity).isSame(since)) return false;
+  const unit = granularity === 'day' ? 'day' : granularity === 'month' ? 'month' : 'hour';
+  const extent = (granularity === 'minute' || granularity === 'min15')
+    ? cutoff.startOf('minute').diff(until, 'minute', true)
+    : rowCoverageEnd(until, unit, cutoff).diff(until, 'minute', true);
+  return extent > 0;
+}
+
+// liveLabelCollides is true when the live cell's wall-clock label already
+// occurred inside the same window: on a DST fall-back the axis holds the
+// FIRST occurrence's labels, so a live cell landing on the repeated hour's
+// second occurrence (e.g. the 3h preset viewed at 01:30 EST) would
+// duplicate an existing tick. Mirrors livePoint's axis-based dedup so the
+// KPI share never counts the slice of a cell the chart did not append.
+// The check mirrors isRepeatHour's support boundary (whole-hour DST shifts
+// — the half-hour repeat zones are outside the coverage machinery's scope).
+function liveLabelCollides(until: dayjs.Dayjs, since: dayjs.Dayjs, granularity: Granularity): boolean {
+  const earlier = until.subtract(1, 'hour');
+  return !earlier.isBefore(since) && bucketLabel(granularity, earlier).label === bucketLabel(granularity, until).label;
+}
+
+// livePoint builds the CURRENT window's live-bucket SeriesPoint, or null
+// when the window must not extend (see hasLiveCell) or the point's label
+// would collide with a bucket already on the axis (on a DST fall-back the
+// axis holds the FIRST occurrence's labels, so a live cell landing on the
+// repeated hour's second occurrence would duplicate a tick — the repeat's
+// usage then stays on the first occurrence and the chart total keeps
+// agreeing with bucketWindowShare's proration, which excludes the second
+// occurrence's tail the same way).
+function livePoint(
+  until: dayjs.Dayjs,
+  since: dayjs.Dayjs,
+  cutoff: dayjs.Dayjs,
+  granularity: Granularity,
+  existingLabels: Set<string>,
+  liveExtend: boolean,
+): SeriesPoint | null {
+  if (!hasLiveCell(until, since, cutoff, granularity, liveExtend)) return null;
+  const f = bucketLabel(granularity, until);
+  if (existingLabels.has(f.label)) return null;
+  return { label: f.label, sort: f.sort, value: 0 };
 }
 
 // bucketAxis builds a CONTINUOUS bucket axis over since..until at the given
@@ -512,7 +615,14 @@ function overlapFractions(
     const idx = new Map<string, number>();
     for (let i = 0; i < starts.length; i++) idx.set(starts[i].format('YYYY-MM-DD HH:mm'), i);
     const lo = Math.max(h.valueOf(), since.valueOf());
-    const hi = Math.min(covEnd.valueOf(), until.valueOf());
+    // The appended live cell (see livePoint) lies past until: the row's
+    // coverage extends into it, so the fold must cover up to the cell's end
+    // there (never past it — beyond the cell the row belongs to the next
+    // window's data, and the KPI clamps the same way).
+    const appended = starts.length > 0 && starts[starts.length - 1].valueOf() === until.valueOf();
+    const hi = appended
+      ? Math.min(covEnd.valueOf(), until.add(stepMin, 'minute').valueOf())
+      : Math.min(covEnd.valueOf(), until.valueOf());
     const counts = new Map<number, number>(); // axis index -> covered ms
     let lost = 0; // ms whose wall-clock label the axis cannot show
     for (let t = lo; t < hi; ) {
@@ -541,7 +651,10 @@ function overlapFractions(
   for (let i = 0; i < starts.length; i++) {
     const s = starts[i];
     const e = s.add(stepMin, 'minute');
-    const overlap = Math.min(e.valueOf(), covEnd.valueOf(), until.valueOf())
+    // The appended live cell starts at `until` (the window's end): its
+    // recorded slice reaches to the row's coverage end, not to `until`.
+    const clampEnd = s.valueOf() >= until.valueOf() ? covEnd.valueOf() : until.valueOf();
+    const overlap = Math.min(e.valueOf(), covEnd.valueOf(), clampEnd)
       - Math.max(s.valueOf(), h.valueOf(), since.valueOf());
     if (overlap > 0) out.push([i, perMin * (overlap / 60000)]);
   }
@@ -574,12 +687,26 @@ function overlapFractions(
 // buckets are prorated to the overlap, so a rolling window shows exactly
 // the data inside its span and repeated auto-refreshes never accumulate
 // pre-window (or post-window) usage into the totals.
+//
+// The LIVE cell — the bucket that starts exactly at the CURRENT window's
+// `until` and contains the fetch time (1d's current hour, 1w's current day,
+// the 3h preset's current 15-minute cell) — is the exception, exactly
+// mirroring the chart's livePoint append: its rows' recorded slice inside
+// the cell is REAL in-window usage (the user's newest traffic, accumulated
+// since the bucket began) and counts on top of the until-clamped overlap —
+// without it the KPI misses exactly the newest usage the chart shows, and
+// the "line falls to 0 at its end" report would persist in the totals. The
+// gate is the SAME as livePoint's (a current-aligned preset window with at
+// least one whole recorded minute, plus liveLabelCollides here since no
+// axis is available), so the KPI and the chart can never disagree about
+// whether the cell exists.
 export function bucketWindowShare(
   hourBucket: string,
   since: dayjs.Dayjs,
   until: dayjs.Dayjs,
   cutoff: dayjs.Dayjs,
   granularity: Granularity,
+  liveExtend = true,
 ): number {
   const h = dayjs(hourBucket);
   // Rows are always hourly; day/month granularity aggregates the containing
@@ -589,7 +716,26 @@ export function bucketWindowShare(
   const covEnd = rowCoverageEnd(start, rowUnit, cutoff);
   const coverage = covEnd.diff(start, 'minute', true);
   if (coverage <= 0) return 0;
-  const overlap = Math.min(covEnd.valueOf(), until.valueOf()) - Math.max(start.valueOf(), since.valueOf());
+  // The live cell exists when the CHART appended it (the gate is the SAME as
+  // livePoint's: a current-aligned preset window with at least one whole
+  // recorded minute and no DST label collision — collision checked via
+  // liveLabelCollides here since no axis is available). liveExtend=false
+  // marks a PAST-window share (previous period): the live bucket's data
+  // belongs to the current period there.
+  const liveCell = hasLiveCell(until, since, cutoff, granularity, liveExtend)
+    && !liveLabelCollides(until, since, granularity);
+  const stepMin = STEP_MIN[granularity];
+  let overlap = Math.max(0, Math.min(covEnd.valueOf(), until.valueOf()) - Math.max(start.valueOf(), since.valueOf()));
+  if (liveCell) {
+    // The row's recorded slice inside the live cell [until, until+step)
+    // counts too — the chart distributes it there (overlapFractions clamps
+    // the appended cell at covEnd), so the KPI must match.
+    const cellEnd = stepMin != null
+      ? until.add(stepMin, 'minute')
+      : until.add(1, granularity === 'hour' ? 'hour' : granularity);
+    const liveSlice = Math.min(covEnd.valueOf(), cellEnd.valueOf()) - Math.max(start.valueOf(), until.valueOf());
+    overlap += Math.max(0, liveSlice);
+  }
   if (overlap <= 0) return 0;
   return (overlap / 60000) / coverage;
 }
@@ -606,13 +752,20 @@ export function series<T extends BucketedRow>(
   until: dayjs.Dayjs,
   cutoff: dayjs.Dayjs,
   granularity: Granularity,
+  liveExtend = true,
 ): SeriesPoint[] {
   const axis = bucketAxis(since, until, granularity);
+  // The CURRENT window's live bucket (the one containing the fetch time)
+  // joins the axis as the last point — its rows are in the fetched data and
+  // carry the user's newest usage (see livePoint / bucketWindowShare).
+  const liveP = livePoint(until, since, cutoff, granularity, new Set(axis.map(p => p.label)), liveExtend);
+  if (liveP) axis.push(liveP);
   const stepMin = STEP_MIN[granularity];
   if (stepMin != null) {
     // Sub-hour axis: the rows are hourly, so distribute each row's value
     // over the minute buckets overlapping its hour.
     const starts = bucketStarts(since, until, granularity);
+    if (liveP) starts.push(until);
     for (const r of list) {
       for (const [i, f] of overlapFractions(r.hour_bucket, since, until, cutoff, starts, stepMin)) {
         axis[i].value += valFn(r) * f;
@@ -626,7 +779,7 @@ export function series<T extends BucketedRow>(
   for (const r of list) {
     const i = idx.get(keyOf(dayjs(r.hour_bucket)));
     if (i !== undefined) {
-      axis[i].value += valFn(r) * bucketWindowShare(r.hour_bucket, since, until, cutoff, granularity);
+      axis[i].value += valFn(r) * bucketWindowShare(r.hour_bucket, since, until, cutoff, granularity, liveExtend);
     }
   }
   return axis;
@@ -645,8 +798,12 @@ export function stackedData<T extends BucketedRow>(
   until: dayjs.Dayjs,
   cutoff: dayjs.Dayjs,
   granularity: Granularity,
+  liveExtend = true,
 ): Array<Record<string, any>> {
   const axis = bucketAxis(since, until, granularity);
+  // The CURRENT window's live bucket joins the axis (see series / livePoint).
+  const liveP = livePoint(until, since, cutoff, granularity, new Set(axis.map(p => p.label)), liveExtend);
+  if (liveP) axis.push(liveP);
   const rows = axis.map(p => {
     const row: Record<string, any> = { label: p.label, sort: p.sort };
     groups.forEach(g => { row[g] = 0; });
@@ -657,6 +814,7 @@ export function stackedData<T extends BucketedRow>(
     // Sub-hour axis: distribute each hourly row over its overlapping
     // minute buckets (see series).
     const starts = bucketStarts(since, until, granularity);
+    if (liveP) starts.push(until);
     for (const r of list) {
       const g = keyFn(r);
       const v = valFn(r);
@@ -676,7 +834,7 @@ export function stackedData<T extends BucketedRow>(
       // Rows whose group is outside `groups` still accumulate under their
       // own key — callers fold those keys into "Other". Guarding against
       // an uninitialized key keeps the fold from summing NaN into Other.
-      rows[i][g] = (rows[i][g] ?? 0) + valFn(r) * bucketWindowShare(r.hour_bucket, since, until, cutoff, granularity);
+      rows[i][g] = (rows[i][g] ?? 0) + valFn(r) * bucketWindowShare(r.hour_bucket, since, until, cutoff, granularity, liveExtend);
     }
   }
   return rows;
@@ -698,10 +856,19 @@ export function resampleResponse(
   until: dayjs.Dayjs,
   cutoff: dayjs.Dayjs,
   granularity: 'minute' | 'min15',
+  liveExtend = true,
 ): ActivityResponse {
   const stepMin = STEP_MIN[granularity]!;
   const starts = bucketStarts(since, until, granularity);
   const buckets = bucketAxis(since, until, granularity).map(p => p.label);
+  // The CURRENT window's live cell (min15; the live minute has no whole
+  // recorded minute so livePoint returns null for it) joins the axis — its
+  // row samples carry the user's newest usage (see livePoint).
+  const liveP = livePoint(until, since, cutoff, granularity, new Set(buckets), liveExtend);
+  if (liveP) {
+    starts.push(until);
+    buckets.push(liveP.label);
+  }
   const groups = Array.from(new Set(resp.series.map(s => s.group)));
   // group -> bucket label -> value
   const acc = new Map<string, Map<string, number>>();

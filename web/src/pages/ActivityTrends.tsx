@@ -6,7 +6,7 @@ import {
   Tooltip as RTooltip, ResponsiveContainer,
 } from 'recharts';
 import { getActivity, getKeys, ActivityResponse } from '../api/client';
-import { DateRange, ActivityFilter, filterKey, fmtUSD, fmtUSDInt, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtTick, fmtBucket, ExploreOpts, maskKey, toChartData, computeTrending, modelFavicon, resampleResponse, exclusiveUntil, queryWindowUntil } from './activityShared';
+import { DateRange, ActivityFilter, filterKey, fmtUSD, fmtUSDInt, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtTick, fmtBucket, ExploreOpts, maskKey, toChartData, computeTrending, modelFavicon, resampleResponse, exclusiveUntil, queryWindowUntil, liveExtensionEligible } from './activityShared';
 import dayjs from 'dayjs';
 const { Text } = Typography;
 
@@ -111,13 +111,14 @@ const TrendSection: React.FC<SectionProps> = ({ title, groupBy, range, filter, o
         const rollup = subGran ? 'hour' : range.granularity;
         // Current chart folds beyond top-5 into "Other" like the reference;
         // the previous period carries the same entity filter so sparklines
-        // and deltas stay consistent with the filtered rows. A bound that
-        // lies exactly on the bucket grid passes one second before it so the
-        // server excludes the live bucket itself; a mid-bucket bound (custom
-        // ranges) passes as-is so the containing bucket's in-range portion
-        // stays in (sub-hour ranges keep the live hour — its rows are the
-        // re-sampling source — and the client minute axis drops the live
-        // bucket itself).
+        // and deltas stay consistent with the filtered rows. A CURRENT-period
+        // boundary-aligned range passes its until as-is so the endpoint's
+        // widened window keeps the LIVE bucket — the user's newest usage is
+        // the chart's real last point (see queryWindowUntil). A mid-bucket
+        // bound (custom ranges) is passed as-is too, so the containing
+        // bucket's in-range portion stays in; a PAST-period bound passes one
+        // second before the boundary so the previous period never picks up
+        // the current period's buckets.
         const curUntil = queryWindowUntil(range, rollup);
         const prevUntil = subGran ? range.since : exclusiveUntil(range.since, range.granularity);
         const [curRes, prevRes] = await Promise.all([
@@ -128,10 +129,12 @@ const TrendSection: React.FC<SectionProps> = ({ title, groupBy, range, filter, o
         // cutNow: the rows' values were recorded up to NOW — the previous
         // period's boundary hour holds the current period's live usage, so
         // re-sampling must divide by the real coverage, not the past window's
-        // own end.
+        // own end. liveExtend: only the CURRENT window extends into the live
+        // bucket (its newest usage is the chart's real last point); the
+        // previous period never does.
         const cutNow = dayjs();
-        setCur(subGran ? resampleResponse(curRes.data, range.since, range.until, cutNow, subGran) : curRes.data);
-        setPrev(subGran ? resampleResponse(prevRes.data, prevSince, range.since, cutNow, subGran) : prevRes.data);
+        setCur(subGran ? resampleResponse(curRes.data, range.since, range.until, cutNow, subGran, liveExtensionEligible(range)) : curRes.data);
+        setPrev(subGran ? resampleResponse(prevRes.data, prevSince, range.since, cutNow, subGran, false) : prevRes.data);
       } catch { if (!cancelled) { setError(true); message.error(`Failed to load ${title} trends`); } }
       finally { if (!cancelled) setLoading(false); }
     };

@@ -6,7 +6,7 @@ import {
   BarChart, Bar, LineChart, Line,
 } from 'recharts';
 import { getConsumptions, getKeys, Consumption, Key } from '../api/client';
-import { DateRange, ActivityFilter, filterKey, ExploreOpts, fmtUSD, fmtTokens, fmtCompact, fmtTokensBare, fmtUSDInt, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtPercent, fmtTick, fmtBucket, series, stackedData, groupTotals, bucketWindowShare, Granularity, maskKey, cacheHitRate } from './activityShared';
+import { DateRange, ActivityFilter, filterKey, ExploreOpts, fmtUSD, fmtTokens, fmtCompact, fmtTokensBare, fmtUSDInt, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtPercent, fmtTick, fmtBucket, series, stackedData, groupTotals, bucketWindowShare, floorWindowUntil, liveExtensionEligible, Granularity, maskKey, cacheHitRate } from './activityShared';
 import dayjs from 'dayjs';
 
 const { Text } = Typography;
@@ -153,6 +153,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
     granularity: Granularity;
     prevSince: dayjs.Dayjs;
     cutoff: dayjs.Dayjs;
+    liveExt: boolean;
   } | null>(null);
   // Compares the fetch key INSIDE the effect (never during render, which
   // StrictMode's double render would defeat): a preset/window/filter switch
@@ -179,10 +180,20 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
       try {
         // When the rows' values were recorded: the current partial bucket
         // accumulates live usage, so boundary proration divides by the real
-        // coverage up to this instant.
+        // coverage up to this instant. The CURRENT-period query reaches into
+        // the live bucket (until floored to the MINUTE, like the sub-hour
+        // flows): the live hour/day/month's rows are the chart's real last
+        // in-window value — without them the line falls to 0 at its end
+        // whenever the traffic lives in the current bucket. The axis and the
+        // proration still use the snapped range.until (win), so the window
+        // itself stays exactly the preset length. Past-period presets and
+        // custom ranges stay bounded to their own until (their boundary data
+        // belongs to the current period).
         const cutoff = dayjs();
+        const liveEligible = liveExtensionEligible(range);
+        const curUntil = liveEligible ? floorWindowUntil(cutoff, 'minute') : range.until;
         const [curRes, prevRes, keyRes] = await Promise.all([
-          getConsumptions({ since: range.since.toISOString(), until: range.until.toISOString(), filter_type: filter?.type, filter_value: filter?.value }),
+          getConsumptions({ since: range.since.toISOString(), until: curUntil.toISOString(), filter_type: filter?.type, filter_value: filter?.value }),
           getConsumptions({ since: prevSince.toISOString(), until: range.since.toISOString(), filter_type: filter?.type, filter_value: filter?.value }),
           getKeys(),
         ]);
@@ -190,7 +201,11 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
         setCurList(curRes.data);
         setPrevList(prevRes.data);
         setKeys(keyRes.data);
-        setWin({ since: range.since, until: range.until, granularity: range.granularity, prevSince, cutoff });
+        // liveExt is captured WITH the window: while a refetch is in flight
+        // or failing, the stale window renders under ITS OWN eligibility
+        // flag, never the newly-selected range's (the axis and the flag must
+        // describe the same window).
+        setWin({ since: range.since, until: range.until, granularity: range.granularity, prevSince, cutoff, liveExt: liveEligible });
         keysRefForOverview = new Map(keyRes.data.map(k => [k.name || `Key #${k.id}`, k.key_value || '']));
       } catch { if (!cancelled) { setError(true); message.error('Failed to load activity'); } }
       finally { if (!cancelled) setLoading(false); }
@@ -220,12 +235,18 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
   // fetch time, never by a window edge.
   const cutNow = win?.cutoff ?? dayjs();
   const prevWinSince = win?.prevSince ?? prevSince;
+  // The CURRENT window's live-bucket eligibility rides WITH the window (see
+  // setWin) so a stale window during a refetch never mixes ranges/flags.
+  const curLiveExt = win?.liveExt ?? liveExtensionEligible(range);
 
-  const sum = (l: Consumption[], since: dayjs.Dayjs, until: dayjs.Dayjs, cutoff: dayjs.Dayjs) => l.reduce((a, c) => {
+  const sum = (l: Consumption[], since: dayjs.Dayjs, until: dayjs.Dayjs, cutoff: dayjs.Dayjs, liveExt: boolean) => l.reduce((a, c) => {
     // Boundary buckets prorate to the window overlap (the same math the
     // charts use), so the KPI cards always add up to the chart and a
-    // rolling window never counts usage outside its span.
-    const f = bucketWindowShare(c.hour_bucket, since, until, cutoff, gran);
+    // rolling window never counts usage outside its span. liveExt=false
+    // disables the current period's LIVE-bucket extension (see
+    // bucketWindowShare): a previous-period window ending at the live
+    // bucket's start must not pick up the current period's usage.
+    const f = bucketWindowShare(c.hour_bucket, since, until, cutoff, gran, liveExt);
     return {
       spend: a.spend + c.cost_usd * f,
       requests: a.requests + c.request_count * f,
@@ -235,29 +256,30 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
     };
   }, { spend: 0, requests: 0, tokens: 0, cache: 0, input: 0 });
 
-  const cur = sum(curList, axSince, axUntil, cutNow);
-  const prev = sum(prevList, prevWinSince, axSince, cutNow);
+  const cur = sum(curList, axSince, axUntil, cutNow, curLiveExt);
+  const prev = sum(prevList, prevWinSince, axSince, cutNow, false);
   // Cache hit rate = cached / total input tokens (incl. cached) — one
-  // consistent formula for both the KPI value and the sparkline.
-  const rateFor = (l: Consumption[], since: dayjs.Dayjs, until: dayjs.Dayjs, cutoff: dayjs.Dayjs) => {
-    const s = sum(l, since, until, cutoff);
+  // consistent formula for both the KPI value and the sparkline. The prev
+  // rate shares the prev sums' flag so it never picks up the live bucket.
+  const rateFor = (l: Consumption[], since: dayjs.Dayjs, until: dayjs.Dayjs, cutoff: dayjs.Dayjs, liveExt: boolean) => {
+    const s = sum(l, since, until, cutoff, liveExt);
     return cacheHitRate(s.input, s.cache);
   };
-  const curRate = rateFor(curList, axSince, axUntil, cutNow);
-  const prevRate = rateFor(prevList, prevWinSince, axSince, cutNow);
+  const curRate = rateFor(curList, axSince, axUntil, cutNow, curLiveExt);
+  const prevRate = rateFor(prevList, prevWinSince, axSince, cutNow, false);
   const blended = cur.tokens > 0 ? (cur.spend / cur.tokens) * 1e6 : 0;
   const blendedPrev = prev.tokens > 0 ? (prev.spend / prev.tokens) * 1e6 : 0;
 
   // share prorates one row to the CURRENT window — used by the ranked
   // tables so they agree with the prorated charts and KPI cards.
-  const share = (c: Consumption) => bucketWindowShare(c.hour_bucket, axSince, axUntil, cutNow, gran);
-  const costSeries = series(curList, c => c.cost_usd, axSince, axUntil, cutNow, gran);
-  const tokenSeries = series(curList, c => c.input_tokens + c.output_tokens, axSince, axUntil, cutNow, gran);
-  const reqSeries = series(curList, c => c.request_count, axSince, axUntil, cutNow, gran);
+  const share = (c: Consumption) => bucketWindowShare(c.hour_bucket, axSince, axUntil, cutNow, gran, curLiveExt);
+  const costSeries = series(curList, c => c.cost_usd, axSince, axUntil, cutNow, gran, curLiveExt);
+  const tokenSeries = series(curList, c => c.input_tokens + c.output_tokens, axSince, axUntil, cutNow, gran, curLiveExt);
+  const reqSeries = series(curList, c => c.request_count, axSince, axUntil, cutNow, gran, curLiveExt);
   // Prompt caching per bucket (token sums, shared by the Cached/Uncached
   // chart and the rate sparkline below).
-  const inSeries = series(curList, c => c.input_tokens, axSince, axUntil, cutNow, gran);
-  const cacheSeries = series(curList, c => c.cache_hit_tokens, axSince, axUntil, cutNow, gran);
+  const inSeries = series(curList, c => c.input_tokens, axSince, axUntil, cutNow, gran, curLiveExt);
+  const cacheSeries = series(curList, c => c.cache_hit_tokens, axSince, axUntil, cutNow, gran, curLiveExt);
   // Blended $/1M per bucket (cost / tokens in the SAME bucket).
   const blendedSeries = costSeries.map((d, i) => ({
     label: d.label,
@@ -293,7 +315,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
   // Usage by model (spend, stacked bars, top-5 + Other like OR)
   const modelSpend = groupTotals(curList, c => c.model_name || 'Unknown', c => c.cost_usd, share);
   const topModels = modelSpend.slice(0, 5).map(([m]) => m);
-  const usageByModel = stackedData(curList, [...topModels, 'Other'], c => c.model_name || 'Unknown', c => c.cost_usd, axSince, axUntil, cutNow, gran);
+  const usageByModel = stackedData(curList, [...topModels, 'Other'], c => c.model_name || 'Unknown', c => c.cost_usd, axSince, axUntil, cutNow, gran, curLiveExt);
   // Fold everything below top-5 into "Other" per bucket.
   const otherModelSet = new Set(modelSpend.slice(5).map(([m]) => m));
   usageByModel.forEach(row => {
@@ -313,7 +335,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
   // Request volume by model (stacked bars, top-5 + Other)
   const modelReqs = groupTotals(curList, c => c.model_name || 'Unknown', c => c.request_count, share);
   const topReqModels = modelReqs.slice(0, 5).map(([m]) => m);
-  const reqByModel = stackedData(curList, [...topReqModels, 'Other'], c => c.model_name || 'Unknown', c => c.request_count, axSince, axUntil, cutNow, gran);
+  const reqByModel = stackedData(curList, [...topReqModels, 'Other'], c => c.model_name || 'Unknown', c => c.request_count, axSince, axUntil, cutNow, gran, curLiveExt);
   const otherReqSet = new Set(modelReqs.slice(5).map(([m]) => m));
   reqByModel.forEach(row => {
     let sum = 0;
@@ -330,8 +352,8 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
 
   // Token breakdown: Prompt / Completion (no reasoning field in the model;
   // cached tokens stay in Prompt so nothing is double-counted).
-  const promptSeries = series(curList, c => c.input_tokens, axSince, axUntil, cutNow, gran);
-  const compSeries = series(curList, c => c.output_tokens, axSince, axUntil, cutNow, gran);
+  const promptSeries = series(curList, c => c.input_tokens, axSince, axUntil, cutNow, gran, curLiveExt);
+  const compSeries = series(curList, c => c.output_tokens, axSince, axUntil, cutNow, gran, curLiveExt);
   const tokenBreakdown = promptSeries.map((d, i) => ({
     label: d.label,
     Prompt: d.value,

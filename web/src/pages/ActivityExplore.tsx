@@ -140,12 +140,16 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
       setError(false);
       const t0 = performance.now();
       try {
-        // The query window must keep every in-range bucket: a range whose
-        // until lies exactly on the rollup boundary already excludes its
-        // live bucket, so we pass one second before it; a mid-bucket until
-        // (a coarse rollup — e.g. default day — over an hour-granularity
-        // 1d/today range) must be sent as-is, or the server's widened window
-        // would amputate the in-progress day the range covers.
+        // The query window must keep every in-range bucket: a CURRENT-period
+        // boundary-aligned range passes its until as-is, so the endpoint's
+        // widened window keeps the LIVE bucket (the user's newest usage is
+        // the chart's real last point — see queryWindowUntil); a PAST-period
+        // boundary (yesterday, prev-week/month/year) passes one second before
+        // it so the previous period never picks up the current period's
+        // buckets; a mid-bucket until (a coarse rollup — e.g. default day
+        // over an hour-granularity 1d/today range) is sent as-is, or the
+        // server's widened window would amputate the in-progress day the
+        // range covers.
         const curUntil = queryWindowUntil(range, rollup);
         const res = await getActivity({
           metric,
