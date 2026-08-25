@@ -732,7 +732,7 @@ export function bucketWindowShare(
     // the appended cell at covEnd), so the KPI must match.
     const cellEnd = stepMin != null
       ? until.add(stepMin, 'minute')
-      : until.add(1, granularity === 'hour' ? 'hour' : granularity);
+      : until.add(1, granularity === 'hour' ? 'hour' : granularity === 'day' ? 'day' : 'month');
     const liveSlice = Math.min(covEnd.valueOf(), cellEnd.valueOf()) - Math.max(start.valueOf(), until.valueOf());
     overlap += Math.max(0, liveSlice);
   }
