@@ -198,7 +198,19 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			return
 		}
 
-		// Resolve target model name
+		// Resolve the model name sent upstream from the route's target_model.
+		// An EMPTY target_model is the universal pass-through contract: the
+		// upstream request must inherit the client-provided (incoming) model
+		// name — for every provider and every route. The incoming name is
+		// the default and ONLY an explicit non-empty route target may
+		// replace it here (route-level extra_params are merged later by the
+		// relay and may deliberately set the model too — that is explicit
+		// admin config, not auto-resolution). Nothing may be auto-resolved
+		// in this block — no cached upstream endpoint ids, provider defaults
+		// or model aliases: an upstream that retired such an artifact
+		// answers not_found_error → non-retryable 400 → the whole calling
+		// session aborts, while the original incoming name is accepted
+		// upstream.
 		targetModel := reqMeta.Model
 		if route.Route.TargetModel != "" {
 			targetModel = route.Route.TargetModel

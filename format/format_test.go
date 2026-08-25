@@ -1256,6 +1256,40 @@ func TestOpenAIRequestToAnthropicSystemOnly(t *testing.T) {
 	}
 }
 
+// TestEmptyModelOverrideKeepsIncomingModel pins the pass-through branch of
+// EVERY request conversion: when the route's target_model is empty (no model
+// override), the converted upstream body must carry the client-provided
+// incoming model name — never an auto-resolved value (regression guard for
+// the empty-target_model routing contract at handler/chat.go).
+func TestEmptyModelOverrideKeepsIncomingModel(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		conv func([]byte, string) ([]byte, error)
+		want string
+	}{
+		{"openai to anthropic", `{"model":"arb-incoming-model-1","messages":[{"role":"user","content":"hi"}]}`, OpenAIRequestToAnthropic, "arb-incoming-model-1"},
+		{"anthropic to openai", `{"model":"arb-incoming-model-2","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`, AnthropicRequestToOpenAI, "arb-incoming-model-2"},
+		{"responses to anthropic", `{"model":"arb-incoming-model-3","input":"hi"}`, ResponsesRequestToAnthropic, "arb-incoming-model-3"},
+		{"responses to chat completions", `{"model":"arb-incoming-model-4","input":"hi"}`, ResponsesRequestToChatCompletion, "arb-incoming-model-4"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := tc.conv([]byte(tc.body), "")
+			if err != nil {
+				t.Fatalf("conversion failed: %v", err)
+			}
+			var got map[string]interface{}
+			if err := json.Unmarshal(out, &got); err != nil {
+				t.Fatalf("invalid JSON result: %v", err)
+			}
+			if got["model"] != tc.want {
+				t.Errorf("converted model = %v, want %q (empty override must pass the incoming name through)", got["model"], tc.want)
+			}
+		})
+	}
+}
+
 func TestMergeContentPartsExplicitNull(t *testing.T) {
 	// An explicit null content on the second message must not wipe the
 	// first message's accumulated content.
