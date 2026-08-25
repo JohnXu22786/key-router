@@ -70,6 +70,12 @@ func TestExtractAppName(t *testing.T) {
 		{"LobeHub UA", hdr("User-Agent", "lobehub/2.0"), nil, "LobeChat"},
 		{"Continue UA", hdr("User-Agent", "Continue/0.9.42"), nil, "Continue"},
 		{"Cline UA", hdr("User-Agent", "Cline/3.4.0 (VSCode)"), nil, "Cline"},
+		{"Kilo Code UA", hdr("User-Agent", "KiloCode/2.35.0 (VSCode)"), nil, "Kilo Code"},
+		{"Kilo Code hyphenated UA", hdr("User-Agent", "Kilo-Code/5.3.0"), nil, "Kilo Code"},
+		{"Roo Code UA", hdr("User-Agent", "RooCode/3.5.5"), nil, "Roo Code"},
+		{"bare kilo substring no false match", hdr("User-Agent", "KiloMeter/1.0"), nil, ""},
+		{"bare roo substring no false match", hdr("User-Agent", "Kangaroo/2.0"), nil, ""},
+		{"bare Roo token no false match", hdr("User-Agent", "Roo/1.0"), nil, ""},
 		{"Gemini CLI UA", hdr("User-Agent", "GeminiCLI/0.35.3/gemini-3-pro-preview (linux; x64; GitHub) google-api-nodejs-client/9.15.1"), nil, "Gemini CLI"},
 		{"Cherry Studio Electron UA", hdr("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) CherryStudio/1.5.11 Chrome/138.0.7204.243 Electron/37.4.0 Safari/537.36"), nil, "Cherry Studio"},
 

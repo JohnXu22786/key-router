@@ -751,7 +751,8 @@ func extractAppName(h http.Header, body []byte) string {
 //     identifier (the app's URL). Localhost referers are ignored.
 //  6. Known client User-Agent tokens — claude-cli, opencode, GeminiCLI,
 //     CherryStudio (Electron UA token), lobe-chat, lobehub, chatbox,
-//     continue, cline, cursor, codex, aider, open-webui.
+//     continue, cline, kilo-code, kilocode, roocode, cursor, codex, aider,
+//     open-webui.
 //  7. Request body client_metadata.app_name — older Codex releases.
 //  8. Browser User-Agent (Mozilla/...) — Chrome / Edge / Firefox / Safari.
 //  9. ""                           — shown as "Unknown" in the Activity page.
@@ -856,6 +857,9 @@ func extractAppNameUnchecked(h http.Header, body []byte) string {
 			{"chatbox", "Chatbox"},
 			{"continue", "Continue"},
 			{"cline", "Cline"},
+			{"kilo-code", "Kilo Code"},
+			{"kilocode", "Kilo Code"},
+			{"roocode", "Roo Code"},
 			{"cursor", "Cursor"},
 			{"codex", "Codex"},
 			{"aider", "Aider"},
