@@ -5,7 +5,7 @@
 // leaks into the other suites (which run in the machine's local zone).
 import { describe, it, expect, vi, beforeAll } from 'vitest';
 import dayjs from 'dayjs';
-import { bucketWindowShare } from './activityShared';
+import { bucketWindowShare, bucketAxis } from './activityShared';
 
 beforeAll(() => {
   vi.stubEnv('TZ', 'America/New_York');
@@ -65,5 +65,42 @@ describe('bucketWindowShare — DST fall-back', () => {
       'hour',
     );
     expect(share).toBeCloseTo(70 / 120, 10);
+  });
+});
+
+// bucketStarts hosts the DST repeat-dedup guard (sort > prevSort) inside the
+// loop this fix changed to the half-open window condition — these tests pin
+// the guard down under the new condition.
+describe('bucketStarts — DST axes under the half-open window', () => {
+  it('fall-back: keeps the FIRST occurrence of the repeated hour, drops the repeat and the boundary bucket', () => {
+    // [00:00 EDT, 03:00 EST) spans 3 elapsed hours; 01:00 wall-clock occurs
+    // twice. The axis must hold exactly 00:00, 01:00 (first), 02:00 — no
+    // repeated 01:00 tick, and no 03:00 bucket (starts AT until).
+    const since = dayjs('2026-11-01T00:00:00');
+    const until = dayjs('2026-11-01T03:00:00');
+    const out = bucketAxis(since, until, 'hour');
+    expect(out.map(p => p.sort)).toEqual([
+      '2026-11-01 00:00', '2026-11-01 01:00', '2026-11-01 02:00',
+    ]);
+  });
+
+  it('spring-forward: skips the non-existent hour and excludes the boundary bucket', () => {
+    // 02:00 does not exist on 2026-03-08 (EST -> EDT). [00:00, 03:00 EDT)
+    // covers 00:00 and 01:00; the 03:00 bucket starts AT until (zero
+    // overlap) and is excluded.
+    const since = dayjs('2026-03-08T00:00:00');
+    const until = dayjs('2026-03-08T03:00:00');
+    const out = bucketAxis(since, until, 'hour');
+    expect(out.map(p => p.sort)).toEqual(['2026-03-08 00:00', '2026-03-08 01:00']);
+  });
+
+  it('minute axis over the fall-back repeat keeps strictly increasing sort keys', () => {
+    // The repeated 01:00..01:59 wall-clock walk is deduped off the axis; the
+    // surviving keys must still strictly increase.
+    const since = dayjs('2026-11-01T01:55:00');
+    const until = dayjs('2026-11-01T02:05:00');
+    const sorts = bucketAxis(since, until, 'minute').map(p => p.sort);
+    expect(sorts).toEqual([...new Set(sorts)]);
+    expect(sorts.every((s, i) => i === 0 || s > sorts[i - 1])).toBe(true);
   });
 });

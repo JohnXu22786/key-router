@@ -133,15 +133,18 @@ describe('series — continuous axis bucketing', () => {
       [row('2026-08-13T10:00:00'), row('2026-08-13T10:30:00'), row('2026-08-13T12:00:00')],
       () => 1, since, until, until, 'hour',
     );
-    expect(out.map(p => p.label)).toEqual(['08-13 09:00', '08-13 10:00', '08-13 11:00', '08-13 12:00', '08-13 13:00']);
-    expect(out.map(p => p.value)).toEqual([0, 2, 0, 1, 0]);
+    // [since, until): the bucket starting AT until (13:00) is excluded — it
+    // can never hold data, so it must not render as an empty trailing tick.
+    expect(out.map(p => p.label)).toEqual(['08-13 09:00', '08-13 10:00', '08-13 11:00', '08-13 12:00']);
+    expect(out.map(p => p.value)).toEqual([0, 2, 0, 1]);
   });
 
   it('buckets a week daily and a year monthly', () => {
     const since = dayjs('2026-08-10T00:00:00');
     const out = series([row('2026-08-11T03:00:00'), row('2026-08-13T22:00:00')], () => 5, since, since.add(4, 'day'), since.add(4, 'day'), 'day');
-    expect(out.map(p => p.label)).toEqual(['08-10', '08-11', '08-12', '08-13', '08-14']);
-    expect(out.map(p => p.value)).toEqual([0, 5, 0, 5, 0]);
+    // The 08-14 bucket starts exactly AT until — excluded from the axis.
+    expect(out.map(p => p.label)).toEqual(['08-10', '08-11', '08-12', '08-13']);
+    expect(out.map(p => p.value)).toEqual([0, 5, 0, 5]);
 
     const ySince = dayjs('2026-01-01T00:00:00');
     const yUntil = dayjs('2026-03-01T23:59:59');
@@ -154,7 +157,7 @@ describe('series — continuous axis bucketing', () => {
     const since = dayjs('2026-08-01T00:00:00');
     const until = since.add(6, 'day');
     const out = series([row('2026-08-05T00:00:00')], () => 1, since, until, until, 'day');
-    expect(out.length).toBe(7);
+    expect(out.length).toBe(6);
     expect(out[0].label).toBe('08-01');
     expect(out[0].value).toBe(0);
   });
@@ -521,7 +524,6 @@ describe('stackedData', () => {
     expect(out).toEqual([
       { label: '08-13 09:00', sort: '2026-08-13 09:00', a: 2, b: 0 },
       { label: '08-13 10:00', sort: '2026-08-13 10:00', a: 0, b: 4 },
-      { label: '08-13 11:00', sort: '2026-08-13 11:00', a: 0, b: 0 },
     ]);
   });
 
@@ -549,31 +551,58 @@ describe('bucketAxis', () => {
   it('produces sortable continuous buckets for each granularity', () => {
     const since = dayjs('2026-08-13T09:00:00');
     const hour = bucketAxis(since, since.add(2, 'hour'), 'hour');
-    expect(hour.map(p => p.sort)).toEqual(['2026-08-13 09:00', '2026-08-13 10:00', '2026-08-13 11:00']);
+    // [since, until): the 11:00 bucket starting AT until is excluded.
+    expect(hour.map(p => p.sort)).toEqual(['2026-08-13 09:00', '2026-08-13 10:00']);
     const month = bucketAxis(dayjs('2026-01-01'), dayjs('2026-03-31'), 'month');
     expect(month.map(p => p.label)).toEqual(['2026-01', '2026-02', '2026-03']);
   });
 
-  it('builds a 1-minute axis covering the window start to its containing minute', () => {
+  it('builds exactly the 15 minute buckets inside a 15m window — no trailing empty bucket', () => {
+    // The window is [since, until): a bucket starting AT until (16:05) can
+    // never receive data (the overlap clamp yields 0), so the axis holds
+    // exactly the 15 complete buckets 15:50..16:04. Before the fix the loop
+    // also emitted 16:05 — 16 ticks for 15 minutes of data, the last always 0.
     const out = bucketAxis(dayjs('2026-08-13T15:50:00'), dayjs('2026-08-13T16:05:00'), 'minute');
-    expect(out).toHaveLength(16);
+    expect(out).toHaveLength(15);
     expect(out[0]).toMatchObject({ label: '08-13 15:50', sort: '2026-08-13 15:50', value: 0 });
-    expect(out[15]).toMatchObject({ label: '08-13 16:05', sort: '2026-08-13 16:05', value: 0 });
+    expect(out[14]).toMatchObject({ label: '08-13 16:04', sort: '2026-08-13 16:04', value: 0 });
     expect(out.map(p => p.label)).toEqual([
       '08-13 15:50', '08-13 15:51', '08-13 15:52', '08-13 15:53', '08-13 15:54',
       '08-13 15:55', '08-13 15:56', '08-13 15:57', '08-13 15:58', '08-13 15:59',
       '08-13 16:00', '08-13 16:01', '08-13 16:02', '08-13 16:03', '08-13 16:04',
-      '08-13 16:05',
     ]);
   });
 
-  it('builds a 15-minute axis for a 3-hour window', () => {
-    const out = bucketAxis(dayjs('2026-08-13T13:00:00'), dayjs('2026-08-13T15:59:59'), 'min15');
+  it('builds exactly the 12 fifteen-minute buckets inside a snapped 3h window', () => {
+    // The 3h preset snaps BOTH bounds to the 15-minute grid: [13:00, 16:00).
+    // The 16:00 bucket can never receive data — 13 ticks would be 3 hours of
+    // data plus a phantom period. The axis holds 13:00..15:45, 12 buckets.
+    const out = bucketAxis(dayjs('2026-08-13T13:00:00'), dayjs('2026-08-13T16:00:00'), 'min15');
     expect(out.map(p => p.label)).toEqual([
       '08-13 13:00', '08-13 13:15', '08-13 13:30', '08-13 13:45',
       '08-13 14:00', '08-13 14:15', '08-13 14:30', '08-13 14:45',
       '08-13 15:00', '08-13 15:15', '08-13 15:30', '08-13 15:45',
     ]);
+  });
+
+  it('keeps every bucket whose start lies inside a mid-cell until (custom ranges)', () => {
+    // Custom ranges are never snapped: until = 16:05:30 keeps the 16:05
+    // bucket (it overlaps the window by 30 s), only 16:06 and later are
+    // excluded.
+    const out = bucketAxis(dayjs('2026-08-13T15:59:00'), dayjs('2026-08-13T16:05:30'), 'minute');
+    expect(out.map(p => p.label)).toEqual([
+      '08-13 15:59', '08-13 16:00', '08-13 16:01', '08-13 16:02',
+      '08-13 16:03', '08-13 16:04', '08-13 16:05',
+    ]);
+  });
+
+  it('yields an empty axis for a zero-length window on the bucket grid', () => {
+    // e.g. the 'today' preset loaded within the first second of midnight:
+    // since and the floored until are the same bucket start, so no bucket
+    // lies inside the half-open window — an empty axis, never one zero tick.
+    const t = dayjs('2026-08-13T16:00:00');
+    expect(bucketAxis(t, t, 'minute')).toEqual([]);
+    expect(bucketAxis(t, t, 'hour')).toEqual([]);
   });
 
   it('floors the 15-minute axis to the clock cell (never 13:07, 13:22, ...)', () => {
@@ -601,12 +630,12 @@ describe('series — sub-hour distribution of hourly rows', () => {
       ],
       (r) => r.v, since, until, until, 'minute',
     );
-    // 15:50-15:59 get 120/60 = 2 each; 16:00-16:04 get 10/5 = 2 each; 16:05 (the
-    // bucket containing `until`, no row coverage) stays 0.
+    // 15:50-15:59 get 120/60 = 2 each; 16:00-16:04 get 10/5 = 2 each. The
+    // bucket starting AT until (16:05) is excluded from the axis — it can
+    // never hold data — so the window keeps exactly its 15 buckets.
     expect(out.map(p => p.value)).toEqual([
       2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
       2, 2, 2, 2, 2,
-      0,
     ]);
     // Window total = the hour's share overlapping the window + the partial hour.
     expect(out.reduce((a, p) => a + p.value, 0)).toBeCloseTo(120 * (10 / 60) + 10, 6);
@@ -620,7 +649,7 @@ describe('series — sub-hour distribution of hourly rows', () => {
       ],
       (r) => r.v, since, until, until, 'minute',
     );
-    expect(out.map(p => p.value)).toEqual([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0]);
+    expect(out.map(p => p.value)).toEqual([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0]);
     expect(out.reduce((a, p) => a + p.value, 0)).toBeCloseTo(60 * (10 / 60), 6);
   });
 
@@ -647,7 +676,8 @@ describe('series — sub-hour distribution of hourly rows', () => {
     const until = dayjs('2026-08-13T10:10:00');
     const cutoff = dayjs('2026-08-13T10:30:00');
     const out = series([{ hour_bucket: '2026-08-13T10:00:00', v: 120 }], (r) => r.v, since, until, cutoff, 'minute');
-    expect(out.map(p => p.value)).toEqual([4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0]);
+    // The 10:10 bucket starts AT until — excluded, like every trailing bucket.
+    expect(out.map(p => p.value)).toEqual([4, 4, 4, 4, 4, 4, 4, 4, 4, 4]);
     expect(out.reduce((a, p) => a + p.value, 0)).toBeCloseTo(120 * (10 / 30), 6);
   });
 });
@@ -662,11 +692,10 @@ describe('stackedData — sub-hour distribution per group', () => {
       { hour_bucket: '2026-08-13T16:00:00', m: 'a', n: 10 },
     ];
     const out = stackedData(rows, ['a', 'b'], r => r.m, r => r.n, since, until, until, 'minute');
-    // 15:50-15:59: a=2, b=1; 16:00 (containing `until`, no coverage): 0/0.
+    // 15:50-15:59: a=2, b=1 each; the 16:00 bucket starts AT until — excluded.
     expect(out.map(r => ({ a: r.a, b: r.b }))).toEqual([
       { a: 2, b: 1 }, { a: 2, b: 1 }, { a: 2, b: 1 }, { a: 2, b: 1 }, { a: 2, b: 1 },
       { a: 2, b: 1 }, { a: 2, b: 1 }, { a: 2, b: 1 }, { a: 2, b: 1 }, { a: 2, b: 1 },
-      { a: 0, b: 0 },
     ]);
     expect(Number.isNaN(out[0].a)).toBe(false);
   });
@@ -690,14 +719,15 @@ describe('resampleResponse — Trends hourly rollup onto a sub-hour axis', () =>
 
   it('re-buckets every group onto the minute axis with is_zero flags', () => {
     const out = resampleResponse(resp, dayjs('2026-08-13T15:50:00'), dayjs('2026-08-13T16:05:00'), dayjs('2026-08-13T16:05:00'), 'minute');
-    expect(out.buckets).toHaveLength(16);
+    expect(out.buckets).toHaveLength(15);
     expect(out.buckets[0]).toBe('08-13 15:50');
-    // 16 buckets x 2 groups, all zero-filled like the server does.
-    expect(out.series).toHaveLength(32);
+    expect(out.buckets[14]).toBe('08-13 16:04'); // the 16:05 bucket (start == until) is excluded
+    // 15 buckets x 2 groups, all zero-filled like the server does.
+    expect(out.series).toHaveLength(30);
     const a = out.series.filter(p => p.group === 'a').map(p => p.value);
     const b = out.series.filter(p => p.group === 'b').map(p => p.value);
-    expect(a).toEqual([2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 0]);  // 15:00 (120/60) + 16:00 (10/5)
-    expect(b).toEqual([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0]);
+    expect(a).toEqual([2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]);  // 15:00 (120/60) + 16:00 (10/5)
+    expect(b).toEqual([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1]);
     expect(out.series.every(p => p.is_zero === (p.value === 0))).toBe(true);
     // Summary is recomputed from the re-bucketed series (server semantics:
     // min/max/avg over non-empty buckets, value = last bucket, percent of total).
@@ -708,8 +738,10 @@ describe('resampleResponse — Trends hourly rollup onto a sub-hour axis', () =>
     expect(sa.min).toBeCloseTo(2, 6);
     expect(sa.max).toBeCloseTo(2, 6);
     expect(sa.avg).toBeCloseTo(2, 6);
-    expect(sa.value).toBe(0);   // last bucket (16:05) is empty
-    expect(sb.value).toBe(0);
+    // value = the LAST in-window bucket (16:04): before the fix the trailing
+    // 16:05 bucket forced it to 0 for every sub-hour window.
+    expect(sa.value).toBe(2);
+    expect(sb.value).toBe(1);
     expect(sa.percent).toBeCloseTo(30 / 35 * 100, 6);
     // The re-sampled metric's total matches the series; the others carry over.
     expect(out.totals.spend).toBeCloseTo(35, 6);
@@ -763,11 +795,11 @@ describe('resampleResponse — Trends hourly rollup onto a sub-hour axis', () =>
       '08-13 13:00', '08-13 13:15', '08-13 13:30', '08-13 13:45',
       '08-13 14:00', '08-13 14:15', '08-13 14:30', '08-13 14:45',
       '08-13 15:00', '08-13 15:15', '08-13 15:30', '08-13 15:45',
-      '08-13 16:00',
     ]);
     // 13:00 hour: 53 of its 60 minutes fall in the window (13:07-14:00)
-    // -> 24 + 45x3; 14:00 hour: 15 x4; 15:00 hour: 30 x4; 16:00 bucket: 0.
-    expect(out.series.map(p => p.value)).toEqual([24, 45, 45, 45, 15, 15, 15, 15, 30, 30, 30, 30, 0]);
+    // -> 24 + 45x3; 14:00 hour: 15 x4; 15:00 hour: 30 x4. The 16:00 bucket
+    // starts AT until — excluded, and the totals are unchanged.
+    expect(out.series.map(p => p.value)).toEqual([24, 45, 45, 45, 15, 15, 15, 15, 30, 30, 30, 30]);
     expect(out.series.reduce((a, p) => a + p.value, 0)).toBeCloseTo(180 * (53 / 60) + 60 + 120, 6);
   });
 });

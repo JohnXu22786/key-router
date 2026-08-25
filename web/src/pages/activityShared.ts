@@ -365,18 +365,23 @@ function bucketLabel(granularity: Granularity, t: dayjs.Dayjs): { label: string;
   }
 }
 
-// bucketStarts lists the bucket START times covering since..until at the
-// granularity's step (sub-hour granularities advance by STEP_MIN minutes
-// and the min15 axis is floored to the 15-minute clock cell; the others
-// advance by their calendar unit). Buckets are kept only while their sort
-// key strictly increases: DST fall-back repeats wall-clock times (dayjs
-// steps in elapsed time) — for hour granularity the repeat is consecutive
-// ("01:00" twice), for minute steps the whole repeated hour re-appears
-// non-consecutively ("01:59" then "01:00" again) — dropping the repeats
-// keeps the axis monotonic and the repeated hour's usage lands on its
-// first occurrence. (Rows serialized with the second occurrence's offset
-// are re-anchored by dayjs to the first occurrence's hour — the chart and
-// the KPI proration shift identically, so the totals stay consistent.)
+// bucketStarts lists the bucket START times strictly inside the half-open
+// window [since, until) at the granularity's step (sub-hour granularities
+// advance by STEP_MIN minutes and the min15 axis is floored to the
+// 15-minute clock cell; the others advance by their calendar unit). The
+// bucket starting AT `until` is excluded: it can never receive data — the
+// overlap clamps in overlapFractions / bucketWindowShare yield 0 for it —
+// so it would only render an always-empty trailing tick (and would make
+// resampleResponse's summary `value` — the LAST bucket — read 0 for every
+// grid-aligned window). Buckets are kept only while their sort key strictly
+// increases: DST fall-back repeats wall-clock times (dayjs steps in elapsed
+// time) — for hour granularity the repeat is consecutive ("01:00" twice),
+// for minute steps the whole repeated hour re-appears non-consecutively
+// ("01:59" then "01:00" again) — dropping the repeats keeps the axis
+// monotonic and the repeated hour's usage lands on its first occurrence.
+// (Rows serialized with the second occurrence's offset are re-anchored by
+// dayjs to the first occurrence's hour — the chart and the KPI proration
+// shift identically, so the totals stay consistent.)
 function bucketStarts(since: dayjs.Dayjs, until: dayjs.Dayjs, granularity: Granularity): dayjs.Dayjs[] {
   const stepMin = STEP_MIN[granularity];
   const unit = granularity === 'hour' ? 'hour' : granularity === 'day' ? 'day' : 'month';
@@ -387,7 +392,7 @@ function bucketStarts(since: dayjs.Dayjs, until: dayjs.Dayjs, granularity: Granu
     : since.startOf('month');
   if (granularity === 'min15') cur = cur.subtract(cur.minute() % 15, 'minute');
   let prevSort = '';
-  while (!cur.isAfter(until)) {
+  while (cur.isBefore(until)) {
     const sort = bucketLabel(granularity, cur).sort;
     if (sort > prevSort) { out.push(cur); prevSort = sort; }
     cur = stepMin != null ? cur.add(stepMin, 'minute') : cur.add(1, unit);
