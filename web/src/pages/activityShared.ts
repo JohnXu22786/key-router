@@ -145,7 +145,32 @@ export function floorWindowUntil(until: dayjs.Dayjs, granularity: Granularity): 
   // fields (midnight / the 1st) and stay on startOf.
   if (granularity === 'minute') return floorMinute(until);
   if (granularity === 'min15') return floorMinute(until).subtract(until.minute() % 15, 'minute');
-  if (granularity === 'hour') return floorMinute(until).subtract(until.minute(), 'minute');
+  if (granularity === 'hour') {
+    // The hour floor must snap to the start of the wall-clock hour
+    // CONTAINING `until`, in ELAPSED time. Subtracting until.minute() as
+    // elapsed minutes is exact only while the offset stays uniform across
+    // the subtraction SPAN: whole-hour-shift zones (New York, Chatham) and
+    // ordinary half-hour-zone hours (whose :30 hour starts the subtraction
+    // lands on) all satisfy it. On a half-hour-shift FALL-BACK (Lord Howe
+    // +10:30/+11:00) it does not: 01:40:30 +10:30 (15:10:30Z) subtracts 40
+    // elapsed minutes to 14:30Z — wall-clock 01:30 +11:00, MID-HOUR inside
+    // the FIRST occurrence — instead of the true containing hour start
+    // 15:00Z (the transition instant where the displayed hour's second pass
+    // begins). The floor then sits off the hour grid, hasLiveCell's gate
+    // (floor(until).isSame(until)) fails, and the live cell amputates the
+    // whole second occurrence from the KPI and the hour chart. Rebuild the
+    // hour start in zoned arithmetic instead: the JS Date setters resolve
+    // the ambiguous wall-clock to the FIRST occurrence, and an instant on
+    // the second pass carries a lower offset than that first start — push
+    // it one elapsed hour forward, where a repeated DISPLAYED hour begins
+    // its second pass (14:00Z -> 15:00Z for Lord Howe, 05:00Z -> 06:00Z
+    // for New York). Anything else takes the first branch: while the
+    // offset is uniform across the subtraction span the rebuilt start
+    // coincides exactly with the old minute subtraction, so every
+    // unambiguous-ordinary floor stays bit-identical.
+    const first = until.minute(0).second(0).millisecond(0);
+    return first.utcOffset() > until.utcOffset() ? first.add(1, 'hour') : first;
+  }
   if (granularity === 'day') return until.startOf('day');
   return until.startOf('month');
 }
