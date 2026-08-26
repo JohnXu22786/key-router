@@ -914,19 +914,22 @@ func extractAppNameUnchecked(h http.Header, body []byte) string {
 	//    Chrome because Edge's UA contains both. Desktop Edge brands its UA
 	//    "Edg/"; the mobile builds use "EdgA/" (Android) and "EdgiOS/"
 	//    (iOS), which contain no "edg/" token and would otherwise fall
-	//    through to their Chrome/Safari engine tokens. Electron apps that
-	//    carry no known app token (VS Code, Slack, Discord, ...) are not
-	//    "Chrome" — they stay unknown unless identified by an earlier
-	//    signal.
+	//    through to their Chrome/Safari engine tokens. iOS Chrome and
+	//    Firefox follow the same scheme — "CriOS/" and "FxiOS/" — and
+	//    their UAs carry neither "chrome/" nor "firefox/", only the WebKit
+	//    token "safari/", so those tokens must be matched before the
+	//    Safari fallback. Electron apps that carry no known app token (VS
+	//    Code, Slack, Discord, ...) are not "Chrome" — they stay unknown
+	//    unless identified by an earlier signal.
 	if ua := strings.ToLower(h.Get("User-Agent")); strings.HasPrefix(ua, "mozilla/") {
 		switch {
 		case strings.Contains(ua, "electron/"):
 			return ""
 		case strings.Contains(ua, "edg/") || strings.Contains(ua, "edga/") || strings.Contains(ua, "edgios/"):
 			return "Edge"
-		case strings.Contains(ua, "firefox/"):
+		case strings.Contains(ua, "firefox/") || strings.Contains(ua, "fxios/"):
 			return "Firefox"
-		case strings.Contains(ua, "chrome/"):
+		case strings.Contains(ua, "chrome/") || strings.Contains(ua, "crios/"):
 			return "Chrome"
 		case strings.Contains(ua, "safari/"):
 			return "Safari"
