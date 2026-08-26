@@ -361,6 +361,54 @@ func TestResponsesRequestToAnthropicEmptyInput(t *testing.T) {
 	}
 }
 
+// TestResponsesRequestToAnthropicToolChoice covers every tool_choice shape a
+// Responses-API client may send: the flat {"type":"function","name":...}
+// object (the shape Codex-style clients send), the chat-nested function
+// object, and the string forms mapped per the OpenAI→Anthropic conventions.
+func TestResponsesRequestToAnthropicToolChoice(t *testing.T) {
+	cases := []struct {
+		name     string
+		input    string // JSON value for "tool_choice"
+		wantType string
+		wantName string
+	}{
+		{"flat function object", `{"type":"function","name":"search"}`, "tool", "search"},
+		{"chat-nested function object", `{"type":"function","function":{"name":"search"}}`, "tool", "search"},
+		{"auto", `"auto"`, "auto", ""},
+		{"none", `"none"`, "none", ""},
+		{"required", `"required"`, "any", ""},
+		// Flat form without a name has nothing to map — stays passthrough.
+		{"flat function object without name", `{"type":"function"}`, "function", ""},
+		// A present-but-broken "function" key is not the flat form — passthrough.
+		{"broken function key passthrough", `{"type":"function","function":42,"name":"x"}`, "function", "x"},
+		// Unrecognized shapes keep passing through untouched.
+		{"unknown object passthrough", `{"type":"custom"}`, "custom", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := ResponsesRequestToAnthropic([]byte(`{"model":"m","input":"","tool_choice":`+tc.input+`}`), "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var req map[string]interface{}
+			if err := json.Unmarshal(out, &req); err != nil {
+				t.Fatal(err)
+			}
+			tcMap, ok := req["tool_choice"].(map[string]interface{})
+			if !ok {
+				t.Fatalf("tool_choice = %v, want an object", req["tool_choice"])
+			}
+			if tcMap["type"] != tc.wantType {
+				t.Errorf("tool_choice.type = %v, want %q", tcMap["type"], tc.wantType)
+			}
+			gotName, _ := tcMap["name"].(string)
+			if gotName != tc.wantName {
+				t.Errorf("tool_choice.name = %v, want %q", tcMap["name"], tc.wantName)
+			}
+		})
+	}
+}
+
 // ---- Streaming converter: chat completions upstream ----
 
 func decodeEvents(t *testing.T, raw [][]byte) []map[string]interface{} {
