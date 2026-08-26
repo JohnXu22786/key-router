@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
@@ -1225,6 +1226,9 @@ func (h *AdminHandler) GetStatsConsumptions(c *gin.Context) {
 		return
 	}
 	query = filtered
+	// The parsed window bounds (local), kept for the range-aware cap below
+	// (the WHERE clauses are applied inline, exactly as before).
+	var sinceTime, untilTime *time.Time
 	if since := c.Query("since"); since != "" {
 		if t, err := time.Parse(time.RFC3339, since); err == nil {
 			// Floor to the LOCAL hour: hour_bucket holds the whole hour's
@@ -1232,7 +1236,9 @@ func (h *AdminHandler) GetStatsConsumptions(c *gin.Context) {
 			// the 16:00 bucket — otherwise those presets show nothing for
 			// most of the hour (the chart axis floors the same way).
 			l := t.Local()
-			query = query.Where("hour_bucket >= ?", time.Date(l.Year(), l.Month(), l.Day(), l.Hour(), 0, 0, 0, l.Location()))
+			floored := time.Date(l.Year(), l.Month(), l.Day(), l.Hour(), 0, 0, 0, l.Location())
+			sinceTime = &floored
+			query = query.Where("hour_bucket >= ?", floored)
 		} else {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid since parameter"})
 			return
@@ -1240,21 +1246,88 @@ func (h *AdminHandler) GetStatsConsumptions(c *gin.Context) {
 	}
 	if until := c.Query("until"); until != "" {
 		if t, err := time.Parse(time.RFC3339, until); err == nil {
-			query = query.Where("hour_bucket <= ?", t.Local())
+			l := t.Local()
+			untilTime = &l
+			query = query.Where("hour_bucket <= ?", l)
 		} else {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid until parameter"})
 			return
 		}
 	}
 
-	// Generous cap. Rows are hourly per (key, model, app): 24h × 7d is 168
-	// per (key, model, app), so a key serving several model/app combos emits
-	// multiples of that. 100000 still covers hundreds of keys without
-	// truncating the Stats page charts.
-	if err := query.Order("hour_bucket DESC").Limit(100000).Find(&consumptions).Error; err != nil {
+	// Range-aware response cap. Rows are hourly per (key_id, model_name,
+	// app_name); the old fixed Limit(100000) with ORDER BY hour_bucket DESC
+	// silently amputated the OLDEST rows whenever a window legitimately held
+	// more than 100k of them. The Overview page's 1y preset spans ~8,760
+	// hours, so a modest combo set (3 keys × 3 models × 2 apps = 18 combos ≈
+	// 158k rows/year) rendered with its earliest months zeroed and its KPI
+	// totals understated — and nothing in the response flagged the loss
+	// (GetActivity, the Trends source for the same window, has no cap at
+	// all). The cap is now range-aware:
+	//   - a window can hold at most buckets × groups rows, where buckets is
+	//     the number of hour slots in [since, until] (hourly rows are ≥ 1
+	//     real hour apart, so the real-time distance in hours + 1 is always
+	//     an upper bound, DST included) and groups is the count of distinct
+	//     (key_id, model_name, app_name) tuples in the same filtered window
+	//     (the unique idx_key_hour index keeps each group to one row per
+	//     hour bucket);
+	//   - when that maximum fits the response contract (≤ consumptionCapRows)
+	//     the query runs WITHOUT a LIMIT: the response is always complete —
+	//     legitimate long ranges work like GetActivity;
+	//   - only a genuinely runaway window (multi-year × many combos, or an
+	//     unbounded request) exceeds the cap: the query is then limited to
+	//     the NEWEST consumptionCapRows rows and the response is flagged
+	//     with the X-Consumptions-Truncated header, so truncation is an
+	//     explicit contract, never silent. The header signals that the
+	//     WINDOW exceeds the response contract — it is set by the window's
+	//     maximum possible rows, so a window that only LOOKS runaway (few
+	//     actual rows) is bounded to exactly those rows but still flagged.
+	//     An entity filter shrinks the group count with the query, so a
+	//     filter can bring even a long range back under the cap.
+	const consumptionCapRows = 1000000 // ≈ 250MB of JSON; no renderable window needs more
+
+	var groups int64
+	// Fork the statement: gorm chain calls on a clone=0 DB mutate the same
+	// statement, so the group-count chain must not leak its clauses
+	// (GROUP BY, count(*)) into the Find below.
+	countQ := query.Session(&gorm.Session{})
+	if err := countQ.Model(&model.Consumption{}).
+		Group("key_id, model_name, app_name").
+		Count(&groups).Error; err != nil {
+		log.Printf("[admin] GetStatsConsumptions group count error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load consumptions"})
+		return
+	}
+
+	// buckets: upper bound on the distinct hour buckets matching the window.
+	// Matched buckets are ≥ 1 real hour apart (hourly rows — DST included),
+	// so (until − since)/1h + 1 can never undercount. The anchor is the
+	// floored since and the RAW until (no floor): flooring the until inside
+	// a DST-repeated hour would be ambiguous, while the raw instant keeps
+	// the real-time distance exact. A request without since or until is
+	// unbounded on that side — treat it as exceeding the cap.
+	buckets := int64(math.MaxInt64)
+	if sinceTime != nil && untilTime != nil {
+		if d := untilTime.Sub(*sinceTime); d >= 0 {
+			buckets = int64(d/time.Hour) + 1
+		} else {
+			buckets = 0
+		}
+	}
+
+	truncated := groups > 0 && buckets > consumptionCapRows/groups
+	if truncated {
+		query = query.Limit(consumptionCapRows)
+	}
+	if err := query.Order("hour_bucket DESC").Find(&consumptions).Error; err != nil {
 		log.Printf("[admin] GetStatsConsumptions error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load consumptions"})
 		return
+	}
+	// Flag AFTER the query succeeded: the header describes the response that
+	// is actually being sent (a failed Find must not claim truncation).
+	if truncated {
+		c.Header("X-Consumptions-Truncated", "true")
 	}
 	c.JSON(http.StatusOK, consumptions)
 }
