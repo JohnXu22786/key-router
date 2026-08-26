@@ -131,6 +131,18 @@ func TestExtractAppName(t *testing.T) {
 		{"Browser UA chrome regression", hdr("User-Agent", "Mozilla/5.0 (Macintosh) AppleWebKit/537.36 Chrome/140.0.0.0 Safari/537.36"), nil, "Chrome"},
 		{"Browser UA firefox", hdr("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:139.0) Gecko/20100101 Firefox/139.0"), nil, "Firefox"},
 		{"Browser UA safari", hdr("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"), nil, "Safari"},
+		// Chrome for iOS brands its UA "CriOS/" and Firefox for iOS
+		// "FxiOS/"; neither carries its desktop engine token ("chrome/",
+		// "firefox/") — only the WebKit token "safari/" — so both fell
+		// through to the Safari branch and were recorded as Safari.
+		// Regression for the same mislabel class #148 fixed for
+		// EdgA/EdgiOS.
+		{"Browser UA chrome iOS CriOS", hdr("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/126.0.6478.105 Mobile/15E148 Safari/604.1"), nil, "Chrome"},
+		{"Browser UA firefox iOS FxiOS", hdr("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) FxiOS/127.0 Mobile/15E148 Safari/605.1.15"), nil, "Firefox"},
+		// Ordering guard: the "safari/" token appears before CriOS/ here;
+		// only the branch order (CriOS before the Safari fallback) keeps it
+		// labelled Chrome — token position must not matter.
+		{"Browser UA chrome iOS CriOS after safari token", hdr("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Safari/604.1 CriOS/126.0.6478.105 Mobile/15E148"), nil, "Chrome"},
 		{"Electron UA without app token", hdr("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.7204.243 Electron/37.4.0 Safari/537.36"), nil, ""},
 
 		{"nothing -> empty (Unknown)", hdr(), nil, ""},
