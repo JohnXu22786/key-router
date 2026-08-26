@@ -147,9 +147,18 @@ func ResponsesRequestToChatCompletion(body []byte, modelOverride string) ([]byte
 		}
 	}
 
-	// tools pass through unchanged
+	// tools: the Responses API's function tool is the FLAT form
+	// {"type":"function","name":"x","description":"d","parameters":{...}},
+	// but chat completions requires the NESTED form
+	// {"type":"function","function":{...}} — translate it (non-function tool
+	// types and the legacy nested form pass through unchanged, see
+	// responsesToolsToChat).
 	if v, ok := rReq["tools"]; ok {
-		out["tools"] = v
+		if tools, ok := v.([]interface{}); ok {
+			out["tools"] = responsesToolsToChat(tools)
+		} else {
+			out["tools"] = v
+		}
 	}
 	// tool_choice: the Responses forced-function object is the flat form
 	// {"type":"function","name":"x"}, but chat completions requires the
@@ -271,6 +280,48 @@ func responsesInputItemToChat(item interface{}, systemParts *[]string) []interfa
 		}}
 	}
 	return nil
+}
+
+// responsesToolsToChat maps Responses API tools onto chat completions. The
+// Responses API's function tool is the FLAT form
+// {"type":"function","name":"x","description":"d","parameters":{...}}
+// (canonical per the OpenAI spec), while chat completions requires the
+// NESTED form {"type":"function","function":{...}} with the function's keys
+// grouped under a "function" object. Every key except the "type"
+// discriminator moves into that object verbatim (name, description,
+// parameters, strict, ...). Non-function tool types (file_search and other
+// custom types) and the legacy nested form (already carrying a "function"
+// object) pass through unchanged, as do non-map entries.
+func responsesToolsToChat(tools []interface{}) []interface{} {
+	converted := make([]interface{}, 0, len(tools))
+	for _, tool := range tools {
+		t, ok := safeMap(tool)
+		if !ok {
+			converted = append(converted, tool)
+			continue
+		}
+		if safeStringOrDefault(t, "type", "") != "function" {
+			converted = append(converted, tool)
+			continue
+		}
+		if _, has := t["function"]; has {
+			// Legacy nested chat form — leave unchanged.
+			converted = append(converted, tool)
+			continue
+		}
+		fn := make(map[string]interface{}, len(t)-1)
+		for k, v := range t {
+			if k == "type" {
+				continue
+			}
+			fn[k] = v
+		}
+		converted = append(converted, map[string]interface{}{
+			"type":     "function",
+			"function": fn,
+		})
+	}
+	return converted
 }
 
 // responsesToolChoiceToChat maps a Responses API tool_choice onto chat
