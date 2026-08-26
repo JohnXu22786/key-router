@@ -123,6 +123,120 @@ function floorMinute(t: dayjs.Dayjs): dayjs.Dayjs {
   return dayjs(t.valueOf() - (t.second() * 1000 + t.millisecond()));
 }
 
+// --- DST fall-back transition machinery ---------------------------------
+// An hourly row's recorded value covers the elapsed instants whose LOCAL
+// wall-clock hour field equals the row's hour. On a fall-back night the
+// clock jumps back at a transition instant T (the offset DROPS from
+// `before` to `after`, Δ = before - after minutes) and the wall-clock span
+// [τ+, τ+ + Δ) — τ+ = the wall time displayed AT T, post-jump — displays
+// twice. Whole-hour shifts (New York 02:00 -> 01:00) and half-hour shifts
+// (Lord Howe 02:00 -> 01:30) keep that span inside ONE hour field, so the
+// affected row's extent is a single contiguous [start, end) — the shape the
+// old hour-field-equality walk modeled. But the 45-minute-offset shift
+// (Pacific/Chatham +13:45/+12:45, the only real zone) repeats the span
+// [02:45, 03:45) on the Apr 5 2026 fall-back — it CROSSES the 02/03 field
+// boundary: row '02:00' then covers [02:00, 03:00) +13:45 ([12:15Z, 13:15Z))
+// plus the 15-minute slice [02:45, 03:00) +12:45 ([14:00Z, 14:15Z)) — a
+// NON-CONTIGUOUS 75-minute extent with a 45-minute gap — and row '03:00'
+// covers 45 + 60 = 105 minutes ([13:15Z, 14:00Z) plus [14:15Z, 15:15Z),
+// the [14:00Z, 14:15Z) gap being row '02:00''s data). The old detection
+// (`start.add(1,'hour').hour() === start.hour()`) assumed every repeat is
+// hour-field-aligned and got BOTH Chatham rows wrong: row '03:00''s +1h
+// step crossed the transition and absorbed 15 minutes of row '02:00''s
+// second pass into a contiguous 120-minute span, and row '02:00''s +1h
+// step lands on field 03 (no match), so its second-pass slice was never
+// represented at all.
+//
+// The fixed machinery derives the repeat from the OFFSET CHANGE instead:
+// findFallBack locates the transition, and repeatRuns maps the repeated
+// span onto the row's field to return its TRUE extent as epoch runs. For
+// New York and Lord Howe the runs merge into exactly the contiguous span
+// the old walk produced (120 / 90 minutes) — bit-identical coverage — and
+// the misaligned Chatham rows get their true two-run extents.
+//
+// Real zones have at most one offset transition per day, so a single offset
+// comparison 179 minutes out proves whether any transition can sit inside
+// the 180-minute window (an offset difference there can only be a
+// spring-forward or a fall-back; the walk resolves which).
+function findFallBack(start: dayjs.Dayjs): { t: dayjs.Dayjs; before: number; after: number } | null {
+  if (start.add(179, 'minute').utcOffset() === start.utcOffset()) return null;
+  let t = start;
+  let prevOff = start.utcOffset();
+  for (let i = 0; i < 180; i++) {
+    t = t.add(1, 'minute');
+    const off = t.utcOffset();
+    if (off !== prevOff) return off < prevOff ? { t, before: prevOff, after: off } : null;
+    prevOff = off;
+  }
+  return null;
+}
+
+// findFallBackBefore is the backward twin of findFallBack: the first
+// transition BEFORE `until` within 180 minutes (used only on the hour
+// floor's second-pass branch, so no probe shortcut). Walking BACKWARD a
+// fall-back shows up as an offset INCREASE (from the post-jump offset to
+// the pre-jump one).
+function findFallBackBefore(until: dayjs.Dayjs): { t: dayjs.Dayjs; before: number; after: number } | null {
+  // Walk the WHOLE-MINUTE grid (floorMinute(until)): the boundary rows of
+  // the transition sit on it, while stepping from a second-bearing until
+  // would land every probe :30 later and shift the found T by half a
+  // minute.
+  let t = floorMinute(until);
+  const prevOff = until.utcOffset();
+  for (let i = 0; i < 180; i++) {
+    const off = t.utcOffset();
+    if (off !== prevOff) return off > prevOff ? { t: t.add(1, 'minute'), before: off, after: prevOff } : null;
+    t = t.subtract(1, 'minute');
+  }
+  return null;
+}
+
+// repeatRuns returns the epoch runs an hourly row's recorded value covers
+// when a fall-back affects it — the elapsed instants displaying the row's
+// field, decomposed into contiguous runs — or null when the row is
+// unaffected (the caller keeps the plain [start, start+1h) model). `start`
+// must be the row's FIRST-pass anchor (the first instant displaying its
+// hour field). The runs, for an affected row:
+//   - [start, min(start+60min, T)): the first pass (its wall hour runs to
+//     its own field end, or to the jump when the jump cuts the field short
+//     — the τ- field, e.g. Chatham row '03:00' whose [03:00, 03:45) pre-
+//     jump pass ends at T).
+//   - the field's slice of the second pass: wall [max(field, τ+),
+//     min(field+60, τ+ + Δ)) at the post-jump offset.
+//   - the post-repeat continuation: for the field CONTAINING the span's
+//     end (τ+ + Δ < field + 60 — e.g. Chatham row '03:00', whose wall
+//     [03:45, 04:00) displays only once, after the repeat, up to its field
+//     end 04:00).
+// Whole-hour and half-hour shifts produce adjacent runs that merge into one
+// span; the Chatham shift produces two runs with a gap. Wall times are
+// minute-of-day values; real fall-backs happen 01:00–03:45 wall, so the
+// repeated span never crosses midnight.
+function repeatRuns(start: dayjs.Dayjs): Array<{ from: number; to: number }> | null {
+  const fb = findFallBack(start);
+  if (!fb) return null;
+  const delta = fb.before - fb.after;                     // jump size in minutes
+  const tauPlus = fb.t.hour() * 60 + fb.t.minute();       // wall time displayed AT the jump (post-jump offset)
+  const field = start.hour() * 60 + start.minute();       // the row's field on the minute-of-day grid
+  if (field + 60 <= tauPlus || field >= tauPlus + delta) return null; // the repeated span misses the row's field
+  const runs: Array<{ from: number; to: number }> = [{
+    from: start.valueOf(),
+    to: Math.min(start.add(1, 'hour').valueOf(), fb.t.valueOf()),
+  }];
+  const w1 = Math.max(field, tauPlus);
+  const w2 = Math.min(field + 60, tauPlus + delta);
+  if (w2 > w1) runs.push({ from: fb.t.valueOf() + (w1 - tauPlus) * 60000, to: fb.t.valueOf() + (w2 - tauPlus) * 60000 });
+  if (tauPlus + delta < field + 60) {
+    runs.push({ from: fb.t.valueOf() + delta * 60000, to: fb.t.valueOf() + (field + 60 - tauPlus) * 60000 });
+  }
+  const merged: Array<{ from: number; to: number }> = [runs[0]];
+  for (let i = 1; i < runs.length; i++) {
+    const last = merged[merged.length - 1];
+    if (runs[i].from === last.to) last.to = runs[i].to;
+    else merged.push(runs[i]);
+  }
+  return merged;
+}
+
 // floorWindowUntil snaps a time to the START of the bucket that contains it
 // at the given granularity. Preset windows snap BOTH bounds to the bucket
 // grid so the window keeps its exact nominal length and the COMPLETED cells
@@ -179,8 +293,37 @@ export function floorWindowUntil(until: dayjs.Dayjs, granularity: Granularity): 
     // the transition point 15:30Z — the true start of the displayed
     // hour — and the live cell keeps the whole recorded slice (share 1
     // where the old floor read 0).
+    //
+    // The +1h push itself assumes the second pass REALIGNS with the hour
+    // field (first + 1h = the second pass's start) — true for New York
+    // and Lord Howe, whose fall-backs land on a field boundary, but not
+    // for the 15-minute-misaligned Pacific/Chatham shift (+13:45/+12:45,
+    // Apr 5 2026: the jump 03:45 +13:45 -> 02:45 +12:45 at 14:00Z repeats
+    // the span [02:45, 03:45), crossing the 02/03 field boundary). There,
+    // a second-pass instant like 02:50 +12:45 (14:05Z) reconstructs
+    // 02:00:00, which exists only in the FIRST pass (12:15Z), and the +1h
+    // push lands on 13:15Z — one full hour before the true containing-
+    // hour start 14:00Z (wall 02:45:00 +12:45, the instant the second
+    // pass begins; 02:00:00 +12:45 never occurs). Rebuild from the
+    // transition instead: walk back to the fall-back T, take τ+ (the wall
+    // time the clock reads AT T) and the field `first` resolved to, and
+    // floor to the first post-jump instant displaying that field —
+    // T + max(0, field - τ+). For aligned shifts this degenerates to T =
+    // first + 1h (the pre-jump pass ran to the field's end), so New York
+    // and Lord Howe floors are bit-identical; for Chatham field 02 it
+    // lands on T (14:00Z) and for field 03 on T + 15min (14:15Z — the
+    // real start of the second 03:00–04:00 pass).
     const first = until.minute(0).second(0).millisecond(0);
-    return first.utcOffset() > until.utcOffset() ? first.add(1, 'hour') : first;
+    if (first.utcOffset() > until.utcOffset()) {
+      const fb = findFallBackBefore(until);
+      if (fb) {
+        const tauPlus = fb.t.hour() * 60 + fb.t.minute();
+        const field = first.hour() * 60 + first.minute();
+        return fb.t.add(Math.max(0, field - tauPlus), 'minute');
+      }
+      return first.add(1, 'hour');
+    }
+    return first;
   }
   if (granularity === 'day') return until.startOf('day');
   return until.startOf('month');
@@ -645,70 +788,89 @@ export function bucketAxis(since: dayjs.Dayjs, until: dayjs.Dayjs, granularity: 
   });
 }
 
-// isRepeatHour is true when `start`..`start+1h` crosses a DST fall-back: the
-// wall-clock hour repeats (01:00 EDT then 01:00 EST), so an hourly row
-// starting at `start` records two elapsed hours of usage.
+// isRepeatHour is true when the hourly row anchored at `start` is affected
+// by a DST fall-back repeat: the repeated wall-clock span intersects the
+// row's hour field (see repeatRuns). The detection derives from the OFFSET
+// CHANGE at the transition, never from hour-field equality — the old
+// `start.add(1,'hour').hour() === start.hour()` test modeled every repeat
+// as hour-field-aligned. That held for New York and Lord Howe (their
+// repeated spans stay inside one field) but broke on the 45-minute-offset
+// Pacific/Chatham shift, whose repeated span [02:45, 03:45) crosses the
+// 02/03 field boundary: row '02:00' (its +1h step lands on field 03 — no
+// match) lost its second-pass slice [14:00Z, 14:15Z) entirely, while row
+// '03:00' matched only by accident.
 function isRepeatHour(start: dayjs.Dayjs): boolean {
-  return start.add(1, 'hour').hour() === start.hour();
+  return repeatRuns(start) !== null;
+}
+
+// RowCoverage is an hourly (or coarser) row's recorded extent: the epoch
+// runs (whole-minute cutoff-clamped) plus the coverage in whole minutes.
+export interface RowCoverage {
+  runs: Array<{ from: number; to: number }>;
+  coverage: number;
+}
+
+// rowCoverage returns the extent an hourly row's recorded value covers: the
+// fall-back runs from repeatRuns for an affected row, else the plain
+// one-row-unit span, each run capped at the whole-minute cutoff floor and
+// the whole extent rescued to one minute when the cutoff lands inside the
+// unit's FIRST minute — the same cutoff semantics the old rowCoverageEnd
+// applied to its single contiguous span, now per run. Shared by
+// bucketWindowShare, overlapFractions and boundaryShare so the KPI
+// proration and the sub-hour chart split divide by the SAME coverage and
+// clamp to the SAME runs (the gap between a misaligned row's runs displays
+// the OTHER row's hour and must never count for either).
+//
+// The floor must NOT go through dayjs's startOf('minute'): on the
+// fall-back's repeated hour a second-occurrence cutoff (01:15:45 EST)
+// floors to 01:15 EST — wall-clock fields that ALSO exist in the first
+// occurrence — and the ambiguous-local reconstruction inside the JS
+// Date setter re-anchors the instant to the FIRST occurrence (01:15
+// EDT, one hour earlier). The coverage would then end before a live
+// window's start and the whole recent usage reads 0 (the "#135 line
+// ends at the real last in-window value" contract), prorated wrong
+// everywhere else. Floor on the epoch instead (floorMinute): whole-
+// minute offsets keep the epoch and the local minute grids on the same
+// boundaries, preserving the instant — 01:15:45 EST floors to 01:15
+// EST, its real minute.
+export function rowCoverage(start: dayjs.Dayjs, rowUnit: 'hour' | 'day' | 'month', cutoff: dayjs.Dayjs): RowCoverage {
+  const base = rowUnit === 'hour'
+    ? repeatRuns(start) ?? [{ from: start.valueOf(), to: start.add(1, 'hour').valueOf() }]
+    : [{ from: start.valueOf(), to: start.add(1, rowUnit).valueOf() }];
+  const clamp = floorMinute(cutoff).valueOf();
+  const runs: Array<{ from: number; to: number }> = [];
+  for (const r of base) {
+    const to = Math.min(r.to, clamp);
+    if (to > r.from) runs.push({ from: r.from, to });
+  }
+  // Whole-minute extent (see floorMinute above): a cutoff inside the unit's
+  // FIRST minute floors to the unit start and would drop a row that
+  // demonstrably holds data — read at least the first whole minute then (a
+  // cutoff at or before the unit start still reads as no recorded data).
+  if (runs.length === 0 && cutoff.isAfter(start)) {
+    runs.push({ from: start.valueOf(), to: start.valueOf() + 60000 });
+  }
+  let coverage = 0;
+  for (const r of runs) coverage += (r.to - r.from) / 60000;
+  return { runs, coverage };
 }
 
 // rowCoverageEnd returns the instant an hourly row's recorded value extends
-// to: one row unit after its start, extended through a DST fall-back repeat,
-// and capped at `cutoff` read as WHOLE MINUTES (the minute-grid floor with
-// the first-minute rescue — see overlapFractions). Shared by
-// bucketWindowShare and overlapFractions so the KPI proration and the
-// sub-hour chart split divide by the SAME coverage.
-//
-// DST fall-back repeats a wall-clock hour (01:00 EDT then 01:00 EST) and
-// both occurrences truncate to the SAME hourly row, so its recorded value
-// covers two elapsed hours. The elapsed +1h step lands on the same
-// wall-clock hour exactly then (spring-forward skips an hour and lands
-// two ahead; half-hour zones like Lord Howe land on :30) — walk minute by
-// minute to the first instant whose wall-clock hour differs, which is the
-// second occurrence's end in every transition shape. A window crossing
-// the repeat hour must divide by this real coverage, never by 60 minutes
-// (that would inflate the share up to 2x). The walk runs BEFORE the
-// whole-minute cutoff clamp, so a repeated hour whose cutoff is patched
-// early reads its floored extent like any other row.
+// to: the end of its LAST coverage run (see rowCoverage), capped at `cutoff`
+// read as WHOLE MINUTES. Only the >-0 gate of hasLiveCell consumes the bare
+// instant; every extent-aware consumer reads the runs' coverage directly.
 function rowCoverageEnd(start: dayjs.Dayjs, rowUnit: 'hour' | 'day' | 'month', cutoff: dayjs.Dayjs): dayjs.Dayjs {
-  let covEnd = start.add(1, rowUnit);
-  if (rowUnit === 'hour' && isRepeatHour(start)) {
-    while (covEnd.hour() === start.hour() && covEnd.diff(start, 'minute', true) < 180) {
-      covEnd = covEnd.add(1, 'minute');
-    }
-  }
-  if (covEnd.isAfter(cutoff)) {
-    // Whole-minute extent (see overlapFractions): cutoff floors to the
-    // minute grid, so the coverage is a function of the window, not the
-    // refresh clock (the raw fetch time would shrink every window total
-    // between 30s auto-refreshes). A cutoff inside the unit's FIRST minute
-    // floors to the unit start and would drop a row that demonstrably holds
-    // data — read at least the first whole minute then (a cutoff at or
-    // before the unit start still reads as no recorded data).
-    //
-    // The floor must NOT go through dayjs's startOf('minute'): on the
-    // fall-back's repeated hour a second-occurrence cutoff (01:15:45 EST)
-    // floors to 01:15 EST — wall-clock fields that ALSO exist in the first
-    // occurrence — and the ambiguous-local reconstruction inside the JS
-    // Date setter re-anchors the instant to the FIRST occurrence (01:15
-    // EDT, one hour earlier). The coverage would then end before a live
-    // window's start and the whole recent usage reads 0 (the "#135 line
-    // ends at the real last in-window value" contract), prorated wrong
-    // everywhere else. Floor on the epoch instead (floorMinute): whole-
-    // minute offsets keep the epoch and the local minute grids on the same
-    // boundaries, preserving the instant — 01:15:45 EST floors to 01:15
-    // EST, its real minute.
-    covEnd = floorMinute(cutoff);
-    const minEnd = start.add(1, 'minute');
-    if (covEnd.isBefore(minEnd) && cutoff.isAfter(start)) covEnd = minEnd;
-  }
-  return covEnd;
+  const { runs } = rowCoverage(start, rowUnit, cutoff);
+  return runs.length > 0 ? dayjs(runs[runs.length - 1].to) : dayjs(start.valueOf());
 }
 
 // overlapFractions splits ONE hourly row across the sub-hour axis buckets
 // overlapping the WINDOW [since, until), returning [axisIndex, fraction]
-// pairs. A row covers [hour, hour+1h) — the repeated hour's 120 minutes on
-// a DST fall-back night (see rowCoverageEnd) — but only up to `cutoff`: the
+// pairs. A row covers [hour, hour+1h) — on a DST fall-back night the
+// repeated hour's real coverage from rowCoverage (120 contiguous minutes
+// for whole-hour shifts like New York; 90 for half-hour Lord Howe; two
+// runs with a gap for the 45-minute-misaligned Chatham shift) — but only
+// up to `cutoff`: the
 // time its value was recorded: the current hour accumulates live usage, so
 // a PAST window (previous period, calendar preset) shares its boundary hour
 // with the live window, and that hour's value must be divided by its real
@@ -740,16 +902,18 @@ function overlapFractions(
   liveCell: boolean,
 ): Array<[number, number]> {
   const h = dayjs(hourBucket).startOf('hour');
-  const covEnd = rowCoverageEnd(h, 'hour', cutoff);
-  const coverage = covEnd.diff(h, 'minute', true);
-  if (coverage <= 0) return [];
-  const perMin = 1 / coverage;
+  const row = rowCoverage(h, 'hour', cutoff);
+  if (row.coverage <= 0) return [];
+  const perMin = 1 / row.coverage;
   const out: Array<[number, number]> = [];
   if (isRepeatHour(h) || isRepeatHour(h.subtract(1, 'hour'))) {
-    // DST fall-back: the repeated wall-clock hour covers two elapsed hours.
-    // isRepeatHour(h) = the row anchors on the FIRST occurrence; the
-    // subtract(1,'hour') variant catches a row SERIALIZED with the second
-    // occurrence's offset (hour_bucket "01:00 EST" — today's server
+    // DST fall-back: the repeated wall-clock hour covers two elapsed hours
+    // (a non-contiguous pair of runs for the 15-minute-misaligned Chatham
+    // shift — see repeatRuns; each run iterated separately here, so the gap
+    // between them, which displays the OTHER row's hour, never counts for
+    // this row). isRepeatHour(h) = the row anchors on the FIRST occurrence;
+    // the subtract(1,'hour') variant catches a row SERIALIZED with the
+    // second occurrence's offset (hour_bucket "01:00 EST" — today's server
     // truncates to the local hour and merges both occurrences into the
     // first's row, but a future backend or serialization variant could
     // keep the -05:00 row). dayjs's startOf('hour') above re-anchors the
@@ -772,7 +936,6 @@ function overlapFractions(
     // same window and rows.
     const idx = new Map<string, number>();
     for (let i = 0; i < starts.length; i++) idx.set(starts[i].format('YYYY-MM-DD HH:mm'), i);
-    const lo = Math.max(h.valueOf(), since.valueOf());
     // The live cell (see hasLiveCell) lies past until: the row's coverage
     // extends into it, so the fold must cover up to the cell's end there
     // (never past it — beyond the cell the row belongs to the next
@@ -781,24 +944,26 @@ function overlapFractions(
     // label duplicates a first-occurrence tick, so the point is skipped and
     // the cell's minutes fold onto that existing tick — the same coverage
     // bucketWindowShare counts for the KPI.
-    const hi = liveCell
-      ? Math.min(covEnd.valueOf(), until.add(stepMin, 'minute').valueOf())
-      : Math.min(covEnd.valueOf(), until.valueOf());
+    const cellHi = liveCell ? until.add(stepMin, 'minute').valueOf() : until.valueOf();
     const counts = new Map<number, number>(); // axis index -> covered ms
     let lost = 0; // ms whose wall-clock label the axis cannot show
-    for (let t = lo; t < hi; ) {
-      // Next WALL-clock minute boundary (TZ-aware — half-hour zones like
-      // Lord Howe do not align with epoch minutes); on a boundary the
-      // whole minute counts.
-      const wallMs = new Date(t).getSeconds() * 1000 + new Date(t).getMilliseconds();
-      const next = Math.min(t + (wallMs === 0 ? 60000 : 60000 - wallMs), hi);
-      const minute = new Date(t).getMinutes();
-      const cellMs = stepMin === 15 ? t - (minute % 15) * 60000 : t;
-      const i = idx.get(dayjs(cellMs).format('YYYY-MM-DD HH:mm'));
-      const ms = next - t;
-      if (i !== undefined) counts.set(i, (counts.get(i) ?? 0) + ms);
-      else lost += ms;
-      t = next;
+    for (const run of row.runs) {
+      const lo = Math.max(run.from, since.valueOf());
+      const hi = Math.min(run.to, cellHi);
+      for (let t = lo; t < hi; ) {
+        // Next WALL-clock minute boundary (TZ-aware — half-hour zones like
+        // Lord Howe do not align with epoch minutes); on a boundary the
+        // whole minute counts.
+        const wallMs = new Date(t).getSeconds() * 1000 + new Date(t).getMilliseconds();
+        const next = Math.min(t + (wallMs === 0 ? 60000 : 60000 - wallMs), hi);
+        const minute = new Date(t).getMinutes();
+        const cellMs = stepMin === 15 ? t - (minute % 15) * 60000 : t;
+        const i = idx.get(dayjs(cellMs).format('YYYY-MM-DD HH:mm'));
+        const ms = next - t;
+        if (i !== undefined) counts.set(i, (counts.get(i) ?? 0) + ms);
+        else lost += ms;
+        t = next;
+      }
     }
     if (lost > 0 && counts.size > 0) {
       const per = Math.floor(lost / counts.size);
@@ -818,17 +983,18 @@ function overlapFractions(
       let rem = lost % starts.length;
       for (let i = 0; i < starts.length; i++) counts.set(i, per + (rem-- > 0 ? 1 : 0));
     }
-    const coverageMs = covEnd.valueOf() - h.valueOf();
+    const coverageMs = row.runs.reduce((a, r) => a + (r.to - r.from), 0);
     for (const [i, c] of counts) out.push([i, c / coverageMs]);
     return out;
   }
+  const covEnd = row.runs[0].to;
   for (let i = 0; i < starts.length; i++) {
     const s = starts[i];
     const e = s.add(stepMin, 'minute');
     // The appended live cell starts at `until` (the window's end): its
     // recorded slice reaches to the row's coverage end, not to `until`.
-    const clampEnd = s.valueOf() >= until.valueOf() ? covEnd.valueOf() : until.valueOf();
-    const overlap = Math.min(e.valueOf(), covEnd.valueOf(), clampEnd)
+    const clampEnd = s.valueOf() >= until.valueOf() ? covEnd : until.valueOf();
+    const overlap = Math.min(e.valueOf(), covEnd, clampEnd)
       - Math.max(s.valueOf(), h.valueOf(), since.valueOf());
     if (overlap > 0) out.push([i, perMin * (overlap / 60000)]);
   }
@@ -843,8 +1009,10 @@ function overlapFractions(
 //
 // A bucket covers [start, start+unit); its recorded value only covers up to
 // `cutoff` (the fetch time) — the bucket containing cutoff accumulates live
-// usage, so its value is divided by the real coverage (rowCoverageEnd, which
-// also spans a DST fall-back's repeated hour), never by a window boundary (a
+// usage, so its value is divided by the real coverage (rowCoverage, which
+// also spans a DST fall-back's repeated hour — as one contiguous run for
+// whole-hour and half-hour shifts, two runs for the misaligned Chatham
+// shift), never by a window boundary (a
 // past window sharing that hour must not inflate it). The coverage reads the
 // recorded extent as WHOLE MINUTES (cutoff floored to the minute grid — see
 // overlapFractions): the row value is a per-request accumulation whose last
@@ -891,8 +1059,8 @@ export function bucketWindowShare(
   // calendar unit, sub-hour (minute/min15) stays on the hour.
   const rowUnit = granularity === 'day' ? 'day' : granularity === 'month' ? 'month' : 'hour';
   const start = rowUnit === 'hour' ? h.startOf('hour') : rowUnit === 'day' ? h.startOf('day') : h.startOf('month');
-  const covEnd = rowCoverageEnd(start, rowUnit, cutoff);
-  const coverage = covEnd.diff(start, 'minute', true);
+  const row = rowCoverage(start, rowUnit, cutoff);
+  const coverage = row.coverage;
   if (coverage <= 0) return 0;
   // The live cell exists when the row's recorded slice reaches past `until`
   // — the gate is the SAME hasLiveCell the chart side uses. On the repeated
@@ -904,7 +1072,13 @@ export function bucketWindowShare(
   // belongs to the current period there.
   const liveCell = hasLiveCell(until, since, cutoff, granularity, liveExtend);
   const stepMin = STEP_MIN[granularity];
-  let overlap = Math.max(0, Math.min(covEnd.valueOf(), until.valueOf()) - Math.max(start.valueOf(), since.valueOf()));
+  // Overlap is summed over the row's coverage RUNS, so the gap between a
+  // misaligned repeat's runs (displaying the OTHER row's hour) never counts
+  // for this row — the chart's fold iterates the same runs.
+  let overlap = 0;
+  for (const r of row.runs) {
+    overlap += Math.max(0, Math.min(r.to, until.valueOf()) - Math.max(r.from, since.valueOf()));
+  }
   if (liveCell) {
     // The row's recorded slice inside the live cell [until, until+step)
     // counts too — the chart distributes it there (overlapFractions clamps
@@ -912,8 +1086,9 @@ export function bucketWindowShare(
     const cellEnd = stepMin != null
       ? until.add(stepMin, 'minute')
       : until.add(1, granularity === 'hour' ? 'hour' : granularity === 'day' ? 'day' : 'month');
-    const liveSlice = Math.min(covEnd.valueOf(), cellEnd.valueOf()) - Math.max(start.valueOf(), until.valueOf());
-    overlap += Math.max(0, liveSlice);
+    for (const r of row.runs) {
+      overlap += Math.max(0, Math.min(r.to, cellEnd.valueOf()) - Math.max(r.from, until.valueOf()));
+    }
   }
   if (overlap <= 0) return 0;
   return (overlap / 60000) / coverage;
@@ -1161,19 +1336,26 @@ function boundaryShare(
   // resolves an ambiguous bound to the first pass — see activityWindow's
   // time.Date in admin.go), and bucketWindowShare's hour_bucket string
   // round-trip resolves to that same instant. A start rebuilt onto the
-  // SECOND pass (floorWindowUntil's rebuild for a second-pass bound — only
-  // reachable from offset-bearing instants today, like overlapFractions'
-  // serialization-variant safety net) would measure only a fraction of the
-  // row's coverage (60 of the merged 120 minutes — 60 of 90 in half-hour
-  // shift zones like Lord Howe); step it back to the first pass so the
-  // coverage and the overlap clamp match bucketWindowShare's anchor.
+  // SECOND pass (floorWindowUntil's rebuild for a second-pass bound — now
+  // reachable for the 15-minute-misaligned Chatham shift, whose fixed floor
+  // lands a custom range's last bucket at the transition 14:00Z, wall
+  // 02:45:00 +12:45) would measure only a fraction of the row's coverage
+  // (60 of the merged 120 minutes — 60 of 90 in half-hour shift zones like
+  // Lord Howe, and 60 of 75 on Chatham's field-02 row); rebuild the anchor
+  // from the ambiguous wall-clock instead — minute(0) resolves to the FIRST
+  // pass (06:00Z -> 05:00Z in New York, 15:00Z -> 14:00Z on Lord Howe, and
+  // 14:00Z -> 12:15Z on Chatham, which subtract(1, 'hour') can never reach
+  // — the second pass there starts 105 minutes after the anchor).
   if (rowUnit === 'hour' && isRepeatHour(start.subtract(1, 'hour'))) {
-    start = start.subtract(1, 'hour');
+    start = start.minute(0).second(0).millisecond(0);
   }
-  const covEnd = rowCoverageEnd(start, rowUnit, cutoff);
-  const coverage = covEnd.diff(start, 'minute', true);
+  const row = rowCoverage(start, rowUnit, cutoff);
+  const coverage = row.coverage;
   if (coverage <= 0) return 0;
-  const overlap = Math.min(covEnd.valueOf(), until.valueOf()) - Math.max(start.valueOf(), since.valueOf());
+  let overlap = 0;
+  for (const r of row.runs) {
+    overlap += Math.max(0, Math.min(r.to, until.valueOf()) - Math.max(r.from, since.valueOf()));
+  }
   return overlap > 0 ? (overlap / 60000) / coverage : 0;
 }
 
