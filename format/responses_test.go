@@ -162,6 +162,75 @@ func TestResponsesRequestToChatCompletionImageAndChoices(t *testing.T) {
 	}
 }
 
+func TestResponsesRequestToChatCompletionToolChoice(t *testing.T) {
+	// The Responses API's forced-function tool_choice is the FLAT form
+	// {"type":"function","name":"x"} (canonical per the OpenAI spec), while
+	// chat completions requires the NESTED
+	// {"type":"function","function":{"name":"x"}}. Everything else — string
+	// forms, the legacy nested object form, other object forms (e.g.
+	// allowed_tools) and null — passes through unchanged.
+	cases := []struct {
+		name string
+		in   string // tool_choice JSON as sent by the client
+		want string // tool_choice JSON expected in the chat request
+	}{
+		{
+			name: "flat function object",
+			in:   `{"type":"function","name":"get_weather"}`,
+			want: `{"function":{"name":"get_weather"},"type":"function"}`,
+		},
+		{
+			name: "auto string",
+			in:   `"auto"`,
+			want: `"auto"`,
+		},
+		{
+			name: "none string",
+			in:   `"none"`,
+			want: `"none"`,
+		},
+		{
+			name: "required string",
+			in:   `"required"`,
+			want: `"required"`,
+		},
+		{
+			name: "legacy nested function object",
+			in:   `{"type":"function","function":{"name":"get_weather"}}`,
+			want: `{"function":{"name":"get_weather"},"type":"function"}`,
+		},
+		{
+			name: "allowed_tools object",
+			in:   `{"type":"allowed_tools","mode":"auto","tools":[{"type":"function","name":"get_weather"}]}`,
+			want: `{"mode":"auto","tools":[{"name":"get_weather","type":"function"}],"type":"allowed_tools"}`,
+		},
+		{
+			name: "null",
+			in:   `null`,
+			want: `null`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := ResponsesRequestToChatCompletion([]byte(`{"model":"m","input":"hi","tool_choice":`+tc.in+`}`), "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var req map[string]interface{}
+			if err := json.Unmarshal(out, &req); err != nil {
+				t.Fatal(err)
+			}
+			got, err := json.Marshal(req["tool_choice"])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != tc.want {
+				t.Errorf("tool_choice = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestResponsesRequestToAnthropic(t *testing.T) {
 	body := `{
 		"model": "claude-sonnet",

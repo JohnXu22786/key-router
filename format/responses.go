@@ -147,12 +147,16 @@ func ResponsesRequestToChatCompletion(body []byte, modelOverride string) ([]byte
 		}
 	}
 
-	// tools and tool_choice have identical schemas in both protocols
+	// tools pass through unchanged
 	if v, ok := rReq["tools"]; ok {
 		out["tools"] = v
 	}
+	// tool_choice: the Responses forced-function object is the flat form
+	// {"type":"function","name":"x"}, but chat completions requires the
+	// nested form — translate it (strings and the legacy nested form pass
+	// through unchanged, see responsesToolChoiceToChat).
 	if v, ok := rReq["tool_choice"]; ok {
-		out["tool_choice"] = v
+		out["tool_choice"] = responsesToolChoiceToChat(v)
 	}
 
 	// text.format → response_format
@@ -263,6 +267,38 @@ func responsesInputItemToChat(item interface{}, systemParts *[]string) []interfa
 		}}
 	}
 	return nil
+}
+
+// responsesToolChoiceToChat maps a Responses API tool_choice onto chat
+// completions. The Responses API's forced-function object is the FLAT form
+// {"type":"function","name":"x"} (canonical per the OpenAI spec), while chat
+// completions requires the NESTED form
+// {"type":"function","function":{"name":"x"}}. String forms
+// ("auto"/"none"/"required") and the legacy nested object form pass through
+// unchanged.
+func responsesToolChoiceToChat(v interface{}) interface{} {
+	if _, ok := v.(string); ok {
+		return v
+	}
+	m, ok := safeMap(v)
+	if !ok {
+		return v
+	}
+	if safeStringOrDefault(m, "type", "") != "function" {
+		return v
+	}
+	if name, ok := safeString(m, "name"); ok && name != "" {
+		// flat Responses form → nested chat form
+		return map[string]interface{}{
+			"type": "function",
+			"function": map[string]interface{}{
+				"name": name,
+			},
+		}
+	}
+	// No flat name — the legacy nested form ({"type":"function",
+	// "function":{...}}) or an unknown variant: pass through unchanged.
+	return v
 }
 
 // responsesFileToChat converts a Responses API input_file part into a chat
