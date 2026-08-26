@@ -990,6 +990,66 @@ export function stackedData<T extends BucketedRow>(
   return rows;
 }
 
+// recomputeFromSeries rebuilds a response's summary and metric total from
+// its bucket x group series grid, following the server's aggregation shape
+// (see admin.go): min/max/avg over the buckets with a POSITIVE value
+// (the grid cannot distinguish a present-but-zero bucket from an absent
+// one, so "positive" is the implementable approximation — the convention
+// resampleResponse already used), value = the LAST bucket, percent = the
+// group's share of the grid's total (top-N + Other; the server divides by
+// every group's total, but the fold-away groups cannot be re-derived from
+// the scaled grid and keep their original rows below).
+// Shared by resampleResponse and prorateBoundaryBuckets — both modify the
+// series values and must re-derive the summed fields so every consumer
+// (Trends' deltas, Explore's table) reads the PRORATED numbers, never the
+// server's raw widened-window ones. Summary rows for groups OUTSIDE the
+// series grid (beyond the server's top-N) keep their original values: the
+// response only carries their totals, so they cannot be re-derived.
+function recomputeFromSeries(
+  resp: ActivityResponse,
+  series: ActivitySeriesPoint[],
+  buckets: string[],
+): { summary: ActivityGroupSummary[]; totals: ActivityResponse['totals'] } {
+  const groups = Array.from(new Set(series.map(s => s.group)));
+  const acc = new Map<string, Map<string, number>>();
+  for (const p of series) {
+    if (p.value === 0) continue;
+    let base = acc.get(p.group);
+    if (!base) { base = new Map(); acc.set(p.group, base); }
+    base.set(p.bucket, (base.get(p.bucket) ?? 0) + p.value);
+  }
+  const groupSum = new Map<string, number>();
+  let totalSum = 0;
+  for (const g of groups) {
+    const s = buckets.reduce((a, b) => a + (acc.get(g)?.get(b) ?? 0), 0);
+    groupSum.set(g, s);
+    totalSum += s;
+  }
+  const summary: ActivityGroupSummary[] = groups.map(g => {
+    const vals = buckets.map(b => acc.get(g)?.get(b) ?? 0);
+    const nonZero = vals.filter(v => v > 0);
+    const sum = groupSum.get(g) ?? 0;
+    return {
+      group: g,
+      min: nonZero.length ? Math.min(...nonZero) : 0,
+      max: nonZero.length ? Math.max(...nonZero) : 0,
+      avg: nonZero.length ? sum / nonZero.length : 0,
+      sum,
+      value: vals[vals.length - 1] ?? 0,
+      percent: totalSum > 0 ? (sum / totalSum) * 100 : 0,
+    };
+  });
+  const gridGroups = new Set(groups);
+  summary.push(...resp.summary.filter(s => !gridGroups.has(s.group)));
+  const totals = { ...resp.totals };
+  const metricTotal = series.reduce((a, p) => a + p.value, 0);
+  if (resp.metric === 'spend') totals.spend = metricTotal;
+  else if (resp.metric === 'tokens') totals.tokens = metricTotal;
+  else if (resp.metric === 'requests') totals.requests = metricTotal;
+  else if (resp.metric === 'cache') totals.cache = metricTotal;
+  return { summary, totals };
+}
+
 // resampleResponse re-samples an HOURLY-rolled ActivityResponse onto a
 // sub-hour client axis (the Trends/Explore API rolls up at most hourly —
 // see activityWindow in admin.go). Every hourly series point is distributed
@@ -1039,40 +1099,150 @@ export function resampleResponse(
       series.push({ bucket: b, group: g, value: v, is_zero: v === 0 });
     }
   }
-  const groupSum = new Map<string, number>();
-  let totalSum = 0;
-  for (const g of groups) {
-    const s = buckets.reduce((a, b) => a + (acc.get(g)?.get(b) ?? 0), 0);
-    groupSum.set(g, s);
-    totalSum += s;
-  }
-  const summary: ActivityGroupSummary[] = groups.map(g => {
-    const vals = buckets.map(b => acc.get(g)?.get(b) ?? 0);
-    const nonZero = vals.filter(v => v > 0);
-    const sum = groupSum.get(g) ?? 0;
-    return {
-      group: g,
-      min: nonZero.length ? Math.min(...nonZero) : 0,
-      max: nonZero.length ? Math.max(...nonZero) : 0,
-      avg: nonZero.length ? sum / nonZero.length : 0,
-      sum,
-      value: vals[vals.length - 1] ?? 0,
-      percent: totalSum > 0 ? (sum / totalSum) * 100 : 0,
-    };
-  });
-  // Groups folded away server-side (beyond top-N) keep their ORIGINAL
-  // summary rows: the response only carries their totals, so they cannot be
-  // re-bucketed — Trends' deltas for them stay on the server's raw sums,
-  // exactly as before this change (the chart itself only draws top-N + Other).
-  const resampledGroups = new Set(groups);
-  summary.push(...resp.summary.filter(s => !resampledGroups.has(s.group)));
-  const totals = { ...resp.totals };
-  const metricTotal = series.reduce((a, p) => a + p.value, 0);
-  if (resp.metric === 'spend') totals.spend = metricTotal;
-  else if (resp.metric === 'tokens') totals.tokens = metricTotal;
-  else if (resp.metric === 'requests') totals.requests = metricTotal;
-  else if (resp.metric === 'cache') totals.cache = metricTotal;
+  const { summary, totals } = recomputeFromSeries(resp, series, buckets);
   return { ...resp, rollup: granularity, buckets, series, summary, totals };
+}
+
+// boundaryShare mirrors bucketWindowShare for a whole bucket whose START is
+// known as an instant: the same coverage (rowCoverageEnd — the live bucket's
+// recorded extent caps the denominator, cutoff floored to whole minutes)
+// and the same clamped window overlap. The windows that reach this path are
+// custom picks and past periods, which never live-extend (see
+// liveExtensionEligible), so the live-cell branch of bucketWindowShare is
+// excluded by construction. bucketWindowShare itself only accepts
+// hour_bucket STRINGS (the database serialization), and the string
+// round-trip re-anchors a fall-back's SECOND-occurrence start through the
+// ambiguous wall-clock (dayjs's setter resolves it to the FIRST occurrence —
+// the exact trap floorWindowUntil's rebuild exists to dodge, see its
+// comment), so for known instants the share is computed directly on the
+// epoch instead.
+function boundaryShare(
+  start: dayjs.Dayjs,
+  since: dayjs.Dayjs,
+  until: dayjs.Dayjs,
+  cutoff: dayjs.Dayjs,
+  granularity: Granularity,
+): number {
+  const rowUnit = granularity === 'day' ? 'day' : granularity === 'month' ? 'month' : 'hour';
+  // The server anchors a fall-back's repeated hour on its FIRST occurrence
+  // (billing truncates rows to the local hour; the endpoint's widening also
+  // resolves an ambiguous bound to the first pass — see activityWindow's
+  // time.Date in admin.go), and bucketWindowShare's hour_bucket string
+  // round-trip resolves to that same instant. A start rebuilt onto the
+  // SECOND pass (floorWindowUntil's rebuild for a second-pass bound — only
+  // reachable from offset-bearing instants today, like overlapFractions'
+  // serialization-variant safety net) would measure only a fraction of the
+  // row's coverage (60 of the merged 120 minutes — 60 of 90 in half-hour
+  // shift zones like Lord Howe); step it back to the first pass so the
+  // coverage and the overlap clamp match bucketWindowShare's anchor.
+  if (rowUnit === 'hour' && isRepeatHour(start.subtract(1, 'hour'))) {
+    start = start.subtract(1, 'hour');
+  }
+  const covEnd = rowCoverageEnd(start, rowUnit, cutoff);
+  const coverage = covEnd.diff(start, 'minute', true);
+  if (coverage <= 0) return 0;
+  const overlap = Math.min(covEnd.valueOf(), until.valueOf()) - Math.max(start.valueOf(), since.valueOf());
+  return overlap > 0 ? (overlap / 60000) / coverage : 0;
+}
+
+// prorateBoundaryBuckets fixes the SERVER-bucketed boundary overcount for
+// custom ranges whose picked bounds cut mid-bucket at the range granularity
+// (e.g. a 14:37-18:22 pick -> hour). The activity endpoint widens the query
+// window to the buckets CONTAINING the raw bounds (activityWindow in
+// admin.go) and sums the FULL boundary rows into the response: rows in
+// [14:00, 14:37) inflate the first bar and [18:22, 19:00) the last, plus
+// the summary sums/value/min/max/avg/percent and the metric total. The
+// Overview flow prorates those exact rows with bucketWindowShare (its KPI
+// and charts read the same hour_bucket rows), so the same window is correct
+// there — this mirrors that share for the already-aggregated response: each
+// boundary bucket's value is scaled by the fraction of its recorded extent
+// that lies inside [since, until) (boundaryShare), interior buckets are
+// unchanged, and the summed fields are recomputed from the scaled grid
+// (recomputeFromSeries). The result agrees with the Overview computation
+// for the same window and rows; a boundary bucket whose share is 1 (fully
+// in-window) is left untouched and the response is returned as-is when no
+// bucket is partial.
+//
+// The gate is EXACTLY the query shape that overcounts:
+//   - the response rollup must equal the range granularity — the server
+//     bucketed at the window's own scale. A COARSER rollup (Explore's day
+//     rollup over an hour-granularity range, week/total anywhere) sums
+//     whole boundary days into its boundary bars on purpose (the accepted
+//     residual-4 behavior) and is never prorated; a FINER rollup (Explore's
+//     hour rollup over a day-granularity range) overcounts its own hourly
+//     boundary bars the same way but is out of this fix's scope (the same
+//     residual as the coarser ones — the shares would have to be computed at
+//     the rollup's scale, not the range's); the sub-hour granularities are
+//     returned unchanged by the first gate below — Trends' sub-hour ranges
+//     never even reach this function (resampleResponse handles them),
+//     while Explore's pass through and are skipped there.
+//   - a bound must be MID-bucket at that granularity: preset ranges arrive
+//     snapped to their own grid (Activity.tsx), and the query either
+//     aligned to the boundary (exclusiveUntil — the previous periods) or
+//     intentionally kept the live bucket, so their responses are already
+//     exact and returned unchanged.
+//   - the BLENDED metric is excluded entirely: its cells are RATES. A rate
+//     is invariant under the window overlap (the in-window slice carries the
+//     same rate as the whole bucket under the uniform-within-bucket
+//     assumption — the Overview rate series prorates numerator and
+//     denominator alike), so scaling a rate bar by a time share would
+//     invent an error where the server's rate is already right, and the
+//     summary can't be re-derived from rates alone (it needs the cell's
+//     spend/tokens, which the response does not carry).
+//
+// `untilSent` is the `until` the QUERY actually carried (the
+// queryWindowUntil result), which locates the response's last bucket (the
+// bucket containing it); it differs from the user's `until` exactly when
+// the query floored to the boundary. `cutoff` is the fetch time (like the
+// Overview's cutNow): the live bucket's recorded extent caps the boundary
+// denominator, so a custom range ending in the live hour keeps its full
+// accumulated value, exactly like the Overview proration.
+export function prorateBoundaryBuckets(
+  resp: ActivityResponse,
+  since: dayjs.Dayjs,
+  until: dayjs.Dayjs,
+  untilSent: dayjs.Dayjs,
+  cutoff: dayjs.Dayjs,
+  granularity: Granularity,
+  rollup: string,
+): ActivityResponse {
+  if (granularity === 'minute' || granularity === 'min15') return resp;
+  if (rollup !== granularity) return resp;
+  if (resp.metric === 'blended') return resp;
+  if (resp.buckets.length === 0) return resp;
+  const shares = new Map<string, number>();
+  const firstStart = floorWindowUntil(since, granularity);
+  if (!firstStart.isSame(since)) {
+    shares.set(resp.buckets[0], boundaryShare(firstStart, since, until, cutoff, granularity));
+  }
+  const lastStart = floorWindowUntil(untilSent, granularity);
+  if (!lastStart.isSame(until)) {
+    // The last bucket of the widened window starts at floor(untilSent) — the
+    // bucket containing the SENT until. It is partial exactly when the user's
+    // until cuts inside it (share < 1): when the query floored to the
+    // boundary (exclusiveUntil), the last bucket lies entirely inside the
+    // window and its share is exactly 1 — skipped below, so the Trends
+    // previous-period response only prorates its first bucket.
+    shares.set(resp.buckets[resp.buckets.length - 1], boundaryShare(lastStart, since, until, cutoff, granularity));
+  }
+  const toApply = new Map<string, number>();
+  for (const [b, share] of shares) {
+    // A share of exactly 1 means the bucket lies entirely inside the window
+    // (the previous-period last bucket, and grid-aligned ends the query
+    // already cut) — skip it so the response stays untouched when nothing
+    // is partial.
+    if (share < 1) toApply.set(b, share);
+  }
+  if (toApply.size === 0) return resp;
+  const series = resp.series.map(p => {
+    const share = toApply.get(p.bucket);
+    // is_zero is rebuilt from the scaled value, so a boundary bucket scaled
+    // to 0 (a share of 0 only arises for a no-data future window) never
+    // claims a value it no longer carries.
+    return share === undefined ? p : { ...p, value: p.value * share, is_zero: p.value * share === 0 };
+  });
+  const { summary, totals } = recomputeFromSeries(resp, series, resp.buckets);
+  return { ...resp, series, summary, totals };
 }
 
 // groupTotals sums a metric per group, sorted descending. An optional

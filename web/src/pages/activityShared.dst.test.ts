@@ -5,7 +5,8 @@
 // leaks into the other suites (which run in the machine's local zone).
 import { describe, it, expect, vi, beforeAll } from 'vitest';
 import dayjs from 'dayjs';
-import { bucketWindowShare, bucketAxis, series, floorWindowUntil } from './activityShared';
+import { bucketWindowShare, bucketAxis, series, floorWindowUntil, prorateBoundaryBuckets } from './activityShared';
+import type { ActivityResponse } from '../api/client';
 
 beforeAll(() => {
   vi.stubEnv('TZ', 'America/New_York');
@@ -65,6 +66,63 @@ describe('bucketWindowShare — DST fall-back', () => {
       'hour',
     );
     expect(share).toBeCloseTo(70 / 120, 10);
+  });
+});
+
+// prorateBoundaryBuckets prorates the boundary buckets of a server-bucketed
+// custom range by the same share bucketWindowShare gives the merged rows.
+// The fall-back's repeated hour must anchor BOTH paths to the SAME instant
+// (the merged row's first occurrence): a boundary share measured from the
+// second pass would divide a 120-minute row by 60.
+describe('prorateBoundaryBuckets — DST fall-back boundary buckets', () => {
+  const resp = (buckets: string[], values: number[]): ActivityResponse => ({
+    metric: 'spend', group_by: 'model', rollup: 'hour',
+    series: buckets.map((b, i) => ({ bucket: b, group: 'a', value: values[i], is_zero: false })),
+    summary: [{ group: 'a', min: 60, max: 120, avg: 75, sum: 300, value: 60, percent: 100 }],
+    buckets,
+    totals: { spend: 300, tokens: 0, requests: 0, cache: 0 },
+  });
+
+  it('prorates a first bucket spanning the repeated hour by the 120-minute coverage', () => {
+    // Custom window [01:10 EDT, 04:10 EST) — the 01:00 bucket holds both
+    // passes (120 elapsed minutes of usage); only [01:10 EDT, 02:00 EDT)
+    // i.e. 110 of them lie inside the window. The 02:00/03:00 buckets are
+    // normal single-pass hours (the fall-back already happened at 02:00).
+    const since = dayjs('2026-11-01T01:10:00');
+    const until = dayjs('2026-11-01T04:10:00');
+    const cutoff = dayjs('2026-11-01T05:00:00');
+    const buckets = ['2026-11-01 01:00', '2026-11-01 02:00', '2026-11-01 03:00', '2026-11-01 04:00'];
+    const out = prorateBoundaryBuckets(resp(buckets, [120, 60, 60, 60]), since, until, until, cutoff, 'hour', 'hour');
+    expect(out.series[0].value).toBeCloseTo(110, 10);
+    expect(out.series[1].value).toBe(60);
+    expect(out.series[3].value).toBeCloseTo(10, 10); // [04:00, 04:10) = 10/60
+    // The prorated response must agree with the Overview per-row proration.
+    expect(bucketWindowShare('2026-11-01T01:00:00', since, until, cutoff, 'hour', false)).toBeCloseTo(110 / 120, 10);
+    expect(bucketWindowShare('2026-11-01T04:00:00', since, until, cutoff, 'hour', false)).toBeCloseTo(10 / 60, 10);
+  });
+
+  it('anchors a SECOND-pass boundary bound to the merged row\'s first occurrence', () => {
+    // An until on the repeated hour's second pass (01:10 EST = one elapsed
+    // hour after 01:10 EDT) is re-anchored by the ENDPOINT itself: Go's
+    // time.Date resolves the ambiguous local hour to the FIRST occurrence,
+    // so the widened window's `to` lands at 06:00Z and the response's
+    // "01:00" bucket carries only the first pass's rows (the second-pass
+    // rows are >= to and excluded). The share must still anchor at the
+    // FIRST occurrence with the 120-minute merged coverage — exactly what
+    // bucketWindowShare's string round-trip resolves to — so the prorated
+    // response agrees with the Overview flow for the same row set.
+    const since = dayjs('2026-10-31T23:30:00'); // EDT, the night before
+    const until = dayjs('2026-11-01T01:10:00').add(1, 'hour'); // second pass, 01:10 EST
+    const cutoff = dayjs('2026-11-01T03:00:00').add(1, 'hour');
+    const buckets = ['2026-10-31 23:00', '2026-11-01 00:00', '2026-11-01 01:00'];
+    const out = prorateBoundaryBuckets(resp(buckets, [30, 60, 60]), since, until, until, cutoff, 'hour', 'hour');
+    // Last bucket 01:00: the carried first-pass value (60) is scaled by the
+    // 70 elapsed in-window minutes of the 120-minute merged row — the same
+    // convention bucketWindowShare applies to those rows. Without the
+    // first-occurrence anchor the share would read 10/60 instead.
+    expect(out.series[2].value).toBeCloseTo(60 * (70 / 120), 10);
+    expect(bucketWindowShare('2026-11-01T01:00:00', since, until, cutoff, 'hour', false)).toBeCloseTo(70 / 120, 10);
+    expect(out.series[0].value).toBeCloseTo(30 * (30 / 60), 10); // [23:30, 00:00) = 30/60
   });
 });
 

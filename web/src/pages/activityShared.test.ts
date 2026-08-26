@@ -5,6 +5,7 @@ import {
   bucketWindowShare, groupTotals, floorWindowUntil, exclusiveUntil, queryWindowUntil,
   fmtTick, fmtBucket, fmtDayLabel, CUSTOM_KEY,
   computeTrending, toChartData, cacheHitRate, resampleResponse, liveExtensionEligible,
+  prorateBoundaryBuckets,
 } from './activityShared';
 import type { ActivityResponse } from '../api/client';
 import type { Granularity } from './activityShared';
@@ -1296,6 +1297,221 @@ describe('resampleResponse — Trends hourly rollup onto a sub-hour axis', () =>
     // starts AT until — excluded, and the totals are unchanged.
     expect(out.series.map(p => p.value)).toEqual([24, 45, 45, 45, 15, 15, 15, 15, 30, 30, 30, 30]);
     expect(out.series.reduce((a, p) => a + p.value, 0)).toBeCloseTo(180 * (53 / 60) + 60 + 120, 6);
+  });
+});
+
+describe('prorateBoundaryBuckets — server-bucketed custom ranges', () => {
+  // The exact shape the activity endpoint returns for a custom range whose
+  // bounds cut mid-bucket: the server widened the query window to the
+  // buckets CONTAINING the raw bounds (activityWindow in admin.go) and
+  // summed the FULL boundary buckets into the response.
+  const hourResp = (vals: number[], buckets = ['2026-08-13 14:00', '2026-08-13 15:00', '2026-08-13 16:00', '2026-08-13 17:00', '2026-08-13 18:00']): ActivityResponse => ({
+    metric: 'spend', group_by: 'model', rollup: 'hour',
+    series: [
+      ...buckets.map((b, i) => ({ bucket: b, group: 'a', value: vals[i], is_zero: vals[i] === 0 })),
+      ...buckets.map((b, i) => ({ bucket: b, group: 'b', value: vals[i] / 2, is_zero: vals[i] === 0 })),
+    ],
+    summary: [
+      { group: 'a', min: 60, max: 60, avg: 60, sum: 300, value: 60, percent: 66.7 },
+      { group: 'b', min: 30, max: 30, avg: 30, sum: 150, value: 30, percent: 33.3 },
+    ],
+    buckets,
+    totals: { spend: 450, tokens: 0, requests: 0, cache: 0 },
+  });
+
+  it('prorates the boundary buckets of a 14:37-18:22 hour range and matches the Overview computation', () => {
+    const since = dayjs('2026-08-13T14:37:00');
+    const until = dayjs('2026-08-13T18:22:00');
+    const cutoff = dayjs('2026-08-13T19:00:00');
+    const out = prorateBoundaryBuckets(hourResp([60, 60, 60, 60, 60]), since, until, until, cutoff, 'hour', 'hour');
+    // First bucket [14:00, 15:00): only [14:37, 15:00) = 23 min inside the
+    // window; last [18:00, 19:00): [18:00, 18:22) = 22 min. Interior buckets
+    // keep their full values.
+    expect(out.series.filter(p => p.group === 'a').map(p => p.value)).toEqual([23, 60, 60, 60, 22]);
+    expect(out.series.filter(p => p.group === 'b').map(p => p.value)).toEqual([11.5, 30, 30, 30, 11]);
+    // Summary rebuilt with server semantics over the prorated buckets.
+    const a = out.summary.find(s => s.group === 'a')!;
+    const b = out.summary.find(s => s.group === 'b')!;
+    expect(a.sum).toBeCloseTo(225, 10);
+    expect(a.min).toBe(22);
+    expect(a.max).toBe(60);
+    expect(a.avg).toBe(45);
+    expect(a.value).toBe(22); // last bucket, like the chart's last bar
+    expect(a.percent).toBeCloseTo((225 / 337.5) * 100, 10);
+    expect(b.sum).toBeCloseTo(112.5, 10);
+    expect(out.totals.spend).toBeCloseTo(337.5, 10);
+    // The Overview flow prorates the SAME boundary rows with
+    // bucketWindowShare (which reads them directly); the prorated response
+    // must agree exactly with that per-row computation.
+    const hours = ['2026-08-13T14:00:00', '2026-08-13T15:00:00', '2026-08-13T16:00:00', '2026-08-13T17:00:00', '2026-08-13T18:00:00'];
+    const overviewA = hours.reduce((acc, h) => acc + 60 * bucketWindowShare(h, since, until, cutoff, 'hour', false), 0);
+    const overviewB = hours.reduce((acc, h) => acc + 30 * bucketWindowShare(h, since, until, cutoff, 'hour', false), 0);
+    expect(a.sum).toBeCloseTo(overviewA, 10);
+    expect(b.sum).toBeCloseTo(overviewB, 10);
+    expect(out.totals.spend).toBeCloseTo(overviewA + overviewB, 10);
+  });
+
+  it('leaves a grid-aligned custom range untouched (the query already excluded the boundary buckets)', () => {
+    const since = dayjs('2026-08-13T14:00:00');
+    const until = dayjs('2026-08-13T18:00:00');
+    // queryWindowUntil sends exclusiveUntil (17:59:59) for an aligned custom
+    // end, so the widened server window ends exactly at 18:00 — the
+    // response carries only full in-window buckets.
+    const untilSent = queryWindowUntil(
+      { key: CUSTOM_KEY, since, until, granularity: 'hour' as Granularity },
+      'hour',
+    );
+    expect(untilSent.format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-13 17:59:59');
+    const r = hourResp([60, 60, 60, 60], ['2026-08-13 14:00', '2026-08-13 15:00', '2026-08-13 16:00', '2026-08-13 17:00']);
+    const out = prorateBoundaryBuckets(r, since, until, untilSent, dayjs('2026-08-13T19:00:00'), 'hour', 'hour');
+    expect(out).toBe(r);
+  });
+
+  it('prorates the Explore equal-rollup case (day-granularity custom, day rollup)', () => {
+    const since = dayjs('2026-08-10T14:00:00');
+    const until = dayjs('2026-08-14T12:30:00');
+    expect(granularityFor(since, until)).toBe('day');
+    const buckets = ['2026-08-10', '2026-08-11', '2026-08-12', '2026-08-13', '2026-08-14'];
+    const r: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'day',
+      series: buckets.map(b => ({ bucket: b, group: 'a', value: 48, is_zero: false })),
+      summary: [{ group: 'a', min: 48, max: 48, avg: 48, sum: 240, value: 48, percent: 100 }],
+      buckets,
+      totals: { spend: 240, tokens: 0, requests: 0, cache: 0 },
+    };
+    const out = prorateBoundaryBuckets(r, since, until, until, dayjs('2026-08-15T10:00:00'), 'day', 'day');
+    // First day [Aug 10 00:00, Aug 11 00:00): [14:00, 24:00) = 10/24; last
+    // day: [00:00, 12:30) = 12.5/24 (the fetch on Aug 15 means the boundary
+    // days' rows are complete); interior days unchanged.
+    expect(out.series.map(p => p.value)).toEqual([20, 48, 48, 48, 25]);
+    expect(out.summary[0].sum).toBeCloseTo(189, 10);
+    expect(out.summary[0].value).toBe(25);
+    expect(out.summary[0].min).toBe(20);
+    expect(out.totals.spend).toBeCloseTo(189, 10);
+  });
+
+  it('leaves coarser AND finer rollups untouched (accepted residual behavior)', () => {
+    const since = dayjs('2026-08-13T14:37:00');
+    const until = dayjs('2026-08-13T18:22:00');
+    const r = hourResp([60, 60, 60, 60, 60]);
+    const cutoff = dayjs('2026-08-13T19:00:00');
+    // Explore's day/week/total rollup over an hour-granularity range: whole
+    // boundary days in the boundary bars by design — never prorated.
+    expect(prorateBoundaryBuckets(r, since, until, until, cutoff, 'hour', 'day')).toBe(r);
+    expect(prorateBoundaryBuckets(r, since, until, until, cutoff, 'hour', 'week')).toBe(r);
+    expect(prorateBoundaryBuckets(r, since, until, until, cutoff, 'hour', 'total')).toBe(r);
+    // A FINER rollup (hour over a day-granularity range) overcounts its own
+    // hourly boundary bars the same way but is outside this fix's scope —
+    // the response must stay exactly as the server returned it. The bounds
+    // are MID-DAY so the first/last-bucket conditions would fire if the
+    // gate were removed — this pins the gate itself.
+    const daySince = dayjs('2026-08-10T14:00:00');
+    const dayUntil = dayjs('2026-08-14T12:30:00');
+    expect(prorateBoundaryBuckets(r, daySince, dayUntil, dayUntil, cutoff, 'day', 'hour')).toBe(r);
+  });
+
+  it('prorates a month-granularity custom range at the month scale', () => {
+    const since = dayjs('2026-03-15T00:00:00');
+    const until = dayjs('2026-06-20T00:00:00');
+    expect(granularityFor(since, until)).toBe('month');
+    const buckets = ['2026-03', '2026-04', '2026-05', '2026-06'];
+    const r: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'month',
+      series: buckets.map(b => ({ bucket: b, group: 'a', value: 62, is_zero: false })),
+      summary: [{ group: 'a', min: 62, max: 62, avg: 62, sum: 248, value: 62, percent: 100 }],
+      buckets,
+      totals: { spend: 248, tokens: 0, requests: 0, cache: 0 },
+    };
+    const out = prorateBoundaryBuckets(r, since, until, until, dayjs('2026-07-01T00:00:00'), 'month', 'month');
+    // March: [Mar 15, Apr 1) = 17/31; June: [Jun 1, Jun 20) = 19/30; the
+    // boundary months' rows are complete (fetch on Jul 1).
+    expect(out.series.map(p => p.value)).toEqual([
+      62 * (17 / 31),
+      62,
+      62,
+      62 * (19 / 30),
+    ]);
+    expect(out.summary[0].sum).toBeCloseTo(62 * (17 / 31) + 62 + 62 + 62 * (19 / 30), 10);
+  });
+
+  it('keeps the last boundary DAY at its full recorded value when the cutoff lies inside it', () => {
+    // The day-scale twin of the live-hour test: [Aug 10 14:00, Aug 14 12:30)
+    // viewed at Aug 14 11:00 — the last day's rows hold only [00:00, 11:00)
+    // of recorded usage, all of it in-window, so the share is 1 and the day
+    // bucketed at 12.5/24 by a naive window overlap would wrongly over-cut.
+    const since = dayjs('2026-08-10T14:00:00');
+    const until = dayjs('2026-08-14T12:30:00');
+    const cutoff = dayjs('2026-08-14T11:00:00');
+    const buckets = ['2026-08-10', '2026-08-11', '2026-08-12', '2026-08-13', '2026-08-14'];
+    const r: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'day',
+      series: buckets.map(b => ({ bucket: b, group: 'a', value: 48, is_zero: false })),
+      summary: [{ group: 'a', min: 48, max: 48, avg: 48, sum: 240, value: 48, percent: 100 }],
+      buckets,
+      totals: { spend: 240, tokens: 0, requests: 0, cache: 0 },
+    };
+    const out = prorateBoundaryBuckets(r, since, until, until, cutoff, 'day', 'day');
+    expect(out.series.map(p => p.value)).toEqual([20, 48, 48, 48, 48]);
+    // The same share the Overview flow gives that day's rows.
+    expect(bucketWindowShare('2026-08-14T00:00:00', since, until, cutoff, 'day', false)).toBe(1);
+  });
+
+  it('leaves the blended metric untouched (rate cells are invariant under the window overlap)', () => {
+    const since = dayjs('2026-08-13T14:37:00');
+    const until = dayjs('2026-08-13T18:22:00');
+    const r: ActivityResponse = {
+      metric: 'blended', group_by: 'model', rollup: 'hour',
+      series: [
+        ...['2026-08-13 14:00', '2026-08-13 15:00', '2026-08-13 16:00', '2026-08-13 17:00', '2026-08-13 18:00']
+          .map(b => ({ bucket: b, group: 'a', value: 2.5, is_zero: false })),
+      ],
+      summary: [{ group: 'a', min: 2.5, max: 2.5, avg: 2.5, sum: 2.5, value: 2.5, percent: 100 }],
+      buckets: ['2026-08-13 14:00', '2026-08-13 15:00', '2026-08-13 16:00', '2026-08-13 17:00', '2026-08-13 18:00'],
+      totals: { spend: 0, tokens: 0, requests: 0, cache: 0 },
+    };
+    expect(prorateBoundaryBuckets(r, since, until, until, dayjs('2026-08-13T19:00:00'), 'hour', 'hour')).toBe(r);
+  });
+
+  it('leaves sub-hour custom ranges untouched (resampleResponse already clips them)', () => {
+    const since = dayjs('2026-08-13T13:00:00');
+    const until = dayjs('2026-08-13T15:00:00');
+    expect(granularityFor(since, until)).toBe('min15');
+    const r = hourResp([60, 60, 60, 60, 60]);
+    expect(prorateBoundaryBuckets(r, since, until, until, dayjs('2026-08-13T15:30:00'), 'min15', 'hour')).toBe(r);
+  });
+
+  it('prorates only the first bucket of the Trends PREVIOUS-period window (its query until was exclusiveUntil)', () => {
+    // Trends' prev window for the 14:37-18:22 custom is [10:37, 14:37) and
+    // sends exclusiveUntil(range.since) = 13:59:59, so the server's last
+    // bucket (13:00) lies ENTIRELY inside the window — only the first
+    // bucket (10:00, holding 10:00-10:37 pre-window rows) overcounts.
+    const prevSince = dayjs('2026-08-13T10:37:00');
+    const since = dayjs('2026-08-13T14:37:00'); // the prev window's end
+    const untilSent = exclusiveUntil(since, 'hour');
+    const buckets = ['2026-08-13 10:00', '2026-08-13 11:00', '2026-08-13 12:00', '2026-08-13 13:00'];
+    const r: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'hour',
+      series: buckets.map(b => ({ bucket: b, group: 'a', value: 60, is_zero: false })),
+      summary: [{ group: 'a', min: 60, max: 60, avg: 60, sum: 240, value: 60, percent: 100 }],
+      buckets,
+      totals: { spend: 240, tokens: 0, requests: 0, cache: 0 },
+    };
+    const out = prorateBoundaryBuckets(r, prevSince, since, untilSent, dayjs('2026-08-13T19:00:00'), 'hour', 'hour');
+    expect(out.series.map(p => p.value)).toEqual([23, 60, 60, 60]);
+    expect(out.summary[0].sum).toBeCloseTo(203, 10);
+  });
+
+  it('keeps the live boundary bucket at its full recorded value when the cutoff lies inside it', () => {
+    // Custom [16:37, 19:22) fetched at 19:10: the 19:00 bucket's rows hold
+    // only [19:00, 19:10) of recorded usage — all of it in-window — so the
+    // share is 1 (the same value bucketWindowShare gives the Overview flow
+    // for that row), and the bucket must NOT be cut.
+    const since = dayjs('2026-08-13T16:37:00');
+    const until = dayjs('2026-08-13T19:22:00');
+    const cutoff = dayjs('2026-08-13T19:10:00');
+    const out = prorateBoundaryBuckets(hourResp([60, 60, 60, 60, 60]), since, until, until, cutoff, 'hour', 'hour');
+    expect(out.series.filter(p => p.group === 'a').map(p => p.value)).toEqual([23, 60, 60, 60, 60]);
+    expect(bucketWindowShare('2026-08-13T19:00:00', since, until, cutoff, 'hour', false)).toBe(1);
   });
 });
 
