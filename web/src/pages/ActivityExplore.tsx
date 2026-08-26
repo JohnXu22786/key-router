@@ -487,7 +487,10 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
             columns={columns}
           />
           <Text type="secondary" style={{ fontSize: 12, marginTop: 8, display: 'block' }}>
-            {data.summary.length} rows · {loadMs}ms
+            {/* summary is the sliced list the table renders (see the slice
+                above); the server's uncapped data.summary would over-count
+                whenever the window holds more groups than the Top-N selector */}
+            {summary.length} rows · {loadMs}ms
           </Text>
         </Card>
       )}
