@@ -444,6 +444,16 @@ func openAIToolChoiceToAnthropic(v interface{}) interface{} {
 				"name": fn["name"],
 			}
 		}
+		// Responses-API flat form: {"type":"function","name":"x"} has no
+		// nested "function" object — read the name off the top level.
+		if _, hasFn := m["function"]; !hasFn {
+			if name, ok := m["name"]; ok {
+				return map[string]interface{}{
+					"type": "tool",
+					"name": name,
+				}
+			}
+		}
 	}
 	return v
 }
