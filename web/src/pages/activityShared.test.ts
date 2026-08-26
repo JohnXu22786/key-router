@@ -3,6 +3,7 @@ import dayjs from 'dayjs';
 import {
   makeRanges, customRange, granularityFor, series, stackedData, bucketAxis,
   bucketWindowShare, groupTotals, floorWindowUntil, exclusiveUntil, queryWindowUntil,
+  prevWindowUntil,
   fmtTick, fmtBucket, fmtDayLabel, CUSTOM_KEY,
   computeTrending, toChartData, cacheHitRate, resampleResponse, liveExtensionEligible,
   prorateBoundaryBuckets,
@@ -451,6 +452,119 @@ describe('queryWindowUntil — the query keeps every in-range bucket', () => {
   it('sub-hour ranges pass the raw range.until (the re-sampling source)', () => {
     expect(w('15m').granularity).toBe('minute');
     expect(queryWindowUntil(w('15m'), 'hour').toISOString()).toBe(w('15m').until.toISOString());
+  });
+});
+
+describe('prevWindowUntil — the previous-period query keeps the mid-bucket since boundary slice', () => {
+  // Mirrors the activity endpoint (activityWindow + buildActivityAxis in
+  // admin.go): a server-bucketed query widens to the rollup buckets
+  // CONTAINING its raw bounds (to = floor(untilQ) + 1 unit), sums the FULL
+  // boundary rows into the response, and emits the floored axis
+  // floor(sinceQ) .. floor(untilQ). Each bucket carries `val`.
+  const serverResp = (g: 'hour' | 'day', sinceQ: dayjs.Dayjs, untilQ: dayjs.Dayjs, val: number): ActivityResponse => {
+    const buckets: string[] = [];
+    const fmt = g === 'hour' ? 'YYYY-MM-DD HH:00' : 'YYYY-MM-DD';
+    for (let t = floorWindowUntil(sinceQ, g); !t.isAfter(untilQ); t = t.add(1, g)) {
+      buckets.push(t.format(fmt));
+    }
+    return {
+      metric: 'spend', group_by: 'model', rollup: g,
+      series: buckets.map(b => ({ bucket: b, group: 'a', value: val, is_zero: false })),
+      summary: [{ group: 'a', min: val, max: val, avg: val, sum: val * buckets.length, value: val, percent: 100 }],
+      buckets,
+      totals: { spend: val * buckets.length, tokens: 0, requests: 0, cache: 0 },
+    };
+  };
+
+  it('a custom hour range with a mid-bucket since keeps its boundary slice in the previous period (no gap, no double count)', () => {
+    // Custom 14:37-18:22 -> hour buckets; the previous period is
+    // [10:37, 14:37). The bucket CONTAINING since, [14:00, 15:00), starts
+    // INSIDE the prev window: its slice [14:00, 14:37) is prev-period data.
+    const since = dayjs('2026-08-13T14:37:00');
+    const until = dayjs('2026-08-13T18:22:00');
+    const prevSince = dayjs('2026-08-13T10:37:00');
+    const cutoff = dayjs('2026-08-13T19:00:00');
+    const gran: 'hour' | 'day' = 'hour';
+    const curRange = { key: CUSTOM_KEY, since, until, granularity: gran };
+    // THE FIX: a mid-bucket since is sent RAW — the old code sent
+    // exclusiveUntil(since) = 13:59:59, whose widened server window ended at
+    // 14:00 and dropped the previous period's last 37 in-window minutes from
+    // BOTH responses (the cur query only prorates [14:37, 15:00)).
+    expect(prevWindowUntil(since, gran).toISOString()).toBe(since.toISOString());
+    // The server response for the raw-since query carries the 14:00 bucket
+    // with its full value.
+    const prevResp = serverResp(gran, prevSince, prevWindowUntil(since, gran), 60);
+    expect(prevResp.buckets).toEqual(['2026-08-13 10:00', '2026-08-13 11:00', '2026-08-13 12:00', '2026-08-13 13:00', '2026-08-13 14:00']);
+    const prevOut = prorateBoundaryBuckets(prevResp, prevSince, since, prevWindowUntil(since, gran), cutoff, gran, gran);
+    // Last bucket [14:00, 15:00): only [14:00, 14:37) = 37/60 lies in the
+    // prev window — the exact share the Overview flow's bucketWindowShare
+    // gives that row (the two pages must agree on identical windows).
+    expect(prevOut.series.map(p => p.value)).toEqual([23, 60, 60, 60, 37]);
+    expect(bucketWindowShare('2026-08-13T14:00:00', prevSince, since, cutoff, gran, false)).toBeCloseTo(37 / 60, 10);
+    // The current period prorates the SAME bucket to its own slice [14:37,
+    // 15:00) = 23/60; prev + cur tile the full hour exactly — the 37-minute
+    // boundary usage is counted once, never lost.
+    const curResp = serverResp(gran, since, queryWindowUntil(curRange, gran), 60);
+    const curOut = prorateBoundaryBuckets(curResp, since, until, queryWindowUntil(curRange, gran), cutoff, gran, gran);
+    expect(curOut.series.map(p => p.value)).toEqual([23, 60, 60, 60, 22]);
+    expect(prevOut.series[4].value + curOut.series[0].value).toBeCloseTo(60, 10);
+    expect(prevOut.summary[0].sum).toBeCloseTo(240, 10); // 23+60+60+60+37 = the whole 4h window
+  });
+
+  it('a custom day range with a mid-day since keeps its boundary day slice in the previous period', () => {
+    // Custom May 10 09:30 - May 20 09:30 -> day buckets; the previous period
+    // is [Apr 30 09:30, May 10 09:30). The day bucket CONTAINING since
+    // (May 10) starts inside the prev window: its slice [May 10 00:00,
+    // 09:30) is prev-period data. The old exclusiveUntil(since) = May 9
+    // 23:59:59 made the server window end at May 10 00:00, losing that
+    // whole 9.5-hour portion.
+    const since = dayjs('2026-05-10T09:30:00');
+    const until = dayjs('2026-05-20T09:30:00');
+    const prevSince = dayjs('2026-04-30T09:30:00');
+    const cutoff = dayjs('2026-05-21T00:00:00');
+    const gran: 'hour' | 'day' = 'day';
+    expect(granularityFor(since, until)).toBe(gran);
+    expect(prevWindowUntil(since, gran).format('YYYY-MM-DD HH:mm')).toBe('2026-05-10 09:30');
+    const prevResp = serverResp(gran, prevSince, prevWindowUntil(since, gran), 48);
+    expect(prevResp.buckets).toContain('2026-05-10'); // the containing day is in the response
+    const prevOut = prorateBoundaryBuckets(prevResp, prevSince, since, prevWindowUntil(since, gran), cutoff, gran, gran);
+    // First day [Apr 30]: [09:30, 24:00) = 14.5/24; last day May 10:
+    // [00:00, 09:30) = 9.5/24; interior days unchanged.
+    expect(prevOut.series.map(p => p.value)).toEqual([29, 48, 48, 48, 48, 48, 48, 48, 48, 48, 19]);
+    expect(bucketWindowShare('2026-05-10T00:00:00', prevSince, since, cutoff, gran, false)).toBeCloseTo(9.5 / 24, 10);
+    // The current period takes the rest of May 10: [09:30, 24:00) = 14.5/24;
+    // prev + cur tile the full day exactly (no gap, no double count).
+    const curResp = serverResp(gran, since, queryWindowUntil({ key: CUSTOM_KEY, since, until, granularity: gran }, gran), 48);
+    const curOut = prorateBoundaryBuckets(curResp, since, until, queryWindowUntil({ key: CUSTOM_KEY, since, until, granularity: gran }, gran), cutoff, gran, gran);
+    expect(curOut.series[0].value).toBe(29);
+    expect(prevOut.series[10].value + curOut.series[0].value).toBeCloseTo(48, 10);
+  });
+
+  it('keeps preset behavior byte-identical: snapped since still excludes the since-aligned bucket', () => {
+    // Preset ranges snap BOTH bounds (Activity.tsx), so a snapped since lies
+    // on the bucket grid and prevWindowUntil falls back to exclusiveUntil —
+    // the exact same query as before the fix.
+    const since1d = floorWindowUntil(dayjs('2026-08-12T16:05:00'), 'hour'); // 1d preset
+    expect(prevWindowUntil(since1d, 'hour').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-12 15:59:59');
+    // A grid-aligned CUSTOM bound takes the same path: its since-aligned
+    // bucket holds no in-window usage.
+    expect(prevWindowUntil(dayjs('2026-08-13T14:00:00'), 'hour').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-13 13:59:59');
+    expect(prevWindowUntil(dayjs('2026-08-03T00:00:00'), 'day').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-02 23:59:59');
+    expect(prevWindowUntil(dayjs('2025-01-01T00:00:00'), 'month').format('YYYY-MM-DD HH:mm:ss')).toBe('2024-12-31 23:59:59');
+    // Sub-hour granularities keep passing the raw since (the re-sampling
+    // data source), like the old subGran branch.
+    expect(prevWindowUntil(dayjs('2026-08-13T14:37:00'), 'minute').format('YYYY-MM-DD HH:mm')).toBe('2026-08-13 14:37');
+    expect(prevWindowUntil(dayjs('2026-08-13T14:37:00'), 'min15').format('YYYY-MM-DD HH:mm')).toBe('2026-08-13 14:37');
+    // The whole downstream shape is unchanged for a snapped since: the prev
+    // response ends at floor(since - 1s) — the since-aligned 16:00 bucket
+    // never enters it — and prorateBoundaryBuckets leaves the response
+    // untouched (its last bucket is fully in-window, share exactly 1).
+    const prevResp = serverResp('hour', dayjs('2026-08-11T16:00:00'), prevWindowUntil(since1d, 'hour'), 60);
+    expect(prevResp.buckets).toHaveLength(24);
+    expect(prevResp.buckets[prevResp.buckets.length - 1]).toBe('2026-08-12 15:00');
+    expect(prevResp.buckets).not.toContain('2026-08-12 16:00');
+    const out = prorateBoundaryBuckets(prevResp, dayjs('2026-08-11T16:00:00'), since1d, prevWindowUntil(since1d, 'hour'), dayjs('2026-08-13T16:05:00'), 'hour', 'hour');
+    expect(out).toBe(prevResp);
   });
 });
 
@@ -1480,25 +1594,27 @@ describe('prorateBoundaryBuckets — server-bucketed custom ranges', () => {
     expect(prorateBoundaryBuckets(r, since, until, until, dayjs('2026-08-13T15:30:00'), 'min15', 'hour')).toBe(r);
   });
 
-  it('prorates only the first bucket of the Trends PREVIOUS-period window (its query until was exclusiveUntil)', () => {
+  it('prorates BOTH boundary buckets of the Trends PREVIOUS-period window (its query sends the raw mid-bucket since)', () => {
     // Trends' prev window for the 14:37-18:22 custom is [10:37, 14:37) and
-    // sends exclusiveUntil(range.since) = 13:59:59, so the server's last
-    // bucket (13:00) lies ENTIRELY inside the window — only the first
-    // bucket (10:00, holding 10:00-10:37 pre-window rows) overcounts.
+    // sends the RAW since (prevWindowUntil: a mid-bucket since keeps the
+    // bucket containing it in the widened server window), so the response's
+    // last bucket (14:00) holds the prev-period slice [14:00, 14:37) — it
+    // must be prorated by 37/60 on top of the first bucket's 23/60.
     const prevSince = dayjs('2026-08-13T10:37:00');
     const since = dayjs('2026-08-13T14:37:00'); // the prev window's end
-    const untilSent = exclusiveUntil(since, 'hour');
-    const buckets = ['2026-08-13 10:00', '2026-08-13 11:00', '2026-08-13 12:00', '2026-08-13 13:00'];
+    const untilSent = prevWindowUntil(since, 'hour');
+    expect(untilSent.toISOString()).toBe(since.toISOString());
+    const buckets = ['2026-08-13 10:00', '2026-08-13 11:00', '2026-08-13 12:00', '2026-08-13 13:00', '2026-08-13 14:00'];
     const r: ActivityResponse = {
       metric: 'spend', group_by: 'model', rollup: 'hour',
       series: buckets.map(b => ({ bucket: b, group: 'a', value: 60, is_zero: false })),
-      summary: [{ group: 'a', min: 60, max: 60, avg: 60, sum: 240, value: 60, percent: 100 }],
+      summary: [{ group: 'a', min: 60, max: 60, avg: 60, sum: 300, value: 60, percent: 100 }],
       buckets,
-      totals: { spend: 240, tokens: 0, requests: 0, cache: 0 },
+      totals: { spend: 300, tokens: 0, requests: 0, cache: 0 },
     };
     const out = prorateBoundaryBuckets(r, prevSince, since, untilSent, dayjs('2026-08-13T19:00:00'), 'hour', 'hour');
-    expect(out.series.map(p => p.value)).toEqual([23, 60, 60, 60]);
-    expect(out.summary[0].sum).toBeCloseTo(203, 10);
+    expect(out.series.map(p => p.value)).toEqual([23, 60, 60, 60, 37]);
+    expect(out.summary[0].sum).toBeCloseTo(240, 10);
   });
 
   it('keeps the live boundary bucket at its full recorded value when the cutoff lies inside it', () => {

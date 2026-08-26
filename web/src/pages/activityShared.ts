@@ -301,6 +301,38 @@ const PAST_RANGE_KEYS = new Set(['yesterday', 'prevweek', 'prevmonth', 'prevyear
 export const liveExtensionEligible = (range: Pick<DateRange, 'key'>): boolean =>
   range.key !== CUSTOM_KEY && !PAST_RANGE_KEYS.has(range.key);
 
+// prevWindowUntil returns the `until` the activity server should receive for
+// a range's PREVIOUS-period query — the since-side mirror of
+// queryWindowUntil's until handling. The previous period is the half-open
+// window [since - len, since); its query must never reach into the CURRENT
+// period's buckets, but it must keep every in-window slice.
+// Sub-hour granularities pass the raw `since` (as the old sub-hour branch
+// of ActivityTrends did): their rows live in the containing hour and are the
+// data source the client re-samples onto its minute axis (resampleResponse
+// clips them to the window). Hourly-and-coarser queries pass one second
+// before the bucket floor — exclusiveUntil — ONLY when `since` lies exactly
+// on the bucket grid (preset ranges snap both bounds, see Activity.tsx):
+// the endpoint's widened window (activityWindow: to = floor(until) + 1 unit)
+// then ends exactly AT `since`, so the bucket starting there — which holds
+// no in-window usage — stays out of the response. A mid-bucket `since`
+// (custom ranges) must be passed RAW instead: the bucket CONTAINING it
+// starts INSIDE the previous window, so its slice [floor(since), since) is
+// previous-period data, and only the widened window (to = floor(since) + 1
+// unit) can deliver that bucket's rows; prorateBoundaryBuckets then scales
+// them by exactly that slice's share (boundaryShare) — the same share the
+// Overview flow's bucketWindowShare computes for the same rows. The old
+// exclusiveUntil path dropped that bucket ENTIRELY: the slice appeared in
+// NEITHER the prev nor the cur response (the cur query prorates only
+// [since, +1 unit)), so the Trends deltas/sparklines disagreed with the
+// Overview KPIs on identical windows and the boundary usage was counted
+// nowhere.
+export function prevWindowUntil(since: dayjs.Dayjs, granularity: Granularity): dayjs.Dayjs {
+  if (granularity === 'minute' || granularity === 'min15') return since;
+  return floorWindowUntil(since, granularity).isSame(since)
+    ? exclusiveUntil(since, granularity)
+    : since;
+}
+
 // customRange wraps a user-picked from/to window; the bucket granularity is
 // derived from the window's length.
 export function customRange(since: dayjs.Dayjs, until: dayjs.Dayjs): DateRange {
@@ -1178,9 +1210,9 @@ function boundaryShare(
 //     while Explore's pass through and are skipped there.
 //   - a bound must be MID-bucket at that granularity: preset ranges arrive
 //     snapped to their own grid (Activity.tsx), and the query either
-//     aligned to the boundary (exclusiveUntil — the previous periods) or
-//     intentionally kept the live bucket, so their responses are already
-//     exact and returned unchanged.
+//     aligned to the boundary (exclusiveUntil — the previous-period queries
+//     whose since lies on the grid) or intentionally kept the live bucket,
+//     so their responses are already exact and returned unchanged.
 //   - the BLENDED metric is excluded entirely: its cells are RATES. A rate
 //     is invariant under the window overlap (the in-window slice carries the
 //     same rate as the whole bucket under the uniform-within-bucket
@@ -1221,8 +1253,11 @@ export function prorateBoundaryBuckets(
     // bucket containing the SENT until. It is partial exactly when the user's
     // until cuts inside it (share < 1): when the query floored to the
     // boundary (exclusiveUntil), the last bucket lies entirely inside the
-    // window and its share is exactly 1 — skipped below, so the Trends
-    // previous-period response only prorates its first bucket.
+    // window and its share is exactly 1 — skipped below, so a grid-aligned
+    // prev/since response only prorates its first bucket — while a prev query
+    // that sent the RAW mid-bucket since (prevWindowUntil) reaches this
+    // branch with the shared bucket's prev-period slice, exactly like the
+    // first-bucket machinery.
     shares.set(resp.buckets[resp.buckets.length - 1], boundaryShare(lastStart, since, until, cutoff, granularity));
   }
   const toApply = new Map<string, number>();

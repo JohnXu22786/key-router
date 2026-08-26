@@ -6,7 +6,7 @@ import {
   Tooltip as RTooltip, ResponsiveContainer,
 } from 'recharts';
 import { getActivity, getKeys, ActivityResponse } from '../api/client';
-import { DateRange, ActivityFilter, filterKey, fmtUSD, fmtUSDInt, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtTick, fmtBucket, ExploreOpts, maskKey, toChartData, computeTrending, modelFavicon, resampleResponse, exclusiveUntil, queryWindowUntil, liveExtensionEligible, prorateBoundaryBuckets } from './activityShared';
+import { DateRange, ActivityFilter, filterKey, fmtUSD, fmtUSDInt, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtTick, fmtBucket, ExploreOpts, maskKey, toChartData, computeTrending, modelFavicon, resampleResponse, prevWindowUntil, queryWindowUntil, liveExtensionEligible, prorateBoundaryBuckets } from './activityShared';
 import dayjs from 'dayjs';
 const { Text } = Typography;
 
@@ -117,10 +117,14 @@ const TrendSection: React.FC<SectionProps> = ({ title, groupBy, range, filter, o
         // the chart's real last point (see queryWindowUntil). A mid-bucket
         // bound (custom ranges) is passed as-is too, so the containing
         // bucket's in-range portion stays in; a PAST-period bound passes one
-        // second before the boundary so the previous period never picks up
-        // the current period's buckets.
+        // second before the boundary only when it lies on the bucket grid —
+        // the previous period never picks up the current period's buckets —
+        // while a mid-bucket past bound (custom ranges) passes the raw
+        // `since` so the bucket CONTAINING it stays in the prev response and
+        // its in-window slice [floor(since), since) is prorated (see
+        // prevWindowUntil / prorateBoundaryBuckets).
         const curUntil = queryWindowUntil(range, rollup);
-        const prevUntil = subGran ? range.since : exclusiveUntil(range.since, range.granularity);
+        const prevUntil = prevWindowUntil(range.since, range.granularity);
         const [curRes, prevRes] = await Promise.all([
           getActivity({ metric, group_by: groupBy, rollup, top: 5, since: range.since.toISOString(), until: curUntil.toISOString(), filter_type: filter?.type, filter_value: filter?.value }),
           getActivity({ metric, group_by: groupBy, rollup, top: 0, since: prevSince.toISOString(), until: prevUntil.toISOString(), filter_type: filter?.type, filter_value: filter?.value }),
