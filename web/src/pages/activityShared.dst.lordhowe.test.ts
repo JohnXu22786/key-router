@@ -57,6 +57,40 @@ describe('floorWindowUntil hour branch — Lord Howe half-hour fall-back', () =>
   });
 });
 
+// Spring-forward gap: Oct 4 2026, 02:00 +10:30 -> 02:30 +11:00 at 15:30Z
+// (Oct 3 UTC) — a 30-minute gap where wall-clock 02:00..02:29 never
+// displays. The post-gap hour is UNAMBIGUOUS, yet its subtraction span
+// crosses the jump: the old minute subtraction floored 02:40 +11:00
+// (15:40:30Z) to 15:00Z — wall-clock 01:30 +10:30, mid-hour inside the
+// PREVIOUS hour (the same off-grid break as the fall-back, share 0). These
+// pins fix that floor at the transition point — the true start of the
+// displayed hour — so a refactor cannot silently reintroduce the amputation.
+describe('floorWindowUntil hour branch — Lord Howe spring-forward gap', () => {
+  it('floors a post-gap instant to the transition point (15:30Z, not 15:00Z)', () => {
+    // 02:40:30 +11:00 on Oct 4 = 2026-10-03T15:40:30Z; the displayed hour
+    // 02:30–03:00 (+11:00) begins at the transition instant 15:30Z — a
+    // fixed point of the floor, unlike the old subtraction's 15:00Z
+    // (mid-hour inside 01:30 +10:30, the previous wall-clock hour).
+    const until = dayjs('2026-10-03T15:40:30.000Z');
+    expect(floorWindowUntil(until, 'hour').toISOString()).toBe('2026-10-03T15:30:00.000Z');
+    expect(floorWindowUntil(dayjs('2026-10-03T15:30:00.000Z'), 'hour').toISOString())
+      .toBe('2026-10-03T15:30:00.000Z');
+  });
+
+  it('shares the whole recorded slice on a live window over the post-gap hour (1, was 0)', () => {
+    // 1d preset at 02:40:30 +11:00 (15:40:30Z): until floors to 15:30Z, the
+    // live hour [15:30Z, 16:30Z) holds the row's whole recorded slice
+    // [15:30Z, 15:40Z) — share 1, where the old floor's 15:00Z failed the
+    // gate and read 0.
+    const now = dayjs('2026-10-03T15:40:30.000Z');
+    const until = floorWindowUntil(now, 'hour');
+    const since = floorWindowUntil(now.subtract(24, 'hour'), 'hour');
+    expect(until.toISOString()).toBe('2026-10-03T15:30:00.000Z');
+    const share = bucketWindowShare('2026-10-04T02:00:00', since, until, now, 'hour');
+    expect(share).toBeCloseTo(1, 10);
+  });
+});
+
 // The 1d/2d/today/yesterday presets (hour granularity) snap `until` to the
 // hour floor; the live cell — the hour starting AT the snapped until — then
 // carries the second occurrence's recorded minutes. The old 14:30Z floor

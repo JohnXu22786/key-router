@@ -167,7 +167,18 @@ export function floorWindowUntil(until: dayjs.Dayjs, granularity: Granularity): 
     // for New York). Anything else takes the first branch: while the
     // offset is uniform across the subtraction span the rebuilt start
     // coincides exactly with the old minute subtraction, so every
-    // unambiguous-ordinary floor stays bit-identical.
+    // unambiguous floor whose span stays inside one offset regime is
+    // bit-identical (whole-hour zones, constant-offset days, ordinary
+    // hours). Where the span DOES cross a transition the new floor is
+    // the CORRECTION, never a regression: the spring-forward post-gap
+    // hour is unambiguous but its subtraction span crosses the jump —
+    // Lord Howe 02:40 +11:00 (local Oct 4 2026, 15:40:30Z) subtracted 40
+    // minutes across the 15:30Z transition and floored to 15:00Z, mid-
+    // hour inside the PREVIOUS wall-clock hour (01:30 +10:30, the same
+    // off-grid break as the fall-back), while the rebuilt start lands on
+    // the transition point 15:30Z — the true start of the displayed
+    // hour — and the live cell keeps the whole recorded slice (share 1
+    // where the old floor read 0).
     const first = until.minute(0).second(0).millisecond(0);
     return first.utcOffset() > until.utcOffset() ? first.add(1, 'hour') : first;
   }
