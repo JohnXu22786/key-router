@@ -229,6 +229,10 @@ func responsesInputItemToChat(item interface{}, systemParts *[]string) []interfa
 					if b := responsesFileToChat(p); b != nil {
 						textParts = append(textParts, b)
 					}
+				case "input_audio":
+					if b := responsesAudioToChat(p); b != nil {
+						textParts = append(textParts, b)
+					}
 				case "function_call":
 					// assistant tool-call part → chat tool_calls. The id MUST
 					// be the CALL id — the client echoes it back in
@@ -257,8 +261,8 @@ func responsesInputItemToChat(item interface{}, systemParts *[]string) []interfa
 		return []interface{}{msg}
 	case "function_call_output":
 		// The output may be a plain string or an array of Responses-shaped
-		// parts (text/image/file) — convert them to chat tool content parts
-		// instead of shipping Responses blocks upstream. null → "" (chat
+		// parts (text/image/file/audio) — convert them to chat tool content
+		// parts instead of shipping Responses blocks upstream. null → "" (chat
 		// tool messages must never carry null content).
 		return []interface{}{map[string]interface{}{
 			"role":         "tool",
@@ -317,6 +321,30 @@ func responsesFileToChat(p map[string]interface{}) interface{} {
 	return map[string]interface{}{"type": "file", "file": file}
 }
 
+// responsesAudioToChat converts a Responses API {"type":"input_audio"} part
+// (flat format/data fields) into a chat completions input_audio content part
+// — the exact shape anthropicAudioToOpenAI produces and openAIAudioPartToAnthropic
+// consumes, so the round trip stays symmetric. Returns nil when the part
+// cannot be represented: chat's input_audio contract accepts only wav/mp3,
+// so other codecs are dropped rather than 400-ing the request upstream.
+func responsesAudioToChat(p map[string]interface{}) interface{} {
+	data := safeStringOrDefault(p, "data", "")
+	if data == "" {
+		return nil
+	}
+	format := mediaTypeToAudioFormat(audioFormatToMediaType(safeStringOrDefault(p, "format", "")))
+	if format == "" {
+		return nil
+	}
+	return map[string]interface{}{
+		"type": "input_audio",
+		"input_audio": map[string]interface{}{
+			"data":   data,
+			"format": format,
+		},
+	}
+}
+
 // responsesOutputToChatContent converts a function_call_output value (string
 // or array of Responses-shaped output parts) into chat tool message content.
 // nil/unrepresentable becomes "" — OpenAI tool messages must not carry null.
@@ -354,6 +382,10 @@ func responsesOutputToChatContent(output interface{}) interface{} {
 			}
 		case "input_file":
 			if b := responsesFileToChat(p); b != nil {
+				parts = append(parts, b)
+			}
+		case "input_audio":
+			if b := responsesAudioToChat(p); b != nil {
 				parts = append(parts, b)
 			}
 		}
@@ -594,8 +626,9 @@ func responsesItemText(m map[string]interface{}) string {
 }
 
 // responsesUserContent converts a user message item's content (string or
-// input_text/input_image parts) into Anthropic content parts. Empty content
-// yields an empty text block — Anthropic rejects null content, not empty.
+// input_text/input_image/input_file/input_audio parts) into Anthropic content
+// parts. Empty content yields an empty text block — Anthropic rejects null
+// content, not empty.
 func responsesUserContent(content interface{}) []interface{} {
 	var parts []interface{}
 	switch c := content.(type) {
@@ -616,6 +649,10 @@ func responsesUserContent(content interface{}) []interface{} {
 				}
 			case "input_file":
 				if b := responsesFileToAnthropic(p); b != nil {
+					parts = append(parts, b)
+				}
+			case "input_audio":
+				if b := responsesAudioToAnthropic(p); b != nil {
 					parts = append(parts, b)
 				}
 			}
@@ -648,9 +685,26 @@ func responsesOutputToAnthropic(arr []interface{}) []interface{} {
 			if b := responsesFileToAnthropic(p); b != nil {
 				parts = append(parts, b)
 			}
+		case "input_audio":
+			if b := responsesAudioToAnthropic(p); b != nil {
+				parts = append(parts, b)
+			}
 		}
 	}
 	return parts
+}
+
+// responsesAudioToAnthropic converts a Responses API {"type":"input_audio"}
+// part (flat format/data fields) into an Anthropic audio block — the exact
+// shape openAIAudioPartToAnthropic produces, so the round trip stays
+// symmetric. Returns nil for empty/unknown formats, which the caller skips.
+func responsesAudioToAnthropic(p map[string]interface{}) interface{} {
+	return openAIAudioPartToAnthropic(map[string]interface{}{
+		"input_audio": map[string]interface{}{
+			"data":   safeStringOrDefault(p, "data", ""),
+			"format": safeStringOrDefault(p, "format", ""),
+		},
+	})
 }
 
 // responsesImageToAnthropic converts an input_image part into an Anthropic
