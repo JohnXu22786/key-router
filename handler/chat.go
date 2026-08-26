@@ -910,15 +910,19 @@ func extractAppNameUnchecked(h http.Header, body []byte) string {
 	}
 
 	// 8. Browser User-Agents. The rendering-engine tokens differ between
-	//    Chrome/Edge/Firefox/Safari; Edg must be checked before Chrome
-	//    because Edge's UA contains both. Electron apps that carry no known
-	//    app token (VS Code, Slack, Discord, ...) are not "Chrome" — they
-	//    stay unknown unless identified by an earlier signal.
+	//    Chrome/Edge/Firefox/Safari; the Edg family must be checked before
+	//    Chrome because Edge's UA contains both. Desktop Edge brands its UA
+	//    "Edg/"; the mobile builds use "EdgA/" (Android) and "EdgiOS/"
+	//    (iOS), which contain no "edg/" token and would otherwise fall
+	//    through to their Chrome/Safari engine tokens. Electron apps that
+	//    carry no known app token (VS Code, Slack, Discord, ...) are not
+	//    "Chrome" — they stay unknown unless identified by an earlier
+	//    signal.
 	if ua := strings.ToLower(h.Get("User-Agent")); strings.HasPrefix(ua, "mozilla/") {
 		switch {
 		case strings.Contains(ua, "electron/"):
 			return ""
-		case strings.Contains(ua, "edg/"):
+		case strings.Contains(ua, "edg/") || strings.Contains(ua, "edga/") || strings.Contains(ua, "edgios/"):
 			return "Edge"
 		case strings.Contains(ua, "firefox/"):
 			return "Firefox"

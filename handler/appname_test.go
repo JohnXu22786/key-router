@@ -116,6 +116,19 @@ func TestExtractAppName(t *testing.T) {
 		// Browser User-Agents.
 		{"Browser UA chrome", hdr("User-Agent", "Mozilla/5.0 (Macintosh) AppleWebKit/537.36 Chrome/139.0.0.0 Safari/537.36"), nil, "Chrome"},
 		{"Browser UA edge", hdr("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36 Edg/139.0.0.0"), nil, "Edge"},
+		// Edge's mobile builds brand their UA with the EdgA (Android) and
+		// EdgiOS (iOS) tokens instead of the desktop "Edg/". Neither
+		// contains "edg/", so Chrome/Safari must not win on the engine
+		// tokens those UAs still carry — regression for the mislabel that
+		// showed Edge on Android as "Chrome" and Edge on iOS as "Safari".
+		{"Browser UA edge android EdgA", hdr("User-Agent", "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Mobile Safari/537.36 EdgA/118.0.2218.37"), nil, "Edge"},
+		{"Browser UA edge iOS EdgiOS", hdr("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1 EdgiOS/118.0.2218.36"), nil, "Edge"},
+		{"Browser UA edge desktop regression", hdr("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0"), nil, "Edge"},
+		// Ordering guard: the chrome/ token appears before EdgA/ in this
+		// UA; only the branch order (Edg family checked before Chrome)
+		// keeps it labelled Edge.
+		{"Browser UA edge EdgA after chrome token", hdr("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36 EdgA/119.0.2151.58"), nil, "Edge"},
+		{"Browser UA chrome regression", hdr("User-Agent", "Mozilla/5.0 (Macintosh) AppleWebKit/537.36 Chrome/140.0.0.0 Safari/537.36"), nil, "Chrome"},
 		{"Browser UA firefox", hdr("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:139.0) Gecko/20100101 Firefox/139.0"), nil, "Firefox"},
 		{"Browser UA safari", hdr("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"), nil, "Safari"},
 		{"Electron UA without app token", hdr("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.7204.243 Electron/37.4.0 Safari/537.36"), nil, ""},
