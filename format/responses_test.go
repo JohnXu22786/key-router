@@ -478,6 +478,98 @@ func TestResponsesRequestToAnthropicToolChoice(t *testing.T) {
 	}
 }
 
+func TestResponsesRequestToAnthropicTools(t *testing.T) {
+	// The Responses API's function tool is the FLAT form
+	// {"type":"function","name":"x","description":"d","parameters":{...}}
+	// (canonical per the OpenAI spec). convertOpenAITools requires the chat
+	// NESTED form {"type":"function","function":{...}} — a flat tool has no
+	// "function" key and was silently dropped, so the converted request went
+	// out tool-less. Every key except "type" must move into the function
+	// object verbatim; already-nested legacy tools convert as before, and
+	// non-function tool types / non-map entries stay out of the Anthropic
+	// body (Anthropic has no equivalent for them).
+	cases := []struct {
+		name string
+		in   string // tools JSON as sent by the client
+		want string // tools JSON expected in the Anthropic body
+	}{
+		{
+			name: "flat functions converted with name/description/parameters preserved",
+			in:   `[{"type":"function","name":"get_weather","description":"Get the weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}},"strict":true}]`,
+			want: `[{"description":"Get the weather","input_schema":{"properties":{"city":{"type":"string"}},"type":"object"},"name":"get_weather","type":"custom"}]`,
+		},
+		{
+			name: "already-nested tool passthrough",
+			in:   `[{"type":"function","function":{"name":"f","description":"d","parameters":{"type":"object"}}}]`,
+			want: `[{"description":"d","input_schema":{"type":"object"},"name":"f","type":"custom"}]`,
+		},
+		{
+			name: "mixed flat, nested, non-function and non-map",
+			in:   `[{"type":"function","name":"flat","description":"d","parameters":{"type":"object"}},{"type":"function","function":{"name":"legacy","description":"ld"}},{"type":"file_search","file_search":{"max_num_results":3}},"pickle"]`,
+			want: `[{"description":"d","input_schema":{"type":"object"},"name":"flat","type":"custom"},{"description":"ld","input_schema":{"type":"object"},"name":"legacy","type":"custom"}]`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := ResponsesRequestToAnthropic([]byte(`{"model":"m","input":"","tools":`+tc.in+`}`), "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var req map[string]interface{}
+			if err := json.Unmarshal(out, &req); err != nil {
+				t.Fatal(err)
+			}
+			got, err := json.Marshal(req["tools"])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != tc.want {
+				t.Errorf("tools = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestResponsesRequestToAnthropicToolsToolChoice(t *testing.T) {
+	// End to end: a flat tools array plus a flat forced-function tool_choice
+	// (the spec-conformant Responses-API shape, e.g. Codex CLI) must produce
+	// a valid Anthropic Messages body — the tool present with its
+	// name/description/parameters and the tool_choice mapped onto that same
+	// converted tool name (previously the tool was dropped silently and the
+	// choice referenced a tool the model never saw).
+	out, err := ResponsesRequestToAnthropic([]byte(`{
+		"model": "m",
+		"input": "what's the weather?",
+		"tools": [{"type":"function","name":"get_weather","description":"Get the weather","parameters":{"type":"object"}}],
+		"tool_choice": {"type":"function","name":"get_weather"}
+	}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req map[string]interface{}
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	if msgs, _ := req["messages"].([]interface{}); len(msgs) != 1 {
+		t.Fatalf("messages = %v, want the input user turn", req["messages"])
+	}
+	tools, _ := req["tools"].([]interface{})
+	if len(tools) != 1 {
+		t.Fatalf("tools = %v, want 1 converted tool", req["tools"])
+	}
+	tool := tools[0].(map[string]interface{})
+	schema, _ := tool["input_schema"].(map[string]interface{})
+	if tool["type"] != "custom" || tool["name"] != "get_weather" ||
+		safeStringOrDefault(tool, "description", "") != "Get the weather" ||
+		schema["type"] != "object" {
+		t.Errorf("tool = %v, want custom get_weather with description and object schema", tool)
+	}
+	tc, _ := req["tool_choice"].(map[string]interface{})
+	if tc["type"] != "tool" || tc["name"] != "get_weather" {
+		t.Errorf("tool_choice = %v, want {type:tool name:get_weather}", req["tool_choice"])
+	}
+}
+
 // ---- Streaming converter: chat completions upstream ----
 
 func decodeEvents(t *testing.T, raw [][]byte) []map[string]interface{} {

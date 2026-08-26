@@ -305,6 +305,49 @@ func responsesToolChoiceToChat(v interface{}) interface{} {
 	return v
 }
 
+// responsesToolsToNested maps Responses API tools onto the chat-nested form
+// convertOpenAITools expects. The Responses API's function tool is the FLAT
+// form {"type":"function","name":"x","description":"d","parameters":{...}}
+// (canonical per the OpenAI spec), while convertOpenAITools requires the
+// NESTED form {"type":"function","function":{...}} with the function's keys
+// grouped under a "function" object — a flat tool has no "function" key and
+// would otherwise be silently skipped. Every key except the "type"
+// discriminator moves into that object verbatim (name, description,
+// parameters, strict, ...). Non-function tool types (file_search and other
+// custom types) and the legacy nested form (already carrying a "function"
+// object) pass through unchanged, as do non-map entries.
+func responsesToolsToNested(tools []interface{}) []interface{} {
+	converted := make([]interface{}, 0, len(tools))
+	for _, tool := range tools {
+		t, ok := safeMap(tool)
+		if !ok {
+			converted = append(converted, tool)
+			continue
+		}
+		if safeStringOrDefault(t, "type", "") != "function" {
+			converted = append(converted, tool)
+			continue
+		}
+		if _, has := t["function"]; has {
+			// Legacy nested chat form — leave unchanged.
+			converted = append(converted, tool)
+			continue
+		}
+		fn := make(map[string]interface{}, len(t)-1)
+		for k, v := range t {
+			if k == "type" {
+				continue
+			}
+			fn[k] = v
+		}
+		converted = append(converted, map[string]interface{}{
+			"type":     "function",
+			"function": fn,
+		})
+	}
+	return converted
+}
+
 // responsesFileToChat converts a Responses API input_file part into a chat
 // file content part. Returns nil when the file cannot be represented
 // (file_id-only references need a Files API round-trip with the client's
@@ -480,8 +523,16 @@ func ResponsesRequestToAnthropic(body []byte, modelOverride string) ([]byte, err
 	if v, ok := rReq["tool_choice"]; ok {
 		out["tool_choice"] = openAIToolChoiceToAnthropic(v)
 	}
+	// tools: the Responses API's function tool is the FLAT form
+	// {"type":"function","name":"x","description":"d","parameters":{...}},
+	// but convertOpenAITools requires the chat NESTED form
+	// {"type":"function","function":{...}} — a flat tool has no "function"
+	// key and was silently skipped, leaving the request tool-less. Nest flat
+	// function tools first (non-function tool types and the legacy nested
+	// form pass through unchanged, see responsesToolsToNested); the
+	// converted array then flows through the regular Anthropic tool mapping.
 	if tools, ok := safeArr(rReq, "tools"); ok {
-		out["tools"] = convertOpenAITools(tools)
+		out["tools"] = convertOpenAITools(responsesToolsToNested(tools))
 	}
 
 	// instructions + system/developer messages → the system prompt
