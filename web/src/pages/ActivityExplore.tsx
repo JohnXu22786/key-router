@@ -13,8 +13,9 @@ import {
 import { getActivity, ActivityResponse, ActivityGroupSummary } from '../api/client';
 import {
   DateRange, ActivityFilter, filterKey, fmtUSDInt, fmtTokens, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS,
-  fmtPercent, fmt3sig, fmtTick, fmtBucket, modelFavicon, Granularity, queryWindowUntil,
+  fmtPercent, fmt3sig, fmtTick, fmtBucket, modelFavicon, Granularity, queryWindowUntil, prorateBoundaryBuckets,
 } from './activityShared';
+import dayjs from 'dayjs';
 import './explore.css';
 
 const { Text } = Typography;
@@ -151,6 +152,7 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
         // server's widened window would amputate the in-progress day the
         // range covers.
         const curUntil = queryWindowUntil(range, rollup);
+        const cutoff = dayjs();
         const res = await getActivity({
           metric,
           group_by: groupBy,
@@ -164,7 +166,15 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
           filter_value: filter?.value,
         });
         if (cancelled) return;
-        setData(res.data);
+        // A custom range whose picked bounds cut mid-bucket makes the endpoint
+        // return FULL boundary buckets when the selected rollup equals the
+        // range granularity (the widened query window — see activityWindow
+        // in admin.go); prorateBoundaryBuckets scales them by the window
+        // overlap like the Overview flow, so the chart, table and totals
+        // agree with it. Coarser rollups keep the accepted residual
+        // behavior, and the wrapper skips sub-hour granularities and the
+        // blended metric by design (see its gate comment).
+        setData(prorateBoundaryBuckets(res.data, range.since, range.until, curUntil, cutoff, range.granularity, rollup));
         setLoadMs(Math.max(1, Math.round(performance.now() - t0)));
       } catch { if (!cancelled) { setError(true); message.error('Failed to load explore'); } }
       finally { if (!cancelled) setLoading(false); }

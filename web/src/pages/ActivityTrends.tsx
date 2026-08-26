@@ -6,7 +6,7 @@ import {
   Tooltip as RTooltip, ResponsiveContainer,
 } from 'recharts';
 import { getActivity, getKeys, ActivityResponse } from '../api/client';
-import { DateRange, ActivityFilter, filterKey, fmtUSD, fmtUSDInt, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtTick, fmtBucket, ExploreOpts, maskKey, toChartData, computeTrending, modelFavicon, resampleResponse, exclusiveUntil, queryWindowUntil, liveExtensionEligible } from './activityShared';
+import { DateRange, ActivityFilter, filterKey, fmtUSD, fmtUSDInt, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtTick, fmtBucket, ExploreOpts, maskKey, toChartData, computeTrending, modelFavicon, resampleResponse, exclusiveUntil, queryWindowUntil, liveExtensionEligible, prorateBoundaryBuckets } from './activityShared';
 import dayjs from 'dayjs';
 const { Text } = Typography;
 
@@ -131,10 +131,20 @@ const TrendSection: React.FC<SectionProps> = ({ title, groupBy, range, filter, o
         // re-sampling must divide by the real coverage, not the past window's
         // own end. liveExtend: only the CURRENT window extends into the live
         // bucket (its newest usage is the chart's real last point); the
-        // previous period never does.
+        // previous period never does. The server-bucketed path (hour+ axes)
+        // wraps the response in prorateBoundaryBuckets: a custom range whose
+        // picked bounds cut mid-bucket made the endpoint return FULL boundary
+        // buckets (the widened window — see activityWindow in admin.go), so
+        // the boundary bars/summary/totals overcounted by up to a bucket; the
+        // wrapper scales them by the window overlap exactly like the Overview
+        // flow (bucketWindowShare), keeping the pages consistent.
         const cutNow = dayjs();
-        setCur(subGran ? resampleResponse(curRes.data, range.since, range.until, cutNow, subGran, liveExtensionEligible(range)) : curRes.data);
-        setPrev(subGran ? resampleResponse(prevRes.data, prevSince, range.since, cutNow, subGran, false) : prevRes.data);
+        setCur(subGran
+          ? resampleResponse(curRes.data, range.since, range.until, cutNow, subGran, liveExtensionEligible(range))
+          : prorateBoundaryBuckets(curRes.data, range.since, range.until, curUntil, cutNow, range.granularity, rollup));
+        setPrev(subGran
+          ? resampleResponse(prevRes.data, prevSince, range.since, cutNow, subGran, false)
+          : prorateBoundaryBuckets(prevRes.data, prevSince, range.since, prevUntil, cutNow, range.granularity, rollup));
       } catch { if (!cancelled) { setError(true); message.error(`Failed to load ${title} trends`); } }
       finally { if (!cancelled) setLoading(false); }
     };
