@@ -162,6 +162,98 @@ func TestResponsesRequestToChatCompletionImageAndChoices(t *testing.T) {
 	}
 }
 
+func TestResponsesRequestToChatCompletionTools(t *testing.T) {
+	// The Responses API's function tool is the FLAT form
+	// {"type":"function","name":"x","description":"d","parameters":{...}}
+	// (canonical per the OpenAI spec), while chat completions requires the
+	// NESTED form {"type":"function","function":{...}} — every key except
+	// "type" moves into the function object verbatim. Already-nested legacy
+	// tools, non-function tool types and non-map entries pass through.
+	cases := []struct {
+		name string
+		in   string // tools JSON as sent by the client
+		want string // tools JSON expected in the chat request
+	}{
+		{
+			name: "flat functions nested with keys preserved",
+			in:   `[{"type":"function","name":"get_weather","description":"Get the weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}},"strict":true,"metadata":{"origin":"test"}}]`,
+			want: `[{"function":{"description":"Get the weather","metadata":{"origin":"test"},"name":"get_weather","parameters":{"properties":{"city":{"type":"string"}},"type":"object"},"strict":true},"type":"function"}]`,
+		},
+		{
+			name: "legacy nested tool passthrough",
+			in:   `[{"type":"function","function":{"name":"f","description":"d","parameters":{"type":"object"}}}]`,
+			want: `[{"function":{"description":"d","name":"f","parameters":{"type":"object"}},"type":"function"}]`,
+		},
+		{
+			name: "mixed flat and nested",
+			in:   `[{"type":"function","name":"flat","parameters":{"type":"object"}},{"type":"function","function":{"name":"legacy"}}]`,
+			want: `[{"function":{"name":"flat","parameters":{"type":"object"}},"type":"function"},{"function":{"name":"legacy"},"type":"function"}]`,
+		},
+		{
+			name: "non-function and non-map passthrough",
+			in:   `["pickle",{"type":"file_search","file_search":{"max_num_results":3}},{"type":"web_search"}]`,
+			want: `["pickle",{"file_search":{"max_num_results":3},"type":"file_search"},{"type":"web_search"}]`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := ResponsesRequestToChatCompletion([]byte(`{"model":"m","input":"hi","tools":`+tc.in+`}`), "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var req map[string]interface{}
+			if err := json.Unmarshal(out, &req); err != nil {
+				t.Fatal(err)
+			}
+			got, err := json.Marshal(req["tools"])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != tc.want {
+				t.Errorf("tools = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestResponsesRequestToChatCompletionToolsToolChoice(t *testing.T) {
+	// End to end: a flat tools array plus a flat forced-function tool_choice
+	// (the spec-conformant Responses-API shape, e.g. Codex CLI) must produce
+	// a valid chat body — nested tools, nested tool_choice referencing the
+	// same converted tool name, and a messages array.
+	out, err := ResponsesRequestToChatCompletion([]byte(`{
+		"model": "m",
+		"input": "what's the weather?",
+		"tools": [{"type":"function","name":"get_weather","description":"Get the weather","parameters":{"type":"object"}}],
+		"tool_choice": {"type":"function","name":"get_weather"}
+	}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req map[string]interface{}
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	if msgs, _ := req["messages"].([]interface{}); len(msgs) != 1 {
+		t.Fatalf("messages = %v, want the input user turn", req["messages"])
+	}
+	tools, _ := req["tools"].([]interface{})
+	if len(tools) != 1 {
+		t.Fatalf("tools = %v, want 1 nested tool", req["tools"])
+	}
+	tool := tools[0].(map[string]interface{})
+	fn, _ := tool["function"].(map[string]interface{})
+	if tool["type"] != "function" || fn["name"] != "get_weather" ||
+		safeStringOrDefault(fn, "description", "") != "Get the weather" {
+		t.Errorf("tool = %v, want nested function get_weather", tool)
+	}
+	tc, _ := req["tool_choice"].(map[string]interface{})
+	tcfn, _ := tc["function"].(map[string]interface{})
+	if tc["type"] != "function" || tcfn["name"] != "get_weather" {
+		t.Errorf("tool_choice = %v, want nested function get_weather", req["tool_choice"])
+	}
+}
+
 func TestResponsesRequestToChatCompletionToolChoice(t *testing.T) {
 	// The Responses API's forced-function tool_choice is the FLAT form
 	// {"type":"function","name":"x"} (canonical per the OpenAI spec), while
