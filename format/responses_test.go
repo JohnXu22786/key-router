@@ -1447,6 +1447,251 @@ func TestResponsesRequestToChatCompletionEndsWithAssistantToolCalls(t *testing.T
 	}
 }
 
+func TestResponsesRequestToChatCompletionInputAudio(t *testing.T) {
+	// An input_audio part on a user message must become a chat completions
+	// input_audio content part (regression: it used to be silently dropped,
+	// so the audio never reached the model).
+	body := `{"model":"m","input":[
+		{"type":"message","role":"user","content":[
+			{"type":"input_text","text":"what tone is this"},
+			{"type":"input_audio","format":"wav","data":"UklGRg=="}
+		]}
+	]}`
+	out, err := ResponsesRequestToChatCompletion([]byte(body), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req map[string]interface{}
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := req["messages"].([]interface{})
+	if len(msgs) != 1 {
+		t.Fatalf("messages = %v", msgs)
+	}
+	content := msgs[0].(map[string]interface{})["content"].([]interface{})
+	if len(content) != 2 {
+		t.Fatalf("content parts = %v, want text + input_audio", content)
+	}
+	// the audio-less neighbor keeps its exact chat shape
+	txt := content[0].(map[string]interface{})
+	if txt["type"] != "text" || txt["text"] != "what tone is this" {
+		t.Errorf("text part = %v", txt)
+	}
+	audio := content[1].(map[string]interface{})
+	if audio["type"] != "input_audio" {
+		t.Fatalf("part = %v, want input_audio", audio)
+	}
+	ia, _ := audio["input_audio"].(map[string]interface{})
+	if ia["format"] != "wav" || ia["data"] != "UklGRg==" {
+		t.Errorf("input_audio = %v, want format wav + data", ia)
+	}
+}
+
+func TestResponsesRequestToAnthropicInputAudio(t *testing.T) {
+	// An input_audio part on a user message must become an Anthropic audio
+	// block (regression: it used to be silently dropped).
+	body := `{"model":"m","input":[
+		{"type":"message","role":"user","content":[
+			{"type":"input_text","text":"what tone is this"},
+			{"type":"input_audio","format":"mp3","data":"SUQzBQ=="}
+		]}
+	]}`
+	out, err := ResponsesRequestToAnthropic([]byte(body), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req map[string]interface{}
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := req["messages"].([]interface{})
+	if len(msgs) != 1 {
+		t.Fatalf("messages = %v", msgs)
+	}
+	content := msgs[0].(map[string]interface{})["content"].([]interface{})
+	if len(content) != 2 {
+		t.Fatalf("content = %v, want 2 blocks (text + audio)", content)
+	}
+	// the audio-less neighbor keeps its exact anthropic shape
+	if content[0].(map[string]interface{})["type"] != "text" ||
+		content[0].(map[string]interface{})["text"] != "what tone is this" {
+		t.Errorf("first block = %v, want text", content[0])
+	}
+	audio := content[1].(map[string]interface{})
+	if audio["type"] != "audio" {
+		t.Fatalf("block = %v, want audio", audio)
+	}
+	src, _ := audio["source"].(map[string]interface{})
+	if src["type"] != "base64" || src["media_type"] != "audio/mpeg" || src["data"] != "SUQzBQ==" {
+		t.Errorf("audio source = %v, want base64 audio/mpeg", src)
+	}
+}
+
+func TestResponsesRequestToChatCompletionToolOutputAudio(t *testing.T) {
+	// An input_audio part inside a function_call_output output array must
+	// become a chat tool content part (regression: it used to be silently
+	// dropped).
+	body := `{"model":"m","input":[
+		{"type":"function_call_output","call_id":"call_9","output":[
+			{"type":"output_text","text":"72F"},
+			{"type":"input_audio","format":"wav","data":"UklGRg=="}
+		]}
+	]}`
+	out, err := ResponsesRequestToChatCompletion([]byte(body), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req map[string]interface{}
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := req["messages"].([]interface{})
+	if len(msgs) != 2 {
+		t.Fatalf("messages = %v (tool + padded assistant)", msgs)
+	}
+	tool := msgs[0].(map[string]interface{})
+	if tool["role"] != "tool" || tool["tool_call_id"] != "call_9" {
+		t.Fatalf("tool message = %v", tool)
+	}
+	parts := tool["content"].([]interface{})
+	if len(parts) != 2 {
+		t.Fatalf("tool content parts = %v, want text + input_audio", parts)
+	}
+	if parts[0].(map[string]interface{})["type"] != "text" ||
+		parts[0].(map[string]interface{})["text"] != "72F" {
+		t.Errorf("first part = %v, want unchanged text", parts[0])
+	}
+	audio := parts[1].(map[string]interface{})
+	if audio["type"] != "input_audio" {
+		t.Fatalf("part = %v, want input_audio", audio)
+	}
+	ia, _ := audio["input_audio"].(map[string]interface{})
+	if ia["format"] != "wav" || ia["data"] != "UklGRg==" {
+		t.Errorf("input_audio = %v, want format wav + data", ia)
+	}
+}
+
+func TestResponsesRequestToAnthropicToolOutputAudio(t *testing.T) {
+	// An input_audio part inside a function_call_output output array must
+	// become an Anthropic tool_result audio block (regression: it used to
+	// be silently dropped).
+	body := `{"model":"m","input":[
+		{"type":"function_call_output","call_id":"call_9","output":[
+			{"type":"output_text","text":"72F"},
+			{"type":"input_audio","format":"wav","data":"UklGRg=="}
+		]}
+	]}`
+	out, err := ResponsesRequestToAnthropic([]byte(body), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req map[string]interface{}
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := req["messages"].([]interface{})
+	if len(msgs) != 1 {
+		t.Fatalf("messages = %v", msgs)
+	}
+	tr := msgs[0].(map[string]interface{})["content"].([]interface{})[0].(map[string]interface{})
+	if tr["type"] != "tool_result" || tr["tool_use_id"] != "call_9" {
+		t.Fatalf("tool_result = %v", tr)
+	}
+	blocks := tr["content"].([]interface{})
+	if len(blocks) != 2 {
+		t.Fatalf("tool_result content = %v, want text + audio", blocks)
+	}
+	if blocks[0].(map[string]interface{})["type"] != "text" ||
+		blocks[0].(map[string]interface{})["text"] != "72F" {
+		t.Errorf("first block = %v, want unchanged text", blocks[0])
+	}
+	audio := blocks[1].(map[string]interface{})
+	if audio["type"] != "audio" {
+		t.Fatalf("block = %v, want audio", audio)
+	}
+	src, _ := audio["source"].(map[string]interface{})
+	if src["type"] != "base64" || src["media_type"] != "audio/wav" || src["data"] != "UklGRg==" {
+		t.Errorf("audio source = %v, want base64 audio/wav", src)
+	}
+}
+
+func TestResponsesRequestToChatCompletionAudioUnsupportedFormat(t *testing.T) {
+	// Audio in a codec chat completions cannot represent must be dropped,
+	// never shipped upstream (strict gateways 400 on unknown formats) —
+	// the audio-less parts stay untouched.
+	body := `{"model":"m","input":[
+		{"type":"message","role":"user","content":[
+			{"type":"input_text","text":"hi"},
+			{"type":"input_audio","format":"flac","data":"ZmxhYw=="},
+			{"type":"input_audio","format":"wav","data":""}
+		]}
+	]}`
+	out, err := ResponsesRequestToChatCompletion([]byte(body), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req map[string]interface{}
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := req["messages"].([]interface{})
+	content := msgs[0].(map[string]interface{})["content"].([]interface{})
+	if len(content) != 1 {
+		t.Fatalf("content parts = %v, want only the text part", content)
+	}
+	if content[0].(map[string]interface{})["type"] != "text" {
+		t.Errorf("part = %v, want text", content[0])
+	}
+}
+
+func TestResponsesRequestToAnthropicAudioFormatPassthrough(t *testing.T) {
+	// Unknown codecs pass through toward Anthropic as audio/<codec>
+	// (mirroring openAIAudioPartToAnthropic), while empty data drops —
+	// leaving the empty-text fallback when nothing is representable.
+	body := `{"model":"m","input":[
+		{"type":"message","role":"user","content":[
+			{"type":"input_audio","format":"flac","data":"ZmxhYw=="},
+			{"type":"input_audio","format":"wav","data":""}
+		]}
+	]}`
+	out, err := ResponsesRequestToAnthropic([]byte(body), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req map[string]interface{}
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := req["messages"].([]interface{})
+	content := msgs[0].(map[string]interface{})["content"].([]interface{})
+	if len(content) != 1 {
+		t.Fatalf("content = %v, want only the flac audio block (empty data dropped)", content)
+	}
+	audio := content[0].(map[string]interface{})
+	src, _ := audio["source"].(map[string]interface{})
+	if audio["type"] != "audio" || src["type"] != "base64" || src["media_type"] != "audio/flac" {
+		t.Errorf("audio block = %v, want base64 audio/flac passthrough", audio)
+	}
+
+	// an only-empty-data message has nothing left → empty-text fallback
+	body = `{"model":"m","input":[{"type":"message","role":"user","content":[
+		{"type":"input_audio","format":"wav","data":""}
+	]}]}`
+	if out, err = ResponsesRequestToAnthropic([]byte(body), ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ = req["messages"].([]interface{})
+	content = msgs[0].(map[string]interface{})["content"].([]interface{})
+	if len(content) != 1 || content[0].(map[string]interface{})["type"] != "text" ||
+		content[0].(map[string]interface{})["text"] != "" {
+		t.Errorf("content = %v, want empty-text fallback", content)
+	}
+}
+
 func TestResponsesRequestNumericCallIDCoerced(t *testing.T) {
 	// A numeric call_id (non-conformant client) must not leak into
 	// tool_call_id/tool_use_id as a JSON number — upstreams require strings.
