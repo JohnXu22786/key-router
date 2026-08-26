@@ -1366,10 +1366,17 @@ describe('resampleResponse — Trends hourly rollup onto a sub-hour axis', () =>
     expect(out.group_by).toBe('model');
   });
 
-  it('preserves summary rows for groups beyond the server top-N (not in the series grid)', () => {
+  it('scales the summary rows for groups beyond the server top-N to the re-sampled scale', () => {
     // The current-period response only carries top-5 + Other series, but its
-    // summary lists every group; dropped groups must keep their original
-    // (raw) row so Trends deltas don't read them as zero and show -100%.
+    // summary lists every group. Rows beyond the grid cannot be re-derived
+    // bucket-by-bucket; their SUMS are moved to the re-sampled scale by the
+    // grid's aggregate factor — here the resampled grid total 35 over the
+    // raw grid total 135 (this response has no Other fold, so the whole
+    // grid is the basis): 9 x 35/135 = 7/3. Keeping the raw 9 would pit a
+    // FULL widened-window hour sum against the previous period's re-sampled
+    // sums in Trends (the hybrid-summary bug). The per-bucket statistics
+    // (min/max/avg), the last-bucket value and the share stay as the server
+    // reported them: an aggregate factor cannot faithfully re-derive them.
     const withTail = {
       ...resp,
       summary: [
@@ -1379,13 +1386,79 @@ describe('resampleResponse — Trends hourly rollup onto a sub-hour axis', () =>
     };
     const out = resampleResponse(withTail, dayjs('2026-08-13T15:50:00'), dayjs('2026-08-13T16:05:00'), dayjs('2026-08-13T16:05:00'), 'minute');
     const tail = out.summary.find(s => s.group === 'tail-model')!;
-    expect(tail).toEqual({ group: 'tail-model', min: 9, max: 9, avg: 9, sum: 9, value: 9, percent: 4 });
+    // Sum moved to the re-sampled scale: 9 x 35/135 = 7/3 (the un-scaled
+    // row would still read 9); the per-bucket fields stay as the server
+    // reported them.
+    expect(tail).toMatchObject({ group: 'tail-model', min: 9, max: 9, avg: 9, value: 9, percent: 4 });
+    expect(tail.sum).toBeCloseTo(7 / 3, 10);
     // Every group appears exactly once: the 2 resampled grid groups plus the
     // preserved tail row.
     expect(out.summary).toHaveLength(3);
     expect(new Set(out.summary.map(s => s.group)).size).toBe(3);
     // The resampled groups still get recomputed rows.
     expect(out.summary.find(s => s.group === 'a')!.sum).toBeCloseTo(30, 6);
+  });
+
+  it('Trends deltas for groups ranked 6+ use the re-sampled scale, never the raw widened-window sum (no inflation, no arrow flip)', () => {
+    // TRIGGER: a sub-hour range with >=6 groups in the window. The current
+    // response carries the top-5 + Other SERIES but a summary for EVERY
+    // group; the widened query window [14:00, 16:00) (until sent as 15:00)
+    // holds the full 14:00 hour AND the live 15:00 hour's row. The resample
+    // puts the 14:00 row fully on the axis but only the live cell's minute
+    // of the 15:00 row (1/20 — 20 recorded whole minutes by cutoff 15:20),
+    // so the grid's aggregate shrinks by (60 + 10/20)/70 = 121/140 — Other
+    // is the fold of the beyond-grid groups, so its own raw/scaled pair is
+    // exactly their aggregate share. The ranked-6 group t1 has NO per-bucket
+    // series: its raw summary sum (70 = full 14:00 + full 15:00 hour) must
+    // scale by 121/140 to 60.5 — its true re-sampled value — BEFORE
+    // computeTrending pairs it with the previous period.
+    const curResp: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'hour',
+      series: [
+        ...['g1', 'g2', 'g3', 'g4', 'g5'].flatMap(g => [
+          { bucket: '2026-08-13 14:00', group: g, value: 60, is_zero: false },
+          { bucket: '2026-08-13 15:00', group: g, value: 10, is_zero: false },
+        ]),
+        { bucket: '2026-08-13 14:00', group: 'Other', value: 60, is_zero: false },
+        { bucket: '2026-08-13 15:00', group: 'Other', value: 10, is_zero: false },
+      ],
+      summary: [
+        ...['g1', 'g2', 'g3', 'g4', 'g5', 't1'].map(g => ({ group: g, min: 10, max: 60, avg: 35, sum: 70, value: 10, percent: 0 })),
+      ],
+      buckets: ['2026-08-13 14:00', '2026-08-13 15:00'],
+      totals: { spend: 490, tokens: 0, requests: 0, cache: 0 },
+    };
+    // Previous period [13:00, 14:00) fetched with top: 0 — every group is in
+    // its series grid, so the whole prev summary is fully re-sampled.
+    const prevResp: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'hour',
+      series: [
+        ...['g1', 'g2', 'g3', 'g4', 'g5'].map(g => ({ bucket: '2026-08-13 13:00', group: g, value: 30, is_zero: false })),
+        { bucket: '2026-08-13 13:00', group: 't1', value: 65, is_zero: false },
+      ],
+      summary: [
+        ...['g1', 'g2', 'g3', 'g4', 'g5'].map(g => ({ group: g, min: 30, max: 30, avg: 30, sum: 30, value: 30, percent: 0 })),
+        { group: 't1', min: 65, max: 65, avg: 65, sum: 65, value: 65, percent: 0 },
+      ],
+      buckets: ['2026-08-13 13:00', '2026-08-13 14:00'],
+      totals: { spend: 215, tokens: 0, requests: 0, cache: 0 },
+    };
+    const since = dayjs('2026-08-13T14:00:00');
+    const until = dayjs('2026-08-13T15:00:00');
+    const cutoff = dayjs('2026-08-13T15:20:00');
+    const cur = resampleResponse(curResp, since, until, cutoff, 'minute');
+    const prev = resampleResponse(prevResp, since.subtract(1, 'hour'), since, cutoff, 'minute', false);
+    // The ranked-6+ group's sum is on the re-sampled scale (60.5), not the
+    // raw widened-window 70 — and agrees with the re-sampled grid rows.
+    expect(cur.summary.find(s => s.group === 't1')!.sum).toBeCloseTo(60.5, 10);
+    expect(cur.summary.find(s => s.group === 'g1')!.sum).toBeCloseTo(60.5, 10);
+    expect(cur.summary.find(s => s.group === 'Other')!.sum).toBeCloseTo(60.5, 10);
+    // t1 actually DROPPED: (60.5-65)/65 = -6.9% — the raw sum would have
+    // reported (70-65)/65 = +7.7% and flipped the arrow direction. g1's rise
+    // is (60.5-30)/30 = +101.7%, not the +133.3% the raw hour sum inflates.
+    const rows = computeTrending(cur, prev);
+    expect(rows.find(r => r.group === 't1')!.pct).toBeCloseTo(-(4.5 / 65) * 100, 6);
+    expect(rows.find(r => r.group === 'g1')!.pct).toBeCloseTo((30.5 / 30) * 100, 6);
   });
 
   it('re-buckets onto a clock-aligned 15-minute axis from a mid-cell window start', () => {
@@ -1592,6 +1665,54 @@ describe('prorateBoundaryBuckets — server-bucketed custom ranges', () => {
     expect(granularityFor(since, until)).toBe('min15');
     const r = hourResp([60, 60, 60, 60, 60]);
     expect(prorateBoundaryBuckets(r, since, until, until, dayjs('2026-08-13T15:30:00'), 'min15', 'hour')).toBe(r);
+  });
+
+  it('moves the beyond-top-N summary rows to the prorated scale (custom mid-bucket range + equal rollup)', () => {
+    // Custom 14:37-18:22, rollup == hour (the exact query shape
+    // prorateBoundaryBuckets fixes), Top = 2: the response carries the
+    // a/b/Other grid series but summary rows for t1/t2 (ranked beyond the
+    // Top-N selector). Explore's table renders only the top-N slice, so
+    // the visible consumer of these rows is Trends' computeTrending on
+    // custom ranges — its delta denominators must see the prorated sums.
+    // The boundary buckets [14:00] and [18:00] are prorated (23/60, 22/60)
+    // in the series; the retained rows' sums follow the grid's aggregate
+    // factor — measured on "Other", which IS the fold of the beyond-grid
+    // groups (scaled 37.5 / raw 50 = 3/4) — so t1/t2 read 22.5/15 instead
+    // of the raw widened-window 30/20, and t1 + t2 exactly equals the
+    // scaled Other fold. Their per-bucket statistics, last-bucket value
+    // and share stay as the server reported.
+    const buckets = ['2026-08-13 14:00', '2026-08-13 15:00', '2026-08-13 16:00', '2026-08-13 17:00', '2026-08-13 18:00'];
+    const r: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'hour',
+      series: [
+        ...buckets.map(b => ({ bucket: b, group: 'a', value: 60, is_zero: false })),
+        ...buckets.map(b => ({ bucket: b, group: 'b', value: 30, is_zero: false })),
+        ...buckets.map(b => ({ bucket: b, group: 'Other', value: 10, is_zero: false })),
+      ],
+      summary: [
+        { group: 'a', min: 60, max: 60, avg: 60, sum: 300, value: 60, percent: 60 },
+        { group: 'b', min: 30, max: 30, avg: 30, sum: 150, value: 30, percent: 30 },
+        { group: 't1', min: 6, max: 6, avg: 6, sum: 30, value: 6, percent: 6 },
+        { group: 't2', min: 4, max: 4, avg: 4, sum: 20, value: 4, percent: 4 },
+      ],
+      buckets,
+      totals: { spend: 500, tokens: 0, requests: 0, cache: 0 },
+    };
+    const since = dayjs('2026-08-13T14:37:00');
+    const until = dayjs('2026-08-13T18:22:00');
+    const out = prorateBoundaryBuckets(r, since, until, until, dayjs('2026-08-13T19:00:00'), 'hour', 'hour');
+    // Grid rows recomputed at the prorated scale, unchanged by this fix.
+    expect(out.summary.find(s => s.group === 'a')!.sum).toBeCloseTo(225, 10);
+    expect(out.summary.find(s => s.group === 'b')!.sum).toBeCloseTo(112.5, 10);
+    expect(out.summary.find(s => s.group === 'Other')!.sum).toBeCloseTo(37.5, 10);
+    // Beyond-Top-N rows: displayed sums match the prorated scale.
+    const t1 = out.summary.find(s => s.group === 't1')!;
+    const t2 = out.summary.find(s => s.group === 't2')!;
+    expect(t1.sum).toBeCloseTo(22.5, 10);
+    expect(t2.sum).toBeCloseTo(15, 10);
+    expect(t1.sum + t2.sum).toBeCloseTo(37.5, 10);
+    expect(t1).toMatchObject({ min: 6, max: 6, avg: 6, value: 6, percent: 6 });
+    expect(t2).toMatchObject({ min: 4, max: 4, avg: 4, value: 4, percent: 4 });
   });
 
   it('prorates BOTH boundary buckets of the Trends PREVIOUS-period window (its query sends the raw mid-bucket since)', () => {

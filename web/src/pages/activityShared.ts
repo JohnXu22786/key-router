@@ -1204,14 +1204,17 @@ export function stackedData<T extends BucketedRow>(
 // one, so "positive" is the implementable approximation — the convention
 // resampleResponse already used), value = the LAST bucket, percent = the
 // group's share of the grid's total (top-N + Other; the server divides by
-// every group's total, but the fold-away groups cannot be re-derived from
-// the scaled grid and keep their original rows below).
+// every group's total).
 // Shared by resampleResponse and prorateBoundaryBuckets — both modify the
 // series values and must re-derive the summed fields so every consumer
 // (Trends' deltas, Explore's table) reads the PRORATED numbers, never the
 // server's raw widened-window ones. Summary rows for groups OUTSIDE the
-// series grid (beyond the server's top-N) keep their original values: the
-// response only carries their totals, so they cannot be re-derived.
+// series grid (beyond the server's top-N) cannot be re-derived bucket-by-
+// bucket — the response only carries their totals — so their SUMS are
+// moved to the corrected scale by the grid's aggregate window factor (see
+// the scaling block below): without it the response's summary stays a
+// HYBRID whose raw widened-window sums inflate Trends' deltas and the
+// beyond-selection Explore rows.
 function recomputeFromSeries(
   resp: ActivityResponse,
   series: ActivitySeriesPoint[],
@@ -1247,7 +1250,50 @@ function recomputeFromSeries(
     };
   });
   const gridGroups = new Set(groups);
-  summary.push(...resp.summary.filter(s => !gridGroups.has(s.group)));
+  const beyond = resp.summary.filter(s => !gridGroups.has(s.group));
+  if (beyond.length > 0) {
+    // The retained fold-away rows carry the SERVER's raw widened-window
+    // sums (full boundary buckets / full hourly rows — the response has no
+    // per-bucket series for them, so they cannot be re-derived bucket-by-
+    // bucket). Left as-is they would keep the response's summary a HYBRID:
+    // the grid rows sit at the window scale while these stay raw, so
+    // computeTrending pitted RAW current sums against the previous
+    // period's FULLY re-sampled ones on sub-hour windows (pct =
+    // (rawHourSum - prevResampledSum)/prev — inflated by the whole-hour
+    // accumulation, able to FLIP the arrow for entities that actually
+    // dropped). Both callers shrink every raw VALUE by its window share,
+    // so the ratio of the re-derived grid total to the raw grid total is
+    // the weighted-average share the grid applied — under the same
+    // uniform-within-bucket assumption the resample itself uses, the
+    // fold-away groups' sums shrink by that factor too. The basis is the
+    // "Other" fold when the response carries it: Other IS the beyond-grid
+    // groups' aggregate, so its raw/scaled pair is exactly their share;
+    // the whole grid is the fallback (only reachable on hand-built
+    // responses — a real top-N response always carries the fold when
+    // beyond rows exist). The per-bucket statistics (min/max/avg) and the
+    // last-bucket value stay as the server reported them — an aggregate
+    // factor cannot faithfully re-derive bucket-level numbers — and
+    // percent stays too: it is a share whose numerator and denominator
+    // shrink by the same factor, so the server's value already holds at
+    // the new scale.
+    const rawOther = resp.series.reduce((a, p) => (p.group === 'Other' ? a + p.value : a), 0);
+    let rawBasis = rawOther;
+    let scaledBasis = series.reduce((a, p) => (p.group === 'Other' ? a + p.value : a), 0);
+    if (rawOther <= 0) {
+      // No fold: the whole grid is the basis (raw values from resp.series —
+      // the callers leave it untouched — vs the re-derived series).
+      rawBasis = resp.series.reduce((a, p) => (gridGroups.has(p.group) ? a + p.value : a), 0);
+      scaledBasis = series.reduce((a, p) => (gridGroups.has(p.group) ? a + p.value : a), 0);
+    }
+    if (rawBasis > 0 && scaledBasis !== rawBasis) {
+      const scale = scaledBasis / rawBasis;
+      for (let i = 0; i < beyond.length; i++) {
+        const s = beyond[i];
+        beyond[i] = { ...s, sum: s.sum * scale };
+      }
+    }
+  }
+  summary.push(...beyond);
   const totals = { ...resp.totals };
   const metricTotal = series.reduce((a, p) => a + p.value, 0);
   if (resp.metric === 'spend') totals.spend = metricTotal;
@@ -1266,7 +1312,11 @@ function recomputeFromSeries(
 // with is_zero flags). Summary and totals are RECOMPUTED from the resampled
 // buckets (server semantics: min/max/avg over non-empty buckets, value =
 // last bucket, percent of the total) so the Trends "Trending" deltas agree
-// with the re-bucketed chart.
+// with the re-bucketed chart; summary rows beyond the series grid (groups
+// ranked 6+ under top-5) are moved to the same scale by the grid's
+// aggregate factor inside recomputeFromSeries — without that, their raw
+// widened-window sums inflated the deltas against the previous period's
+// fully re-sampled ones.
 export function resampleResponse(
   resp: ActivityResponse,
   since: dayjs.Dayjs,
@@ -1372,7 +1422,9 @@ function boundaryShare(
 // boundary bucket's value is scaled by the fraction of its recorded extent
 // that lies inside [since, until) (boundaryShare), interior buckets are
 // unchanged, and the summed fields are recomputed from the scaled grid
-// (recomputeFromSeries). The result agrees with the Overview computation
+// (recomputeFromSeries — summary rows beyond the series grid follow the
+// same scale via the grid's aggregate factor there). The result agrees
+// with the Overview computation
 // for the same window and rows; a boundary bucket whose share is 1 (fully
 // in-window) is left untouched and the response is returned as-is when no
 // bucket is partial.
