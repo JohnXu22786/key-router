@@ -237,3 +237,10 @@ func TestStatsConsumptionsRunawayWindowCapped(t *testing.T) {
 		t.Fatalf("filtered rows = %d, want 3 (the m0 combos)", len(got))
 	}
 }
+
+// bucketBound arithmetic is unit-tested in consumptions_cap_internal_test.go
+// (package handler, accesses the unexported helper directly). The
+// integration tests above (TestStatsConsumptionsYearWindowComplete /
+// TestStatsConsumptionsRunawayWindowCapped) pin the cap contract against
+// the real DB; the unit test pins the hour-bound arithmetic that drives
+// the cap.
