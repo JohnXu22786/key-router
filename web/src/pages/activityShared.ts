@@ -191,6 +191,33 @@ function findFallBackBefore(until: dayjs.Dayjs): { t: dayjs.Dayjs; before: numbe
   return null;
 }
 
+// findSpringForwardBefore is the spring-forward mirror of
+// findFallBackBefore: the first spring-forward T BEFORE `start` within 180
+// minutes. Walking BACKWARD across a spring-forward, the offset DROPS
+// (we step from the post-jump higher offset to the pre-jump lower one) —
+// the opposite of the fall-back pattern. Used by the hour floor's
+// spring-forward rebuild to recover T (the transition instant) when
+// V8's setter resolution of the minute-zeroed wall time landed past the
+// gap. The 45-minute-offset Chatham shift is the only real zone where
+// this triggers: V8 rolls the non-existent `03:00+13:45` (in the spring
+// gap [02:45, 03:45) at +12:45) forward to the first valid post-jump
+// time `04:00+13:45` = 14:15Z, and the old fall-back branch's
+// `first.utcOffset() > until.utcOffset()` test is INERT (both offsets are
+// the post-jump +13:45) — the new branch walks back from `first` to
+// locate T and rebuilds the floor from it.
+function findSpringForwardBefore(start: dayjs.Dayjs): { t: dayjs.Dayjs; before: number; after: number } | null {
+  let t = floorMinute(start);
+  const startOff = start.utcOffset();
+  let prevOff = startOff;
+  for (let i = 0; i < 180; i++) {
+    const off = t.utcOffset();
+    if (off !== prevOff) return off < prevOff ? { t: t.add(1, 'minute'), before: off, after: prevOff } : null;
+    prevOff = off;
+    t = t.subtract(1, 'minute');
+  }
+  return null;
+}
+
 // repeatRuns returns the epoch runs an hourly row's recorded value covers
 // when a fall-back affects it — the elapsed instants displaying the row's
 // field, decomposed into contiguous runs — or null when the row is
@@ -322,6 +349,34 @@ export function floorWindowUntil(until: dayjs.Dayjs, granularity: Granularity): 
         return fb.t.add(Math.max(0, field - tauPlus), 'minute');
       }
       return first.add(1, 'hour');
+    }
+    // Spring-forward mirror: the fall-back branch above fires when
+    // `first` resolved to the PRE-jump grid (a higher offset than until's
+    // post-jump one). The symmetric spring-forward case is when the V8
+    // setter rolls the non-existent minute-zeroed wall time FORWARD by
+    // the gap's length — a Chatham spring `03:00+13:45` (in the gap
+    // [02:45, 03:45) at +12:45) lands on `04:00+13:45` = 14:15Z, with
+    // first's POST-jump offset EQUAL to until's (+13:45), so neither
+    // offset comparison flags it. Walk back from `first` to locate the
+    // transition T and rebuild the containing-hour start from it: T +
+    // max(0, field - τ+) where τ+ is the wall the clock reads AT T
+    // (post-jump). `field` is the wall hour field of `until` (the
+    // containing wall hour in the post-jump world) — `until` is a real
+    // post-jump instant with an unambiguous wall display, unlike V8's
+    // rolled-forward `first`. The criterion `first > sf.t` (strict) keeps
+    // the bit-identical whole-hour / half-hour / Chatham-fall-back cases
+    // from going through the new branch: NY and Lord Howe spring land
+    // first at T (first == T, no overshoot), and the Chatham fall-back
+    // row's first is in the pre-jump world (T is much earlier, walk-back
+    // finds no spring-forward). The misaligned Chatham spring overshoots
+    // T by the 15-min τ+ − field-03 gap, and the rebuild pulls the floor
+    // back to T = 14:00Z — the true start of the post-gap 03:00 wall
+    // hour, whose [03:00, 03:45) portion is skipped by the gap.
+    const sf = findSpringForwardBefore(first);
+    if (sf && first.valueOf() > sf.t.valueOf()) {
+      const tauPlus = sf.t.hour() * 60 + sf.t.minute();
+      const field = until.hour() * 60;
+      return sf.t.add(Math.max(0, field - tauPlus), 'minute');
     }
     return first;
   }
