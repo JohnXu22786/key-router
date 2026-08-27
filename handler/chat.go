@@ -467,7 +467,10 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			// Stream response and capture token usage from stream end events.
 			// The upstream format comes from the relay (a /v1/responses
 			// request may have been fallback-routed to chat completions).
-			usage, streamErr := relay.StreamResponse(c.Writer, resp, inputFormat, rr.UpstreamFormat, targetModel)
+			// sawContent reports whether the stream carried any text,
+			// tool_call or reasoning_content; the empty-response failover
+			// uses it (see Engine.RecordEmptyResponse).
+			usage, sawContent, streamErr := relay.StreamResponse(c.Writer, resp, inputFormat, rr.UpstreamFormat, targetModel)
 			resp.Body.Close()
 
 			if streamErr != nil {
@@ -482,24 +485,52 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			// (read/conversion failure) must not inflate costs or burn
 			// rate-limit quotas — the client received an error, not work.
 			if streamErr == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				consumption, err := billing.RecordConsumption(key.ID, reqMeta.Model, targetModel, extractAppName(c.Request.Header, meta.RequestBody), usage, route.Route, h.Engine.Calculator)
-				if err != nil {
-					log.Printf("[relay] failed to record consumption for key %d: %v", key.ID, err)
+				// Empty-response failover (streaming): an empty 2xx
+				// stream (no text / no tool_call / no reasoning_content)
+				// cools the key for FUTURE requests but does NOT
+				// abandon THIS one — the bytes already went to the
+				// client. ONLY trips when the operator opted the
+				// provider in via FailoverEmptyEnabled (default off —
+				// empty streams are an upstream-specific behavior and
+				// not every provider emits them). On the empty +
+				// enabled path the success observation is intentionally
+				// skipped: an empty completion is not a "non-empty
+				// success", and RecordResult(ok=true) would reset the
+				// empty streak the detection just incremented. The
+				// counter is windowed by FailoverEmptyWindowSec; once
+				// the threshold is reached the engine calls failKey
+				// (rate_limited + ReasonEmptyResponse) and, when
+				// FailoverEmptyDisable is on, additionally
+				// MarkKeyDisabled. The empty-but-disabled path leaves
+				// the success observation in place — the operator has
+				// not opted in, so an empty body is whatever the
+				// upstream chose to answer with.
+				emptyAndEnabled := !sawContent && route.Provider.FailoverEmptyEnabled
+				if emptyAndEnabled {
+					log.Printf("[relay] key %d returned an empty stream (no content, no tool_call, no reasoning_content)", key.ID)
+					h.Engine.RecordEmptyResponse(key.ID, route.Provider.ID)
 				}
-				costMicro := int64(consumption.CostUSD * 1e6)
-				if usage.TotalTokens > 0 {
-					h.Engine.RecordSuccess(key.ID, usage.TotalTokens, costMicro)
-				} else {
-					h.Engine.WindowManager.IncrementAllWithCost(key.ID, 0, costMicro)
-				}
-				// Every successful request is one ordered observation toward
-				// the key's recovery streak (2 consecutive successes return
-				// a cooled/disabled key to active).
-				h.Engine.RecordResult(key.ID, true, "", 0)
-				// Lifetime budget: accumulate spend; if the key's total
-				// budget is exhausted, take it out of rotation permanently.
-				if costMicro > 0 {
-					h.applySpendLimit(key.ID, costMicro)
+				if !emptyAndEnabled {
+					consumption, err := billing.RecordConsumption(key.ID, reqMeta.Model, targetModel, extractAppName(c.Request.Header, meta.RequestBody), usage, route.Route, h.Engine.Calculator)
+					if err != nil {
+						log.Printf("[relay] failed to record consumption for key %d: %v", key.ID, err)
+					}
+					costMicro := int64(consumption.CostUSD * 1e6)
+					if usage.TotalTokens > 0 {
+						h.Engine.RecordSuccess(key.ID, usage.TotalTokens, costMicro)
+					} else {
+						h.Engine.WindowManager.IncrementAllWithCost(key.ID, 0, costMicro)
+					}
+					// Every successful request is one ordered observation
+					// toward the key's recovery streak (2 consecutive
+					// successes return a cooled/disabled key to active).
+					h.Engine.RecordResult(key.ID, true, "", 0)
+					// Lifetime budget: accumulate spend; if the key's
+					// total budget is exhausted, take it out of rotation
+					// permanently.
+					if costMicro > 0 {
+						h.applySpendLimit(key.ID, costMicro)
+					}
 				}
 			}
 		} else {
@@ -590,6 +621,30 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			// responses: 3xx/4xx/5xx represent work the upstream never
 			// performed and must not burn the key's request budgets.
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				// Empty-response failover (non-stream): a 2xx body that
+				// carries no text / no tool_call / no reasoning_content
+				// trips the failover loop ONLY when the operator opted
+				// the provider in via FailoverEmptyEnabled (default off
+				// — empty responses are an upstream-specific behavior
+				// and not every provider emits them). On the empty +
+				// enabled path, RecordEmptyResponse (windowed +
+				// thresholded) and attempt++/continue fail over to the
+				// next key; the body never reaches the client. The
+				// success observation is intentionally skipped: an
+				// empty completion is not a "non-empty success" and
+				// would reset the empty streak the detection just
+				// incremented (see selector/outcome_test.go). The
+				// empty-but-disabled path leaves the body to be
+				// relayed as a normal successful completion — the
+				// operator has not opted in, so the body is whatever
+				// the upstream chose to answer with.
+				if responseIsEmpty(responseBody, rr.UpstreamFormat) &&
+					route.Provider.FailoverEmptyEnabled {
+					log.Printf("[relay] key %d returned an empty body (no content, no tool_call, no reasoning_content), failing over", key.ID)
+					h.Engine.RecordEmptyResponse(key.ID, route.Provider.ID)
+					attempt++
+					continue
+				}
 				usage := relay.ParseTokenUsage(responseBody, rr.UpstreamFormat)
 				consumption, err := billing.RecordConsumption(key.ID, reqMeta.Model, targetModel, extractAppName(c.Request.Header, meta.RequestBody), usage, route.Route, h.Engine.Calculator)
 				if err != nil {
@@ -1037,6 +1092,122 @@ func truncateAppName(s string) string {
 		return s
 	}
 	return string(r[:max])
+}
+
+// responseIsEmpty reports whether a successful 2xx body (upstream
+// "completed successfully" but produced no user-visible content) is
+// empty for the empty-response failover. Empty means: no text content
+// AND no tool_calls / tool_use AND no reasoning_content. Usage /
+// stop_reason alone do not make a body non-empty — a model that
+// consumed prompt tokens but produced nothing is still an empty
+// completion from the user's perspective.
+//
+// The check is format-aware. The OpenAI default branch is the most
+// common case; Anthropic looks at the top-level content array; Responses
+// looks at the top-level output array. Unparseable / unrecognized
+// bodies return false (the same conservative default the stream-time
+// streamChunkHasContent helper uses) so a malformed shape never
+// triggers an unnecessary failover.
+func responseIsEmpty(body []byte, upstreamFormat string) bool {
+	if len(bytes.TrimSpace(body)) == 0 {
+		return true
+	}
+	var v map[string]interface{}
+	if err := json.Unmarshal(body, &v); err != nil {
+		return false
+	}
+	switch upstreamFormat {
+	case "anthropic":
+		arr, ok := v["content"].([]interface{})
+		if !ok {
+			return true // no content array at all = empty
+		}
+		for _, bi := range arr {
+			block, ok := bi.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			switch block["type"] {
+			case "text":
+				if s, ok := block["text"].(string); ok && s != "" {
+					return false
+				}
+			case "tool_use":
+				return false
+			case "thinking":
+				if s, ok := block["thinking"].(string); ok && s != "" {
+					return false
+				}
+			}
+		}
+		return true
+	case "responses":
+		// New "output" array OR legacy "output_text" string — both are
+		// content. A reasoning-only response still counts as content
+		// (the chain is the answer).
+		if arr, ok := v["output"].([]interface{}); ok && len(arr) > 0 {
+			return false
+		}
+		if s, ok := v["output_text"].(string); ok && s != "" {
+			return false
+		}
+		return true
+	default:
+		// OpenAI / chat-completions body: choices[0].message.content
+		// (string OR a parts array of {"type":"text","text":...}),
+		// .tool_calls (array), .reasoning_content (string). A choice
+		// with ANY of those non-empty is non-empty. (Some OpenAI-
+		// compatible gateways mirror Anthropic's multi-block shape and
+		// return content as a parts array — same convention
+		// relay.completionToStreamChunk and relay.ConvertOpenAIResponse
+		// ToAnthropic already follow; missing it would falsely flag
+		// a non-empty body as empty and waste a retry on it.)
+		choices, ok := v["choices"].([]interface{})
+		if !ok {
+			return true
+		}
+		for _, ci := range choices {
+			choice, ok := ci.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			msg, _ := choice["message"].(map[string]interface{})
+			if msg == nil {
+				continue
+			}
+			if s, ok := msg["content"].(string); ok && s != "" {
+				return false
+			}
+			if arr, ok := msg["content"].([]interface{}); ok && openAIPartsHaveText(arr) {
+				return false
+			}
+			if arr, ok := msg["tool_calls"].([]interface{}); ok && len(arr) > 0 {
+				return false
+			}
+			if s, ok := msg["reasoning_content"].(string); ok && s != "" {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+// openAIPartsHaveText reports whether an OpenAI-format content parts
+// array (the {"type":"text","text":...} shape some gateways use) has
+// at least one non-empty text part. Mirrors relay.completionToStream
+// Chunk's parts-handling convention so a content-as-parts body is
+// never falsely reported as empty.
+func openAIPartsHaveText(parts []interface{}) bool {
+	for _, part := range parts {
+		p, ok := part.(map[string]interface{})
+		if !ok || p["type"] != "text" {
+			continue
+		}
+		if t, ok := p["text"].(string); ok && t != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // extractUpstreamError pulls a readable error message from an upstream error

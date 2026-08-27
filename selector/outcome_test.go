@@ -25,6 +25,12 @@ import (
 //     is what made a flaky key look "active" while traffic kept failing
 //     over to the next one).
 //   - An intervening success breaks the failure streak and vice versa.
+//
+// RecordEmptyResponse is a separate, OPT-IN counter driven by the
+// provider's FailoverEmptyEnabled / FailoverEmptyThreshold setting. It
+// only cools (or also disables, with FailoverEmptyDisable) — it does NOT
+// feed the generic 2-of-the-same disable rule (ReasonEmptyResponse is
+// intentionally not in DisableClassReason).
 
 func mustKey(t *testing.T, e *Engine, k *model.Key) *model.Key {
 	t.Helper()
@@ -428,5 +434,190 @@ func TestResetOutcomeClearsStreaks(t *testing.T) {
 	e.RecordResult(k.ID, false, model.ReasonAuthFailed, 30*time.Second)
 	if after := loadKey(t, k.ID); after.Status != model.KeyStatusDisabled {
 		t.Errorf("status = %q, want disabled after 2 consecutive post-reset failures", after.Status)
+	}
+}
+
+// mustProvider inserts a provider and refreshes the engine so its
+// in-memory provider map picks it up. Returns the provider with its
+// assigned ID.
+func mustProvider(t *testing.T, e *Engine, p *model.Provider) *model.Provider {
+	t.Helper()
+	if err := db.GetDB().Create(p).Error; err != nil {
+		t.Fatal(err)
+	}
+	e.Refresh()
+	return p
+}
+
+// TestRecordEmptyResponseThresholdCoolsKey: when the provider has
+// FailoverEmptyEnabled + threshold set, observing the threshold number
+// of empty responses within the window cools the key (rate_limited
+// with reason empty_response, the same machinery 429 / 5xx use). One
+// observation short of the threshold must NOT cool the key.
+func TestRecordEmptyResponseThresholdCoolsKey(t *testing.T) {
+	e := newTestEngine(t)
+	provider := mustProvider(t, e, &model.Provider{
+		Name:                   "p1",
+		Type:                   model.ProviderTypeOpenAI,
+		BaseURL:                "http://localhost:1",
+		FailoverEmptyEnabled:   true,
+		FailoverEmptyThreshold: 2,
+		FailoverEmptyWindowSec: 60,
+	})
+	k := mustKey(t, e, &model.Key{ProviderID: provider.ID, Status: model.KeyStatusActive})
+
+	e.RecordEmptyResponse(k.ID, provider.ID)
+	if after := loadKey(t, k.ID); after.Status != model.KeyStatusActive {
+		t.Fatalf("status after 1st empty = %q, want active (one short of threshold)", after.Status)
+	}
+
+	e.RecordEmptyResponse(k.ID, provider.ID)
+	after := loadKey(t, k.ID)
+	if after.Status != model.KeyStatusRateLimited {
+		t.Errorf("status after 2nd empty = %q, want rate_limited", after.Status)
+	}
+	if after.DisabledReason != model.ReasonEmptyResponse {
+		t.Errorf("disabled_reason = %q, want %q (the UI shows why the key is down)",
+			after.DisabledReason, model.ReasonEmptyResponse)
+	}
+	if after.RateLimitedUntil == nil || time.Now().After(*after.RateLimitedUntil) {
+		t.Errorf("rate_limited_until = %v, want a future cooldown", after.RateLimitedUntil)
+	}
+}
+
+// TestRecordEmptyResponseSuccessResetsStreak: a non-empty success
+// observation (RecordResult ok=true) clears the empty streak so a
+// single non-empty response between two empties doesn't trip the
+// threshold. The streak count and timestamp are zeroed — a later empty
+// starts fresh from 1.
+func TestRecordEmptyResponseSuccessResetsStreak(t *testing.T) {
+	e := newTestEngine(t)
+	provider := mustProvider(t, e, &model.Provider{
+		Name:                   "p1",
+		Type:                   model.ProviderTypeOpenAI,
+		BaseURL:                "http://localhost:1",
+		FailoverEmptyEnabled:   true,
+		FailoverEmptyThreshold: 2,
+		FailoverEmptyWindowSec: 60,
+	})
+	k := mustKey(t, e, &model.Key{ProviderID: provider.ID, Status: model.KeyStatusActive})
+
+	e.RecordEmptyResponse(k.ID, provider.ID) // streak = 1
+	e.RecordResult(k.ID, true, "", 0)        // non-empty success resets the streak
+	e.RecordEmptyResponse(k.ID, provider.ID) // streak = 1 again (NOT 2)
+
+	if after := loadKey(t, k.ID); after.Status != model.KeyStatusActive {
+		t.Fatalf("status = %q, want active (the non-empty success reset the streak so the 2nd empty is a fresh 1-of-2)", after.Status)
+	}
+}
+
+// TestRecordEmptyResponseDisableFlavor: when the provider sets
+// FailoverEmptyDisable = true, the threshold additionally disables the
+// key (MarkKeyDisabled with ReasonEmptyResponse). The disabled reason
+// is a system-set reason (IsSystemDisabledReason), so a successful
+// probe auto-recovers the key — the auto-reconnect flavor the operator
+// chose.
+func TestRecordEmptyResponseDisableFlavor(t *testing.T) {
+	e := newTestEngine(t)
+	provider := mustProvider(t, e, &model.Provider{
+		Name:                   "p1",
+		Type:                   model.ProviderTypeOpenAI,
+		BaseURL:                "http://localhost:1",
+		FailoverEmptyEnabled:   true,
+		FailoverEmptyThreshold: 2,
+		FailoverEmptyWindowSec: 60,
+		FailoverEmptyDisable:   true,
+	})
+	k := mustKey(t, e, &model.Key{ProviderID: provider.ID, Status: model.KeyStatusActive})
+
+	e.RecordEmptyResponse(k.ID, provider.ID)
+	e.RecordEmptyResponse(k.ID, provider.ID)
+
+	after := loadKey(t, k.ID)
+	if after.Status != model.KeyStatusDisabled {
+		t.Fatalf("status = %q, want disabled (disable flavor on threshold trip)", after.Status)
+	}
+	if !model.IsSystemDisabledReason(after.DisabledReason) {
+		t.Errorf("disabled_reason %q is not a system reason — health-checker auto-recovery would be blocked", after.DisabledReason)
+	}
+}
+
+// TestRecordEmptyResponseNoOpWhenDisabled: by default
+// FailoverEmptyEnabled is false, so the empty-streak counter must NOT
+// advance (the operator opted every provider out). The key stays
+// active across many empty observations, and RecordResult ok=true
+// still works without ever touching the empty streak.
+func TestRecordEmptyResponseNoOpWhenDisabled(t *testing.T) {
+	e := newTestEngine(t)
+	provider := mustProvider(t, e, &model.Provider{
+		Name:    "p1",
+		Type:    model.ProviderTypeOpenAI,
+		BaseURL: "http://localhost:1",
+		// FailoverEmptyEnabled defaults to false
+	})
+	k := mustKey(t, e, &model.Key{ProviderID: provider.ID, Status: model.KeyStatusActive})
+
+	for i := 0; i < 10; i++ {
+		e.RecordEmptyResponse(k.ID, provider.ID)
+	}
+
+	if after := loadKey(t, k.ID); after.Status != model.KeyStatusActive {
+		t.Fatalf("status = %q, want active (empty failover is off by default)", after.Status)
+	}
+}
+
+// TestRecordEmptyResponseDisableFlavorAutoRecovers: when the provider
+// uses the disable flavor, the threshold disables the key with
+// ReasonEmptyResponse, and the health-checker recovery path (modeled
+// here by 2 consecutive successful RecordResult observations) must
+// bring the key back to active. This guards against a regression
+// where IsSystemDisabledReason was extended to include
+// ReasonEmptyResponse but the matching MarkKeyActive SQL guard was
+// missed — without the guard, the auto-reconnect flavor the operator
+// chose would be silently broken (the key would stay disabled until
+// an admin touched it).
+func TestRecordEmptyResponseDisableFlavorAutoRecovers(t *testing.T) {
+	e := newTestEngine(t)
+	provider := mustProvider(t, e, &model.Provider{
+		Name:                   "p1",
+		Type:                   model.ProviderTypeOpenAI,
+		BaseURL:                "http://localhost:1",
+		FailoverEmptyEnabled:   true,
+		FailoverEmptyThreshold: 2,
+		FailoverEmptyWindowSec: 60,
+		FailoverEmptyDisable:   true,
+	})
+	k := mustKey(t, e, &model.Key{ProviderID: provider.ID, Status: model.KeyStatusActive})
+
+	e.RecordEmptyResponse(k.ID, provider.ID)
+	e.RecordEmptyResponse(k.ID, provider.ID)
+	if after := loadKey(t, k.ID); after.Status != model.KeyStatusDisabled {
+		t.Fatalf("status after threshold = %q, want disabled (disable flavor)", after.Status)
+	}
+
+	// RecordEmptyResponse sets a 30s cooldown first (via failKey) and
+	// then layers the disable on top. MarkKeyActive refuses to recover
+	// while a cooldown is still running (the upstream's own wait
+	// instruction wins), so the recovery test must zero the cooldown
+	// to model "the cooldown has elapsed and a fresh health pass now
+	// sees a healthy response" — which is exactly the health-checker
+	// path. (Production cooldown expiry is verified by
+	// TestRecordResultCooldownRunningBlocksRecovery and is independent
+	// of the empty-failover rule.)
+	db.GetDB().Model(&model.Key{}).Where("id = ?", k.ID).Update("rate_limited_until", nil)
+
+	// The health-checker / observation path: two consecutive non-empty
+	// successes must bring the key back. Single success must NOT.
+	e.RecordResult(k.ID, true, "", 0)
+	if after := loadKey(t, k.ID); after.Status != model.KeyStatusDisabled {
+		t.Fatalf("status after 1st success = %q, want disabled (needs 2 successes)", after.Status)
+	}
+	e.RecordResult(k.ID, true, "", 0)
+	after := loadKey(t, k.ID)
+	if after.Status != model.KeyStatusActive {
+		t.Errorf("status after 2nd success = %q, want active (MarkKeyActive must allow empty_response recovery)", after.Status)
+	}
+	if after.DisabledReason != "" {
+		t.Errorf("disabled_reason = %q, want cleared on recovery", after.DisabledReason)
 	}
 }
