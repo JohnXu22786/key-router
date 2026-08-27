@@ -1209,6 +1209,25 @@ func (h *AdminHandler) GetKeyDetail(c *gin.Context) {
 	})
 }
 
+// bucketBound returns an upper bound on the number of distinct hour buckets
+// matching a (since, until) window. Matched buckets are ≥ 1 real hour apart
+// (hourly rows — DST included), so the count is (until − flooredSince)/1h + 1.
+// The since is truncated to the hour grid; using the raw since would
+// undercount by one bucket whenever until is exactly on an hour boundary
+// (the WHERE clause hour_bucket <= until then matches the boundary bucket
+// the raw-since d/1h+1 omits). The until is intentionally NOT floored:
+// flooring the until inside a DST-repeated hour would be ambiguous, while
+// the raw instant keeps the real-time distance exact. A reversed window
+// (until < flooredSince) returns 0.
+func bucketBound(since, until time.Time) int64 {
+	flooredSince := since.Truncate(time.Hour)
+	d := until.Sub(flooredSince)
+	if d < 0 {
+		return 0
+	}
+	return int64(d/time.Hour) + 1
+}
+
 // GetStatsConsumptions returns consumption records
 func (h *AdminHandler) GetStatsConsumptions(c *gin.Context) {
 	var consumptions []model.Consumption
@@ -1301,18 +1320,16 @@ func (h *AdminHandler) GetStatsConsumptions(c *gin.Context) {
 
 	// buckets: upper bound on the distinct hour buckets matching the window.
 	// Matched buckets are ≥ 1 real hour apart (hourly rows — DST included),
-	// so (until − since)/1h + 1 can never undercount. The anchor is the
-	// floored since and the RAW until (no floor): flooring the until inside
-	// a DST-repeated hour would be ambiguous, while the raw instant keeps
-	// the real-time distance exact. A request without since or until is
-	// unbounded on that side — treat it as exceeding the cap.
+	// so (until − flooredSince)/1h + 1 can never undercount. The since is
+	// truncated to the hour grid (raw since mid-hour would undercount by one
+	// bucket when until is exactly on an hour boundary); the RAW until is
+	// kept (no floor): flooring the until inside a DST-repeated hour would
+	// be ambiguous, while the raw instant keeps the real-time distance
+	// exact. A request without since or until is unbounded on that side —
+	// treat it as exceeding the cap.
 	buckets := int64(math.MaxInt64)
 	if sinceTime != nil && untilTime != nil {
-		if d := untilTime.Sub(*sinceTime); d >= 0 {
-			buckets = int64(d/time.Hour) + 1
-		} else {
-			buckets = 0
-		}
+		buckets = bucketBound(*sinceTime, *untilTime)
 	}
 
 	truncated := groups > 0 && buckets > consumptionCapRows/groups
