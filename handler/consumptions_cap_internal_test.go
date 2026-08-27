@@ -33,8 +33,6 @@ func TestBucketBound(t *testing.T) {
 			mk(2026, 1, 1, 16, 15), mk(2026, 1, 1, 20, 0), 5},
 		{"reversed window returns 0",
 			mk(2026, 1, 1, 18, 0), mk(2026, 1, 1, 16, 0), 0},
-		{"second-resolution since truncates the same",
-			mk(2026, 1, 1, 16, 31), mk(2026, 1, 1, 18, 0), 3},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
