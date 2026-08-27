@@ -58,12 +58,21 @@ jobs:
           echo "ver=${tag#v}" >> "$GITHUB_OUTPUT"
           echo "Resolved tag: $tag"
 
-      - name: Create and push tag
+      - name: Create and push tag (idempotent: skip if a pre-signed tag already exists)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag "${{ steps.resolve.outputs.tag }}"
-          git push origin "${{ steps.resolve.outputs.tag }}"
+          # If the tag already exists on the remote, the release manager has
+          # already pushed a GPG-signed tag — leave it alone and let build/publish
+          # run against the existing tag. Otherwise create + push the tag.
+          if git ls-remote --tags origin "${{ steps.resolve.outputs.tag }}" | grep -q "refs/tags/${{ steps.resolve.outputs.tag }}$"; then
+            echo "Tag ${{ steps.resolve.outputs.tag }} already exists on remote; using it."
+          else
+            git tag "${{ steps.resolve.outputs.tag }}"
+            if ! git push origin "${{ steps.resolve.outputs.tag }}"; then
+              echo "Tag push failed (likely created by a concurrent run). Continuing — build/publish will run against the existing tag."
+            fi
+          fi
 
   build:
     name: Build ${{ matrix.name }}
