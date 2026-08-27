@@ -117,7 +117,13 @@ const Models: React.FC = () => {
     } catch { message.error('Failed to save route'); }
   };
 
-  const deleteRoute = async (id: number) => {
+  // Renamed from `deleteRoute` to avoid shadowing the imported `deleteRoute`
+  // from `../api/client`. The local `await deleteRoute(id)` would otherwise
+  // resolve to THIS function (the local binding wins inside the closure),
+  // so the call recursed into itself instead of firing
+  // `api.delete('/routes/:id')` — the HTTP request was never sent and the
+  // recursion surfaced as a stack overflow.
+  const onDeleteRoute = async (id: number) => {
     try {
       await deleteRoute(id); message.success('Deleted'); fetch();
     } catch { message.error('Failed to delete route'); }
@@ -169,7 +175,7 @@ const Models: React.FC = () => {
       render: (_: unknown, r: Route) => (
         <Space>
           <Button icon={<EditOutlined />} size="small" onClick={() => { setEditingRoute(r); setExtraError(''); routeForm.setFieldsValue(r); setRouteModal(true); }} title="Edit" />
-          <Popconfirm title="Delete?" onConfirm={() => deleteRoute(r.id)}>
+          <Popconfirm title="Delete?" onConfirm={() => onDeleteRoute(r.id)}>
             <Button icon={<DeleteOutlined />} size="small" danger title="Delete" />
           </Popconfirm>
         </Space>

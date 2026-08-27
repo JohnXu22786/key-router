@@ -225,7 +225,13 @@ const Providers: React.FC = () => {
     } catch (err: any) { message.error(err?.message || 'Failed to save provider'); }
   };
 
-  const deleteProvider = async (id: number) => {
+  // Renamed from `deleteProvider` to avoid shadowing the imported
+  // `deleteProvider` from `../api/client`. The local `await deleteProvider(id)`
+  // would otherwise resolve to THIS function (the local binding wins inside
+  // the closure), so the call recursed into itself instead of firing
+  // `api.delete('/providers/:id')` — the HTTP request was never sent and the
+  // recursion surfaced as a stack overflow.
+  const onDeleteProvider = async (id: number) => {
     try {
       await deleteProvider(id); message.success('Provider deleted'); fetch();
     } catch { message.error('Failed to delete provider'); }
@@ -250,7 +256,9 @@ const Providers: React.FC = () => {
     } catch { message.error('Failed to save key'); }
   };
 
-  const deleteKey = async (id: number) => {
+  // Renamed from `deleteKey` to avoid shadowing the imported `deleteKey`
+  // from `../api/client`. See onDeleteProvider above for the same bug shape.
+  const onDeleteKey = async (id: number) => {
     try {
       await deleteKey(id); message.success('Key deleted'); fetch();
     } catch { message.error('Failed to delete key'); }
@@ -362,7 +370,7 @@ const Providers: React.FC = () => {
         <Space>
           <Button icon={<EyeOutlined />} size="small" onClick={() => showDetail(r)} title="Detail" />
           <Button icon={<EditOutlined />} size="small" onClick={() => openEditKey(r)} title="Edit" />
-          <Popconfirm title="Delete?" onConfirm={() => deleteKey(r.id)}>
+          <Popconfirm title="Delete?" onConfirm={() => onDeleteKey(r.id)}>
             <Button icon={<DeleteOutlined />} size="small" danger title="Delete" />
           </Popconfirm>
         </Space>
@@ -429,7 +437,7 @@ const Providers: React.FC = () => {
               extra: (
                 <Space>
                   <Button size="small" icon={<EditOutlined />} onClick={(e) => { e.stopPropagation(); setEditingProv(p); provForm.setFieldsValue(p); setProvModal(true); }} title="Edit provider" />
-                  <Popconfirm title="Delete provider?" onConfirm={() => deleteProvider(p.id)}>
+                  <Popconfirm title="Delete provider?" onConfirm={() => onDeleteProvider(p.id)}>
                     <Button size="small" danger icon={<DeleteOutlined />} onClick={(e) => e.stopPropagation()} title="Delete provider" />
                   </Popconfirm>
                 </Space>
