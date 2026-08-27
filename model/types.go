@@ -20,8 +20,32 @@ type Provider struct {
 	Type         string    `gorm:"type:varchar(20);not null;default:'openai'" json:"type"` // "openai" or "anthropic"
 	BaseURL      string    `gorm:"type:varchar(512);not null" json:"base_url"`
 	ExtraHeaders string    `gorm:"type:text" json:"extra_headers"` // JSON string
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	// FailoverEmptyEnabled: auto-fail over a key whose upstream returns
+	// FailoverEmptyThreshold consecutive empty (no text / no tool_call /
+	// no reasoning_content) responses inside FailoverEmptyWindowSec
+	// seconds. Default false: empty responses never trigger failover
+	// unless the operator opts the provider in. 0 / off means the feature
+	// is disabled regardless of FailoverEmptyEnabled.
+	FailoverEmptyEnabled bool `gorm:"default:false" json:"failover_empty_enabled"`
+	// FailoverEmptyThreshold is the number of consecutive empty responses
+	// that trip failover. 0 = feature off. Stored as int for room (large
+	// values are nonsense but the column has to be a number).
+	FailoverEmptyThreshold int `gorm:"default:0" json:"failover_empty_threshold"`
+	// FailoverEmptyWindowSec is the rolling window in which
+	// FailoverEmptyThreshold empties must be observed to trip failover.
+	// 0 = no windowing (any two consecutive empties count, even hours
+	// apart). Default 60s.
+	FailoverEmptyWindowSec int `gorm:"default:60" json:"failover_empty_window_sec"`
+	// FailoverEmptyDisable selects the FAIL flavor when the threshold
+	// trips: false (default) cools the key + fails over to the next key
+	// within the same request (the typical "swap" flavor); true takes the
+	// key out of rotation (disabled with ReasonEmptyResponse, recoverable
+	// by a successful probe — see IsSystemDisabledReason). Whichever
+	// flavor is chosen, the underlying cool/disable uses the same code
+	// path as 429 / 5xx so the UI and retry loop treat it the same.
+	FailoverEmptyDisable bool `gorm:"default:false" json:"failover_empty_disable"`
+	CreatedAt            time.Time `json:"created_at"`
+	UpdatedAt            time.Time `json:"updated_at"`
 }
 
 // KeyStatus constants
@@ -55,6 +79,17 @@ const (
 	// ReasonNetworkError: the upstream could not be reached at all (no
 	// response). Transient — only cools the key.
 	ReasonNetworkError = "network_error"
+	// ReasonEmptyResponse: the upstream answered 2xx with a body that
+	// carried no text, no tool_call / tool_use and no reasoning_content
+	// (a "silent" completion). The trip is gated by the provider's
+	// FailoverEmptyEnabled + FailoverEmptyThreshold setting — by default
+	// empty responses NEVER trip anything. Whichever flavor the operator
+	// chose, this reason only ever cools (or also disables, when the
+	// FailoverEmptyDisable flavor is on); it is NOT in DisableClassReason
+	// so the generic 2-consecutive-observation path of RecordResult can
+	// never disable a key on empties — only the threshold path can, and
+	// only after the operator explicitly opted the provider in.
+	ReasonEmptyResponse = "empty_response"
 )
 
 // HTTPStatusReason builds the display reason for an unambiguous upstream
@@ -80,9 +115,16 @@ func DisableClassReason(reason string) bool {
 // reason — a custom admin justification or an empty reason — marks an
 // admin-disable that must stay out of rotation (each probe is a billable
 // chat completion) until an admin re-enables or resets it.
+//
+// ReasonEmptyResponse is included when the provider's FailoverEmptyDisable
+// flavor is on (see selector.Engine.RecordEmptyResponse) — a successful
+// probe (real content produced) proves the upstream's silent-failure
+// cleared and the key may come back. Without that inclusion, an
+// auto-disconnected empty key would be stuck disabled until an admin
+// touched it, defeating the auto-reconnect flavor the operator chose.
 func IsSystemDisabledReason(reason string) bool {
 	switch reason {
-	case ReasonAuthFailed, ReasonInsufficientQuota, KeyDisabledReasonSpendLimit:
+	case ReasonAuthFailed, ReasonInsufficientQuota, KeyDisabledReasonSpendLimit, ReasonEmptyResponse:
 		return true
 	}
 	return false
