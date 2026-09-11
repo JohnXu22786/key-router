@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, cleanup } from '@testing-library/react';
+import { render, screen, cleanup, act } from '@testing-library/react';
 import dayjs from 'dayjs';
 import ActivityExplore from './ActivityExplore';
 import { getActivity } from '../api/client';
@@ -97,7 +97,10 @@ beforeEach(() => {
 
 // vitest runs without globals, so RTL's auto-cleanup never registers; without
 // this the previous test's rendered tree stays in document.body.
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
 
 describe('ActivityExplore summary footer', () => {
   it('counts the rows actually rendered when the server summary exceeds Top-N (default 10)', async () => {
@@ -116,5 +119,56 @@ describe('ActivityExplore summary footer', () => {
     const footer = await screen.findByText(/rows ·/);
     expect(footer.textContent).toMatch(/^5 rows · \d+ms$/);
     expect(container.querySelectorAll('.ant-table-tbody .ant-table-row')).toHaveLength(5);
+  });
+
+  it('uses the response-time cutoff for a slow custom-range response', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const requestStartedAt = dayjs('2026-08-13T10:00:00');
+    const responseAt = dayjs('2026-08-13T10:30:00');
+    vi.setSystemTime(requestStartedAt.toDate());
+
+    let resolveActivity!: (value: Awaited<ReturnType<typeof getActivity>>) => void;
+    const pending = new Promise<Awaited<ReturnType<typeof getActivity>>>((resolve) => {
+      resolveActivity = resolve;
+    });
+    vi.mocked(getActivity).mockReturnValue(pending);
+
+    const slowRange: DateRange = {
+      key: 'custom',
+      label: 'Custom',
+      badge: '',
+      since: dayjs('2026-08-09T00:00:00'),
+      until: requestStartedAt,
+      granularity: 'day',
+    };
+    const response: ActivityResponse = {
+      metric: 'spend',
+      group_by: 'model',
+      rollup: 'day',
+      buckets: ['2026-08-09', '2026-08-10', '2026-08-11', '2026-08-12', '2026-08-13'],
+      series: [
+        ...['2026-08-09', '2026-08-10', '2026-08-11', '2026-08-12'].map(bucket => ({
+          bucket, group: 'model-1', value: 1, is_zero: false,
+        })),
+        { bucket: '2026-08-13', group: 'model-1', value: 100, is_zero: false },
+      ],
+      summary: [{ group: 'model-1', min: 1, max: 100, avg: 20.8, sum: 104, value: 100, percent: 100 }],
+      totals: { spend: 104, tokens: 0, requests: 0, cache: 0 },
+    };
+
+    render(<ActivityExplore range={slowRange} />);
+    expect(getActivity).toHaveBeenCalledTimes(1);
+
+    vi.setSystemTime(responseAt.toDate());
+    await act(async () => {
+      resolveActivity({ data: response } as Awaited<ReturnType<typeof getActivity>>);
+      await pending;
+    });
+
+    // At request start the live day had 10h of recorded coverage, so using
+    // that stale cutoff would leave the full $100 row untouched. At response
+    // time it has 10.5h, and the selected 10h slice is $95.2.
+    expect(screen.getAllByText('$95.2')).toHaveLength(2);
+    expect(screen.queryByText('$100')).toBeNull();
   });
 });
