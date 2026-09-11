@@ -1531,6 +1531,78 @@ describe('resampleResponse — Trends hourly rollup onto a sub-hour axis', () =>
 });
 
 describe('hourly activity normalization', () => {
+  it('honors the selected rollup instead of the range granularity', () => {
+    const resp: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'hour',
+      series: [
+        { bucket: '2026-08-13 15:00', group: 'a', value: 60, is_zero: false },
+        { bucket: '2026-08-13 16:00', group: 'a', value: 60, is_zero: false },
+      ],
+      summary: [{ group: 'a', min: 60, max: 60, avg: 60, sum: 120, value: 60, percent: 100 }],
+      buckets: ['2026-08-13 15:00', '2026-08-13 16:00'],
+      totals: { spend: 120, tokens: 0, requests: 0, cache: 0 },
+    };
+    const since = dayjs('2026-08-13T15:50:00');
+    const until = dayjs('2026-08-13T16:05:00');
+    const cutoff = dayjs('2026-08-13T17:00:00');
+
+    const daily = normalizeHourlyResponse(resp, since, until, cutoff, 'minute', 'day', false);
+    expect(daily.rollup).toBe('day');
+    expect(daily.buckets).toEqual(['2026-08-13']);
+    expect(daily.series).toEqual([{ bucket: '2026-08-13', group: 'a', value: 15, is_zero: false }]);
+
+    const hourly = normalizeHourlyResponse(resp, since, until, cutoff, 'minute', 'hour', false);
+    expect(hourly.rollup).toBe('hour');
+    expect(hourly.buckets).toEqual(['2026-08-13 15:00', '2026-08-13 16:00']);
+    expect(hourly.series.map(p => p.value)).toEqual([10, 5]);
+  });
+
+  it('includes explicit zero-valued cells in additive summary statistics', () => {
+    const resp: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'hour',
+      series: [
+        { bucket: '2026-08-13 15:00', group: 'a', value: 0, is_zero: true },
+        { bucket: '2026-08-13 16:00', group: 'a', value: 100, is_zero: false },
+      ],
+      summary: [{ group: 'a', min: 0, max: 100, avg: 50, sum: 100, value: 100, percent: 100 }],
+      buckets: ['2026-08-13 15:00', '2026-08-13 16:00'],
+      totals: { spend: 100, tokens: 0, requests: 0, cache: 0 },
+    };
+    const out = aggregateHourlyResponse(
+      resp,
+      dayjs('2026-08-13T15:00:00'),
+      dayjs('2026-08-13T17:00:00'),
+      dayjs('2026-08-13T17:00:00'),
+      'hour', 'hour', false,
+    );
+    expect(out.summary[0]).toMatchObject({ min: 0, avg: 50, max: 100 });
+  });
+
+  it('includes zero-valued cells in blended summary statistics', () => {
+    const resp: ActivityResponse = {
+      metric: 'blended', group_by: 'model', rollup: 'hour',
+      series: [
+        { bucket: '2026-08-13 15:00', group: 'a', value: 0, is_zero: true },
+        { bucket: '2026-08-13 16:00', group: 'a', value: 100, is_zero: false },
+      ],
+      summary: [{ group: 'a', min: 0, max: 100, avg: 50, sum: 50, value: 100, percent: 100 }],
+      buckets: ['2026-08-13 15:00', '2026-08-13 16:00'],
+      totals: { spend: 0, tokens: 0, requests: 0, cache: 0 },
+    };
+    const out = resampleResponse(
+      resp,
+      dayjs('2026-08-13T15:00:00'),
+      dayjs('2026-08-13T17:00:00'),
+      dayjs('2026-08-13T17:00:00'),
+      'min15',
+      false,
+    );
+    const summary = out.summary[0];
+    expect(summary.min).toBe(0);
+    expect(summary.avg).toBe(50);
+    expect(summary.max).toBe(100);
+  });
+
   it('keeps blended rates constant when an hourly response is resampled', () => {
     const resp: ActivityResponse = {
       metric: 'blended', group_by: 'model', rollup: 'hour',
@@ -1548,7 +1620,7 @@ describe('hourly activity normalization', () => {
       dayjs('2026-08-13T16:05:00'),
       dayjs('2026-08-13T16:05:00'),
       'minute',
-      'hour',
+      'minute',
       false,
     );
     expect(out.series.filter(p => p.group === 'a').map(p => p.value)).toEqual(Array(15).fill(2.5));
@@ -1571,7 +1643,7 @@ describe('hourly activity normalization', () => {
       dayjs('2026-08-13T15:45:00'),
       dayjs('2026-08-13T16:00:00'),
       'min15',
-      'hour',
+      'min15',
       false,
     );
     expect(out.series.filter(p => p.subgroup === 'key-1').map(p => p.value)).toEqual([15, 15]);

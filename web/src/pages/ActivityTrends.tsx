@@ -144,12 +144,12 @@ const TrendSection: React.FC<SectionProps> = ({ title, groupBy, range, filter, o
         const cutNow = dayjs();
         const curNormalized = normalizeHourlyResponse(
           curRes.data, range.since, range.until, cutNow,
-          range.granularity, range.granularity === 'month' ? 'month' : range.granularity === 'day' ? 'day' : 'hour',
+          range.granularity, range.granularity,
           liveExtensionEligible(range),
         );
         const prevNormalized = normalizeHourlyResponse(
           prevRes.data, prevSince, range.since, cutNow,
-          range.granularity, range.granularity === 'month' ? 'month' : range.granularity === 'day' ? 'day' : 'hour',
+          range.granularity, range.granularity,
           false,
         );
         setCur(limitActivityResponse(curNormalized, 5));

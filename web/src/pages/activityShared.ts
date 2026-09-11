@@ -1422,12 +1422,10 @@ function collectSeriesCells(series: ActivitySeriesPoint[]): SeriesCell[] {
 
 // recomputeFromSeries rebuilds a response's summary and metric total from
 // its bucket x group series grid, following the server's aggregation shape
-// (see admin.go): min/max/avg over the buckets with a POSITIVE value
-// (the grid cannot distinguish a present-but-zero bucket from an absent
-// one, so "positive" is the implementable approximation — the convention
-// resampleResponse already used), value = the LAST bucket, percent = the
-// group's share of the grid's total (top-N + Other; the server divides by
-// every group's total).
+// (see admin.go): min/max/avg over every represented bucket, including
+// explicit zero-valued cells, value = the LAST bucket, percent = the group's
+// share of the grid's total (top-N + Other; the server divides by every
+// group's total).
 // Shared by resampleResponse, aggregateHourlyResponse, and
 // prorateBoundaryBuckets — all modify the
 // series values and must re-derive the summed fields so every consumer
@@ -1447,7 +1445,6 @@ function recomputeFromSeries(
   const groups = Array.from(new Set(series.map(s => s.group)));
   const acc = new Map<string, Map<string, number>>();
   for (const p of series) {
-    if (p.value === 0) continue;
     let base = acc.get(p.group);
     if (!base) { base = new Map(); acc.set(p.group, base); }
     base.set(p.bucket, (base.get(p.bucket) ?? 0) + p.value);
@@ -1461,13 +1458,12 @@ function recomputeFromSeries(
   }
   const summary: ActivityGroupSummary[] = groups.map(g => {
     const vals = buckets.map(b => acc.get(g)?.get(b) ?? 0);
-    const nonZero = vals.filter(v => v > 0);
     const sum = groupSum.get(g) ?? 0;
     return {
       group: g,
-      min: nonZero.length ? Math.min(...nonZero) : 0,
-      max: nonZero.length ? Math.max(...nonZero) : 0,
-      avg: nonZero.length ? sum / nonZero.length : 0,
+      min: vals.length ? Math.min(...vals) : 0,
+      max: vals.length ? Math.max(...vals) : 0,
+      avg: vals.length ? sum / vals.length : 0,
       sum,
       value: vals[vals.length - 1] ?? 0,
       percent: totalSum > 0 ? (sum / totalSum) * 100 : 0,
@@ -1565,12 +1561,11 @@ function recomputeBlendedFromSeries(
     const values = buckets.map(bucket =>
       series.find(p => p.group === group && p.bucket === bucket)?.value ?? 0,
     );
-    const nonZero = values.filter(v => v > 0);
     return {
       group,
-      min: nonZero.length ? Math.min(...nonZero) : 0,
-      max: nonZero.length ? Math.max(...nonZero) : 0,
-      avg: nonZero.length ? nonZero.reduce((a, v) => a + v, 0) / nonZero.length : 0,
+      min: values.length ? Math.min(...values) : 0,
+      max: values.length ? Math.max(...values) : 0,
+      avg: values.length ? values.reduce((a, v) => a + v, 0) / values.length : 0,
       sum: source?.sum ?? 0,
       value: values[values.length - 1] ?? source?.value ?? 0,
       percent: source?.percent ?? 0,
@@ -1587,8 +1582,9 @@ function recomputeBlendedFromSeries(
 // for raw rows (cutoff = the fetch time, see overlapFractions); every group
 // stays zero-filled per bucket (the server emits full bucket x group grids
 // with is_zero flags). Summary and totals are RECOMPUTED from the resampled
-// buckets (server semantics: min/max/avg over non-empty buckets, value =
-// last bucket, percent of the total) so the Trends "Trending" deltas agree
+// buckets (server semantics: min/max/avg over represented buckets, including
+// explicit zero-valued cells, value = last bucket, percent of the total) so
+// the Trends "Trending" deltas agree
 // with the re-bucketed chart; summary rows beyond the series grid (groups
 // ranked 6+ under top-5) are moved to the same scale by the grid's
 // aggregate factor inside recomputeFromSeries — without that, their raw
@@ -1618,7 +1614,6 @@ export function resampleResponse(
   const acc = new Map<string, Map<string, number>>();
   const liveCell = hasLiveCell(until, since, cutoff, granularity, liveExtend);
   for (const p of resp.series) {
-    if (p.value === 0) continue;
     const key = seriesCellKey(p.group, p.subgroup);
     let base = acc.get(key);
     if (!base) { base = new Map(); acc.set(key, base); }
@@ -1655,6 +1650,7 @@ export function resampleResponse(
 }
 
 export type ActivityRollup = 'hour' | 'day' | 'week' | 'month' | 'total';
+export type ActivityOutputRollup = ActivityRollup | 'minute' | 'min15';
 
 function rollupBucketLabel(bucket: string, rollup: ActivityRollup): string {
   if (rollup === 'total') return 'Total';
@@ -1726,24 +1722,22 @@ export function aggregateHourlyResponse(
 // normalizeHourlyResponse is the single client-side boundary-normalization
 // entry point. The activity endpoint widens every query to complete buckets,
 // so callers must retain hourly cells until after the requested window has
-// been applied. Sub-hour charts distribute additive cells across their fine
-// axis; all other rollups aggregate corrected hourly cells directly.
+// been applied. Sub-hour charts request an explicit minute/min15 output
+// rollup; all other rollups aggregate corrected hourly cells directly. The
+// range granularity alone must not override an Explore rollup selection.
 export function normalizeHourlyResponse(
   resp: ActivityResponse,
   since: dayjs.Dayjs,
   until: dayjs.Dayjs,
   cutoff: dayjs.Dayjs,
   rangeGranularity: Granularity,
-  rollup: ActivityRollup,
+  rollup: ActivityOutputRollup,
   liveExtend = false,
 ): ActivityResponse {
-  const subGran = rollup !== 'total'
-    && (rangeGranularity === 'minute' || rangeGranularity === 'min15')
-    ? rangeGranularity
-    : null;
-  return subGran
-    ? resampleResponse(resp, since, until, cutoff, subGran, liveExtend)
-    : aggregateHourlyResponse(resp, since, until, cutoff, rangeGranularity, rollup, liveExtend);
+  if (rollup === 'minute' || rollup === 'min15') {
+    return resampleResponse(resp, since, until, cutoff, rollup, liveExtend);
+  }
+  return aggregateHourlyResponse(resp, since, until, cutoff, rangeGranularity, rollup, liveExtend);
 }
 
 function seriesValueMap(resp: ActivityResponse): Map<string, number> {
@@ -1811,13 +1805,12 @@ export function combineBlendedResponses(
   const totalSpend = [...groupSpend.values()].reduce((a, v) => a + v, 0);
   const summary: ActivityGroupSummary[] = groups.map(group => {
     const rates = bucketRates.get(group) ?? [];
-    const nonZero = rates.filter(v => v > 0);
     const sum = blendedRate(groupSpend.get(group) ?? 0, groupTokens.get(group) ?? 0);
     return {
       group,
-      min: nonZero.length ? Math.min(...nonZero) : 0,
-      max: nonZero.length ? Math.max(...nonZero) : 0,
-      avg: nonZero.length ? nonZero.reduce((a, v) => a + v, 0) / nonZero.length : 0,
+      min: rates.length ? Math.min(...rates) : 0,
+      max: rates.length ? Math.max(...rates) : 0,
+      avg: rates.length ? rates.reduce((a, v) => a + v, 0) / rates.length : 0,
       sum,
       value: rates[rates.length - 1] ?? 0,
       percent: totalSpend > 0 ? ((groupSpend.get(group) ?? 0) / totalSpend) * 100 : 0,
