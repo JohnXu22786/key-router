@@ -14,6 +14,7 @@ import { getActivity, ActivityResponse, ActivityGroupSummary } from '../api/clie
 import {
   DateRange, ActivityFilter, filterKey, fmtUSDInt, fmtTokens, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS,
   fmtPercent, fmt3sig, fmtTick, fmtBucket, modelFavicon, Granularity, queryWindowUntil, prorateBoundaryBuckets,
+  liveExtensionEligible,
 } from './activityShared';
 import dayjs from 'dayjs';
 import './explore.css';
@@ -170,15 +171,10 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
         // the live boundary bucket's coverage too small and its value too
         // large.
         const cutoff = dayjs();
-        // A custom range whose picked bounds cut mid-bucket makes the endpoint
-        // return FULL boundary buckets when the selected rollup equals the
-        // range granularity (the widened query window — see activityWindow
-        // in admin.go); prorateBoundaryBuckets scales them by the window
-        // overlap like the Overview flow, so the chart, table and totals
-        // agree with it. Coarser rollups keep the accepted residual
-        // behavior, and the wrapper skips sub-hour granularities and the
-        // blended metric by design (see its gate comment).
-        setData(prorateBoundaryBuckets(res.data, range.since, range.until, curUntil, cutoff, range.granularity, rollup));
+        setData(prorateBoundaryBuckets(
+          res.data, range.since, range.until, curUntil, cutoff,
+          range.granularity, rollup, liveExtensionEligible(range),
+        ));
         setLoadMs(Math.max(1, Math.round(performance.now() - t0)));
       } catch { if (!cancelled) { setError(true); message.error('Failed to load explore'); } }
       finally { if (!cancelled) setLoading(false); }

@@ -59,8 +59,8 @@ if (typeof (window as unknown as { ResizeObserver?: unknown }).ResizeObserver !=
   };
 }
 
-// A 1y rolling range: granularity 'month' vs the page's default 'day' rollup
-// makes prorateBoundaryBuckets pass the response through untouched.
+// A 1y rolling range whose bounds are aligned to the response's day buckets
+// remains unchanged by boundary normalization.
 const range: DateRange = {
   key: '1y',
   label: 'Past 1 Year',
@@ -120,7 +120,6 @@ describe('ActivityExplore summary footer', () => {
     expect(footer.textContent).toMatch(/^5 rows · \d+ms$/);
     expect(container.querySelectorAll('.ant-table-tbody .ant-table-row')).toHaveLength(5);
   });
-
   it('uses the response-time cutoff for a slow custom-range response', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     const requestStartedAt = dayjs('2026-08-13T10:00:00');

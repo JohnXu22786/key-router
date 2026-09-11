@@ -989,8 +989,9 @@ function isRepeatHour(start: dayjs.Dayjs): boolean {
   return repeatRuns(start) !== null;
 }
 
-// RowCoverage is an hourly (or coarser) row's recorded extent: the epoch
-// runs (whole-minute cutoff-clamped) plus the coverage in whole minutes.
+// RowCoverage is an hourly (or coarser calendar-bucket) row's recorded
+// extent: the epoch runs (whole-minute cutoff-clamped) plus the coverage in
+// whole minutes.
 export interface RowCoverage {
   runs: Array<{ from: number; to: number }>;
   coverage: number;
@@ -1023,7 +1024,7 @@ export interface RowCoverage {
 // EST, its real minute.
 export function rowCoverage(
   start: dayjs.Dayjs,
-  rowUnit: 'hour' | 'day' | 'month',
+  rowUnit: 'hour' | 'day' | 'week' | 'month',
   cutoff: dayjs.Dayjs,
   wallField?: number,
 ): RowCoverage {
@@ -1055,7 +1056,7 @@ export function rowCoverage(
 // to: the end of its LAST coverage run (see rowCoverage), capped at `cutoff`
 // read as WHOLE MINUTES. Only the >-0 gate of hasLiveCell consumes the bare
 // instant; every extent-aware consumer reads the runs' coverage directly.
-function rowCoverageEnd(start: dayjs.Dayjs, rowUnit: 'hour' | 'day' | 'month', cutoff: dayjs.Dayjs): dayjs.Dayjs {
+function rowCoverageEnd(start: dayjs.Dayjs, rowUnit: 'hour' | 'day' | 'week' | 'month', cutoff: dayjs.Dayjs): dayjs.Dayjs {
   const { runs } = rowCoverage(start, rowUnit, cutoff);
   return runs.length > 0 ? dayjs(runs[runs.length - 1].to) : dayjs(start.valueOf());
 }
@@ -1563,28 +1564,33 @@ export function resampleResponse(
   return { ...resp, rollup: granularity, buckets, series, summary, totals };
 }
 
-// boundaryShare mirrors bucketWindowShare for a whole bucket whose START is
-// known as an instant: the same coverage (rowCoverageEnd — the live bucket's
-// recorded extent caps the denominator, cutoff floored to whole minutes)
-// and the same clamped window overlap. The windows that reach this path are
-// custom picks and past periods, which never live-extend (see
-// liveExtensionEligible), so the live-cell branch of bucketWindowShare is
-// excluded by construction. bucketWindowShare itself only accepts
-// hour_bucket STRINGS (the database serialization), and the string
-// round-trip re-anchors a fall-back's SECOND-occurrence start through the
-// ambiguous wall-clock (dayjs's setter resolves it to the FIRST occurrence —
-// the exact trap floorWindowUntil's rebuild exists to dodge, see its
-// comment), so for known instants the share is computed directly on the
-// epoch instead.
+// boundaryShare mirrors bucketWindowShare for a whole response bucket whose
+// START is known as an instant: the same coverage (the recorded extent caps
+// the denominator, cutoff floored to whole minutes) and the same clamped
+// window overlap. Unlike bucketWindowShare, which receives hourly database
+// rows, this helper also handles the day/week/month buckets returned by the
+// activity endpoint. The response's rollup can differ from the range's chart
+// granularity (Explore's default day rollup over a short hourly range is the
+// important case), so the share must be measured at the RESPONSE rollup's
+// scale. `overlapEnd` optionally includes the current range's live cell; the
+// endpoint widens a current preset query to retain that cell even when the
+// selected response rollup is coarser.
+//
+// bucketWindowShare itself only accepts hour_bucket STRINGS (the database
+// serialization), and the string round-trip re-anchors a fall-back's
+// SECOND-occurrence start through the ambiguous wall-clock (dayjs's setter
+// resolves it to the FIRST occurrence — the exact trap floorWindowUntil's
+// rebuild exists to dodge, see its comment), so for known instants the share
+// is computed directly on the epoch instead.
 function boundaryShare(
   start: dayjs.Dayjs,
   since: dayjs.Dayjs,
   until: dayjs.Dayjs,
   cutoff: dayjs.Dayjs,
-  granularity: Granularity,
+  rowUnit: 'hour' | 'day' | 'week' | 'month',
   wallField?: number,
+  overlapEnd = until,
 ): number {
-  const rowUnit = granularity === 'day' ? 'day' : granularity === 'month' ? 'month' : 'hour';
   // The server anchors a fall-back's repeated hour on its FIRST occurrence
   // (billing truncates rows to the local hour; the endpoint's widening also
   // resolves an ambiguous bound to the first pass — see activityWindow's
@@ -1608,44 +1614,89 @@ function boundaryShare(
   if (coverage <= 0) return 0;
   let overlap = 0;
   for (const r of row.runs) {
-    overlap += Math.max(0, Math.min(r.to, until.valueOf()) - Math.max(r.from, since.valueOf()));
+    overlap += Math.max(0, Math.min(r.to, overlapEnd.valueOf()) - Math.max(r.from, since.valueOf()));
   }
   return overlap > 0 ? (overlap / 60000) / coverage : 0;
 }
 
-// prorateBoundaryBuckets fixes the SERVER-bucketed boundary overcount for
-// custom ranges whose picked bounds cut mid-bucket at the range granularity
-// (e.g. a 14:37-18:22 pick -> hour). The activity endpoint widens the query
-// window to the buckets CONTAINING the raw bounds (activityWindow in
-// admin.go) and sums the FULL boundary rows into the response: rows in
-// [14:00, 14:37) inflate the first bar and [18:22, 19:00) the last, plus
-// the summary sums/value/min/max/avg/percent and the metric total. The
-// Overview flow prorates those exact rows with bucketWindowShare (its KPI
-// and charts read the same hour_bucket rows), so the same window is correct
-// there — this mirrors that share for the already-aggregated response: each
-// boundary bucket's value is scaled by the fraction of its recorded extent
-// that lies inside [since, until) (boundaryShare), interior buckets are
+// totalShare is the boundary correction for rollup=total. The endpoint's
+// total response has no per-bucket cells left to prorate: it aggregates the
+// hourly query window into one `Total` cell. Use the same uniform-within-row
+// assumption as boundaryShare, measuring the requested interval against the
+// widened hourly window and the recorded extent of its last hour.
+function totalShare(
+  since: dayjs.Dayjs,
+  untilSent: dayjs.Dayjs,
+  cutoff: dayjs.Dayjs,
+  overlapEnd: dayjs.Dayjs,
+): number {
+  const queryStart = floorWindowUntil(since, 'hour').valueOf();
+  const queryEnd = floorWindowUntil(untilSent, 'hour').add(1, 'hour').valueOf();
+  if (queryEnd <= queryStart) return 0;
+
+  const cutoffFloor = floorMinute(cutoff).valueOf();
+  let recordedEnd = Math.min(queryEnd, cutoffFloor);
+  // Match rowCoverage's one-minute rescue for a non-empty first minute: a
+  // total response can contain a row whose cutoff is after the query start
+  // even when the whole-minute floor is still at that start.
+  if (recordedEnd <= queryStart && cutoff.valueOf() > queryStart) {
+    recordedEnd = Math.min(queryEnd, queryStart + 60000);
+  }
+  if (recordedEnd <= queryStart) return 0;
+
+  const overlap = Math.min(recordedEnd, overlapEnd.valueOf()) - Math.max(queryStart, since.valueOf());
+  return overlap > 0 ? overlap / (recordedEnd - queryStart) : 0;
+}
+
+type BoundaryRollup = 'hour' | 'day' | 'week' | 'month' | 'total';
+
+function boundaryRollup(rollup: string): BoundaryRollup | null {
+  return rollup === 'hour' || rollup === 'day' || rollup === 'week'
+    || rollup === 'month' || rollup === 'total' ? rollup : null;
+}
+
+function boundaryStart(t: dayjs.Dayjs, rollup: Exclude<BoundaryRollup, 'total'>): dayjs.Dayjs {
+  if (rollup === 'week') return mondayOf(t);
+  return floorWindowUntil(t, rollup);
+}
+
+function liveCellEnd(
+  since: dayjs.Dayjs,
+  until: dayjs.Dayjs,
+  cutoff: dayjs.Dayjs,
+  granularity: Granularity,
+  liveExtend: boolean,
+): dayjs.Dayjs | undefined {
+  if (!liveExtend || !hasLiveCell(until, since, cutoff, granularity, true)) return undefined;
+  const unit = granularity === 'hour' ? 'hour' : granularity === 'day' ? 'day' : 'month';
+  return until.add(1, unit);
+}
+
+// prorateBoundaryBuckets fixes the SERVER-bucketed boundary overcount when a
+// query's picked bounds cut through the response's buckets (e.g. a
+// 14:37-18:22 pick -> hour, or an hourly range viewed with day rollup). The
+// activity endpoint widens the query window to the buckets CONTAINING the raw
+// bounds (activityWindow in admin.go) and sums the FULL boundary rows into the
+// response: rows before `since` inflate the first bar and rows after `until`
+// inflate the last, plus the summary sums/value/min/max/avg/percent and the
+// metric total. The Overview flow prorates hourly rows with
+// bucketWindowShare; this mirrors that share for an already-aggregated
+// response when the scales match, and uses the response bucket's own
+// uniform-within-bucket coverage when they differ. Interior buckets are
 // unchanged, and the summed fields are recomputed from the scaled grid
-// (recomputeFromSeries — summary rows beyond the series grid follow the
-// same scale via the grid's aggregate factor there). The result agrees
-// with the Overview computation
-// for the same window and rows; a boundary bucket whose share is 1 (fully
-// in-window) is left untouched and the response is returned as-is when no
-// bucket is partial.
+// (recomputeFromSeries — summary rows beyond the series grid follow the same
+// scale via the grid's aggregate factor there). A boundary bucket whose share
+// is 1 (fully in-window) is left untouched and the response is returned as-is
+// when no bucket is partial.
 //
-// The gate is EXACTLY the query shape that overcounts:
-//   - the response rollup must equal the range granularity — the server
-//     bucketed at the window's own scale. A COARSER rollup (Explore's day
-//     rollup over an hour-granularity range, week/total anywhere) sums
-//     whole boundary days into its boundary bars on purpose (the accepted
-//     residual-4 behavior) and is never prorated; a FINER rollup (Explore's
-//     hour rollup over a day-granularity range) overcounts its own hourly
-//     boundary bars the same way but is out of this fix's scope (the same
-//     residual as the coarser ones — the shares would have to be computed at
-//     the rollup's scale, not the range's); the sub-hour granularities are
-//     returned unchanged by the first gate below — Trends' sub-hour ranges
-//     never even reach this function (resampleResponse handles them),
-//     while Explore's pass through and are skipped there.
+// The boundary correction is measured at the RESPONSE rollup's scale, not
+// the range's chart scale. A COARSER rollup (Explore's day rollup over an
+// hour-granularity range) otherwise sums whole boundary days into its bars;
+// a FINER rollup (hour over a day-granularity range) has the symmetric issue.
+// Week and total are handled by their own calendar/hour-window shares below.
+// The sub-hour granularities are returned unchanged by the first gate below:
+// Trends' sub-hour ranges never reach this function (resampleResponse handles
+// them), while Explore's pass through and are skipped there.
 //   - a bound must be MID-bucket at that granularity: preset ranges arrive
 //     snapped to their own grid (Activity.tsx), and the query either
 //     aligned to the boundary (exclusiveUntil — the previous-period queries
@@ -1665,8 +1716,9 @@ function boundaryShare(
 // bucket containing it); it differs from the user's `until` exactly when
 // the query floored to the boundary. `cutoff` is the fetch time (like the
 // Overview's cutNow): the live bucket's recorded extent caps the boundary
-// denominator, so a custom range ending in the live hour keeps its full
-// accumulated value, exactly like the Overview proration.
+// denominator. `liveExtend` tells the helper whether the current preset's
+// range-aligned live cell should remain included; custom and previous-period
+// callers leave it false.
 export function prorateBoundaryBuckets(
   resp: ActivityResponse,
   since: dayjs.Dayjs,
@@ -1675,43 +1727,50 @@ export function prorateBoundaryBuckets(
   cutoff: dayjs.Dayjs,
   granularity: Granularity,
   rollup: string,
+  liveExtend = false,
 ): ActivityResponse {
   if (granularity === 'minute' || granularity === 'min15') return resp;
-  if (rollup !== granularity) return resp;
   if (resp.metric === 'blended') return resp;
   if (resp.buckets.length === 0) return resp;
+  if (resp.rollup !== rollup) return resp;
+  const responseRollup = boundaryRollup(rollup);
+  if (responseRollup === null) return resp;
+
+  const liveEnd = liveCellEnd(since, until, cutoff, granularity, liveExtend);
   const shares = new Map<string, number>();
-  const firstStart = floorWindowUntil(since, granularity);
-  if (!firstStart.isSame(since)) {
-    shares.set(resp.buckets[0], boundaryShare(
-      firstStart,
-      since,
-      until,
-      cutoff,
-      granularity,
-      granularity === 'hour' ? hourFieldFromBucket(resp.buckets[0]) : undefined,
-    ));
-  }
-  const lastStart = floorWindowUntil(untilSent, granularity);
-  if (!lastStart.isSame(until)) {
-    // The last bucket of the widened window starts at floor(untilSent) — the
-    // bucket containing the SENT until. It is partial exactly when the user's
-    // until cuts inside it (share < 1): when the query floored to the
-    // boundary (exclusiveUntil), the last bucket lies entirely inside the
-    // window and its share is exactly 1 — skipped below, so a grid-aligned
-    // prev/since response only prorates its first bucket — while a prev query
-    // that sent the RAW mid-bucket since (prevWindowUntil) reaches this
-    // branch with the shared bucket's prev-period slice, exactly like the
-    // first-bucket machinery.
-    const lastBucket = resp.buckets[resp.buckets.length - 1];
-    shares.set(lastBucket, boundaryShare(
-      lastStart,
-      since,
-      until,
-      cutoff,
-      granularity,
-      granularity === 'hour' ? hourFieldFromBucket(lastBucket) : undefined,
-    ));
+  if (responseRollup === 'total') {
+    shares.set(resp.buckets[0], totalShare(since, untilSent, cutoff, liveEnd ?? until));
+  } else {
+    const firstStart = boundaryStart(since, responseRollup);
+    if (!firstStart.isSame(since)) {
+      shares.set(resp.buckets[0], boundaryShare(
+        firstStart,
+        since,
+        until,
+        cutoff,
+        responseRollup,
+        responseRollup === 'hour' ? hourFieldFromBucket(resp.buckets[0]) : undefined,
+      ));
+    }
+    const lastStart = boundaryStart(untilSent, responseRollup);
+    // A same-scale current live bucket is already exactly the cell the
+    // response is meant to show (hour/hour, day/day, or month/month), so keep
+    // it at its recorded value. When the response rollup differs from the
+    // range scale, however, even a boundary-aligned `until` can sit at the
+    // START of a much larger bucket; that bucket still needs normalization to
+    // the range (plus its optional live cell).
+    const sameScale = responseRollup === granularity;
+    if (!sameScale || !lastStart.isSame(until)) {
+      const lastBucket = resp.buckets[resp.buckets.length - 1];
+      shares.set(lastBucket, boundaryShare(
+        lastStart,
+        since,
+        liveEnd ?? until,
+        cutoff,
+        responseRollup,
+        responseRollup === 'hour' ? hourFieldFromBucket(lastBucket) : undefined,
+      ));
+    }
   }
   const toApply = new Map<string, number>();
   for (const [b, share] of shares) {

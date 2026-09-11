@@ -1620,24 +1620,108 @@ describe('prorateBoundaryBuckets — server-bucketed custom ranges', () => {
     expect(out.totals.spend).toBeCloseTo(189, 10);
   });
 
-  it('leaves coarser AND finer rollups untouched (accepted residual behavior)', () => {
+  it('prorates a short hourly range when Explore uses the default day rollup', () => {
     const since = dayjs('2026-08-13T14:37:00');
     const until = dayjs('2026-08-13T18:22:00');
-    const r = hourResp([60, 60, 60, 60, 60]);
-    const cutoff = dayjs('2026-08-13T19:00:00');
-    // Explore's day/week/total rollup over an hour-granularity range: whole
-    // boundary days in the boundary bars by design — never prorated.
-    expect(prorateBoundaryBuckets(r, since, until, until, cutoff, 'hour', 'day')).toBe(r);
-    expect(prorateBoundaryBuckets(r, since, until, until, cutoff, 'hour', 'week')).toBe(r);
-    expect(prorateBoundaryBuckets(r, since, until, until, cutoff, 'hour', 'total')).toBe(r);
-    // A FINER rollup (hour over a day-granularity range) overcounts its own
-    // hourly boundary bars the same way but is outside this fix's scope —
-    // the response must stay exactly as the server returned it. The bounds
-    // are MID-DAY so the first/last-bucket conditions would fire if the
-    // gate were removed — this pins the gate itself.
-    const daySince = dayjs('2026-08-10T14:00:00');
-    const dayUntil = dayjs('2026-08-14T12:30:00');
-    expect(prorateBoundaryBuckets(r, daySince, dayUntil, dayUntil, cutoff, 'day', 'hour')).toBe(r);
+    const r: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'day',
+      series: [{ bucket: '2026-08-13', group: 'a', value: 1440, is_zero: false }],
+      summary: [{ group: 'a', min: 1440, max: 1440, avg: 1440, sum: 1440, value: 1440, percent: 100 }],
+      buckets: ['2026-08-13'],
+      totals: { spend: 1440, tokens: 0, requests: 0, cache: 0 },
+    };
+    const out = prorateBoundaryBuckets(r, since, until, until, dayjs('2026-08-14T00:00:00'), 'hour', 'day');
+    // The response contains a complete day, but only 225 of its 1,440
+    // minutes belong to this short window.
+    expect(out.series[0].value).toBe(225);
+    expect(out.summary[0].sum).toBe(225);
+    expect(out.totals.spend).toBe(225);
+  });
+
+  it('prorates a short range when Explore uses a month rollup', () => {
+    const since = dayjs('2026-08-10T14:00:00');
+    const until = dayjs('2026-08-14T12:30:00');
+    const r: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'month',
+      series: [{ bucket: '2026-08', group: 'a', value: 31, is_zero: false }],
+      summary: [{ group: 'a', min: 31, max: 31, avg: 31, sum: 31, value: 31, percent: 100 }],
+      buckets: ['2026-08'],
+      totals: { spend: 31, tokens: 0, requests: 0, cache: 0 },
+    };
+    const out = prorateBoundaryBuckets(r, since, until, until, dayjs('2026-09-01T00:00:00'), 'day', 'month');
+    // The month aggregate must be reduced to the 3.9375 days selected by
+    // this short range instead of showing all 31 days.
+    expect(out.series[0].value).toBeCloseTo(3.9375, 10);
+    expect(out.summary[0].sum).toBeCloseTo(3.9375, 10);
+    expect(out.totals.spend).toBeCloseTo(3.9375, 10);
+  });
+
+  it('keeps a current preset live cell when a coarser response rollup is corrected', () => {
+    const since = dayjs('2026-08-12T16:00:00');
+    const until = dayjs('2026-08-13T16:00:00');
+    const r: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'day',
+      series: [
+        { bucket: '2026-08-12', group: 'a', value: 24, is_zero: false },
+        { bucket: '2026-08-13', group: 'a', value: 5, is_zero: false },
+      ],
+      summary: [{ group: 'a', min: 5, max: 24, avg: 14.5, sum: 29, value: 5, percent: 100 }],
+      buckets: ['2026-08-12', '2026-08-13'],
+      totals: { spend: 29, tokens: 0, requests: 0, cache: 0 },
+    };
+    const out = prorateBoundaryBuckets(
+      r, since, until, until, dayjs('2026-08-13T16:05:00'), 'hour', 'day', true,
+    );
+    // Eight hours of the completed day plus the current hour's recorded live
+    // cell: the response's current-day value is already entirely recorded in
+    // the in-range live cell and must not be trimmed as 16/24 of a day.
+    expect(out.series.map(p => p.value)).toEqual([8, 5]);
+    expect(out.totals.spend).toBe(13);
+  });
+
+  it('prorates a finer hourly rollup over a day-granularity range', () => {
+    const since = dayjs('2026-08-10T14:00:00');
+    const until = dayjs('2026-08-14T12:30:00');
+    const buckets = ['2026-08-10 14:00', '2026-08-14 12:00'];
+    const r: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'hour',
+      series: buckets.map(b => ({ bucket: b, group: 'a', value: 60, is_zero: false })),
+      summary: [{ group: 'a', min: 60, max: 60, avg: 60, sum: 120, value: 60, percent: 100 }],
+      buckets,
+      totals: { spend: 120, tokens: 0, requests: 0, cache: 0 },
+    };
+    const out = prorateBoundaryBuckets(r, since, until, until, dayjs('2026-08-15T00:00:00'), 'day', 'hour');
+    expect(out.series.map(p => p.value)).toEqual([60, 30]);
+    expect(out.totals.spend).toBe(90);
+  });
+
+  it('prorates week and total responses at their own boundary scales', () => {
+    const since = dayjs('2026-08-12T14:00:00');
+    const until = dayjs('2026-08-14T18:00:00');
+    const week: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'week',
+      series: [{ bucket: '2026-08-10', group: 'a', value: 168, is_zero: false }],
+      summary: [{ group: 'a', min: 168, max: 168, avg: 168, sum: 168, value: 168, percent: 100 }],
+      buckets: ['2026-08-10'],
+      totals: { spend: 168, tokens: 0, requests: 0, cache: 0 },
+    };
+    const weekOut = prorateBoundaryBuckets(week, since, until, until, dayjs('2026-08-18T00:00:00'), 'hour', 'week');
+    expect(weekOut.series[0].value).toBe(52);
+
+    const total: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'total',
+      series: [{ bucket: 'Total', group: 'a', value: 300, is_zero: false }],
+      summary: [{ group: 'a', min: 300, max: 300, avg: 300, sum: 300, value: 300, percent: 100 }],
+      buckets: ['Total'],
+      totals: { spend: 300, tokens: 0, requests: 0, cache: 0 },
+    };
+    const totalSince = dayjs('2026-08-14T14:00:00');
+    const totalUntil = dayjs('2026-08-14T18:00:00');
+    const totalOut = prorateBoundaryBuckets(total, totalSince, totalUntil, totalUntil, dayjs('2026-08-15T00:00:00'), 'hour', 'total');
+    // The total query widens to [14:00, 19:00); the requested 4/5 hours are
+    // 240 of the aggregate's 300 units.
+    expect(totalOut.series[0].value).toBe(240);
+    expect(totalOut.totals.spend).toBe(240);
   });
 
   it('prorates a month-granularity custom range at the month scale', () => {
