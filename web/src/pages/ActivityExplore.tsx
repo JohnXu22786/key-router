@@ -13,8 +13,9 @@ import {
 import { getActivity, ActivityResponse, ActivityGroupSummary } from '../api/client';
 import {
   DateRange, ActivityFilter, filterKey, fmtUSDInt, fmtTokens, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS,
-  fmtPercent, fmt3sig, fmtTick, fmtBucket, modelFavicon, Granularity, queryWindowUntil, prorateBoundaryBuckets,
-  liveExtensionEligible, resampleResponse, aggregateTotalResponse,
+  fmtPercent, fmt3sig, fmtTick, fmtBucket, modelFavicon, Granularity, ActivityRollup,
+  queryWindowUntil, floorWindowUntil, liveExtensionEligible, normalizeHourlyResponse, combineBlendedResponses,
+  limitActivityResponse,
 } from './activityShared';
 import dayjs from 'dayjs';
 import './explore.css';
@@ -142,71 +143,72 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
       setError(false);
       const t0 = performance.now();
       try {
-        // The API aggregates stored hourly rows and has no sub-hour rollups.
-        // Short ranges therefore use an hourly response as the source and
-        // are re-sampled onto the range's minute/15-minute axis, just like
-        // Trends. Total is handled separately for additive metrics: its
-        // hourly cells are corrected before being collapsed so a single
-        // boundary ratio never scales interior hours.
-        const subGran: 'minute' | 'min15' | null =
-          rollup !== 'total' && (range.granularity === 'minute' || range.granularity === 'min15')
-            ? range.granularity
-            : null;
-        const additiveTotal = rollup === 'total' && metric !== 'blended';
-        const requestRollup = subGran || additiveTotal ? 'hour' : rollup;
+        // The API stores hourly rows and widens every query to complete
+        // buckets. Fetch every source metric uncapped, then normalize the
+        // hourly cells before applying the requested rollup or Top-N set.
+        // This keeps boundary correction exact for non-uniform usage and
+        // prevents outside-window rows from deciding which groups survive.
+        const chartMetrics = metric === 'blended' ? ['spend', 'tokens'] : [metric];
+        const rankMetric = rankBy === 'current' ? metric : rankBy;
+        const rankMetrics = rankMetric === 'blended' ? ['spend', 'tokens'] : [rankMetric];
+        const sourceMetrics = [...new Set([...chartMetrics, ...rankMetrics])];
+        const requestRollup = 'hour';
+        const queryCutoff = dayjs();
         // The query window must keep every in-range bucket: a CURRENT-period
-        // boundary-aligned range passes its until as-is, so the endpoint's
-        // widened window keeps the LIVE bucket (the user's newest usage is
-        // the chart's real last point — see queryWindowUntil); a PAST-period
-        // boundary (yesterday, prev-week/month/year) passes one second before
-        // it so the previous period never picks up the current period's
-        // buckets; a mid-bucket until (a coarse rollup — e.g. default day
-        // over an hour-granularity 1d/today range) is sent as-is, or the
-        // server's widened window would amputate the in-progress day the
-        // range covers.
-        const curUntil = queryWindowUntil(range, requestRollup);
-        const res = await getActivity({
-          metric,
+        // preset fetches through the current minute so an hourly source still
+        // carries the complete live day/month that a calendar rollup needs;
+        // the normalizer later clips it to the range's live cell. A
+        // PAST-period boundary (yesterday, prev-week/month/year) uses the
+        // exclusive hour boundary so it never picks up the current period's
+        // buckets; custom ranges retain their chosen endpoint and are clipped
+        // exactly by the normalizer.
+        const curUntil = liveExtensionEligible(range)
+          ? floorWindowUntil(queryCutoff, 'minute')
+          : queryWindowUntil(range, requestRollup);
+        const responses = await Promise.all(sourceMetrics.map(sourceMetric => getActivity({
+          metric: sourceMetric,
           group_by: groupBy,
           subgroup: subgroup || undefined,
           rollup: requestRollup,
           rank_by: rankBy,
-          top: topN,
+          top: 0,
           since: range.since.toISOString(),
           until: curUntil.toISOString(),
           filter_type: filter?.type,
           filter_value: filter?.value,
-        });
+        })));
         if (cancelled) return;
         // Capture the response-time cutoff: a slow request can include usage
         // recorded after it started, so the request-time cutoff would make
         // the live boundary bucket's coverage too small and its value too
         // large.
         const cutoff = dayjs();
-        let normalized: ActivityResponse;
-        if (subGran) {
-          normalized = resampleResponse(
-            res.data, range.since, range.until, cutoff, subGran,
+        const normalizedByMetric = new Map<string, ActivityResponse>();
+        sourceMetrics.forEach((sourceMetric, i) => {
+          normalizedByMetric.set(sourceMetric, normalizeHourlyResponse(
+            responses[i].data,
+            range.since,
+            range.until,
+            cutoff,
+            range.granularity,
+            rollup as ActivityRollup,
             liveExtensionEligible(range),
-          );
-        } else if (additiveTotal) {
-          const hourly = prorateBoundaryBuckets(
-            res.data, range.since, range.until, curUntil, cutoff,
-            'hour', 'hour', liveExtensionEligible(range),
-          );
-          normalized = aggregateTotalResponse(hourly);
-        } else {
-          // The endpoint widens every query to complete buckets at the
-          // selected rollup (see activityWindow in admin.go), so a short
-          // range with the default day rollup can contain a full day outside
-          // the range. The shared correction scales the response's
-          // first/last buckets at that rollup's scale and keeps the current
-          // preset's live cell so Explore agrees with Overview.
-          normalized = prorateBoundaryBuckets(
-            res.data, range.since, range.until, curUntil, cutoff,
-            range.granularity, requestRollup, liveExtensionEligible(range),
-          );
-        }
+          ));
+        });
+        const spend = normalizedByMetric.get('spend');
+        const tokens = normalizedByMetric.get('tokens');
+        const chartResponse = metric === 'blended'
+          ? combineBlendedResponses(spend!, tokens!)
+          : normalizedByMetric.get(metric)!;
+        const rankResponse = rankMetric === 'blended'
+          ? combineBlendedResponses(spend!, tokens!)
+          : normalizedByMetric.get(rankMetric)!;
+        const normalized = limitActivityResponse(
+          chartResponse,
+          topN,
+          rankResponse,
+          metric === 'blended' ? { spend: spend!, tokens: tokens! } : undefined,
+        );
         setData(normalized);
         setLoadMs(Math.max(1, Math.round(performance.now() - t0)));
       } catch { if (!cancelled) { setError(true); message.error('Failed to load explore'); } }
