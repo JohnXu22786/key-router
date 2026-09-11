@@ -191,7 +191,7 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
             until: edge.until.toISOString(),
             filter_type: filter?.type,
             filter_value: filter?.value,
-          })));
+          }))); 
           return { base: base.data, boundary: boundary.map(response => response.data) };
         }));
         if (cancelled) return;

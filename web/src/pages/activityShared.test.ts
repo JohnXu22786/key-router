@@ -232,29 +232,27 @@ describe('floorWindowUntil — rolling windows end at the last complete bucket',
     expect(floorWindowUntil(t, 'month').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-01 00:00:00');
   });
 
-  it('a 24h window snapped to the bucket grid keeps the live bucket at its recorded share', () => {
+  it('a 24h window snapped to the bucket grid excludes the current bucket', () => {
     // Both bounds snap to the hour grid: [16:00 yesterday, 16:00 today).
-    // The 16:00 bucket (recorded up to the fetch at 16:30) starts exactly AT
-    // until — its recorded extent is real in-window usage, so the share is 1
-    // (the accumulated live value), never a clamped 0 that would drop the
-    // user's newest usage from the chart and make the line fall to 0.
+    // The 16:00 bucket starts exactly AT until, so it lies outside the
+    // displayed half-open range even when the server has recorded usage in
+    // that current bucket.
     const since = floorWindowUntil(dayjs('2026-08-12T16:05:00'), 'hour');
     const until = floorWindowUntil(dayjs('2026-08-13T16:30:00'), 'hour');
     expect(since.format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-12 16:00:00');
     expect(until.format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-13 16:00:00');
-    expect(bucketWindowShare('2026-08-13T16:00:00', since, until, dayjs('2026-08-13T16:30:00'), 'hour')).toBe(1);
+    expect(bucketWindowShare('2026-08-13T16:00:00', since, until, dayjs('2026-08-13T16:30:00'), 'hour')).toBe(0);
     // Boundary hours inside the snapped window are whole…
     expect(bucketWindowShare('2026-08-12T16:00:00', since, until, dayjs('2026-08-13T16:30:00'), 'hour')).toBe(1);
     // …and interior hours stay whole too.
     expect(bucketWindowShare('2026-08-13T12:00:00', since, until, dayjs('2026-08-13T16:30:00'), 'hour')).toBe(1);
   });
 
-  it('a snapped 24h window is stable between auto-refreshes: only the live hour real usage moves', () => {
+  it('a snapped 24h window is stable between auto-refreshes', () => {
     // Two refreshes 30s apart: both bounds snap to the SAME bucket grid, so
-    // the completed hours render identical values; the only difference is the
-    // live hour's row accumulating real usage (30 -> 31). No phantom decay,
-    // no boundary drift — the window slides by one bucket only when the hour
-    // grid rolls over.
+    // the complete displayed buckets and their labels remain identical. The
+    // current bucket is outside the displayed range and cannot change the
+    // result between refreshes.
     const rows = [
       { hour_bucket: '2026-08-12T16:00:00', v: 60 },
       { hour_bucket: '2026-08-12T17:00:00', v: 60 },
@@ -273,16 +271,9 @@ describe('floorWindowUntil — rolling windows end at the last complete bucket',
       floorWindowUntil(dayjs('2026-08-13T16:30:30'), 'hour'),
       dayjs('2026-08-13T16:30:30'), 'hour');
     expect(refresh1.map(p => p.label)).toEqual(refresh2.map(p => p.label));
-    // The last point is the LIVE hour — refresh2 ends at 31: the line shows
-    // the real last in-window value instead of falling to 0.
-    expect(refresh1[refresh1.length - 1].value).toBe(30);
-    expect(refresh2[refresh2.length - 1].value).toBe(31);
-    // The 24 completed hours are identical between refreshes: only the live
-    // bucket carries the real +1.
-    const complete1 = refresh1.slice(0, -1).reduce((a, p) => a + p.value, 0);
-    const complete2 = refresh2.slice(0, -1).reduce((a, p) => a + p.value, 0);
-    expect(complete1).toBe(180);
-    expect(complete2).toBe(complete1);
+    expect(refresh1).toEqual(refresh2);
+    expect(refresh1).toHaveLength(24);
+    expect(refresh1.reduce((a, p) => a + p.value, 0)).toBe(180);
   });
 
   it('exclusiveUntil lands one second before the floored bucket for server queries', () => {
@@ -332,50 +323,19 @@ describe('queryWindowUntil — the query keeps every in-range bucket', () => {
 
   it('week and total rollups align by their server-shaped cuts (week->day, total->hour)', () => {
     // The week bucket is anchored to Monday, so it cuts per day. This Week
-    // ends at the LIVE day's start — that bucket holds real recorded usage
-    // and the query keeps it (raw until), so the week chart ends at the live
-    // value instead of amputating today.
-    expect(queryWindowUntil(w('week'), 'week').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-13 00:00:00');
+    // ends at today's start; the current day is outside the displayed range.
+    expect(queryWindowUntil(w('week'), 'week').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-12 23:59:59');
     // The total bucket aggregates over the hour-shaped window (same as the
-    // hour rollup on the server); Today ends at the LIVE hour's start, which
-    // must stay in the query — the total is never empty.
-    expect(queryWindowUntil(w('today'), 'total').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-13 16:00:00');
+    // hour rollup on the server); Today excludes the current hour too.
+    expect(queryWindowUntil(w('today'), 'total').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-13 15:59:59');
   });
 
-  it('a finer hourly rollup keeps the complete current day for a day-granularity range', () => {
-    // The current-aligned This Week range ends at today's midnight on its
-    // day grid. An hourly Explore query must reach the end of that live day;
-    // sending the day boundary only widened the server window to 00:00 and
-    // omitted the rest of today's hourly rows.
-    expect(queryWindowUntil(w('week'), 'hour').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-13 23:59:59');
-  });
-
-  it('extends a month-granularity weekly query through the live month', () => {
-    // A current year range is snapped to the start of the live month. The
-    // weekly Explore query reaches month-end so all current-month rows are
-    // available; the server clips the widened final week at the next-month
-    // boundary instead of returning October rows in September's bucket.
-    const r = {
-      key: 'year',
-      label: '',
-      badge: '',
-      since: dayjs('2026-01-01T00:00:00'),
-      until: dayjs('2026-09-01T00:00:00'),
-      granularity: 'month' as Granularity,
-    };
-    expect(queryWindowUntil(r, 'week').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-09-30 23:59:59');
-  });
-
-  it('a CURRENT-aligned preset boundary keeps its live bucket: the query passes until as-is', () => {
-    // A 24h window ending at 09:00 sharp (the current hour's start): the
-    // live hour's row is the chart's real last in-window value, so the query
-    // sends the boundary as-is and the server's widened window includes the
-    // 09:00 bucket — the hour must NOT be amputated (that made the line
-    // always fall to 0 while the traffic lives in the current hour).
+  it('a CURRENT-aligned preset boundary excludes the bucket at its displayed end', () => {
+    // A 24h window ending at 09:00 sharp sends one second before the
+    // boundary, so the server does not return the 09:00 bucket that lies
+    // outside the displayed half-open range.
     const r = { key: '1d', label: '', badge: '', since: dayjs('2026-08-12T09:00:00'), until: dayjs('2026-08-13T09:00:00'), granularity: 'hour' as Granularity };
-    expect(queryWindowUntil(r, 'hour').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-13 09:00:00');
-    // A CUSTOM range ending on the same boundary is NOT eligible: its end is
-    // a chosen cutoff, not "now" — the live bucket stays excluded.
+    expect(queryWindowUntil(r, 'hour').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-13 08:59:59');
     const custom = { ...r, key: 'custom' };
     expect(queryWindowUntil(custom, 'hour').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-13 08:59:59');
   });
@@ -393,19 +353,17 @@ describe('queryWindowUntil — the query keeps every in-range bucket', () => {
     // ends one bucket early" symptom for that one refresh. Alignment is a
     // property of the RANGE (its until lies on its own bucket grid = the
     // bucket that contained the render-time now), never of the fetch clock,
-    // so this window must still pass 16:00 as-is.
+    // so this window still excludes the 16:00 bucket at its displayed end.
     const hour = { key: '1d', label: '', badge: '', since: dayjs('2026-08-12T16:00:00'), until: dayjs('2026-08-13T16:00:00'), granularity: 'hour' as Granularity };
-    expect(queryWindowUntil(hour, 'hour').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-13 16:00:00');
-    // One bucket coarser: rendered Aug 12 23:59:59.9xx -> until = Aug 12
-    // 00:00 (the live day); fetch Aug 13 00:00:00.0xx. The COMPLETED Aug 12
-    // day stays in the query, never amputated to Aug 11 23:59:59.
+    expect(queryWindowUntil(hour, 'hour').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-13 15:59:59');
+    // One bucket coarser: the displayed day ends at Aug 12 00:00, so the
+    // completed Aug 11 day is the last day returned.
     const day = { key: '1w', label: '', badge: '', since: dayjs('2026-08-05T00:00:00'), until: dayjs('2026-08-12T00:00:00'), granularity: 'day' as Granularity };
-    expect(queryWindowUntil(day, 'day').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-12 00:00:00');
-    // And one coarser still: rendered Jul 31 23:59:59.9xx -> until = Jul 1
-    // (the live month); fetch Aug 1 00:00:00.0xx. The COMPLETED July month
-    // stays in the query, never amputated to Jun 30 23:59:59.
+    expect(queryWindowUntil(day, 'day').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-11 23:59:59');
+    // And one coarser still: the displayed month ends at Jul 1, so June is
+    // the last month returned.
     const month = { key: '1y', label: '', badge: '', since: dayjs('2025-07-01T00:00:00'), until: dayjs('2026-07-01T00:00:00'), granularity: 'month' as Granularity };
-    expect(queryWindowUntil(month, 'month').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-07-01 00:00:00');
+    expect(queryWindowUntil(month, 'month').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-06-30 23:59:59');
   });
 
   it('a past preset whose boundary coincides with the current unit still excludes it (Prev Week on a Monday)', () => {
@@ -422,9 +380,9 @@ describe('queryWindowUntil — the query keeps every in-range bucket', () => {
     // Prev month ends at Aug 1 00:00 — a PAST boundary (not the current
     // month's start): the live bucket stays excluded, unchanged.
     expect(queryWindowUntil(w('prevmonth'), 'day').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-07-31 23:59:59');
-    // This year ends at Aug 1 00:00 — the CURRENT month's start: the live
-    // month (August) holds the user's newest usage and must stay in the query.
-    expect(queryWindowUntil(w('year'), 'month').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-01 00:00:00');
+    // This year ends at Aug 1 00:00, so the current August month is outside
+    // the displayed range too.
+    expect(queryWindowUntil(w('year'), 'month').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-07-31 23:59:59');
   });
 
   it('week rollup on a past preset excludes the whole boundary week (week-grid alignment)', () => {
@@ -641,16 +599,14 @@ describe('bucketWindowShare — rolling windows prorate boundary buckets', () =>
     expect(bucketWindowShare('2026-08-13T00:00:00', since, until, dayjs('2026-08-13T16:05:00'), 'hour', false)).toBe(0);
   });
 
-  it('keeps a bucket whose hour starts exactly at the window end when it is the LIVE bucket', () => {
-    // Window ends at 16:00 sharp = the start of the CURRENT hour (cutoff
-    // 16:05 lies inside it): the 16:00 bucket's recorded extent is the real
-    // last in-window value, so its share is 1 — the clamped 0 would drop the
-    // user's newest usage and make the line fall to 0 at its end.
+  it('excludes a bucket whose hour starts exactly at the displayed end', () => {
+    // Window ends at 16:00 sharp, so the 16:00 bucket is outside the
+    // displayed half-open range even when the fetch has recorded usage in it.
     const since = dayjs('2026-08-13T13:00:00');
     const until = dayjs('2026-08-13T16:00:00');
-    expect(bucketWindowShare('2026-08-13T16:00:00', since, until, dayjs('2026-08-13T16:05:00'), 'hour')).toBe(1);
+    expect(bucketWindowShare('2026-08-13T16:00:00', since, until, dayjs('2026-08-13T16:05:00'), 'hour')).toBe(0);
     // The same bucket against a window whose end does NOT coincide with the
-    // live hour's start stays dropped (past windows, mid-cell ends).
+    // hour's start stays dropped too.
     expect(bucketWindowShare('2026-08-13T16:00:00', since, dayjs('2026-08-13T15:30:00'), dayjs('2026-08-13T16:05:00'), 'hour')).toBe(0);
   });
 
@@ -769,7 +725,7 @@ describe('series — rolling windows never accumulate phantom data', () => {
   });
 });
 
-describe('the last chart point is the live bucket real value (hour+ axes)', () => {
+describe('the explicit live-cell extension remains opt-in', () => {
   // User report: "the chart line ALWAYS falls to 0 at its end - the last
   // plotted point is 0". A current-aligned window (its until == the start of
   // the bucket that contained the window's render-time now — see hasLiveCell
@@ -794,7 +750,7 @@ describe('the last chart point is the live bucket real value (hour+ axes)', () =
         { hour_bucket: '2026-08-13T15:00:00', v: 10 },
         { hour_bucket: '2026-08-13T16:00:00', v: 5 }, // live hour
       ],
-      r => r.v, since, until, NOW, 'hour',
+      r => r.v, since, until, NOW, 'hour', true,
     );
     expect(out[out.length - 1]).toMatchObject({ label: '08-13 16:00', sort: '2026-08-13 16:00', value: 5 });
     expect(out[out.length - 2].value).toBe(10);
@@ -809,7 +765,7 @@ describe('the last chart point is the live bucket real value (hour+ axes)', () =
         { hour_bucket: '2026-08-13T15:00:00', v: 10 },
         { hour_bucket: '2026-08-13T16:00:00', v: 5 },
       ],
-      r => r.v, since, until, NOW, 'hour',
+      r => r.v, since, until, NOW, 'hour', true,
     );
     expect(out).toHaveLength(49); // 48 complete hours + the live hour
     expect(out[out.length - 1].value).toBe(5);
@@ -829,7 +785,7 @@ describe('the last chart point is the live bucket real value (hour+ axes)', () =
         { hour_bucket: '2026-08-13T08:00:00', v: 3 }, // today (live day)
         { hour_bucket: '2026-08-13T15:00:00', v: 2 }, // today, accumulated later
       ],
-      r => r.v, since, until, NOW, 'day',
+      r => r.v, since, until, NOW, 'day', true,
     );
     expect(out[out.length - 1]).toMatchObject({ label: '08-13', sort: '2026-08-13', value: 5 });
     expect(out[out.length - 2]).toMatchObject({ label: '08-12', value: 11 });
@@ -846,7 +802,7 @@ describe('the last chart point is the live bucket real value (hour+ axes)', () =
         { hour_bucket: '2026-07-20T00:00:00', v: 4 },
         { hour_bucket: '2026-08-05T00:00:00', v: 9 }, // August (live month)
       ],
-      r => r.v, since, until, NOW, 'month',
+      r => r.v, since, until, NOW, 'month', true,
     );
     expect(out[out.length - 1]).toMatchObject({ label: '2026-08', sort: '2026-08', value: 9 });
     expect(out[out.length - 2]).toMatchObject({ label: '2026-07', value: 4 });
@@ -873,21 +829,21 @@ describe('the last chart point is the live bucket real value (hour+ axes)', () =
         { hour_bucket: '2026-08-13T15:00:00', v: 10 },
         { hour_bucket: '2026-08-13T16:00:00', v: 7 }, // the render-time live hour — completed by fetch time
       ],
-      r => r.v, since, until, cut, 'hour',
+      r => r.v, since, until, cut, 'hour', true,
     );
     expect(out[out.length - 1]).toMatchObject({ label: '08-13 16:00', sort: '2026-08-13 16:00', value: 7 });
     expect(out[out.length - 2].value).toBe(10);
     // The KPI counts the same cell fully: the whole row lies inside it.
-    expect(bucketWindowShare('2026-08-13T16:00:00', since, until, cut, 'hour')).toBe(1);
+    expect(bucketWindowShare('2026-08-13T16:00:00', since, until, cut, 'hour', true)).toBe(1);
     // One bucket coarser: a 1w window rendered Aug 12 23:59:59.9 (until = the
     // live day Aug 12 00:00) fetched Aug 13 00:00:00.05 — the COMPLETED
     // Aug 12 day stays the chart's last point, never amputated to Aug 11.
     const dSince = dayjs('2026-08-05T00:00:00');
     const dUntil = dayjs('2026-08-12T00:00:00');
     const dCut = dayjs('2026-08-13T00:00:00.050');
-    const dOut = series([{ hour_bucket: '2026-08-12T10:00:00', v: 5 }], r => r.v, dSince, dUntil, dCut, 'day');
+    const dOut = series([{ hour_bucket: '2026-08-12T10:00:00', v: 5 }], r => r.v, dSince, dUntil, dCut, 'day', true);
     expect(dOut[dOut.length - 1]).toMatchObject({ label: '08-12', sort: '2026-08-12', value: 5 });
-    expect(bucketWindowShare('2026-08-12T10:00:00', dSince, dUntil, dCut, 'day')).toBe(1);
+    expect(bucketWindowShare('2026-08-12T10:00:00', dSince, dUntil, dCut, 'day', true)).toBe(1);
   });
 
   it('a PAST window (yesterday shape) gains no live bucket — the boundary stays excluded', () => {
@@ -948,7 +904,7 @@ describe('the last chart point is the live bucket real value (hour+ axes)', () =
         { hour_bucket: '2026-08-13T15:00:00', v: 60 },
         { hour_bucket: '2026-08-13T16:00:00', v: 10 }, // live hour
       ],
-      r => r.v, since, until, cut, 'min15',
+      r => r.v, since, until, cut, 'min15', true,
     );
     expect(out).toHaveLength(13); // 12 complete cells + the live cell
     expect(out[out.length - 1]).toMatchObject({ label: '08-13 16:00', sort: '2026-08-13 16:00', value: 10 });
@@ -966,8 +922,8 @@ describe('the last chart point is the live bucket real value (hour+ axes)', () =
     const until = dayjs('2026-08-13T16:15:00');
     const cut = dayjs('2026-08-13T16:17:30');
     const rows = [{ hour_bucket: '2026-08-13T16:00:00', v: 17 }];
-    expect(bucketWindowShare('2026-08-13T16:00:00', since, until, cut, 'min15')).toBe(1);
-    const out = series(rows, r => r.v, since, until, cut, 'min15');
+    expect(bucketWindowShare('2026-08-13T16:00:00', since, until, cut, 'min15', true)).toBe(1);
+    const out = series(rows, r => r.v, since, until, cut, 'min15', true);
     expect(out[out.length - 1]).toMatchObject({ label: '08-13 16:15', value: 2 });
     expect(out.reduce((a, p) => a + p.value, 0)).toBeCloseTo(17, 6);
   });
@@ -1008,7 +964,7 @@ describe('the last chart point is the live bucket real value (hour+ axes)', () =
     } as any;
     const since = dayjs('2026-08-13T13:00:00');
     const until = dayjs('2026-08-13T16:00:00');
-    const out = resampleResponse(resp, since, until, dayjs('2026-08-13T16:05:30'), 'min15');
+    const out = resampleResponse(resp, since, until, dayjs('2026-08-13T16:05:30'), 'min15', true);
     expect(out.buckets).toHaveLength(13);
     expect(out.buckets[12]).toBe('08-13 16:00'); // the live cell
     const a = out.series.filter(p => p.group === 'a').map(p => p.value);
@@ -1022,11 +978,8 @@ describe('the last chart point is the live bucket real value (hour+ axes)', () =
     expect(out.totals.spend).toBeCloseTo(130 + 5, 6);
   });
 
-  it('liveExtensionEligible splits the presets: current-period keys only', () => {
-    for (const k of ['15m', '30m', '1h', '3h', '1d', '2d', '1w', '1mo', '1y', 'today', 'week', 'month', 'year']) {
-      expect(liveExtensionEligible({ key: k })).toBe(true);
-    }
-    for (const k of ['yesterday', 'prevweek', 'prevmonth', 'prevyear', CUSTOM_KEY]) {
+  it('liveExtensionEligible disables the extension for every Activity range', () => {
+    for (const k of ['15m', '30m', '1h', '3h', '1d', '2d', '1w', '1mo', '1y', 'today', 'week', 'month', 'year', 'yesterday', 'prevweek', 'prevmonth', 'prevyear', CUSTOM_KEY]) {
       expect(liveExtensionEligible({ key: k })).toBe(false);
     }
   });
@@ -1065,7 +1018,7 @@ describe('the last chart point is the live bucket real value (hour+ axes)', () =
     // The live hour's row: its recorded extent (16:00..16:05, whole minutes
     // floored) is real in-window usage — the share is 1, never the clamped 0
     // that dropped it from the chart and the KPI.
-    expect(bucketWindowShare('2026-08-13T16:00:00', since, until, NOW, 'hour')).toBe(1);
+    expect(bucketWindowShare('2026-08-13T16:00:00', since, until, NOW, 'hour', true)).toBe(1);
     // The SAME row must not leak into a past window (the previous period) —
     // conservation: current 1 + past 0 = the whole row, never double-counted.
     // Past-window shares pass liveExtend=false (the Overview's prev sums).
@@ -1073,7 +1026,7 @@ describe('the last chart point is the live bucket real value (hour+ axes)', () =
     expect(bucketWindowShare('2026-08-13T16:00:00', prevSince, since, NOW, 'hour', false)).toBe(0);
     // A live DAY row for a week-shaped window: included in the CURRENT
     // window, excluded from the PREVIOUS one.
-    expect(bucketWindowShare('2026-08-13T08:00:00', dayjs('2026-08-06T00:00:00'), dayjs('2026-08-13T00:00:00'), NOW, 'day')).toBe(1);
+    expect(bucketWindowShare('2026-08-13T08:00:00', dayjs('2026-08-06T00:00:00'), dayjs('2026-08-13T00:00:00'), NOW, 'day', true)).toBe(1);
     expect(bucketWindowShare('2026-08-13T08:00:00', dayjs('2026-07-30T00:00:00'), dayjs('2026-08-06T00:00:00'), NOW, 'day', false)).toBe(0);
   });
 });
@@ -1447,14 +1400,13 @@ describe('resampleResponse — Trends hourly rollup onto a sub-hour axis', () =>
     // TRIGGER: a sub-hour range with >=6 groups in the window. The current
     // response carries the top-5 + Other SERIES but a summary for EVERY
     // group; the widened query window [14:00, 16:00) (until sent as 15:00)
-    // holds the full 14:00 hour AND the live 15:00 hour's row. The resample
-    // puts the 14:00 row fully on the axis but only the live cell's minute
-    // of the 15:00 row (1/20 — 20 recorded whole minutes by cutoff 15:20),
-    // so the grid's aggregate shrinks by (60 + 10/20)/70 = 121/140 — Other
-    // is the fold of the beyond-grid groups, so its own raw/scaled pair is
-    // exactly their aggregate share. The ranked-6 group t1 has NO per-bucket
-    // series: its raw summary sum (70 = full 14:00 + full 15:00 hour) must
-    // scale by 121/140 to 60.5 — its true re-sampled value — BEFORE
+    // holds the full 14:00 hour AND the 15:00 boundary row. The displayed
+    // range is half-open, so only the 14:00 row remains on the resampled
+    // axis. The grid's aggregate therefore shrinks by 60/70 — Other is the
+    // fold of the beyond-grid groups, so its own raw/scaled pair is exactly
+    // their aggregate share. The ranked-6 group t1 has NO per-bucket series:
+    // its raw summary sum (70 = full 14:00 + full 15:00 hour) must scale by
+    // 60/70 to 60 — its true re-sampled value — BEFORE
     // computeTrending pairs it with the previous period.
     const curResp: ActivityResponse = {
       metric: 'spend', group_by: 'model', rollup: 'hour',
@@ -1492,17 +1444,17 @@ describe('resampleResponse — Trends hourly rollup onto a sub-hour axis', () =>
     const cutoff = dayjs('2026-08-13T15:20:00');
     const cur = resampleResponse(curResp, since, until, cutoff, 'minute');
     const prev = resampleResponse(prevResp, since.subtract(1, 'hour'), since, cutoff, 'minute', false);
-    // The ranked-6+ group's sum is on the re-sampled scale (60.5), not the
+    // The ranked-6+ group's sum is on the re-sampled scale (60), not the
     // raw widened-window 70 — and agrees with the re-sampled grid rows.
-    expect(cur.summary.find(s => s.group === 't1')!.sum).toBeCloseTo(60.5, 10);
-    expect(cur.summary.find(s => s.group === 'g1')!.sum).toBeCloseTo(60.5, 10);
-    expect(cur.summary.find(s => s.group === 'Other')!.sum).toBeCloseTo(60.5, 10);
-    // t1 actually DROPPED: (60.5-65)/65 = -6.9% — the raw sum would have
+    expect(cur.summary.find(s => s.group === 't1')!.sum).toBeCloseTo(60, 10);
+    expect(cur.summary.find(s => s.group === 'g1')!.sum).toBeCloseTo(60, 10);
+    expect(cur.summary.find(s => s.group === 'Other')!.sum).toBeCloseTo(60, 10);
+    // t1 actually DROPPED: (60-65)/65 = -7.7% — the raw sum would have
     // reported (70-65)/65 = +7.7% and flipped the arrow direction. g1's rise
-    // is (60.5-30)/30 = +101.7%, not the +133.3% the raw hour sum inflates.
+    // is (60-30)/30 = +100%, not the +133.3% the raw hour sum inflates.
     const rows = computeTrending(cur, prev);
-    expect(rows.find(r => r.group === 't1')!.pct).toBeCloseTo(-(4.5 / 65) * 100, 6);
-    expect(rows.find(r => r.group === 'g1')!.pct).toBeCloseTo((30.5 / 30) * 100, 6);
+    expect(rows.find(r => r.group === 't1')!.pct).toBeCloseTo(-(5 / 65) * 100, 6);
+    expect(rows.find(r => r.group === 'g1')!.pct).toBeCloseTo((30 / 30) * 100, 6);
   });
 
   it('re-buckets onto a clock-aligned 15-minute axis from a mid-cell window start', () => {

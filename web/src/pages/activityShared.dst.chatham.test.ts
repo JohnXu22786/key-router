@@ -187,12 +187,12 @@ describe('series — a window crossing the Chatham repeat keeps chart total == K
     const since = dayjs('2026-04-04T13:15:00.000Z');
     const until = dayjs('2026-04-04T14:00:00.000Z');
     const cutoff = dayjs('2026-04-04T14:03:30.000Z');
-    const out = series(ROWS, r => r.v, since, until, cutoff, 'min15');
+    const out = series(ROWS, r => r.v, since, until, cutoff, 'min15', true);
     expect(out[0].value).toBeCloseTo(350, 10);
     expect(out[1].value).toBeCloseTo(350, 10);
     expect(out[2].value).toBeCloseTo(350, 10);
     expect(out[3].value).toBeCloseTo(750 / 21, 10);
-    const kpi = ROWS.reduce((a, r) => a + r.v * bucketWindowShare(r.hour_bucket, since, until, cutoff, 'min15'), 0);
+    const kpi = ROWS.reduce((a, r) => a + r.v * bucketWindowShare(r.hour_bucket, since, until, cutoff, 'min15', true), 0);
     expect(kpi).toBeCloseTo(1050 + 750 / 21, 10);
     expect(out.reduce((a, p) => a + p.value, 0)).toBeCloseTo(kpi, 10);
   });
@@ -217,7 +217,7 @@ describe('bucketWindowShare — hour-granularity live window on the Chatham repe
     expect(until.toISOString()).toBe('2026-04-04T14:00:00.000Z');
     const since = floorWindowUntil(now.subtract(24, 'hour'), 'hour');
     expect(since.toISOString()).toBe('2026-04-03T13:15:00.000Z'); // wall 03:00 +13:45 the day before
-    const share = bucketWindowShare('2026-04-05T02:00:00', since, until, now, 'hour');
+    const share = bucketWindowShare('2026-04-05T02:00:00', since, until, now, 'hour', true);
     expect(share).toBeCloseTo(1, 10);
   });
 });
@@ -351,7 +351,7 @@ describe('bucketWindowShare — hour-granularity live window on the Chatham spri
     const until = floorWindowUntil(now, 'hour');
     expect(until.toISOString()).toBe('2026-09-26T14:00:00.000Z');
     const since = floorWindowUntil(now.subtract(24, 'hour'), 'hour');
-    const share = bucketWindowShare('2026-09-27T02:00:00', since, until, now, 'hour');
+    const share = bucketWindowShare('2026-09-27T02:00:00', since, until, now, 'hour', true);
     expect(share).toBeCloseTo(1, 10);
   });
 
@@ -362,7 +362,7 @@ describe('bucketWindowShare — hour-granularity live window on the Chatham spri
     const now = dayjs('2026-09-27T12:05:30.000Z');
     const until = floorWindowUntil(now, 'hour');
     const since = floorWindowUntil(now.subtract(24, 'hour'), 'hour');
-    const share = bucketWindowShare('2026-09-28T01:00:00', since, until, now, 'hour');
+    const share = bucketWindowShare('2026-09-28T01:00:00', since, until, now, 'hour', true);
     expect(share).toBeCloseTo(1, 10);
   });
 });
