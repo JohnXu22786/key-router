@@ -51,6 +51,11 @@ func TestActivityWindow(t *testing.T) {
 		!to.Equal(time.Date(2026, 10, 1, 0, 0, 0, 0, loc)) {
 		t.Fatalf("week month-end window = %v..%v, want Dec 29..Oct 1", from, to)
 	}
+	from, to = activityWindow(time.Date(2026, 9, 1, 0, 0, 0, 0, loc), monthEnd, "week")
+	if !from.Equal(time.Date(2026, 8, 31, 0, 0, 0, 0, loc)) ||
+		!to.Equal(time.Date(2026, 10, 1, 0, 0, 0, 0, loc)) {
+		t.Fatalf("week month-end window = %v..%v, want Aug 31..Oct 1", from, to)
+	}
 
 	// Month: from = Aug 1, to = the 1st after until's month (year rollover).
 	from, to = activityWindow(time.Date(2026, 8, 13, 0, 0, 0, 0, loc), time.Date(2026, 12, 31, 23, 0, 0, 0, loc), "month")
