@@ -2231,53 +2231,133 @@ func activityBucketLabel(t time.Time, rollup string) string {
 	}
 }
 
+// activityTimeRun is one contiguous epoch interval represented by a local
+// wall-clock bucket. A fall-back can give one hourly row two runs when the
+// offset change is not aligned to an hour (for example, Pacific/Chatham's
+// 45-minute transition).
+type activityTimeRun struct {
+	from time.Time
+	to   time.Time
+}
+
+// activityHourRuns returns the epoch runs represented by one persisted hourly
+// row. The database serializes time.Time values with a fixed offset, so using
+// hourBucket.Location() here loses the application's IANA transition rules:
+// New York's repeated 01:00 row is then treated as 60 minutes instead of 120,
+// and Lord Howe's as 60 instead of 90. Rebuild the persisted wall fields in
+// time.Local, whose rules are the same rules RecordConsumption used when it
+// created the bucket.
+//
+// Ordinary rows use one Add(time.Hour) interval. Only rows within four hours
+// of a timezone transition take the minute walk; the walk preserves repeated
+// or skipped wall-clock fields exactly while keeping long-range Activity
+// queries inexpensive.
+func activityHourRuns(hourBucket time.Time) []activityTimeRun {
+	loc := time.Local
+	year, month, day, hour := hourBucket.Year(), hourBucket.Month(), hourBucket.Day(), hourBucket.Hour()
+	start := time.Date(year, month, day, hour, 0, 0, 0, loc)
+	// A row cannot be persisted for a nonexistent wall-clock hour, but guard
+	// against a malformed/future row rather than assigning it to a different
+	// local hour after time.Date normalizes it across a spring gap.
+	wall := start.In(loc)
+	if wall.Year() != year || wall.Month() != month || wall.Day() != day || wall.Hour() != hour || wall.Minute() != 0 {
+		return nil
+	}
+
+	const transitionWindow = 4 * time.Hour
+	zoneStart, zoneEnd := start.ZoneBounds()
+	nearTransition := (!zoneStart.IsZero() && start.Sub(zoneStart) <= transitionWindow) ||
+		(!zoneEnd.IsZero() && zoneEnd.Sub(start) <= transitionWindow)
+	if !nearTransition {
+		return []activityTimeRun{{from: start, to: start.Add(time.Hour)}}
+	}
+
+	// All current timezone transitions occur on a whole-minute boundary. The
+	// scan is anchored to the persisted hour's minute-zero instant, so every
+	// transition boundary remains exact and the returned runs are epoch ranges.
+	scanStart := start.Add(-transitionWindow)
+	scanEnd := start.Add(transitionWindow)
+	runs := make([]activityTimeRun, 0, 2)
+	var runStart time.Time
+	inRun := false
+	for t := scanStart; t.Before(scanEnd); t = t.Add(time.Minute) {
+		local := t.In(loc)
+		matches := local.Year() == year && local.Month() == month && local.Day() == day && local.Hour() == hour
+		if matches && !inRun {
+			runStart = t
+			inRun = true
+		} else if !matches && inRun {
+			runs = append(runs, activityTimeRun{from: runStart, to: t})
+			inRun = false
+		}
+	}
+	if inRun {
+		runs = append(runs, activityTimeRun{from: runStart, to: scanEnd})
+	}
+	return runs
+}
+
+// activityRecordedHourRuns caps the row's represented runs at the response
+// time. Consumption values are recorded through the whole minute containing
+// cutoff; preserve the existing one-minute minimum when cutoff falls inside a
+// newly-created run so a non-zero row is never divided by zero.
+func activityRecordedHourRuns(hourBucket, cutoff time.Time) []activityTimeRun {
+	runs := activityHourRuns(hourBucket)
+	if len(runs) == 0 {
+		return nil
+	}
+	recordedEnd := cutoff.Truncate(time.Minute)
+	recorded := make([]activityTimeRun, 0, len(runs))
+	for _, run := range runs {
+		to := run.to
+		if recordedEnd.Before(to) {
+			to = recordedEnd
+		}
+		if to.After(run.from) {
+			recorded = append(recorded, activityTimeRun{from: run.from, to: to})
+			continue
+		}
+		if cutoff.After(run.from) {
+			to = run.from.Add(time.Minute)
+			if to.After(run.to) {
+				to = run.to
+			}
+			if to.After(run.from) {
+				recorded = append(recorded, activityTimeRun{from: run.from, to: to})
+			}
+		}
+	}
+	return recorded
+}
+
 // activityRowWindowShare returns the fraction of one hourly consumption row
 // that belongs to the requested half-open window. Consumption is stored at
 // hourly resolution, so this is the finest boundary correction the server
 // can make: only the boundary hour is assumed uniform. Importantly, the
 // correction is applied to each source row before any daily/weekly/monthly
 // aggregation, rather than scaling an already mixed aggregate.
-//
-// The current hour is only recorded through the minute containing cutoff.
-// Keep the one-minute minimum for a cutoff inside the first minute, matching
-// the Activity client and preventing a newly-created row from being divided
-// by zero. time.Time.Add uses elapsed time, which also keeps the repeated DST
-// hour's 120-minute row intact when the database has merged both passes.
 func activityRowWindowShare(hourBucket, since, until, cutoff time.Time) float64 {
-	loc := hourBucket.Location()
-	start := time.Date(hourBucket.Year(), hourBucket.Month(), hourBucket.Day(), hourBucket.Hour(), 0, 0, 0, loc)
-	end := start.Add(time.Hour)
-
-	recordedEnd := cutoff.Truncate(time.Minute)
-	if recordedEnd.After(end) {
-		recordedEnd = end
-	}
-	if !recordedEnd.After(start) {
-		if !cutoff.After(start) {
-			return 0
+	recorded := activityRecordedHourRuns(hourBucket, cutoff)
+	coverage := time.Duration(0)
+	overlap := time.Duration(0)
+	for _, run := range recorded {
+		coverage += run.to.Sub(run.from)
+		overlapStart := run.from
+		if since.After(overlapStart) {
+			overlapStart = since
 		}
-		recordedEnd = start.Add(time.Minute)
-		if recordedEnd.After(end) {
-			recordedEnd = end
+		overlapEnd := run.to
+		if until.Before(overlapEnd) {
+			overlapEnd = until
+		}
+		if overlapEnd.After(overlapStart) {
+			overlap += overlapEnd.Sub(overlapStart)
 		}
 	}
-	coverage := recordedEnd.Sub(start)
-	if coverage <= 0 {
+	if coverage <= 0 || overlap <= 0 {
 		return 0
 	}
-
-	overlapStart := start
-	if since.After(overlapStart) {
-		overlapStart = since
-	}
-	overlapEnd := recordedEnd
-	if until.Before(overlapEnd) {
-		overlapEnd = until
-	}
-	if !overlapEnd.After(overlapStart) {
-		return 0
-	}
-	return float64(overlapEnd.Sub(overlapStart)) / float64(coverage)
+	return float64(overlap) / float64(coverage)
 }
 
 // activityWindow widens a query range to the rollup buckets CONTAINING its

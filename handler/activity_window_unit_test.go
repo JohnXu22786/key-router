@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"math"
 	"testing"
 	"time"
 )
@@ -118,5 +119,47 @@ func TestActivityWindowLocalHourFloor(t *testing.T) {
 	if !from.Equal(time.Date(2026, 8, 13, 15, 0, 0, 0, kolkata)) ||
 		!to.Equal(time.Date(2026, 8, 13, 18, 0, 0, 0, kolkata)) {
 		t.Fatalf("hour window = %v..%v, want 15:00..18:00 local", from, to)
+	}
+}
+
+// TestActivityRowWindowShareDSTReconstructsFixedOffsetBucket verifies the
+// precise Activity path against the way SQLite serializes HourBucket values:
+// the loaded time has a fixed offset even though RecordConsumption merged the
+// repeated local hour using time.Local. The row's denominator must therefore
+// include both passes of the local hour.
+func TestActivityRowWindowShareDSTReconstructsFixedOffsetBucket(t *testing.T) {
+	oldLocal := time.Local
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	ny, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Local = ny
+	firstNY := time.Date(2026, 11, 1, 1, 0, 0, 0, time.FixedZone("EDT", -4*60*60))
+	shareNY := activityRowWindowShare(
+		firstNY,
+		firstNY.Add(30*time.Minute),
+		firstNY.Add(2*time.Hour),
+		firstNY.Add(3*time.Hour),
+	)
+	if math.Abs(shareNY-0.75) > 1e-9 {
+		t.Fatalf("New York repeated-hour share = %v, want 0.75", shareNY)
+	}
+
+	lordHowe, err := time.LoadLocation("Australia/Lord_Howe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Local = lordHowe
+	firstLordHowe := time.Date(2026, 4, 5, 1, 0, 0, 0, time.FixedZone("LHDT", 11*60*60))
+	shareLordHowe := activityRowWindowShare(
+		firstLordHowe,
+		firstLordHowe.Add(30*time.Minute),
+		firstLordHowe.Add(90*time.Minute),
+		firstLordHowe.Add(3*time.Hour),
+	)
+	if math.Abs(shareLordHowe-(2.0/3.0)) > 1e-9 {
+		t.Fatalf("Lord Howe repeated-hour share = %v, want 2/3", shareLordHowe)
 	}
 }
