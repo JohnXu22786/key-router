@@ -485,6 +485,14 @@ const ROLLUP_GRAN: Record<string, 'hour' | 'day' | 'month'> = {
   total: 'hour',
 };
 
+const GRANULARITY_ORDER: Record<Granularity, number> = {
+  minute: 0,
+  min15: 1,
+  hour: 2,
+  day: 3,
+  month: 4,
+};
+
 // queryWindowUntil returns the `until` the activity server should receive
 // for a range's current-period query. Sub-hour ranges pass the raw (live)
 // time: their rows live in the current hour and are the data source the
@@ -522,14 +530,26 @@ const ROLLUP_GRAN: Record<string, 'hour' | 'day' | 'month'> = {
 // ranges are NOT eligible (see liveExtensionEligible): their boundary data
 // belongs to the current period, so they keep excluding it. (A rollup
 // FINER than the live unit — Explore's hour rollup over a day-granularity
-// range — widens to the live bucket's first unit only; the default rollups
-// keep the whole bucket.)
+// range — extends through the live range unit; the default rollups keep the
+// whole bucket.)
 export function queryWindowUntil(range: Pick<DateRange, 'key' | 'granularity' | 'since' | 'until'>, rollup: string): dayjs.Dayjs {
   if (range.granularity === 'minute' || range.granularity === 'min15') return range.until;
   const gran = ROLLUP_GRAN[rollup] ?? 'hour';
   if (liveExtensionEligible(range)
     && floorWindowUntil(range.until, range.granularity).isSame(range.until)
-    && floorWindowUntil(range.since, range.granularity).isSame(range.since)) return range.until;
+    && floorWindowUntil(range.since, range.granularity).isSame(range.since)) {
+    // A finer rollup needs the complete live range unit. Returning a
+    // day-aligned `until` for an hourly Explore query only widens the server
+    // window to that day's first hour, dropping the rest of the current day.
+    // The endpoint's bounds are inclusive and bucket-widened, so stop one
+    // second before the next range-unit boundary to include this unit without
+    // admitting the next one.
+    if (GRANULARITY_ORDER[gran] < GRANULARITY_ORDER[range.granularity]) {
+      const liveUnit = range.granularity === 'month' ? 'month' : range.granularity === 'day' ? 'day' : 'hour';
+      return range.until.add(1, liveUnit).subtract(1, 'second');
+    }
+    return range.until;
+  }
   if (floorWindowUntil(range.until, gran).isSame(range.until)) {
     // A WEEK rollup anchors its buckets to MONDAY (activityWindow's week
     // branch), so whenever `until` is not itself a Monday a day-grid
