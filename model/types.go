@@ -15,11 +15,11 @@ const (
 
 // Provider represents an upstream API provider
 type Provider struct {
-	ID           int64     `gorm:"primaryKey;autoIncrement" json:"id"`
-	Name         string    `gorm:"type:varchar(255);not null" json:"name"`
-	Type         string    `gorm:"type:varchar(20);not null;default:'openai'" json:"type"` // "openai" or "anthropic"
-	BaseURL      string    `gorm:"type:varchar(512);not null" json:"base_url"`
-	ExtraHeaders string    `gorm:"type:text" json:"extra_headers"` // JSON string
+	ID           int64  `gorm:"primaryKey;autoIncrement" json:"id"`
+	Name         string `gorm:"type:varchar(255);not null" json:"name"`
+	Type         string `gorm:"type:varchar(20);not null;default:'openai'" json:"type"` // "openai" or "anthropic"
+	BaseURL      string `gorm:"type:varchar(512);not null" json:"base_url"`
+	ExtraHeaders string `gorm:"type:text" json:"extra_headers"` // JSON string
 	// FailoverEmptyEnabled: auto-fail over a key whose upstream returns
 	// FailoverEmptyThreshold consecutive empty (no text / no tool_call /
 	// no reasoning_content) responses inside FailoverEmptyWindowSec
@@ -43,7 +43,7 @@ type Provider struct {
 	// by a successful probe — see IsSystemDisabledReason). Whichever
 	// flavor is chosen, the underlying cool/disable uses the same code
 	// path as 429 / 5xx so the UI and retry loop treat it the same.
-	FailoverEmptyDisable bool `gorm:"default:false" json:"failover_empty_disable"`
+	FailoverEmptyDisable bool      `gorm:"default:false" json:"failover_empty_disable"`
 	CreatedAt            time.Time `json:"created_at"`
 	UpdatedAt            time.Time `json:"updated_at"`
 }
