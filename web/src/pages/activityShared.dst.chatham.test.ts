@@ -16,7 +16,7 @@
 // Australia/Lord_Howe via activityShared.dst.lordhowe.test.ts).
 import { describe, it, expect, vi, beforeAll } from 'vitest';
 import dayjs from 'dayjs';
-import { bucketWindowShare, floorWindowUntil, rowCoverage, series, prorateBoundaryBuckets } from './activityShared';
+import { bucketWindowShare, floorWindowUntil, rowCoverage, series, stackedData, prorateBoundaryBuckets } from './activityShared';
 import type { ActivityResponse } from '../api/client';
 
 beforeAll(() => {
@@ -257,6 +257,16 @@ describe('prorateBoundaryBuckets — Chatham boundary buckets', () => {
     expect(bucketWindowShare('2026-04-05T01:00:00', since, until, cutoff, 'hour', false)).toBeCloseTo(30 / 60, 10);
     expect(bucketWindowShare('2026-04-05T02:00:00', since, until, cutoff, 'hour', false)).toBeCloseTo(65 / 75, 10);
   });
+
+  it('uses the spring-forward row\'s 15-minute coverage at a custom boundary', () => {
+    const since = dayjs('2026-09-27T03:10:00');
+    const until = dayjs('2026-09-27T04:30:00');
+    const cutoff = dayjs('2026-09-27T06:00:00');
+    const buckets = ['2026-09-27 03:00', '2026-09-27 04:00'];
+    const out = prorateBoundaryBuckets(resp(buckets, [900, 60]), since, until, until, cutoff, 'hour', 'hour');
+
+    expect(out.series.map(p => p.value)).toEqual([0, 20]);
+  });
 });
 
 // Spring-forward night: Sep 27 2026, the clock jumps 02:45 +12:45 -> 03:45
@@ -393,5 +403,32 @@ describe('series — a window crossing the Chatham spring keeps chart total == K
     expect(out[2].value).toBeCloseTo(200, 10);
     expect(out[3].value).toBeCloseTo(900, 10);
     expect(out[4].value).toBeCloseTo(15, 10);
+  });
+});
+
+describe('hourly axes — Chatham spring-forward wall-clock rows', () => {
+  const ROWS = [
+    { hour_bucket: '2026-09-27T02:00:00', model: 'a', v: 600 },
+    { hour_bucket: '2026-09-27T03:00:00', model: 'a', v: 900 },
+    { hour_bucket: '2026-09-27T04:00:00', model: 'a', v: 60 },
+  ];
+
+  it('keeps the serialized 03:00 row on its own hourly axis bucket', () => {
+    const since = dayjs('2026-09-27T01:00:00');
+    const until = dayjs('2026-09-27T05:00:00');
+    const cutoff = dayjs('2026-09-27T06:00:00');
+
+    const hourly = series(ROWS, r => r.v, since, until, cutoff, 'hour', false);
+    expect(hourly.map(p => p.sort)).toEqual([
+      '2026-09-27 01:00',
+      '2026-09-27 02:00',
+      '2026-09-27 03:00',
+      '2026-09-27 04:00',
+    ]);
+    expect(hourly.map(p => p.value)).toEqual([0, 600, 900, 60]);
+
+    const stacked = stackedData(ROWS, ['a'], r => r.model, r => r.v, since, until, cutoff, 'hour', false);
+    expect(stacked.map(p => p.sort)).toEqual(hourly.map(p => p.sort));
+    expect(stacked.map(p => p.a)).toEqual([0, 600, 900, 60]);
   });
 });

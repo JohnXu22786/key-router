@@ -329,6 +329,16 @@ function hourFieldFromBucket(hourBucket: string): number | undefined {
   return Number(match[1]) * 60 + Number(match[2]);
 }
 
+// hourSortFromBucket keeps the serialized wall-clock hour for hourly axis
+// assignment. A nonexistent spring-forward label such as Chatham's 03:00 is
+// normalized by dayjs to 04:00, but the response row still belongs to the
+// serialized 03:00 bucket.
+function hourSortFromBucket(hourBucket: string): string | undefined {
+  const match = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}):\d{2}/.exec(hourBucket);
+  if (!match) return undefined;
+  return `${match[1]} ${match[2]}:00`;
+}
+
 // floorWindowUntil snaps a time to the START of the bucket that contains it
 // at the given granularity. Preset windows snap BOTH bounds to the bucket
 // grid so the window keeps its exact nominal length and the COMPLETED cells
@@ -908,6 +918,37 @@ export function bucketAxis(since: dayjs.Dayjs, until: dayjs.Dayjs, granularity: 
   });
 }
 
+// axisForRows adds serialized hourly labels that the elapsed-time walk cannot
+// represent on a spring-forward transition. It is intentionally row-driven:
+// a normal zone keeps bucketAxis's existing DST behavior (including skipping
+// a nonexistent empty hour), while a real response row such as Chatham's
+// partial 03:00 bucket gets a visible axis point and a matching sort key.
+function axisForRows<T extends BucketedRow>(
+  list: T[],
+  since: dayjs.Dayjs,
+  until: dayjs.Dayjs,
+  granularity: Granularity,
+): SeriesPoint[] {
+  const axis = bucketAxis(since, until, granularity);
+  if (granularity !== 'hour' || list.length === 0) return axis;
+
+  const sinceStart = floorWindowUntil(since, granularity);
+  const untilStart = floorWindowUntil(until, granularity);
+  const sinceSort = bucketLabel(granularity, sinceStart).sort;
+  const untilSort = bucketLabel(granularity, untilStart).sort;
+  const untilIsBoundary = untilStart.isSame(until);
+  const points = new Map(axis.map(p => [p.sort, p]));
+
+  for (const row of list) {
+    const sort = hourSortFromBucket(row.hour_bucket);
+    if (sort === undefined || sort < sinceSort || (untilIsBoundary ? sort >= untilSort : sort > untilSort)) continue;
+    if (!points.has(sort)) {
+      points.set(sort, { label: `${sort.slice(5, 10)} ${sort.slice(11)}`, sort, value: 0 });
+    }
+  }
+  return [...points.values()].sort((a, b) => a.sort.localeCompare(b.sort));
+}
+
 // isRepeatHour is true when the hourly row anchored at `start` is affected
 // by a DST fall-back repeat: the repeated wall-clock span intersects the
 // row's hour field (see repeatRuns). The detection derives from the OFFSET
@@ -1239,7 +1280,7 @@ export function series<T extends BucketedRow>(
   granularity: Granularity,
   liveExtend = true,
 ): SeriesPoint[] {
-  const axis = bucketAxis(since, until, granularity);
+  const axis = axisForRows(list, since, until, granularity);
   // The CURRENT window's live bucket (the one starting at the range's snapped
   // until — its alignment judged from the range, see livePoint /
   // bucketWindowShare) joins the axis as the last point — its rows are in the
@@ -1260,11 +1301,14 @@ export function series<T extends BucketedRow>(
     }
     return axis;
   }
-  const keyOf = (t: dayjs.Dayjs): string =>
-    granularity === 'hour' ? t.format('YYYY-MM-DD HH:00') : granularity === 'day' ? t.format('YYYY-MM-DD') : t.format('YYYY-MM');
+  const keyOf = (hourBucket: string): string => {
+    if (granularity === 'hour') return hourSortFromBucket(hourBucket) ?? dayjs(hourBucket).format('YYYY-MM-DD HH:00');
+    const t = dayjs(hourBucket);
+    return granularity === 'day' ? t.format('YYYY-MM-DD') : t.format('YYYY-MM');
+  };
   const idx = new Map(axis.map((p, i) => [p.sort, i]));
   for (const r of list) {
-    const i = idx.get(keyOf(dayjs(r.hour_bucket)));
+    const i = idx.get(keyOf(r.hour_bucket));
     if (i !== undefined) {
       axis[i].value += valFn(r) * bucketWindowShare(r.hour_bucket, since, until, cutoff, granularity, liveExtend);
     }
@@ -1287,7 +1331,7 @@ export function stackedData<T extends BucketedRow>(
   granularity: Granularity,
   liveExtend = true,
 ): Array<Record<string, any>> {
-  const axis = bucketAxis(since, until, granularity);
+  const axis = axisForRows(list, since, until, granularity);
   // The CURRENT window's live bucket joins the axis (see series / livePoint).
   const liveP = livePoint(until, since, cutoff, granularity, new Set(axis.map(p => p.label)), liveExtend);
   if (liveP) axis.push(liveP);
@@ -1312,11 +1356,14 @@ export function stackedData<T extends BucketedRow>(
     }
     return rows;
   }
-  const keyOf = (t: dayjs.Dayjs): string =>
-    granularity === 'hour' ? t.format('YYYY-MM-DD HH:00') : granularity === 'day' ? t.format('YYYY-MM-DD') : t.format('YYYY-MM');
+  const keyOf = (hourBucket: string): string => {
+    if (granularity === 'hour') return hourSortFromBucket(hourBucket) ?? dayjs(hourBucket).format('YYYY-MM-DD HH:00');
+    const t = dayjs(hourBucket);
+    return granularity === 'day' ? t.format('YYYY-MM-DD') : t.format('YYYY-MM');
+  };
   const idx = new Map(axis.map((p, i) => [p.sort, i]));
   for (const r of list) {
-    const i = idx.get(keyOf(dayjs(r.hour_bucket)));
+    const i = idx.get(keyOf(r.hour_bucket));
     if (i !== undefined) {
       const g = keyFn(r);
       // Rows whose group is outside `groups` still accumulate under their
@@ -1510,6 +1557,7 @@ function boundaryShare(
   until: dayjs.Dayjs,
   cutoff: dayjs.Dayjs,
   granularity: Granularity,
+  wallField?: number,
 ): number {
   const rowUnit = granularity === 'day' ? 'day' : granularity === 'month' ? 'month' : 'hour';
   // The server anchors a fall-back's repeated hour on its FIRST occurrence
@@ -1530,7 +1578,7 @@ function boundaryShare(
   if (rowUnit === 'hour' && isRepeatHour(start.subtract(1, 'hour'))) {
     start = start.minute(0).second(0).millisecond(0);
   }
-  const row = rowCoverage(start, rowUnit, cutoff);
+  const row = rowCoverage(start, rowUnit, cutoff, rowUnit === 'hour' ? wallField : undefined);
   const coverage = row.coverage;
   if (coverage <= 0) return 0;
   let overlap = 0;
@@ -1610,7 +1658,14 @@ export function prorateBoundaryBuckets(
   const shares = new Map<string, number>();
   const firstStart = floorWindowUntil(since, granularity);
   if (!firstStart.isSame(since)) {
-    shares.set(resp.buckets[0], boundaryShare(firstStart, since, until, cutoff, granularity));
+    shares.set(resp.buckets[0], boundaryShare(
+      firstStart,
+      since,
+      until,
+      cutoff,
+      granularity,
+      granularity === 'hour' ? hourFieldFromBucket(resp.buckets[0]) : undefined,
+    ));
   }
   const lastStart = floorWindowUntil(untilSent, granularity);
   if (!lastStart.isSame(until)) {
@@ -1623,7 +1678,15 @@ export function prorateBoundaryBuckets(
     // that sent the RAW mid-bucket since (prevWindowUntil) reaches this
     // branch with the shared bucket's prev-period slice, exactly like the
     // first-bucket machinery.
-    shares.set(resp.buckets[resp.buckets.length - 1], boundaryShare(lastStart, since, until, cutoff, granularity));
+    const lastBucket = resp.buckets[resp.buckets.length - 1];
+    shares.set(lastBucket, boundaryShare(
+      lastStart,
+      since,
+      until,
+      cutoff,
+      granularity,
+      granularity === 'hour' ? hourFieldFromBucket(lastBucket) : undefined,
+    ));
   }
   const toApply = new Map<string, number>();
   for (const [b, share] of shares) {
