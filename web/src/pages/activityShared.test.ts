@@ -348,11 +348,11 @@ describe('queryWindowUntil — the query keeps every in-range bucket', () => {
     expect(queryWindowUntil(w('week'), 'hour').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-13 23:59:59');
   });
 
-  it('does not extend a month-granularity range into a following weekly bucket', () => {
-    // A current year range is snapped to the start of the live month. Its
-    // weekly Explore query must not be extended to month-end: the server
-    // widens that end to the following Monday, which would pull next-month
-    // rows into the final September week without client-side proration.
+  it('extends a month-granularity weekly query through the live month', () => {
+    // A current year range is snapped to the start of the live month. The
+    // weekly Explore query reaches month-end so all current-month rows are
+    // available; the server clips the widened final week at the next-month
+    // boundary instead of returning October rows in September's bucket.
     const r = {
       key: 'year',
       label: '',
@@ -361,7 +361,7 @@ describe('queryWindowUntil — the query keeps every in-range bucket', () => {
       until: dayjs('2026-09-01T00:00:00'),
       granularity: 'month' as Granularity,
     };
-    expect(queryWindowUntil(r, 'week').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-09-01 00:00:00');
+    expect(queryWindowUntil(r, 'week').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-09-30 23:59:59');
   });
 
   it('a CURRENT-aligned preset boundary keeps its live bucket: the query passes until as-is', () => {

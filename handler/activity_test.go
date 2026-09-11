@@ -804,6 +804,81 @@ func TestActivityWeekRollupMondayAlignment(t *testing.T) {
 	}
 }
 
+// TestActivityWeekRollupMonthBoundary pins the month-end clipping used by
+// month-granularity Explore ranges. The final September week is widened by
+// its Monday anchor through October 5 in the normal weekly window, but the
+// query must stop at October 1 so October rows cannot mix into September's
+// final chart bucket and totals.
+func TestActivityWeekRollupMonthBoundary(t *testing.T) {
+	e := bootstrapActivity(t)
+	t.Cleanup(func() {
+		if sqlDB, err := db.GetDB().DB(); err == nil {
+			sqlDB.Close()
+		}
+	})
+
+	var key model.Key
+	if err := db.GetDB().Where("name = ?", "k1").First(&key).Error; err != nil {
+		t.Fatal(err)
+	}
+	loc := time.Local
+	insert := func(hour time.Time, cost float64) {
+		db.GetDB().Create(&model.Consumption{
+			KeyID: key.ID, HourBucket: hour, ModelName: "gtest",
+			RequestCount: 1, InputTokens: 10, CostUSD: cost,
+		})
+	}
+	insert(time.Date(2026, 9, 13, 12, 0, 0, 0, loc), 1.0) // Sep 7 week
+	insert(time.Date(2026, 9, 30, 12, 0, 0, 0, loc), 2.0) // Sep 28 week
+	insert(time.Date(2026, 10, 1, 12, 0, 0, 0, loc), 4.0) // next month
+	insert(time.Date(2026, 10, 4, 12, 0, 0, 0, loc), 8.0) // next month
+
+	until := time.Date(2026, 9, 30, 23, 59, 59, 0, loc)
+	qs := fmt.Sprintf("metric=spend&group_by=model&rollup=week&filter_type=model&filter_value=gtest&since=%s&until=%s",
+		url.QueryEscape(time.Date(2026, 1, 1, 0, 0, 0, 0, loc).Format(time.RFC3339)),
+		url.QueryEscape(until.Format(time.RFC3339)))
+	req := httptest.NewRequest("GET", "/api/stats/activity?"+qs, nil)
+	req.Host = "localhost:9999"
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var out struct {
+		Series []struct {
+			Bucket string  `json:"bucket"`
+			Group  string  `json:"group"`
+			Value  float64 `json:"value"`
+		} `json:"series"`
+		Summary []summaryRow       `json:"summary"`
+		Buckets []string           `json:"buckets"`
+		Totals  map[string]float64 `json:"totals"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("bad json: %v\n%s", err, rec.Body.String())
+	}
+
+	if out.Totals["spend"] != 3 {
+		t.Fatalf("totals.spend = %v, want 3 (September rows only)", out.Totals["spend"])
+	}
+	series := map[string]float64{}
+	for _, point := range out.Series {
+		if point.Group == "gtest" {
+			series[point.Bucket] = point.Value
+		}
+	}
+	if series["2026-09-07"] != 1 || series["2026-09-28"] != 2 {
+		t.Fatalf("weekly series = %v, want Sep 7=1 and Sep 28=2", series)
+	}
+	if len(out.Summary) != 1 || out.Summary[0].Group != "gtest" || out.Summary[0].Sum != 3 || out.Summary[0].Value != 2 {
+		t.Fatalf("summary = %+v, want gtest Sum=3 Value=2", out.Summary)
+	}
+	if len(out.Buckets) == 0 || out.Buckets[len(out.Buckets)-1] != "2026-09-28" {
+		t.Fatalf("last weekly bucket = %v, want 2026-09-28", out.Buckets)
+	}
+}
+
 // TestActivityWeekRollupPastPeriodExcludesBoundaryWeek pins the week-rollup
 // boundary contract the client fix (queryWindowUntil's week-grid exclusion)
 // relies on: for a PAST-period range (Prev Month) + rollup=week, the whole
@@ -819,11 +894,11 @@ func TestActivityWeekRollupMondayAlignment(t *testing.T) {
 // exclusion, never a partial week.
 //
 // The second half re-runs the same query with the PRE-FIX day-aligned until
-// (range.until - 1s, which lies INSIDE the boundary week): the current
-// period's rows (Jul 1-2) leak into the visible boundary bucket and the
-// totals — the exact symptom the client-side fix closes. It also guards
-// activityWindow's Monday anchoring: if the server windowing ever changed,
-// this pin breaks.
+// (range.until - 1s, which lies INSIDE the boundary week): the server's
+// month-end clip keeps the in-range Jun 29 row but excludes the current
+// period's Jul 1-2 rows. The fixed client still uses the week-grid until to
+// exclude that partial boundary bucket entirely, preserving the previous
+// period's full-week contract.
 //
 // All rows use a unique model name ("gtest") with filter_type=model so the
 // fixture rows bootstrapActivity seeds at the real clock can never land in
@@ -892,12 +967,12 @@ func TestActivityWeekRollupPastPeriodExcludesBoundaryWeek(t *testing.T) {
 	}
 
 	// Day-aligned until (pre-fix client): Jun 30 23:59:59 lies INSIDE the
-	// boundary week, so the server widens into [Jun 29, Jul 6): the Jul 2
-	// row (current period) leaks into the visible "2026-06-29" bucket and
-	// the totals — the symptom the client fix closes.
+	// boundary week. The server clips the widened week at Jul 1, so the
+	// in-range Jun 29 row remains in the partial bucket while the Jul 2 row
+	// is excluded before it can reach the response.
 	buckets, totals = fetch(time.Date(2026, 6, 30, 23, 59, 59, 0, loc))
-	if totals["spend"] != 1.75 {
-		t.Fatalf("day-aligned until totals.spend = %v, want 1.75 (0.5 + 0.25 + 1.0 — the current period leaks in)", totals["spend"])
+	if totals["spend"] != 0.75 {
+		t.Fatalf("day-aligned until totals.spend = %v, want 0.75 (0.5 + 0.25 — month-end clip excludes the current period)", totals["spend"])
 	}
 	found := false
 	for _, b := range buckets {
@@ -906,7 +981,7 @@ func TestActivityWeekRollupPastPeriodExcludesBoundaryWeek(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Fatalf("buckets = %v, want the boundary bucket 2026-06-29 present (it holds the leaked Jul 2 row)", buckets)
+		t.Fatalf("buckets = %v, want the boundary bucket 2026-06-29 present (it holds the in-range Jun 29 row)", buckets)
 	}
 }
 

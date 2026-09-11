@@ -2181,10 +2181,12 @@ func activityBucketLabel(t time.Time, rollup string) string {
 // endpoints. hour_bucket rows are truncated to the LOCAL hour, so a window
 // starting at 16:05 must still match the 16:00 bucket (it holds the
 // 16:00–17:00 usage) — without the floor, short presets (15m/30m) return
-// nothing for most of the hour. `from` is the bucket start of since; `to`
-// is the first bucket start AFTER until, so the bucket containing until is
-// complete. Matches buildActivityAxis (same floor and step), so the query
-// and the response axis always agree.
+// nothing for most of the hour. `from` is the bucket start of since; normally
+// `to` is the first bucket start AFTER until, so the bucket containing until
+// is complete. A weekly window crossing a calendar-month boundary is capped
+// at the next month start so that a partial final month does not pull in later
+// rows. Matches buildActivityAxis (same floor and step), so the query and
+// response axis always agree on bucket labels.
 func activityWindow(since, until time.Time, rollup string) (from, to time.Time) {
 	loc := since.Location()
 	switch rollup {
@@ -2203,6 +2205,15 @@ func activityWindow(since, until time.Time, rollup string) (from, to time.Time) 
 	case "week":
 		from = mondayOf(since)
 		to = mondayOf(until).AddDate(0, 0, 7)
+		// A week can straddle two calendar months. When the requested end is
+		// in the final week of a month, keep the partial in-month bucket but
+		// do not widen the database window into the following month. Explore
+		// uses this shape for month-granularity weekly queries and cannot
+		// prorate an aggregate that mixes both months.
+		nextMonth := time.Date(until.Year(), until.Month()+1, 1, 0, 0, 0, 0, loc)
+		if to.After(nextMonth) {
+			to = nextMonth
+		}
 	default: // month
 		from = time.Date(since.Year(), since.Month(), 1, 0, 0, 0, 0, loc)
 		to = time.Date(until.Year(), until.Month(), 1, 0, 0, 0, 0, loc).AddDate(0, 1, 0)

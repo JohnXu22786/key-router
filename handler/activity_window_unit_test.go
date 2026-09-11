@@ -7,10 +7,11 @@ import (
 
 // TestActivityWindow pins activityWindow's bucket widening for every rollup:
 // `from` must be the bucket start containing since (a mid-hour since floors
-// to the LOCAL hour), and `to` must be the first bucket start AFTER until so
-// the bucket containing until is complete. The month branch (year rollover)
-// is only exercised here; the hour/day branches are also covered through the
-// handler_test suite, and the week branch through
+// to the LOCAL hour), and `to` must normally be the first bucket start AFTER
+// until so the bucket containing until is complete. A weekly window crossing
+// a month boundary is capped at the next month start. The month branch (year
+// rollover) is only exercised here; the hour/day branches are also covered
+// through the handler_test suite, and the week branch through
 // TestActivityWeekRollupMondayAlignment.
 func TestActivityWindow(t *testing.T) {
 	loc, err := time.LoadLocation("Asia/Shanghai")
@@ -40,6 +41,15 @@ func TestActivityWindow(t *testing.T) {
 	if !from.Equal(time.Date(2026, 8, 10, 0, 0, 0, 0, loc)) ||
 		!to.Equal(time.Date(2026, 8, 17, 0, 0, 0, 0, loc)) {
 		t.Fatalf("week window = %v..%v, want Aug 10..Aug 17", from, to)
+	}
+
+	// A month-end week is clipped at the next month boundary instead of
+	// widening into the following month's rows.
+	monthEnd := time.Date(2026, 9, 30, 23, 59, 59, 0, loc)
+	from, to = activityWindow(time.Date(2026, 1, 1, 0, 0, 0, 0, loc), monthEnd, "week")
+	if !from.Equal(time.Date(2025, 12, 29, 0, 0, 0, 0, loc)) ||
+		!to.Equal(time.Date(2026, 10, 1, 0, 0, 0, 0, loc)) {
+		t.Fatalf("week month-end window = %v..%v, want Dec 29..Oct 1", from, to)
 	}
 
 	// Month: from = Aug 1, to = the 1st after until's month (year rollover).
