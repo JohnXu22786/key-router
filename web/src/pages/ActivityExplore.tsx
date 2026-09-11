@@ -152,7 +152,6 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
         // server's widened window would amputate the in-progress day the
         // range covers.
         const curUntil = queryWindowUntil(range, rollup);
-        const cutoff = dayjs();
         const res = await getActivity({
           metric,
           group_by: groupBy,
@@ -166,6 +165,11 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
           filter_value: filter?.value,
         });
         if (cancelled) return;
+        // Capture the response-time cutoff: a slow request can include usage
+        // recorded after it started, so the request-time cutoff would make
+        // the live boundary bucket's coverage too small and its value too
+        // large.
+        const cutoff = dayjs();
         // A custom range whose picked bounds cut mid-bucket makes the endpoint
         // return FULL boundary buckets when the selected rollup equals the
         // range granularity (the widened query window — see activityWindow
@@ -519,4 +523,3 @@ const ModelCell: React.FC<{ name: string }> = ({ name }) => {
 };
 
 export default ActivityExplore;
-
