@@ -1648,6 +1648,10 @@ func applyActivityFilter(q *gorm.DB, filterType, filterValue string) (*gorm.DB, 
 //	          order) by the given metric, which may differ from the charted
 //	          one. For the blended RATE metrics the rank uses the group's
 //	          overall rate — sums of per-bucket rates are not rates)
+//	precise:   when true, prorate each hourly source row to [since, until)
+//	          before rollup, ranking, and blended-rate calculation. This is
+//	          used by Activity views whose displayed window can cut a bucket;
+//	          the default keeps the raw widened-bucket API behavior.
 //	since / until: RFC3339, inclusive range
 //	filter_type / filter_value: restrict rows to one entity before
 //	          aggregating (the Activity page's filter button). filter_type is
@@ -1660,6 +1664,7 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 	subgroup := c.DefaultQuery("subgroup", "")
 	rollup := c.DefaultQuery("rollup", "day")
 	rankBy := c.DefaultQuery("rank_by", "current")
+	precise := c.Query("precise") == "1" || strings.EqualFold(c.Query("precise"), "true")
 	// Top-N for the chart: series beyond this many groups are folded into an
 	// "Other" series (#94a3b8) like OpenRouter. 0 = no folding.
 	topN := 0
@@ -1807,12 +1812,41 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 		}
 	}
 
+	// A precise Activity request uses the widened query only as a source of
+	// hourly rows. Each row is reduced to the part that overlaps the requested
+	// half-open window before any rollup, ranking, or rate calculation. Doing
+	// this before aggregation is important: scaling a daily/weekly/monthly
+	// aggregate would assume uniform usage across all of its hours, and
+	// ranking the raw widened rows can put the wrong group in Top-N.
+	var rowShares []float64
+	if precise {
+		cutoff := time.Now()
+		rowShares = make([]float64, len(rows))
+		for i := range rows {
+			rowShares[i] = activityRowWindowShare(rows[i].HourBucket, since, until, cutoff)
+		}
+	}
+	rowShare := func(i int) float64 {
+		if !precise {
+			return 1
+		}
+		return rowShares[i]
+	}
+
 	// Aggregate: bucket -> group -> sum.
 	agg := make(map[string]map[string]*activityAcc)
 	// Bucket labels are year-qualified ("YYYY-MM-DD", "YYYY-MM-DD 15:00",
 	// "2006-01-02", "YYYY-MM") so a long or year-spanning range never
 	// collides two same-month-day buckets into one aggregate.
-	bucketOrder := buildActivityAxis(since, until, rollup)
+	axisUntil := until
+	if precise {
+		// buildActivityAxis is inclusive because the legacy endpoint returns
+		// the bucket containing its until parameter. Precise consumers use a
+		// genuinely half-open axis, while the widened query still includes the
+		// source row needed to trim a boundary bucket.
+		axisUntil = until.Add(-time.Nanosecond)
+	}
+	bucketOrder := buildActivityAxis(since, axisUntil, rollup)
 	// bucketOf labels a consumption row's hour bucket; must match the axis
 	// labels exactly (shared formatter) so rows land on the axis.
 	bucketOf := func(t time.Time) string {
@@ -1826,17 +1860,21 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 	}
 
 	for i := range rows {
+		share := rowShare(i)
+		if share <= 0 {
+			continue
+		}
 		b := bucketOf(rows[i].HourBucket)
 		g := groupOf(&rows[i])
 		if _, ok := agg[b][g]; !ok {
 			agg[b][g] = &activityAcc{}
 		}
 		a := agg[b][g]
-		a.sum += valueOf(&rows[i])
-		a.spend += rows[i].CostUSD
-		a.tokens += float64(rows[i].InputTokens + rows[i].OutputTokens)
-		a.requests += float64(rows[i].RequestCount)
-		a.cache += float64(rows[i].CacheHitTokens)
+		a.sum += valueOf(&rows[i]) * share
+		a.spend += rows[i].CostUSD * share
+		a.tokens += float64(rows[i].InputTokens+rows[i].OutputTokens) * share
+		a.requests += float64(rows[i].RequestCount) * share
+		a.cache += float64(rows[i].CacheHitTokens) * share
 		if !seenGroup[g] {
 			seenGroup[g] = true
 			groupOrder = append(groupOrder, g)
@@ -1851,6 +1889,10 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 	if subgroup != "" {
 		seenSubgroup := make(map[string]bool)
 		for i := range rows {
+			share := rowShare(i)
+			if share <= 0 {
+				continue
+			}
 			b := bucketOf(rows[i].HourBucket)
 			g := groupOf(&rows[i])
 			sg := subgroupOf(&rows[i])
@@ -1863,11 +1905,11 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 			if subAgg[b][g][sg] == nil {
 				subAgg[b][g][sg] = &activityAcc{}
 			}
-			subAgg[b][g][sg].sum += valueOf(&rows[i])
+			subAgg[b][g][sg].sum += valueOf(&rows[i]) * share
 			// Spend/tokens are always tracked so subgroup series can derive
 			// rate metrics (blended $/1M) the same way the main cells do.
-			subAgg[b][g][sg].spend += rows[i].CostUSD
-			subAgg[b][g][sg].tokens += float64(rows[i].InputTokens + rows[i].OutputTokens)
+			subAgg[b][g][sg].spend += rows[i].CostUSD * share
+			subAgg[b][g][sg].tokens += float64(rows[i].InputTokens+rows[i].OutputTokens) * share
 			if !seenSubgroup[g+"\x00"+sg] {
 				seenSubgroup[g+"\x00"+sg] = true
 				subgroupOrder[g] = append(subgroupOrder[g], sg)
@@ -1968,10 +2010,11 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 		Totals:  map[string]float64{"spend": 0, "tokens": 0, "requests": 0, "cache": 0},
 	}
 	for i := range rows {
-		resp.Totals["spend"] += rows[i].CostUSD
-		resp.Totals["tokens"] += float64(rows[i].InputTokens + rows[i].OutputTokens)
-		resp.Totals["requests"] += float64(rows[i].RequestCount)
-		resp.Totals["cache"] += float64(rows[i].CacheHitTokens)
+		share := rowShare(i)
+		resp.Totals["spend"] += rows[i].CostUSD * share
+		resp.Totals["tokens"] += float64(rows[i].InputTokens+rows[i].OutputTokens) * share
+		resp.Totals["requests"] += float64(rows[i].RequestCount) * share
+		resp.Totals["cache"] += float64(rows[i].CacheHitTokens) * share
 	}
 
 	// Series: for each bucket, for each group. Groups beyond the Top-N are
@@ -2186,6 +2229,55 @@ func activityBucketLabel(t time.Time, rollup string) string {
 	default:
 		return t.Format("2006-01-02")
 	}
+}
+
+// activityRowWindowShare returns the fraction of one hourly consumption row
+// that belongs to the requested half-open window. Consumption is stored at
+// hourly resolution, so this is the finest boundary correction the server
+// can make: only the boundary hour is assumed uniform. Importantly, the
+// correction is applied to each source row before any daily/weekly/monthly
+// aggregation, rather than scaling an already mixed aggregate.
+//
+// The current hour is only recorded through the minute containing cutoff.
+// Keep the one-minute minimum for a cutoff inside the first minute, matching
+// the Activity client and preventing a newly-created row from being divided
+// by zero. time.Time.Add uses elapsed time, which also keeps the repeated DST
+// hour's 120-minute row intact when the database has merged both passes.
+func activityRowWindowShare(hourBucket, since, until, cutoff time.Time) float64 {
+	loc := hourBucket.Location()
+	start := time.Date(hourBucket.Year(), hourBucket.Month(), hourBucket.Day(), hourBucket.Hour(), 0, 0, 0, loc)
+	end := start.Add(time.Hour)
+
+	recordedEnd := cutoff.Truncate(time.Minute)
+	if recordedEnd.After(end) {
+		recordedEnd = end
+	}
+	if !recordedEnd.After(start) {
+		if !cutoff.After(start) {
+			return 0
+		}
+		recordedEnd = start.Add(time.Minute)
+		if recordedEnd.After(end) {
+			recordedEnd = end
+		}
+	}
+	coverage := recordedEnd.Sub(start)
+	if coverage <= 0 {
+		return 0
+	}
+
+	overlapStart := start
+	if since.After(overlapStart) {
+		overlapStart = since
+	}
+	overlapEnd := recordedEnd
+	if until.Before(overlapEnd) {
+		overlapEnd = until
+	}
+	if !overlapEnd.After(overlapStart) {
+		return 0
+	}
+	return float64(overlapEnd.Sub(overlapStart)) / float64(coverage)
 }
 
 // activityWindow widens a query range to the rollup buckets CONTAINING its
