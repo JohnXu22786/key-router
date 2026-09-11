@@ -311,16 +311,226 @@ func stripStreamOptions(body []byte) []byte {
 	return clean
 }
 
+// bodyHasContent reports whether an upstream's full non-SSE response
+// body (returned when the upstream ignored stream:true) carried any
+// user-visible content. Mirrors streamChunkHasContent for the body
+// shapes the three upstream formats actually return:
+//
+//   - openai: choices[0].message.content / .tool_calls /
+//     .reasoning_content
+//   - anthropic: a content array with at least one text, tool_use or
+//     thinking block
+//   - responses: an output array with at least one message / function_call /
+//     reasoning item, or a top-level "output_text" field
+//
+// Unparseable / unrecognized shapes return false (the streamChunkHasContent
+// default branch would also miss them — the empty-response rule degrades
+// to "no content seen" which is the safe choice for an unparseable body).
+func bodyHasContent(body []byte, upstreamFormat string) bool {
+	if len(body) == 0 {
+		return false
+	}
+	var v map[string]interface{}
+	if err := json.Unmarshal(body, &v); err != nil {
+		return false
+	}
+	switch upstreamFormat {
+	case "anthropic":
+		arr, ok := v["content"].([]interface{})
+		if !ok {
+			return false
+		}
+		for _, bi := range arr {
+			block, ok := bi.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			switch block["type"] {
+			case "text":
+				if s, ok := block["text"].(string); ok && s != "" {
+					return true
+				}
+			case "tool_use":
+				return true
+			case "thinking":
+				if s, ok := block["thinking"].(string); ok && s != "" {
+					return true
+				}
+			}
+		}
+		return false
+	case "responses":
+		// A native /v1/responses body has either "output" (the new shape)
+		// or the legacy "output_text" (a flat string). Both carry content.
+		if arr, ok := v["output"].([]interface{}); ok {
+			for _, oi := range arr {
+				item, ok := oi.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				switch item["type"] {
+				case "message", "function_call", "reasoning":
+					return true
+				}
+			}
+		}
+		if s, ok := v["output_text"].(string); ok && s != "" {
+			return true
+		}
+		return false
+	default:
+		// OpenAI / chat-completions completion object. Reuse the chunk
+		// path: streamChunkHasContent's default branch already checks
+		// both "delta" and "message" under choices[*], so it covers the
+		// full-completion body too.
+		return streamChunkHasContent(string(body), upstreamFormat)
+	}
+}
+
+// streamChunkHasContent reports whether a single upstream stream event
+// carried user-visible content — text / tool_call / tool_use /
+// reasoning_content. Used to drive the empty-response failover in
+// StreamResponse. Best-effort across the three upstream formats; missing
+// or unparseable chunks return false (safe — the next chunk gets a
+// chance to trip the flag).
+func streamChunkHasContent(jsonStr, upstreamFormat string) bool {
+	if jsonStr == "" {
+		return false
+	}
+	var v map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &v); err != nil {
+		return false
+	}
+	switch upstreamFormat {
+	case "anthropic":
+		// Anthropic events are discriminated by their "type" field.
+		// content_block_start with a text/tool_use/thinking block, or
+		// content_block_delta with text_delta / input_json_delta /
+		// thinking_delta, is content. message_start / message_delta /
+		// message_delta usage / message_stop / ping are not.
+		switch v["type"] {
+		case "content_block_start":
+			if cb, ok := v["content_block"].(map[string]interface{}); ok {
+				switch cb["type"] {
+				case "text", "tool_use", "thinking":
+					return true
+				}
+			}
+		case "content_block_delta":
+			if d, ok := v["delta"].(map[string]interface{}); ok {
+				switch d["type"] {
+				case "text_delta", "input_json_delta", "thinking_delta":
+					return true
+				}
+			}
+		}
+		return false
+	case "responses":
+		// The Responses API's stream events carry a "type" field whose
+		// prefix (response.output_text.delta, response.function_call_*,
+		// response.reasoning_*, ...) marks content. We only need a
+		// positive signal — a "type" we don't recognize returns false
+		// and the next chunk tries again.
+		t, _ := v["type"].(string)
+		switch {
+		case t == "response.output_text.delta":
+			return true
+		case t == "response.function_call_arguments.delta":
+			return true
+		case t == "response.output_item.added":
+			if item, ok := v["item"].(map[string]interface{}); ok {
+				switch item["type"] {
+				case "function_call", "message", "reasoning":
+					return true
+				}
+			}
+		case strings.HasPrefix(t, "response.reasoning"):
+			return true
+		}
+		return false
+	default:
+		// OpenAI / chat-completions chunk: a single "choices" array, each
+		// entry may carry a "delta" with content / tool_calls /
+		// reasoning_content, or a "message" with the same (some gateways
+		// emit a complete choice object). Non-empty string content,
+		// non-empty tool_calls array, and non-empty reasoning_content all
+		// count. content may also be a parts array ({"type":"text",
+		// "text":...} items) on gateways that mirror Anthropic's
+		// multi-block shape — join its text parts and treat a non-empty
+		// join as content (same convention completionToStreamChunk uses
+		// when it rebuilds a chunk from a full body).
+		choices, ok := v["choices"].([]interface{})
+		if !ok {
+			return false
+		}
+		for _, ci := range choices {
+			choice, ok := ci.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			for _, field := range []string{"delta", "message"} {
+				obj, ok := choice[field].(map[string]interface{})
+				if !ok {
+					continue
+				}
+				if s, ok := obj["content"].(string); ok && s != "" {
+					return true
+				}
+				if arr, ok := obj["content"].([]interface{}); ok && openAIPartsHaveText(arr) {
+					return true
+				}
+				if arr, ok := obj["tool_calls"].([]interface{}); ok && len(arr) > 0 {
+					return true
+				}
+				if s, ok := obj["reasoning_content"].(string); ok && s != "" {
+					return true
+				}
+			}
+		}
+		return false
+	}
+}
+
+// openAIPartsHaveText reports whether an OpenAI-format content parts
+// array (the {"type":"text","text":...} shape some gateways use) has
+// at least one non-empty text part. Anything else in the array
+// (non-text types, missing text, empty string) is ignored.
+func openAIPartsHaveText(parts []interface{}) bool {
+	for _, part := range parts {
+		p, ok := part.(map[string]interface{})
+		if !ok || p["type"] != "text" {
+			continue
+		}
+		if t, ok := p["text"].(string); ok && t != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // StreamResponse streams an SSE response from upstream to the client response writer.
 // upstreamFormat is the format the upstream actually spoke ("openai",
 // "anthropic" or "responses") — for /v1/responses requests it can differ
 // from the provider type (chat-completions fallback).
-// Returns captured token usage if available from the stream end events.
-func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, upstreamFormat, modelName string) (*model.TokenUsage, error) {
+//
+// Returns the captured token usage (from stream end events), a "sawContent"
+// boolean that reports whether ANY text / tool_call / tool_use /
+// reasoning_content was emitted in the stream (used by the handler's
+// "consecutive empty responses" failover), and an error if the stream
+// ended on a transport / conversion failure. sawContent is false for a
+// stream that only carried role-only deltas, usage-only events, finish
+// markers or empty keepalive frames — the same definition the non-stream
+// responseIsEmpty helper uses for the body.
+func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, upstreamFormat, modelName string) (*model.TokenUsage, bool, error) {
 	usage := &model.TokenUsage{}
+	// sawContent is sticky: set true the first time we see text, a tool
+	// call, or reasoning content in the stream, and never cleared. The
+	// handler uses it to decide whether a stream was "empty" (no real
+	// content) for the provider's empty-response failover rule.
+	sawContent := false
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		return nil, fmt.Errorf("streaming not supported")
+		return nil, false, fmt.Errorf("streaming not supported")
 	}
 
 	// Some upstreams ignore stream:true and return a plain JSON 200 body.
@@ -356,11 +566,11 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 		resp.Body.Close()
 		if err != nil {
 			WriteStreamError(w, inputFormat, "failed to read upstream response")
-			return usage, fmt.Errorf("failed to read upstream response: %w", err)
+			return usage, sawContent, fmt.Errorf("failed to read upstream response: %w", err)
 		}
 		if len(body) > 256<<20 {
 			WriteStreamError(w, inputFormat, "upstream response too large")
-			return usage, fmt.Errorf("upstream response too large")
+			return usage, sawContent, fmt.Errorf("upstream response too large")
 		}
 		// Strip a UTF-8 BOM and leading/trailing whitespace the sniff skipped
 		// over — json parsers reject the BOM. Whitespace may precede the BOM,
@@ -369,6 +579,14 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 		body = bytes.TrimPrefix(body, []byte{0xEF, 0xBB, 0xBF})
 		body = bytes.TrimSpace(body)
 		usage = ParseTokenUsage(body, upstreamFormat)
+		// The non-SSE path is the upstream's full JSON body in lieu of a
+		// real stream. Detect content presence in the body itself so the
+		// handler's empty-response rule still works when the upstream
+		// ignored stream:true. OpenAI / chat-completions is the dominant
+		// case (the helper's "default" branch already covers both delta
+		// and message shapes); Anthropic / Responses have their own
+		// full-body shape inspected inline.
+		sawContent = sawContent || bodyHasContent(body, upstreamFormat)
 
 		// A 200 with a JSON error body (some gateways do this for
 		// context-length/model errors) must be surfaced as an error, not
@@ -385,7 +603,7 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 				msg = inner.Message
 			}
 			WriteStreamError(w, inputFormat, msg)
-			return usage, fmt.Errorf("upstream returned an error: %s", msg)
+			return usage, sawContent, fmt.Errorf("upstream returned an error: %s", msg)
 		}
 
 		// A Responses-format client gets its full event sequence synthesized
@@ -400,7 +618,7 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 				events, err = responsesBodyToEvents(body)
 				if err != nil {
 					WriteStreamError(w, inputFormat, "failed to convert upstream response")
-					return usage, fmt.Errorf("failed to convert upstream response: %w", err)
+					return usage, sawContent, fmt.Errorf("failed to convert upstream response: %w", err)
 				}
 			} else {
 				conv := format.NewResponsesStreamConverter(upstreamFormat)
@@ -417,7 +635,7 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 						converted, convErr := conv.Convert(pseudo)
 						if convErr != nil && convErr != format.ErrSkipChunk {
 							WriteStreamError(w, inputFormat, "failed to convert upstream response")
-							return usage, fmt.Errorf("failed to convert upstream response: %w", convErr)
+							return usage, sawContent, fmt.Errorf("failed to convert upstream response: %w", convErr)
 						}
 						if u := ParseTokenUsage(body, upstreamFormat); u.TotalTokens > 0 {
 							conv.SetUsage(u.PromptTokens, u.CompletionTokens, u.CacheHitTokens)
@@ -429,7 +647,7 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 						converted, convErr := conv.Convert(body)
 						if convErr != nil && convErr != format.ErrSkipChunk {
 							WriteStreamError(w, inputFormat, "failed to convert upstream response")
-							return usage, fmt.Errorf("failed to convert upstream response: %w", convErr)
+							return usage, sawContent, fmt.Errorf("failed to convert upstream response: %w", convErr)
 						}
 						events = append(events, converted...)
 					}
@@ -440,11 +658,11 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 				out := append([]byte("data: "), ev...)
 				out = append(out, '\n', '\n')
 				if _, err := w.Write(out); err != nil {
-					return usage, err
+					return usage, sawContent, err
 				}
 			}
 			flusher.Flush()
-			return usage, nil
+			return usage, sawContent, nil
 		}
 
 		// Convert the body for cross-format routes so the client gets its
@@ -459,7 +677,7 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 			}
 			if convErr != nil {
 				WriteStreamError(w, inputFormat, "failed to convert upstream response")
-				return usage, fmt.Errorf("failed to convert upstream response: %w", convErr)
+				return usage, sawContent, fmt.Errorf("failed to convert upstream response: %w", convErr)
 			}
 		}
 		// Deliver the completion as consumable STREAM events in the client's
@@ -469,10 +687,10 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 			out := append([]byte("data: "), chunk...)
 			out = append(out, '\n', '\n')
 			if _, err := w.Write(out); err != nil {
-				return usage, err
+				return usage, sawContent, err
 			}
 			if _, err := fmt.Fprintf(w, "data: [DONE]\n\n"); err != nil {
-				return usage, err
+				return usage, sawContent, err
 			}
 		} else {
 			// Empty body (stream:true with nothing returned): emit a clean
@@ -481,10 +699,10 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 				stop := []byte(`data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":0}}` + "\n\n" +
 					`data: {"type":"message_stop"}` + "\n\n")
 				if _, err := w.Write(stop); err != nil {
-					return usage, err
+					return usage, sawContent, err
 				}
 				flusher.Flush()
-				return usage, nil
+				return usage, sawContent, nil
 			}
 			// message_start with the message object, then delta + stop.
 			// Preserve the frame's actual stop_reason and usage when present.
@@ -505,16 +723,16 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 			start = append(start, frame...)
 			start = append(start, []byte("}\n\n")...)
 			if _, err := w.Write(start); err != nil {
-				return usage, err
+				return usage, sawContent, err
 			}
 			delta := fmt.Sprintf(`data: {"type":"message_delta","delta":{"stop_reason":%q,"stop_sequence":null},"usage":{"output_tokens":%d}}`+"\n\n", stopReason, outputTokens)
 			stop := delta + `data: {"type":"message_stop"}` + "\n\n"
 			if _, err := w.Write([]byte(stop)); err != nil {
-				return usage, err
+				return usage, sawContent, err
 			}
 		}
 		flusher.Flush()
-		return usage, nil
+		return usage, sawContent, nil
 	}
 
 	usage = &model.TokenUsage{}
@@ -556,7 +774,7 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 			_, err := fmt.Fprintf(w, "%s\n", line)
 			if err != nil {
 				resp.Body.Close()
-				return usage, err
+				return usage, sawContent, err
 			}
 			flusher.Flush()
 			continue
@@ -574,7 +792,7 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 			_, err := fmt.Fprintf(w, "%s\n", line)
 			if err != nil {
 				resp.Body.Close()
-				return usage, err
+				return usage, sawContent, err
 			}
 			flusher.Flush()
 			continue
@@ -620,6 +838,17 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 
 		// Try to extract token usage from stream events
 		extractStreamUsage([]byte(jsonStr), inputFormat, upstreamFormat, usage)
+
+		// Mark content presence for the empty-response failover. The
+		// detection is best-effort across all upstream formats: a chunk
+		// with non-empty text / tool_call / tool_use / reasoning_content
+		// counts as content, the rest (role-only, usage-only, finish,
+		// keepalive, ping) do not. Sticky — once true, never cleared,
+		// so a late content frame after a long run of role-only deltas
+		// still trips it.
+		if !sawContent && streamChunkHasContent(jsonStr, upstreamFormat) {
+			sawContent = true
+		}
 
 		// Convert format if needed; each event becomes its own data frame
 		var converted [][]byte
@@ -674,7 +903,7 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 			_, writeErr := w.Write(out)
 			if writeErr != nil {
 				resp.Body.Close()
-				return usage, writeErr
+				return usage, sawContent, writeErr
 			}
 		}
 
@@ -688,7 +917,7 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 			log.Printf("[relay] stream chunk conversion error: %v", err)
 			WriteStreamError(w, inputFormat, "stream conversion error")
 			flusher.Flush()
-			return usage, err
+			return usage, sawContent, err
 		}
 		flusher.Flush()
 	}
@@ -700,7 +929,7 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 	if scanErr := scanner.Err(); scanErr != nil {
 		resp.Body.Close()
 		WriteStreamError(w, inputFormat, "upstream connection lost")
-		return usage, scanErr
+		return usage, sawContent, scanErr
 	}
 
 	// If the upstream ended without a finish chunk (EOF), close the converted
@@ -711,7 +940,7 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 			out := append([]byte("data: "), ev...)
 			out = append(out, '\n', '\n')
 			if _, err := w.Write(out); err != nil {
-				return usage, err
+				return usage, sawContent, err
 			}
 		}
 		flusher.Flush()
@@ -724,7 +953,7 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 			out := append([]byte("data: "), ev...)
 			out = append(out, '\n', '\n')
 			if _, err := w.Write(out); err != nil {
-				return usage, err
+				return usage, sawContent, err
 			}
 		}
 		flusher.Flush()
@@ -739,7 +968,7 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 		// [DONE] after it (SDKs treat [DONE] as success)
 		if !(oaiConv != nil && oaiConv.Errored()) {
 			if _, err := fmt.Fprintf(w, "data: [DONE]\n\n"); err != nil {
-				return usage, err
+				return usage, sawContent, err
 			}
 			flusher.Flush()
 		}
@@ -748,13 +977,13 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 			// A real message_delta was already forwarded — emit only the
 			// missing message_stop (a second delta would zero client usage)
 			if _, err := fmt.Fprintf(w, "data: {\"type\":\"message_stop\"}\n\n"); err != nil {
-				return usage, err
+				return usage, sawContent, err
 			}
 		} else {
 			stop := []byte(`data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":0}}` + "\n\n" +
 				`data: {"type":"message_stop"}` + "\n\n")
 			if _, err := w.Write(stop); err != nil {
-				return usage, err
+				return usage, sawContent, err
 			}
 		}
 		flusher.Flush()
@@ -775,7 +1004,7 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 			},
 		})
 		if _, err := fmt.Fprintf(w, "data: %s\n\n", completed); err != nil {
-			return usage, err
+			return usage, sawContent, err
 		}
 		flusher.Flush()
 	}
@@ -785,10 +1014,10 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 	// skips consumption/budget recording (the client already received the
 	// error frame).
 	if sawErrorFrame || (oaiConv != nil && oaiConv.Errored()) || (rsc != nil && rsc.Errored()) {
-		return usage, errors.New("upstream stream error")
+		return usage, sawContent, errors.New("upstream stream error")
 	}
 
-	return usage, nil
+	return usage, sawContent, nil
 }
 
 // isErrorPayload reports whether a JSON "error" field value represents a real

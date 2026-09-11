@@ -53,10 +53,22 @@ type Engine struct {
 //     (auth_failed / insufficient_quota) disable the key; any other
 //     sequence (different reasons, an intervening success) restarts the
 //     streak.
+//   - EmptyStreak / LastEmptyAt: provider-scoped (per-key) consecutive
+//     observations whose upstream answer carried no text / no tool_call
+//     and no reasoning_content. This is a SEPARATE counter from
+//     FailureStreak (empties are not a "failure" in the key-status sense
+//     — a successful, well-formed empty answer is still a clean 2xx that
+//     RecordResult counts as a success and may have already bumped
+//     SuccessStreak). A new observation resets the streak only when the
+//     EMPTY-detection is not the latest signal: any non-empty success
+//     clears the counter and the timestamp, so the streak only ever
+//     reflects a run of "this key just keeps returning nothing".
 type KeyOutcome struct {
 	SuccessStreak int
 	FailureStreak int
 	LastReason    string
+	EmptyStreak   int
+	LastEmptyAt   time.Time
 }
 
 // SetOnStatusChanged registers a callback invoked whenever a key's status
@@ -341,21 +353,28 @@ func (e *Engine) MarkKeyDisabled(keyID int64, reason string) {
 //     event — every 2nd success on a healthy key is a no-op.
 //   - Deliberately-disabled keys are never re-admitted: a disabled key is
 //     only recoverable when its disabled_reason is a SYSTEM-set reason
-//     (auth_failed / insufficient_quota / spend_limit_exhausted) proving a
-//     fault the key can outgrow. A custom (admin justification) or empty
-//     reason marks an admin-disable that only an explicit admin action can
-//     re-enable.
+//     (auth_failed / insufficient_quota / spend_limit_exhausted /
+//     empty_response) proving a fault the key can outgrow. A custom
+//     (admin justification) or empty reason marks an admin-disable that
+//     only an explicit admin action can re-enable.
 //   - Budget-capped keys (spend_limit_exhausted) are never re-admitted:
 //     the lifetime cap is an administrative limit, not an upstream health
 //     condition.
 //   - A still-running cooldown blocks recovery: the upstream's own
 //     wait-instruction must not be wiped (recovering early re-admits a hot
 //     key and the status ping-pongs).
+//
+// empty_response is in the recovery-allowed list only when the
+// provider's FailoverEmptyDisable flavor is on (see
+// model.IsSystemDisabledReason) — without that, a healthy key that
+// briefly returned silent completions would not be excluded by the
+// health checker and would be safe to keep serving without recovery
+// ever needing to run.
 func (e *Engine) MarkKeyActive(keyID int64) {
 	res := db.GetDB().Model(&model.Key{}).
-		Where("id = ? AND (status <> ? OR (disabled_reason IS NOT NULL AND disabled_reason <> '') OR rate_limited_until IS NOT NULL) AND (status <> ? OR disabled_reason IN (?, ?, ?)) AND (total_spend_limit IS NULL OR total_spend_limit = 0 OR total_spent < total_spend_limit) AND (rate_limited_until IS NULL OR rate_limited_until <= ?)",
+		Where("id = ? AND (status <> ? OR (disabled_reason IS NOT NULL AND disabled_reason <> '') OR rate_limited_until IS NOT NULL) AND (status <> ? OR disabled_reason IN (?, ?, ?, ?)) AND (total_spend_limit IS NULL OR total_spend_limit = 0 OR total_spent < total_spend_limit) AND (rate_limited_until IS NULL OR rate_limited_until <= ?)",
 			keyID, model.KeyStatusActive, model.KeyStatusDisabled,
-			model.ReasonAuthFailed, model.ReasonInsufficientQuota, model.KeyDisabledReasonSpendLimit,
+			model.ReasonAuthFailed, model.ReasonInsufficientQuota, model.KeyDisabledReasonSpendLimit, model.ReasonEmptyResponse,
 			time.Now()).
 		Updates(map[string]interface{}{
 			"status":             model.KeyStatusActive,
@@ -399,6 +418,15 @@ func (e *Engine) RecordResult(keyID int64, ok bool, reason string, cooldown time
 		oc.SuccessStreak++
 		oc.FailureStreak = 0
 		oc.LastReason = ""
+		// A successful (well-formed, possibly empty) response is NOT
+		// necessarily non-empty — the empty-streak counter is updated
+		// separately by RecordEmptyResponse. Here we only clear it: a
+		// non-empty success elsewhere in the code path will reset it on
+		// its own; an empty success leaves the EmptyStreak alone, so the
+		// next RecordEmptyResponse increments from the current count
+		// (and a long run of empty successes still trips the threshold).
+		oc.EmptyStreak = 0
+		oc.LastEmptyAt = time.Time{}
 		if oc.SuccessStreak > 2 {
 			oc.SuccessStreak = 2
 		}
@@ -427,6 +455,78 @@ func (e *Engine) RecordResult(keyID int64, ok bool, reason string, cooldown time
 	e.failKey(keyID, reason, cooldown)
 	if streak >= 2 && model.DisableClassReason(reason) {
 		e.MarkKeyDisabled(keyID, reason)
+	}
+}
+
+// RecordEmptyResponse notes that a key's upstream returned a successful 2xx
+// answer that carried no text, no tool_call / tool_use and no
+// reasoning_content. The empty-streak counter is provider-scoped: only
+// keys under a provider with FailoverEmptyEnabled = true and
+// FailoverEmptyThreshold > 0 are observed, and only those providers
+// honor the threshold. The default for an unconfigured provider is to
+// ignore the call entirely — the operator opted every provider out, so
+// silent upstreams never trip anything.
+//
+// Trip semantics, when the threshold is reached:
+//
+//   - FailoverEmptyDisable = false (the typical "swap" flavor): the
+//     key is cooled (status = rate_limited, 30s cooldown) and the
+//     disabled_reason is set to ReasonEmptyResponse. The same machinery
+//     failKey already runs for 429 / 5xx — the retry loop fails over to
+//     the next key within the same request, the UI shows why the key
+//     is down, and a successful probe (non-empty completion) clears it.
+//   - FailoverEmptyDisable = true (the "auto-disconnect" flavor): the
+//     key is additionally MarkKeyDisabled with ReasonEmptyResponse.
+//     ReasonEmptyResponse is in IsSystemDisabledReason, so a successful
+//     probe (real content produced) auto-recovers the key through the
+//     health checker's existing path — the operator got the
+//     auto-reconnect flavor they configured.
+//
+// The EmptyStreak counter is windowed: if FailoverEmptyWindowSec > 0 and
+// the gap from LastEmptyAt exceeds the window, EmptyStreak resets to 1
+// (the current observation) so a slow trickle of empties doesn't trip
+// the threshold. LastEmptyAt is always updated to the observation
+// timestamp, regardless of whether the streak advanced from 0.
+func (e *Engine) RecordEmptyResponse(keyID, providerID int64) {
+	provider := e.GetProvider(providerID)
+	if provider == nil {
+		return // unknown provider — nothing to consult, nothing to do
+	}
+	if !provider.FailoverEmptyEnabled || provider.FailoverEmptyThreshold <= 0 {
+		return // operator opted this provider out (or threshold = 0 = off)
+	}
+
+	now := time.Now()
+	window := time.Duration(provider.FailoverEmptyWindowSec) * time.Second
+
+	e.outcomeMu.Lock()
+	oc := e.outcomes[keyID]
+	if oc == nil {
+		oc = &KeyOutcome{}
+		e.outcomes[keyID] = oc
+	}
+	if window > 0 && !oc.LastEmptyAt.IsZero() && now.Sub(oc.LastEmptyAt) > window {
+		oc.EmptyStreak = 1
+	} else {
+		oc.EmptyStreak++
+	}
+	oc.LastEmptyAt = now
+	streak := oc.EmptyStreak
+	threshold := provider.FailoverEmptyThreshold
+	disable := provider.FailoverEmptyDisable
+	e.outcomeMu.Unlock()
+
+	if streak < threshold {
+		return
+	}
+	// Threshold reached. Cool (and optionally disable) using the same path
+	// 429 / 5xx use — a 30s cooldown + ReasonEmptyResponse in the UI is
+	// consistent with the rest of the failure vocabulary. (The disable
+	// flavor is a deliberate operator choice; the cool flavor is the
+	// default and is fully recoverable by the next non-empty observation.)
+	e.failKey(keyID, model.ReasonEmptyResponse, 30*time.Second)
+	if disable {
+		e.MarkKeyDisabled(keyID, model.ReasonEmptyResponse)
 	}
 }
 
