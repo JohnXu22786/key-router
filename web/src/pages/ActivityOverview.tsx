@@ -6,7 +6,7 @@ import {
   BarChart, Bar, LineChart, Line,
 } from 'recharts';
 import { getConsumptions, getKeys, Consumption, Key } from '../api/client';
-import { DateRange, ActivityFilter, filterKey, ExploreOpts, fmtUSD, fmtTokens, fmtCompact, fmtTokensBare, fmtUSDInt, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtPercent, fmtTick, fmtBucket, series, stackedData, groupTotals, bucketWindowShare, floorWindowUntil, liveExtensionEligible, Granularity, maskKey, cacheHitRate } from './activityShared';
+import { DateRange, ActivityFilter, CUSTOM_KEY, filterKey, ExploreOpts, fmtUSD, fmtTokens, fmtCompact, fmtTokensBare, fmtUSDInt, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtPercent, fmtTick, fmtBucket, series, stackedData, groupTotals, bucketWindowShare, floorWindowUntil, liveExtensionEligible, Granularity, maskKey, cacheHitRate } from './activityShared';
 import dayjs from 'dayjs';
 
 const { Text } = Typography;
@@ -160,7 +160,10 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
   // drops the stale data so the previous window's values are never shown
   // under the new axes; the 30s slide (same key) keeps them while refetching.
   const prevKeyRef = useRef<string | null>(null);
-  const fetchKey = `${range.key}|${filterKey(filter)}`;
+  // Presets intentionally keep their key while their rolling dates slide,
+  // but changing either bound of a custom range is a new window and must drop
+  // the previous snapshot before its replacement arrives.
+  const fetchKey = `${range.key}|${filterKey(filter)}|${range.key === CUSTOM_KEY ? `${range.since.valueOf()}|${range.until.valueOf()}` : ''}`;
   // The previous period of equal length (for KPI deltas and its proration).
   const len = range.until.diff(range.since, 'millisecond');
   const prevSince = range.since.subtract(len, 'millisecond');
