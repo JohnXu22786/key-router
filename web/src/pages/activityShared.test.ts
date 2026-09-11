@@ -340,6 +340,30 @@ describe('queryWindowUntil — the query keeps every in-range bucket', () => {
     expect(queryWindowUntil(w('today'), 'total').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-13 16:00:00');
   });
 
+  it('a finer hourly rollup keeps the complete current day for a day-granularity range', () => {
+    // The current-aligned This Week range ends at today's midnight on its
+    // day grid. An hourly Explore query must reach the end of that live day;
+    // sending the day boundary only widened the server window to 00:00 and
+    // omitted the rest of today's hourly rows.
+    expect(queryWindowUntil(w('week'), 'hour').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-13 23:59:59');
+  });
+
+  it('extends a month-granularity weekly query through the live month', () => {
+    // A current year range is snapped to the start of the live month. The
+    // weekly Explore query reaches month-end so all current-month rows are
+    // available; the server clips the widened final week at the next-month
+    // boundary instead of returning October rows in September's bucket.
+    const r = {
+      key: 'year',
+      label: '',
+      badge: '',
+      since: dayjs('2026-01-01T00:00:00'),
+      until: dayjs('2026-09-01T00:00:00'),
+      granularity: 'month' as Granularity,
+    };
+    expect(queryWindowUntil(r, 'week').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-09-30 23:59:59');
+  });
+
   it('a CURRENT-aligned preset boundary keeps its live bucket: the query passes until as-is', () => {
     // A 24h window ending at 09:00 sharp (the current hour's start): the
     // live hour's row is the chart's real last in-window value, so the query
