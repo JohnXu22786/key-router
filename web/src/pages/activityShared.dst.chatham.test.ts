@@ -16,7 +16,7 @@
 // Australia/Lord_Howe via activityShared.dst.lordhowe.test.ts).
 import { describe, it, expect, vi, beforeAll } from 'vitest';
 import dayjs from 'dayjs';
-import { bucketWindowShare, floorWindowUntil, rowCoverage, series, prorateBoundaryBuckets } from './activityShared';
+import { bucketWindowShare, floorWindowUntil, rowCoverage, series, stackedData, prorateBoundaryBuckets } from './activityShared';
 import type { ActivityResponse } from '../api/client';
 
 beforeAll(() => {
@@ -82,6 +82,28 @@ describe('rowCoverage — Pacific/Chatham 45-minute-offset fall-back', () => {
   it('keeps a constant-offset +12:45 day at 60 minutes (control)', () => {
     const c = rowCoverage(dayjs('2026-04-06T03:00:00'), 'hour', dayjs('2026-04-06T05:00:00'));
     expect(c.coverage).toBe(60);
+  });
+});
+
+// Spring-forward night: Sep 27 2026, the clock jumps 02:45 +12:45 -> 03:45
+// +13:45 at T = 2026-09-26T14:00:00Z. The 02:00 row ends at the transition
+// after 45 real minutes, while the 03:00 row starts at the transition and
+// ends at the 04:00 wall boundary after only 15 real minutes. Neither row is
+// a full 60-minute elapsed interval.
+describe('rowCoverage — Pacific/Chatham 45-minute-offset spring-forward', () => {
+  it('models the 02:00 and 03:00 rows as their real 45-minute and 15-minute spans', () => {
+    const cutoff = dayjs('2026-09-27T05:00:00');
+    const preGap = rowCoverage(dayjs('2026-09-27T02:00:00'), 'hour', cutoff, 120);
+    expect(preGap.coverage).toBe(45);
+    expect(preGap.runs).toEqual([
+      { from: dayjs('2026-09-26T13:15:00.000Z').valueOf(), to: dayjs('2026-09-26T14:00:00.000Z').valueOf() },
+    ]);
+
+    const postGap = rowCoverage(dayjs('2026-09-27T03:00:00'), 'hour', cutoff, 180);
+    expect(postGap.coverage).toBe(15);
+    expect(postGap.runs).toEqual([
+      { from: dayjs('2026-09-26T14:00:00.000Z').valueOf(), to: dayjs('2026-09-26T14:15:00.000Z').valueOf() },
+    ]);
   });
 });
 
@@ -235,18 +257,26 @@ describe('prorateBoundaryBuckets — Chatham boundary buckets', () => {
     expect(bucketWindowShare('2026-04-05T01:00:00', since, until, cutoff, 'hour', false)).toBeCloseTo(30 / 60, 10);
     expect(bucketWindowShare('2026-04-05T02:00:00', since, until, cutoff, 'hour', false)).toBeCloseTo(65 / 75, 10);
   });
+
+  it('uses the spring-forward row\'s 15-minute coverage at a custom boundary', () => {
+    const since = dayjs('2026-09-27T03:10:00');
+    const until = dayjs('2026-09-27T04:30:00');
+    const cutoff = dayjs('2026-09-27T06:00:00');
+    const buckets = ['2026-09-27 03:00', '2026-09-27 04:00'];
+    const out = prorateBoundaryBuckets(resp(buckets, [900, 60]), since, until, until, cutoff, 'hour', 'hour');
+
+    expect(out.series.map(p => p.value)).toEqual([0, 20]);
+  });
 });
 
 // Spring-forward night: Sep 27 2026, the clock jumps 02:45 +12:45 -> 03:45
 // +13:45 at T = 2026-09-26T14:00:00Z. The skipped wall span [02:45, 03:45)
 // (60 minutes of wall time that never display) crosses the 02/03 field
 // boundary — the same misaligned shape as the Apr 5 fall-back, but
-// symmetric: the post-gap wall hour 03:00 has only the 15-minute
-// post-jump slice [03:45+13:45, 04:00+13:45) = [14:00Z, 14:15Z), and the
-// pre-gap wall hour 02:00 has its full 60-minute pre-jump slice
-// [02:00+12:45, 03:00+12:45) = [13:15Z, 14:15Z) split by the 15-min
-// post-jump continuation [02:45+13:45, 03:00+13:45) = [14:00Z, 14:15Z) at
-// the higher offset. These tests pin the hour floor — the symmetric twin
+// symmetric: the pre-gap wall hour 02:00 has only its 45-minute
+// pre-jump slice [02:00+12:45, 02:45+12:45) = [13:15Z, 14:00Z), while
+// the post-gap wall hour 03:00 has only the 15-minute post-jump slice
+// [03:45+13:45, 04:00+13:45) = [14:00Z, 14:15Z). These tests pin the hour floor — the symmetric twin
 // of the fall-back floor — on the post-gap hour containing `until`.
 // The fall-back branch's `first.utcOffset() > until.utcOffset()` check is
 // INERT here: V8 rolls the non-existent `03:00+13:45` forward to the
@@ -307,18 +337,16 @@ describe('floorWindowUntil hour branch — Chatham 45-minute-offset spring-forwa
 
 // 1d/2d presets (hour granularity) snap `until` to the FIXED floor; the
 // live cell at the floor holds the post-jump recorded slice. The old
-// floor (14:15Z) sat inside the post-gap hour, the live cell sat on the
-// 14:15Z-15:00Z tail, and the row's 5 recorded post-jump minutes vanished
-// from the KPI. The fixed floor lands the live cell on [14:00Z, 15:00Z),
-// the row's whole 60-min pre-jump pass lies inside the window, and the
-// 5 min of post-jump data count on top — share 1, exactly like the
-// fall-back case in the suite above.
+// floor (14:15Z) sat inside the post-gap hour, so the 03:00 row's
+// 14:00Z-14:15Z usage was assigned to the wrong interval. The fixed floor
+// lands the live cell on [14:00Z, 15:00Z), where that 15-minute row slice is
+// represented by its real coverage and the 02:00 row remains a 45-minute
+// pre-jump row.
 describe('bucketWindowShare — hour-granularity live window on the Chatham spring', () => {
   it('shares the whole 02:00 row when the live hour starts at the transition (share 1)', () => {
-    // 1d preset at 03:50:30 +13:45 (14:05:30Z): until floors to 14:00Z, the
-    // live hour [14:00Z, 15:00Z) carries the row's pre-jump in-window
-    // slice [13:15Z, 14:00Z) = 45 min PLUS the post-jump continuation
-    // [14:00Z, 14:05:30Z) = 5 min — share 1 of the 60-min row.
+    // 1d preset at 03:50:30 +13:45 (14:05:30Z): until floors to 14:00Z,
+    // the live hour [14:00Z, 15:00Z) follows the 02:00 row's 45-minute
+    // pre-jump coverage [13:15Z, 14:00Z), so its share remains 1.
     const now = dayjs('2026-09-26T14:05:30.000Z');
     const until = floorWindowUntil(now, 'hour');
     expect(until.toISOString()).toBe('2026-09-26T14:00:00.000Z');
@@ -341,41 +369,66 @@ describe('bucketWindowShare — hour-granularity live window on the Chatham spri
 
 // series() on a min15 axis must keep chart total == KPI for a window that
 // crosses the Chatham spring transition. Uses rows with KNOWN coverage
-// (the 02:00 row's full 60-min pre-jump + 15-min post-jump pass; the
-// 04:00 row's normal 60-min post-jump) and a past-shaped window
+// (the 02:00 row's 45-minute pre-jump pass, the 03:00 row's 15-minute
+// post-jump pass, and the 04:00 row's normal 60-minute post-jump pass) and a past-shaped window
 // (cutoff well after `until`, liveExtend=false like the fall-back
 // series tests) so the chart and the KPI read the same window and rows.
-// The 03:00 row is excluded — its real 15-min coverage sits inside the
-// spring gap and the rowCoverage fall-back machinery doesn't model it;
-// a future spring-forward coverage fix is out of scope here. Including
-// only the unambiguously-shaped rows keeps the parity assertion focused
-// on the hour floor: with the fixed floor the live cell (when used)
-// carries the post-jump slice the way the fall-back live cell does, and
-// the chart and KPI count the same coverage for the same window.
 describe('series — a window crossing the Chatham spring keeps chart total == KPI', () => {
   const ROWS = [
-    { hour_bucket: '2026-09-27T02:00:00', v: 600 },  // 60-min coverage (pre-jump 45min + post-jump 15min, contiguous)
+    { hour_bucket: '2026-09-27T02:00:00', v: 600 },  // 45-min coverage, pre-jump
+    { hour_bucket: '2026-09-27T03:00:00', v: 900 },  // 15-min coverage, post-jump
     { hour_bucket: '2026-09-27T04:00:00', v: 60 },   // 60-min coverage, post-jump
   ];
 
   it('min15 past window crossing the transition (chart total matches KPI)', () => {
-    // Window [13:15Z, 14:30Z): 02:00 row's whole 60-min coverage lies
-    // inside the window (share 1); 04:00 row contributes its first 15
-    // min [14:15Z, 14:30Z) of the post-jump hour (share 0.25). KPI =
-    // 600 + 15 = 615. The min15 axis is {13:15, 13:30, 13:45, 14:00,
-    // 14:15} (5 cells — 14:30 starts AT until and is excluded by the
-    // half-open window). The chart distributes the 02:00 row's 60 min
-    // evenly over the first 4 cells (15 min each, 0.25 each) and the
-    // 04:00 row's 15 min over 14:15 (0.25). Total = 4*150 + 15 = 615.
+    // Window [13:15Z, 14:30Z): the 02:00 row's 45 minutes, the 03:00
+    // row's 15 minutes, and the 04:00 row's first 15 minutes are all in
+    // the window. KPI = 600 + 900 + 15 = 1515. The min15 axis is
+    // {13:15, 13:30, 13:45, 14:00, 14:15} (5 cells — 14:30 starts AT
+    // until and is excluded by the half-open window). The chart distributes
+    // the 02:00 row's 45 minutes over the first 3 cells, the 03:00 row's
+    // 15-minute span into 14:00, and the 04:00 row's 15 minutes over 14:15.
     const since = dayjs('2026-09-26T13:15:00.000Z');
     const until = dayjs('2026-09-26T14:30:00.000Z');
     const cutoff = dayjs('2026-09-26T15:45:00.000Z');
     const out = series(ROWS, r => r.v, since, until, cutoff, 'min15', false);
     const kpi = ROWS.reduce((a, r) => a + r.v * bucketWindowShare(r.hour_bucket, since, until, cutoff, 'hour', false), 0);
-    expect(kpi).toBeCloseTo(615, 10);
+    expect(kpi).toBeCloseTo(1515, 10);
     expect(out.reduce((a, p) => a + p.value, 0)).toBeCloseTo(kpi, 10);
-    // The exact axis values for clarity (mirrors the fall-back series
-    // test's `expect(out.map(p => p.value)).toEqual([...])` shape).
-    expect(out.map(p => p.value)).toEqual([150, 150, 150, 150, 15]);
+    // The exact axis values for clarity; use numeric tolerance for the
+    // repeated 600 / 3 calculation.
+    expect(out.map(p => p.value)).toHaveLength(5);
+    expect(out[0].value).toBeCloseTo(200, 10);
+    expect(out[1].value).toBeCloseTo(200, 10);
+    expect(out[2].value).toBeCloseTo(200, 10);
+    expect(out[3].value).toBeCloseTo(900, 10);
+    expect(out[4].value).toBeCloseTo(15, 10);
+  });
+});
+
+describe('hourly axes — Chatham spring-forward wall-clock rows', () => {
+  const ROWS = [
+    { hour_bucket: '2026-09-27T02:00:00', model: 'a', v: 600 },
+    { hour_bucket: '2026-09-27T03:00:00', model: 'a', v: 900 },
+    { hour_bucket: '2026-09-27T04:00:00', model: 'a', v: 60 },
+  ];
+
+  it('keeps the serialized 03:00 row on its own hourly axis bucket', () => {
+    const since = dayjs('2026-09-27T01:00:00');
+    const until = dayjs('2026-09-27T05:00:00');
+    const cutoff = dayjs('2026-09-27T06:00:00');
+
+    const hourly = series(ROWS, r => r.v, since, until, cutoff, 'hour', false);
+    expect(hourly.map(p => p.sort)).toEqual([
+      '2026-09-27 01:00',
+      '2026-09-27 02:00',
+      '2026-09-27 03:00',
+      '2026-09-27 04:00',
+    ]);
+    expect(hourly.map(p => p.value)).toEqual([0, 600, 900, 60]);
+
+    const stacked = stackedData(ROWS, ['a'], r => r.model, r => r.v, since, until, cutoff, 'hour', false);
+    expect(stacked.map(p => p.sort)).toEqual(hourly.map(p => p.sort));
+    expect(stacked.map(p => p.a)).toEqual([0, 600, 900, 60]);
   });
 });
