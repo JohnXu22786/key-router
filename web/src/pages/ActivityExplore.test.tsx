@@ -202,4 +202,19 @@ describe('ActivityExplore summary footer', () => {
     expect(container.textContent).toContain('$21');
     expect(container.textContent).not.toContain('$130');
   });
+
+  it('requests blended source metrics with blended ranking for the current metric', async () => {
+    vi.mocked(getActivity).mockImplementation(async (params) => ({
+      data: {
+        ...makeHourlyResponse(),
+        metric: params.metric!,
+      },
+    } as Awaited<ReturnType<typeof getActivity>>));
+    render(<ActivityExplore range={shortRange} initialMetric="blended" />);
+
+    await screen.findByText(/rows ·/);
+    const calls = vi.mocked(getActivity).mock.calls;
+    expect(calls.map(([params]) => params.metric).sort()).toEqual(['spend', 'tokens']);
+    expect(calls.every(([params]) => params.rank_by === 'blended')).toBe(true);
+  });
 });

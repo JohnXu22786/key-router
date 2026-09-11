@@ -1839,7 +1839,9 @@ export function combineBlendedResponses(
 // carries the normalized values for the requested rank metric; when omitted,
 // the chart metric's normalized summary is used. The folded series is kept
 // small for the chart, but normalized summaries for the tail are retained so
-// Trends can still calculate deltas for groups represented by Other.
+// Trends can still calculate deltas for groups represented by Other. Both
+// the retained series cells and the summary rows are emitted in this
+// normalized rank order, even when every group fits within Top-N.
 export function limitActivityResponse(
   resp: ActivityResponse,
   topN: number,
@@ -1861,7 +1863,6 @@ export function limitActivityResponse(
     ...resp.summary.map(s => s.group),
     ...resp.series.map(s => s.group),
   ])).filter(g => g !== 'Other');
-  if (groups.length <= topN && !resp.series.some(p => p.group === 'Other')) return resp;
 
   const rankTotals = new Map(rankResponse.summary.map(s => [s.group, s.sum]));
   const ordered = [...groups].sort((a, b) => {
@@ -1873,7 +1874,10 @@ export function limitActivityResponse(
   const topGroups = ordered.slice(0, topN);
   const topSet = new Set(topGroups);
   const tailSet = new Set(ordered.slice(topN));
-  const cells = collectSeriesCells(resp.series).filter(c => topSet.has(c.group));
+  const rankIndex = new Map(topGroups.map((group, i) => [group, i]));
+  const cells = collectSeriesCells(resp.series)
+    .filter(c => topSet.has(c.group))
+    .sort((a, b) => (rankIndex.get(a.group)! - rankIndex.get(b.group)!));
   const values = seriesValueMap(resp);
   const buckets = [...resp.buckets];
   const series: ActivitySeriesPoint[] = [];

@@ -152,6 +152,10 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
         const rankMetric = rankBy === 'current' ? metric : rankBy;
         const rankMetrics = rankMetric === 'blended' ? ['spend', 'tokens'] : [rankMetric];
         const sourceMetrics = [...new Set([...chartMetrics, ...rankMetrics])];
+        // A blended current-metric rank must be calculated from spend/tokens
+        // together. Passing "current" to each source would rank spend and
+        // token responses independently before the client combines them.
+        const sourceRankBy = rankMetric === 'blended' ? 'blended' : rankBy;
         const requestRollup = 'hour';
         const queryCutoff = dayjs();
         // The query window must keep every in-range bucket: a CURRENT-period
@@ -170,7 +174,7 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
           group_by: groupBy,
           subgroup: subgroup || undefined,
           rollup: requestRollup,
-          rank_by: rankBy,
+          rank_by: sourceRankBy,
           top: 0,
           since: range.since.toISOString(),
           until: curUntil.toISOString(),

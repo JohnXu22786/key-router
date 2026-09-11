@@ -1763,6 +1763,60 @@ describe('hourly activity normalization', () => {
     expect(out.summary.map(s => s.group)).toEqual(['top', 'Other', 'tail']);
     expect(out.summary.find(s => s.group === 'tail')!.sum).toBe(5);
   });
+
+  it('orders summaries and chart cells by normalized rank even when no fold is needed', () => {
+    const resp: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'hour',
+      series: [
+        { bucket: '2026-08-13 15:00', group: 'spend-first', value: 100, is_zero: false },
+        { bucket: '2026-08-13 15:00', group: 'window-first', value: 10, is_zero: false },
+      ],
+      summary: [
+        { group: 'spend-first', min: 100, max: 100, avg: 100, sum: 100, value: 100, percent: 90 },
+        { group: 'window-first', min: 10, max: 10, avg: 10, sum: 10, value: 10, percent: 10 },
+      ],
+      buckets: ['2026-08-13 15:00'],
+      totals: { spend: 110, tokens: 0, requests: 0, cache: 0 },
+    };
+    const rankResponse: ActivityResponse = {
+      ...resp,
+      summary: [
+        { group: 'window-first', min: 100, max: 100, avg: 100, sum: 100, value: 100, percent: 90 },
+        { group: 'spend-first', min: 10, max: 10, avg: 10, sum: 10, value: 10, percent: 10 },
+      ],
+    };
+    const out = limitActivityResponse(resp, 10, rankResponse);
+    expect(out.summary.map(s => s.group)).toEqual(['window-first', 'spend-first']);
+    expect(out.series.map(s => s.group)).toEqual(['window-first', 'spend-first']);
+
+    const folded = limitActivityResponse(resp, 1, rankResponse);
+    expect(folded.summary.map(s => s.group)).toEqual(['window-first', 'Other', 'spend-first']);
+    expect(folded.series.map(s => s.group)).toEqual(['window-first', 'Other']);
+  });
+
+  it('ranks blended current-metric results by the combined rate', () => {
+    const buckets = ['2026-08-13 15:00'];
+    const make = (metric: 'spend' | 'tokens', values: number[]): ActivityResponse => ({
+      metric, group_by: 'model', rollup: 'hour', buckets,
+      series: [
+        { bucket: buckets[0], group: 'spend-first', value: values[0], is_zero: values[0] === 0 },
+        { bucket: buckets[0], group: 'rate-first', value: values[1], is_zero: values[1] === 0 },
+      ],
+      summary: [
+        { group: 'spend-first', min: values[0], max: values[0], avg: values[0], sum: values[0], value: values[0], percent: 0 },
+        { group: 'rate-first', min: values[1], max: values[1], avg: values[1], sum: values[1], value: values[1], percent: 0 },
+      ],
+      totals: { spend: metric === 'spend' ? values.reduce((a, v) => a + v, 0) : 0, tokens: metric === 'tokens' ? values.reduce((a, v) => a + v, 0) : 0, requests: 0, cache: 0 },
+    });
+    const spend = make('spend', [100, 10]);
+    const tokens = make('tokens', [100, 1]);
+    const blended = combineBlendedResponses(spend, tokens);
+    const out = limitActivityResponse(blended, 10, blended);
+    // spend-first has the larger spend total, but rate-first is 10x more
+    // expensive per token and must lead the blended-current ranking.
+    expect(out.summary.map(s => s.group)).toEqual(['rate-first', 'spend-first']);
+    expect(out.series.map(s => s.group)).toEqual(['rate-first', 'spend-first']);
+  });
 });
 
 describe('prorateBoundaryBuckets — server-bucketed custom ranges', () => {
