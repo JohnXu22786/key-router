@@ -6,7 +6,7 @@ import {
   prevWindowUntil,
   fmtTick, fmtBucket, fmtDayLabel, CUSTOM_KEY,
   computeTrending, toChartData, cacheHitRate, resampleResponse, liveExtensionEligible,
-  prorateBoundaryBuckets,
+  prorateBoundaryBuckets, aggregateTotalResponse,
 } from './activityShared';
 import type { ActivityResponse } from '../api/client';
 import type { Granularity } from './activityShared';
@@ -1708,20 +1708,41 @@ describe('prorateBoundaryBuckets — server-bucketed custom ranges', () => {
     const weekOut = prorateBoundaryBuckets(week, since, until, until, dayjs('2026-08-18T00:00:00'), 'hour', 'week');
     expect(weekOut.series[0].value).toBe(52);
 
-    const total: ActivityResponse = {
-      metric: 'spend', group_by: 'model', rollup: 'total',
-      series: [{ bucket: 'Total', group: 'a', value: 300, is_zero: false }],
-      summary: [{ group: 'a', min: 300, max: 300, avg: 300, sum: 300, value: 300, percent: 100 }],
-      buckets: ['Total'],
-      totals: { spend: 300, tokens: 0, requests: 0, cache: 0 },
+    // Total views fetch the hourly cells and correct them before collapsing.
+    // A single aggregate ratio would incorrectly scale the interior 15:00-
+    // 17:00 values as well, which is visible with non-uniform hourly usage.
+    const hourly: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'hour',
+      series: [
+        { bucket: '2026-08-14 14:00', group: 'a', value: 60, is_zero: false },
+        { bucket: '2026-08-14 15:00', group: 'a', value: 100, is_zero: false },
+        { bucket: '2026-08-14 16:00', group: 'a', value: 20, is_zero: false },
+        { bucket: '2026-08-14 17:00', group: 'a', value: 30, is_zero: false },
+        { bucket: '2026-08-14 18:00', group: 'a', value: 40, is_zero: false },
+      ],
+      summary: [{ group: 'a', min: 20, max: 100, avg: 50, sum: 250, value: 40, percent: 100 }],
+      buckets: ['2026-08-14 14:00', '2026-08-14 15:00', '2026-08-14 16:00', '2026-08-14 17:00', '2026-08-14 18:00'],
+      totals: { spend: 250, tokens: 0, requests: 0, cache: 0 },
     };
-    const totalSince = dayjs('2026-08-14T14:00:00');
-    const totalUntil = dayjs('2026-08-14T18:00:00');
-    const totalOut = prorateBoundaryBuckets(total, totalSince, totalUntil, totalUntil, dayjs('2026-08-15T00:00:00'), 'hour', 'total');
-    // The total query widens to [14:00, 19:00); the requested 4/5 hours are
-    // 240 of the aggregate's 300 units.
-    expect(totalOut.series[0].value).toBe(240);
-    expect(totalOut.totals.spend).toBe(240);
+    const totalSince = dayjs('2026-08-14T14:37:00');
+    const totalUntil = dayjs('2026-08-14T18:22:00');
+    const corrected = prorateBoundaryBuckets(
+      hourly, totalSince, totalUntil, totalUntil,
+      dayjs('2026-08-14T19:00:00'), 'hour', 'hour', false,
+    );
+    const totalOut = aggregateTotalResponse(corrected);
+    // 14:00 contributes 23/60 of 60 and 18:00 contributes 22/60 of 40;
+    // the three interior hours remain exactly 100, 20 and 30.
+    const want = 60 * (23 / 60) + 100 + 20 + 30 + 40 * (22 / 60);
+    expect(totalOut.buckets).toEqual(['Total']);
+    expect(totalOut.series).toEqual([
+      { bucket: 'Total', group: 'a', value: want, is_zero: false },
+    ]);
+    expect(totalOut.summary[0].sum).toBeCloseTo(want, 10);
+    expect(totalOut.summary[0].value).toBeCloseTo(want, 10);
+    expect(totalOut.summary[0].min).toBeCloseTo(want, 10);
+    expect(totalOut.summary[0].max).toBeCloseTo(want, 10);
+    expect(totalOut.totals.spend).toBeCloseTo(want, 10);
   });
 
   it('prorates a month-granularity custom range at the month scale', () => {

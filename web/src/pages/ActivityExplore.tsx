@@ -14,7 +14,7 @@ import { getActivity, ActivityResponse, ActivityGroupSummary } from '../api/clie
 import {
   DateRange, ActivityFilter, filterKey, fmtUSDInt, fmtTokens, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS,
   fmtPercent, fmt3sig, fmtTick, fmtBucket, modelFavicon, Granularity, queryWindowUntil, prorateBoundaryBuckets,
-  liveExtensionEligible,
+  liveExtensionEligible, resampleResponse, aggregateTotalResponse,
 } from './activityShared';
 import dayjs from 'dayjs';
 import './explore.css';
@@ -142,6 +142,18 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
       setError(false);
       const t0 = performance.now();
       try {
+        // The API aggregates stored hourly rows and has no sub-hour rollups.
+        // Short ranges therefore use an hourly response as the source and
+        // are re-sampled onto the range's minute/15-minute axis, just like
+        // Trends. Total is handled separately for additive metrics: its
+        // hourly cells are corrected before being collapsed so a single
+        // boundary ratio never scales interior hours.
+        const subGran: 'minute' | 'min15' | null =
+          rollup !== 'total' && (range.granularity === 'minute' || range.granularity === 'min15')
+            ? range.granularity
+            : null;
+        const additiveTotal = rollup === 'total' && metric !== 'blended';
+        const requestRollup = subGran || additiveTotal ? 'hour' : rollup;
         // The query window must keep every in-range bucket: a CURRENT-period
         // boundary-aligned range passes its until as-is, so the endpoint's
         // widened window keeps the LIVE bucket (the user's newest usage is
@@ -152,12 +164,12 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
         // over an hour-granularity 1d/today range) is sent as-is, or the
         // server's widened window would amputate the in-progress day the
         // range covers.
-        const curUntil = queryWindowUntil(range, rollup);
+        const curUntil = queryWindowUntil(range, requestRollup);
         const res = await getActivity({
           metric,
           group_by: groupBy,
           subgroup: subgroup || undefined,
-          rollup,
+          rollup: requestRollup,
           rank_by: rankBy,
           top: topN,
           since: range.since.toISOString(),
@@ -171,10 +183,31 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
         // the live boundary bucket's coverage too small and its value too
         // large.
         const cutoff = dayjs();
-        setData(prorateBoundaryBuckets(
-          res.data, range.since, range.until, curUntil, cutoff,
-          range.granularity, rollup, liveExtensionEligible(range),
-        ));
+        let normalized: ActivityResponse;
+        if (subGran) {
+          normalized = resampleResponse(
+            res.data, range.since, range.until, cutoff, subGran,
+            liveExtensionEligible(range),
+          );
+        } else if (additiveTotal) {
+          const hourly = prorateBoundaryBuckets(
+            res.data, range.since, range.until, curUntil, cutoff,
+            'hour', 'hour', liveExtensionEligible(range),
+          );
+          normalized = aggregateTotalResponse(hourly);
+        } else {
+          // The endpoint widens every query to complete buckets at the
+          // selected rollup (see activityWindow in admin.go), so a short
+          // range with the default day rollup can contain a full day outside
+          // the range. The shared correction scales the response's
+          // first/last buckets at that rollup's scale and keeps the current
+          // preset's live cell so Explore agrees with Overview.
+          normalized = prorateBoundaryBuckets(
+            res.data, range.since, range.until, curUntil, cutoff,
+            range.granularity, requestRollup, liveExtensionEligible(range),
+          );
+        }
+        setData(normalized);
         setLoadMs(Math.max(1, Math.round(performance.now() - t0)));
       } catch { if (!cancelled) { setError(true); message.error('Failed to load explore'); } }
       finally { if (!cancelled) setLoading(false); }
@@ -247,6 +280,10 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
   }
 
   const fmtAxis = (v: number) => (metric === 'spend' ? fmtUSDInt(v) : metric === 'blended' ? fmt3sig(v) : fmtCompact(v));
+  const displayGranularity: Granularity =
+    data?.rollup === 'minute' || data?.rollup === 'min15'
+      ? data.rollup
+      : rollupGran(rollup);
   const fmtTable = fmtForTable(metric);
   const groupLabel = GROUP_BY.find(g => g.value === groupBy)!.label;
   const subgroupOptions = SUBGROUP_OPTIONS[groupBy];
@@ -329,9 +366,9 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
       {chartType === 'bar' && (
         <BarChart data={chartData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
           <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
-          <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={48} tickFormatter={(v) => fmtTick(rollupGran(rollup), String(v))} />
+          <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={48} tickFormatter={(v) => fmtTick(displayGranularity, String(v))} />
           <YAxis tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} width={60} tickFormatter={fmtAxis} />
-          <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(rollupGran(rollup), String(l))} />
+          <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(displayGranularity, String(l))} />
           {/* dataKey is a function accessor: recharts resolves string keys via
               lodash paths, so dots in names like "claude-3.5" would break */}
           {seriesKeys.map((sk, i) => (
@@ -342,9 +379,9 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
       {chartType === 'area' && (
         <AreaChart data={chartData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
           <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
-          <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={48} tickFormatter={(v) => fmtTick(rollupGran(rollup), String(v))} />
+          <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={48} tickFormatter={(v) => fmtTick(displayGranularity, String(v))} />
           <YAxis tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} width={60} tickFormatter={fmtAxis} />
-          <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(rollupGran(rollup), String(l))} />
+          <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(displayGranularity, String(l))} />
           {seriesKeys.map((sk, i) => (
             <Area key={sk.key} dataKey={(d: any) => d[sk.key]} name={displayFor(sk.group, sk.subgroup)} type="monotone" stackId={stackId} stroke={seriesColor(i, sk.group)} strokeWidth={1.5} fill={seriesColor(i, sk.group)} fillOpacity={0.35} dot={false} />
           ))}
@@ -353,9 +390,9 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
       {chartType === 'line' && (
         <LineChart data={chartData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
           <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
-          <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={48} tickFormatter={(v) => fmtTick(rollupGran(rollup), String(v))} />
+          <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={48} tickFormatter={(v) => fmtTick(displayGranularity, String(v))} />
           <YAxis tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} width={60} tickFormatter={fmtAxis} />
-          <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(rollupGran(rollup), String(l))} />
+          <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(displayGranularity, String(l))} />
           {seriesKeys.map((sk, i) => (
             <Line key={sk.key} dataKey={(d: any) => d[sk.key]} name={displayFor(sk.group, sk.subgroup)} type="monotone" stroke={seriesColor(i, sk.group)} strokeWidth={1.5} dot={false} />
           ))}

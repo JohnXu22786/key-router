@@ -70,6 +70,15 @@ const range: DateRange = {
   granularity: 'month',
 };
 
+const shortRange: DateRange = {
+  key: '15m',
+  label: 'Past 15 Minutes',
+  badge: '15m',
+  since: dayjs('2026-08-13T15:50:00'),
+  until: dayjs('2026-08-13T16:05:00'),
+  granularity: 'minute',
+};
+
 const makeResponse = (n: number): ActivityResponse => ({
   metric: 'spend',
   group_by: 'model',
@@ -83,6 +92,19 @@ const makeResponse = (n: number): ActivityResponse => ({
     min: 1, max: 2, avg: 1.5, sum: i + 1, value: i + 1, percent: 100 / n,
   })),
   totals: { spend: n * 10, tokens: 0, requests: 0, cache: 0 },
+});
+
+const makeHourlyResponse = (): ActivityResponse => ({
+  metric: 'spend',
+  group_by: 'model',
+  rollup: 'hour',
+  buckets: ['2026-08-13 15:00', '2026-08-13 16:00'],
+  series: [
+    { bucket: '2026-08-13 15:00', group: 'model-1', value: 120, is_zero: false },
+    { bucket: '2026-08-13 16:00', group: 'model-1', value: 10, is_zero: false },
+  ],
+  summary: [{ group: 'model-1', min: 10, max: 120, avg: 65, sum: 130, value: 10, percent: 100 }],
+  totals: { spend: 130, tokens: 0, requests: 0, cache: 0 },
 });
 
 const mockSummary = (n: number) => {
@@ -170,4 +192,20 @@ describe('ActivityExplore summary footer', () => {
     expect(screen.getAllByText('$95.2')).toHaveLength(2);
     expect(screen.queryByText('$100')).toBeNull();
   });
+
+  it('uses hourly data and re-samples short ranges instead of showing a full daily bucket', async () => {
+    vi.mocked(getActivity).mockResolvedValue({
+      data: makeHourlyResponse(),
+    } as Awaited<ReturnType<typeof getActivity>>);
+    const { container } = render(<ActivityExplore range={shortRange} />);
+
+    const footer = await screen.findByText(/rows ·/);
+    expect(footer).toBeTruthy();
+    expect(vi.mocked(getActivity)).toHaveBeenCalledWith(expect.objectContaining({ rollup: 'hour' }));
+    // The hourly response sums to $130, while the 15-minute window contains
+    // only the corresponding slice ($21 with the fixed fixture and the
+    // current-range live-minute behavior).
+    expect(container.textContent).toContain('$21');
+    expect(container.textContent).not.toContain('$130');
+});
 });

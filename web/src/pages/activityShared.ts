@@ -1619,40 +1619,11 @@ function boundaryShare(
   return overlap > 0 ? (overlap / 60000) / coverage : 0;
 }
 
-// totalShare is the boundary correction for rollup=total. The endpoint's
-// total response has no per-bucket cells left to prorate: it aggregates the
-// hourly query window into one `Total` cell. Use the same uniform-within-row
-// assumption as boundaryShare, measuring the requested interval against the
-// widened hourly window and the recorded extent of its last hour.
-function totalShare(
-  since: dayjs.Dayjs,
-  untilSent: dayjs.Dayjs,
-  cutoff: dayjs.Dayjs,
-  overlapEnd: dayjs.Dayjs,
-): number {
-  const queryStart = floorWindowUntil(since, 'hour').valueOf();
-  const queryEnd = floorWindowUntil(untilSent, 'hour').add(1, 'hour').valueOf();
-  if (queryEnd <= queryStart) return 0;
-
-  const cutoffFloor = floorMinute(cutoff).valueOf();
-  let recordedEnd = Math.min(queryEnd, cutoffFloor);
-  // Match rowCoverage's one-minute rescue for a non-empty first minute: a
-  // total response can contain a row whose cutoff is after the query start
-  // even when the whole-minute floor is still at that start.
-  if (recordedEnd <= queryStart && cutoff.valueOf() > queryStart) {
-    recordedEnd = Math.min(queryEnd, queryStart + 60000);
-  }
-  if (recordedEnd <= queryStart) return 0;
-
-  const overlap = Math.min(recordedEnd, overlapEnd.valueOf()) - Math.max(queryStart, since.valueOf());
-  return overlap > 0 ? overlap / (recordedEnd - queryStart) : 0;
-}
-
-type BoundaryRollup = 'hour' | 'day' | 'week' | 'month' | 'total';
+type BoundaryRollup = 'hour' | 'day' | 'week' | 'month';
 
 function boundaryRollup(rollup: string): BoundaryRollup | null {
   return rollup === 'hour' || rollup === 'day' || rollup === 'week'
-    || rollup === 'month' || rollup === 'total' ? rollup : null;
+    || rollup === 'month' ? rollup : null;
 }
 
 function boundaryStart(t: dayjs.Dayjs, rollup: Exclude<BoundaryRollup, 'total'>): dayjs.Dayjs {
@@ -1693,10 +1664,15 @@ function liveCellEnd(
 // the range's chart scale. A COARSER rollup (Explore's day rollup over an
 // hour-granularity range) otherwise sums whole boundary days into its bars;
 // a FINER rollup (hour over a day-granularity range) has the symmetric issue.
-// Week and total are handled by their own calendar/hour-window shares below.
+// Week is handled by its own calendar share below. Total responses are not
+// corrected here: additive total views fetch hourly cells, correct those
+// cells, and collapse them client-side so interior hours are never scaled by
+// one aggregate boundary ratio. Blended total views stay on the server path
+// because their cells are rates and cannot be summed safely.
 // The sub-hour granularities are returned unchanged by the first gate below:
-// Trends' sub-hour ranges never reach this function (resampleResponse handles
-// them), while Explore's pass through and are skipped there.
+// Trends and Explore use resampleResponse for their sub-hour chart axes.
+// Explore's additive Total path passes an effective `hour` granularity here
+// before collapsing the corrected cells.
 //   - a bound must be MID-bucket at that granularity: preset ranges arrive
 //     snapped to their own grid (Activity.tsx), and the query either
 //     aligned to the boundary (exclusiveUntil — the previous-period queries
@@ -1736,41 +1712,37 @@ export function prorateBoundaryBuckets(
   const responseRollup = boundaryRollup(rollup);
   if (responseRollup === null) return resp;
 
-  const liveEnd = liveCellEnd(since, until, cutoff, granularity, liveExtend);
   const shares = new Map<string, number>();
-  if (responseRollup === 'total') {
-    shares.set(resp.buckets[0], totalShare(since, untilSent, cutoff, liveEnd ?? until));
-  } else {
-    const firstStart = boundaryStart(since, responseRollup);
-    if (!firstStart.isSame(since)) {
-      shares.set(resp.buckets[0], boundaryShare(
-        firstStart,
-        since,
-        until,
-        cutoff,
-        responseRollup,
-        responseRollup === 'hour' ? hourFieldFromBucket(resp.buckets[0]) : undefined,
-      ));
-    }
-    const lastStart = boundaryStart(untilSent, responseRollup);
-    // A same-scale current live bucket is already exactly the cell the
-    // response is meant to show (hour/hour, day/day, or month/month), so keep
-    // it at its recorded value. When the response rollup differs from the
-    // range scale, however, even a boundary-aligned `until` can sit at the
-    // START of a much larger bucket; that bucket still needs normalization to
-    // the range (plus its optional live cell).
-    const sameScale = responseRollup === granularity;
-    if (!sameScale || !lastStart.isSame(until)) {
-      const lastBucket = resp.buckets[resp.buckets.length - 1];
-      shares.set(lastBucket, boundaryShare(
-        lastStart,
-        since,
-        liveEnd ?? until,
-        cutoff,
-        responseRollup,
-        responseRollup === 'hour' ? hourFieldFromBucket(lastBucket) : undefined,
-      ));
-    }
+  const firstStart = boundaryStart(since, responseRollup);
+  if (!firstStart.isSame(since)) {
+    shares.set(resp.buckets[0], boundaryShare(
+      firstStart,
+      since,
+      until,
+      cutoff,
+      responseRollup,
+      responseRollup === 'hour' ? hourFieldFromBucket(resp.buckets[0]) : undefined,
+    ));
+  }
+  const lastStart = boundaryStart(untilSent, responseRollup);
+  // A same-scale current live bucket is already exactly the cell the
+  // response is meant to show (hour/hour, day/day, or month/month), so keep
+  // it at its recorded value. When the response rollup differs from the
+  // range scale, however, even a boundary-aligned `until` can sit at the
+  // START of a much larger bucket; that bucket still needs normalization to
+  // the range (plus its optional live cell).
+  const sameScale = responseRollup === granularity;
+  if (!sameScale || !lastStart.isSame(until)) {
+    const lastBucket = resp.buckets[resp.buckets.length - 1];
+    const liveEnd = liveCellEnd(since, until, cutoff, granularity, liveExtend);
+    shares.set(lastBucket, boundaryShare(
+      lastStart,
+      since,
+      liveEnd ?? until,
+      cutoff,
+      responseRollup,
+      responseRollup === 'hour' ? hourFieldFromBucket(lastBucket) : undefined,
+    ));
   }
   const toApply = new Map<string, number>();
   for (const [b, share] of shares) {
@@ -1790,6 +1762,39 @@ export function prorateBoundaryBuckets(
   });
   const { summary, totals } = recomputeFromSeries(resp, series, resp.buckets);
   return { ...resp, series, summary, totals };
+}
+
+// aggregateTotalResponse collapses a corrected hourly response into the
+// single bucket used by Explore's Total rollup. Additive metrics must take
+// this path: the server's total response has already discarded the hourly
+// cells, so scaling that one aggregate would also scale interior hours. The
+// caller corrects the hourly boundary cells first, then this helper sums the
+// remaining values and recomputes the one-bucket summary and metric total.
+// Subgroup points are kept as separate series cells; summaries remain at the
+// primary-group level, matching the activity endpoint's response shape.
+export function aggregateTotalResponse(resp: ActivityResponse): ActivityResponse {
+  if (resp.metric === 'blended' || resp.rollup === 'total') return resp;
+
+  const byCell = new Map<string, ActivitySeriesPoint>();
+  for (const p of resp.series) {
+    const key = `${p.group}\u0000${p.subgroup ?? ''}`;
+    const current = byCell.get(key);
+    if (current) {
+      current.value += p.value;
+      current.is_zero = current.value === 0;
+    } else {
+      byCell.set(key, { ...p, bucket: 'Total', is_zero: p.value === 0 });
+    }
+  }
+  const series = [...byCell.values()];
+  const totalResp: ActivityResponse = {
+    ...resp,
+    rollup: 'total',
+    buckets: ['Total'],
+    series,
+  };
+  const { summary, totals } = recomputeFromSeries(totalResp, series, totalResp.buckets);
+  return { ...totalResp, summary, totals };
 }
 
 // groupTotals sums a metric per group, sorted descending. An optional
