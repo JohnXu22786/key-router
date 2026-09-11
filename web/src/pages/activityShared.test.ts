@@ -348,6 +348,22 @@ describe('queryWindowUntil — the query keeps every in-range bucket', () => {
     expect(queryWindowUntil(w('week'), 'hour').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-08-13 23:59:59');
   });
 
+  it('does not extend a month-granularity range into a following weekly bucket', () => {
+    // A current year range is snapped to the start of the live month. Its
+    // weekly Explore query must not be extended to month-end: the server
+    // widens that end to the following Monday, which would pull next-month
+    // rows into the final September week without client-side proration.
+    const r = {
+      key: 'year',
+      label: '',
+      badge: '',
+      since: dayjs('2026-01-01T00:00:00'),
+      until: dayjs('2026-09-01T00:00:00'),
+      granularity: 'month' as Granularity,
+    };
+    expect(queryWindowUntil(r, 'week').format('YYYY-MM-DD HH:mm:ss')).toBe('2026-09-01 00:00:00');
+  });
+
   it('a CURRENT-aligned preset boundary keeps its live bucket: the query passes until as-is', () => {
     // A 24h window ending at 09:00 sharp (the current hour's start): the
     // live hour's row is the chart's real last in-window value, so the query

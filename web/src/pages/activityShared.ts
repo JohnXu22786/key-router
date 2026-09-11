@@ -531,7 +531,8 @@ const GRANULARITY_ORDER: Record<Granularity, number> = {
 // belongs to the current period, so they keep excluding it. (A rollup
 // FINER than the live unit — Explore's hour rollup over a day-granularity
 // range — extends through the live range unit; the default rollups keep the
-// whole bucket.)
+// whole bucket. A weekly rollup over a month-granularity range keeps the
+// snapped boundary because its Monday bucket cannot be clipped safely.)
 export function queryWindowUntil(range: Pick<DateRange, 'key' | 'granularity' | 'since' | 'until'>, rollup: string): dayjs.Dayjs {
   if (range.granularity === 'minute' || range.granularity === 'min15') return range.until;
   const gran = ROLLUP_GRAN[rollup] ?? 'hour';
@@ -544,7 +545,12 @@ export function queryWindowUntil(range: Pick<DateRange, 'key' | 'granularity' | 
     // The endpoint's bounds are inclusive and bucket-widened, so stop one
     // second before the next range-unit boundary to include this unit without
     // admitting the next one.
-    if (GRANULARITY_ORDER[gran] < GRANULARITY_ORDER[range.granularity]) {
+    // Weekly buckets are Monday-anchored. Extending a month-granularity
+    // range to month-end would make activityWindow include the rest of the
+    // boundary week, leaking next-month rows because Explore does not prorate
+    // rollups finer than the range granularity.
+    if (GRANULARITY_ORDER[gran] < GRANULARITY_ORDER[range.granularity]
+      && !(rollup === 'week' && range.granularity === 'month')) {
       const liveUnit = range.granularity === 'month' ? 'month' : range.granularity === 'day' ? 'day' : 'hour';
       return range.until.add(1, liveUnit).subtract(1, 'second');
     }
