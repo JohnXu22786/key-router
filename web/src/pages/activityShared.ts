@@ -123,7 +123,7 @@ function floorMinute(t: dayjs.Dayjs): dayjs.Dayjs {
   return dayjs(t.valueOf() - (t.second() * 1000 + t.millisecond()));
 }
 
-// --- DST fall-back transition machinery ---------------------------------
+// --- DST transition machinery -------------------------------------------
 // An hourly row's recorded value covers the elapsed instants whose LOCAL
 // wall-clock hour field equals the row's hour. On a fall-back night the
 // clock jumps back at a transition instant T (the offset DROPS from
@@ -171,6 +171,24 @@ function findFallBack(start: dayjs.Dayjs): { t: dayjs.Dayjs; before: number; aft
   return null;
 }
 
+// findSpringForward is the forward twin of findFallBack: the first
+// spring-forward T AFTER `start` within 180 minutes. Walking forward across
+// a spring-forward shows an offset increase. It is used for hourly rows whose
+// wall field begins before the gap; the backward twin below handles a row
+// label that V8 normalizes to the first valid post-gap instant.
+function findSpringForward(start: dayjs.Dayjs): { t: dayjs.Dayjs; before: number; after: number } | null {
+  if (start.add(179, 'minute').utcOffset() === start.utcOffset()) return null;
+  let t = start;
+  let prevOff = start.utcOffset();
+  for (let i = 0; i < 180; i++) {
+    t = t.add(1, 'minute');
+    const off = t.utcOffset();
+    if (off !== prevOff) return off > prevOff ? { t, before: prevOff, after: off } : null;
+    prevOff = off;
+  }
+  return null;
+}
+
 // findFallBackBefore is the backward twin of findFallBack: the first
 // transition BEFORE `until` within 180 minutes (used only on the hour
 // floor's second-pass branch, so no probe shortcut). Walking BACKWARD a
@@ -195,16 +213,13 @@ function findFallBackBefore(until: dayjs.Dayjs): { t: dayjs.Dayjs; before: numbe
 // findFallBackBefore: the first spring-forward T BEFORE `start` within 180
 // minutes. Walking BACKWARD across a spring-forward, the offset DROPS
 // (we step from the post-jump higher offset to the pre-jump lower one) —
-// the opposite of the fall-back pattern. Used by the hour floor's
-// spring-forward rebuild to recover T (the transition instant) when
-// V8's setter resolution of the minute-zeroed wall time landed past the
-// gap. The 45-minute-offset Chatham shift is the only real zone where
-// this triggers: V8 rolls the non-existent `03:00+13:45` (in the spring
-// gap [02:45, 03:45) at +12:45) forward to the first valid post-jump
-// time `04:00+13:45` = 14:15Z, and the old fall-back branch's
-// `first.utcOffset() > until.utcOffset()` test is INERT (both offsets are
-// the post-jump +13:45) — the new branch walks back from `first` to
-// locate T and rebuilds the floor from it.
+// the opposite of the fall-back pattern. Used by both the hour floor's
+// spring-forward rebuild and springRuns to recover T when V8's setter
+// resolution of a nonexistent wall time landed past the gap. The
+// 45-minute-offset Chatham shift is the only real zone where the hour-floor
+// branch needs this: V8 rolls `03:00+13:45` forward to `04:00+13:45`
+// = 14:15Z, so the post-jump offset comparison is inert and the transition
+// must be found by walking back.
 function findSpringForwardBefore(start: dayjs.Dayjs): { t: dayjs.Dayjs; before: number; after: number } | null {
   let t = floorMinute(start);
   const startOff = start.utcOffset();
@@ -262,6 +277,56 @@ function repeatRuns(start: dayjs.Dayjs): Array<{ from: number; to: number }> | n
     else merged.push(runs[i]);
   }
   return merged;
+}
+
+// springRuns returns the epoch runs an hourly row covers when its local wall
+// field intersects a spring-forward gap. `field` is the row's wall-clock
+// minute-of-day, supplied from the serialized bucket label when possible:
+// V8 normalizes a nonexistent Chatham `03:00` label to `04:00`, so the
+// normalized Dayjs value alone cannot identify which row was returned.
+//
+// The skipped wall span is [tau-, tau+), where tau+ is the wall time shown at
+// the transition and tau- is the last pre-jump wall boundary. The row keeps
+// any valid pre-gap and post-gap pieces, never the skipped interval itself.
+// A non-intersecting row returns null so the ordinary one-hour model remains
+// unchanged; an entirely skipped row returns an empty array and therefore has
+// zero recorded coverage.
+function springRuns(start: dayjs.Dayjs, field = start.hour() * 60 + start.minute()): Array<{ from: number; to: number }> | null {
+  const sf = findSpringForward(start) ?? findSpringForwardBefore(start);
+  if (!sf) return null;
+  const delta = sf.after - sf.before;
+  const tauPlus = sf.t.hour() * 60 + sf.t.minute();
+  const tauMinus = tauPlus - delta;
+  const fieldEnd = field + 60;
+  if (fieldEnd <= tauMinus || field >= tauPlus) return null;
+
+  const transition = sf.t.valueOf();
+  const runs: Array<{ from: number; to: number }> = [];
+  if (field < tauMinus) {
+    const preEnd = Math.min(fieldEnd, tauMinus);
+    runs.push({
+      from: transition - (tauMinus - field) * 60000,
+      to: transition - (tauMinus - preEnd) * 60000,
+    });
+  }
+  if (fieldEnd > tauPlus) {
+    const postStart = Math.max(field, tauPlus);
+    runs.push({
+      from: transition + (postStart - tauPlus) * 60000,
+      to: transition + (fieldEnd - tauPlus) * 60000,
+    });
+  }
+  return runs;
+}
+
+// hourFieldFromBucket preserves the wall-clock field that a DST-gap bucket
+// label had before the host Date parser normalized it. Hour buckets are
+// serialized as local timestamps, with either T or a space between date and
+// time depending on the response/test fixture.
+function hourFieldFromBucket(hourBucket: string): number | undefined {
+  const match = /[T ](\d{2}):(\d{2})/.exec(hourBucket);
+  if (!match) return undefined;
+  return Number(match[1]) * 60 + Number(match[2]);
 }
 
 // floorWindowUntil snaps a time to the START of the bucket that contains it
@@ -866,15 +931,17 @@ export interface RowCoverage {
 }
 
 // rowCoverage returns the extent an hourly row's recorded value covers: the
-// fall-back runs from repeatRuns for an affected row, else the plain
-// one-row-unit span, each run capped at the whole-minute cutoff floor and
-// the whole extent rescued to one minute when the cutoff lands inside the
-// unit's FIRST minute — the same cutoff semantics the old rowCoverageEnd
-// applied to its single contiguous span, now per run. Shared by
+// fall-back runs from repeatRuns, the spring-forward runs from springRuns, or
+// the plain one-row-unit span, each run capped at the whole-minute cutoff
+// floor and the whole extent rescued to one minute when the cutoff lands
+// inside the unit's FIRST minute — the same cutoff semantics the old
+// rowCoverageEnd applied to its single contiguous span, now per run. Shared by
 // bucketWindowShare, overlapFractions and boundaryShare so the KPI
 // proration and the sub-hour chart split divide by the SAME coverage and
 // clamp to the SAME runs (the gap between a misaligned row's runs displays
-// the OTHER row's hour and must never count for either).
+// the OTHER row's hour and must never count for either). `wallField` keeps a
+// nonexistent spring-forward label such as Chatham's `03:00` distinct from
+// the valid `04:00` instant to which the host Date parser rolls it.
 //
 // The floor must NOT go through dayjs's startOf('minute'): on the
 // fall-back's repeated hour a second-occurrence cutoff (01:15:45 EST)
@@ -888,9 +955,14 @@ export interface RowCoverage {
 // minute offsets keep the epoch and the local minute grids on the same
 // boundaries, preserving the instant — 01:15:45 EST floors to 01:15
 // EST, its real minute.
-export function rowCoverage(start: dayjs.Dayjs, rowUnit: 'hour' | 'day' | 'month', cutoff: dayjs.Dayjs): RowCoverage {
+export function rowCoverage(
+  start: dayjs.Dayjs,
+  rowUnit: 'hour' | 'day' | 'month',
+  cutoff: dayjs.Dayjs,
+  wallField?: number,
+): RowCoverage {
   const base = rowUnit === 'hour'
-    ? repeatRuns(start) ?? [{ from: start.valueOf(), to: start.add(1, 'hour').valueOf() }]
+    ? repeatRuns(start) ?? springRuns(start, wallField) ?? [{ from: start.valueOf(), to: start.add(1, 'hour').valueOf() }]
     : [{ from: start.valueOf(), to: start.add(1, rowUnit).valueOf() }];
   const clamp = floorMinute(cutoff).valueOf();
   const runs: Array<{ from: number; to: number }> = [];
@@ -902,8 +974,11 @@ export function rowCoverage(start: dayjs.Dayjs, rowUnit: 'hour' | 'day' | 'month
   // FIRST minute floors to the unit start and would drop a row that
   // demonstrably holds data — read at least the first whole minute then (a
   // cutoff at or before the unit start still reads as no recorded data).
-  if (runs.length === 0 && cutoff.isAfter(start)) {
-    runs.push({ from: start.valueOf(), to: start.valueOf() + 60000 });
+  // For a spring-forward row, `start` may be V8's rolled-forward value, so
+  // use the first real run as the extent anchor. An entirely skipped row has
+  // no base run and must remain empty.
+  if (base.length > 0 && runs.length === 0 && cutoff.isAfter(base[0].from)) {
+    runs.push({ from: base[0].from, to: base[0].from + 60000 });
   }
   let coverage = 0;
   for (const r of runs) coverage += (r.to - r.from) / 60000;
@@ -921,11 +996,11 @@ function rowCoverageEnd(start: dayjs.Dayjs, rowUnit: 'hour' | 'day' | 'month', c
 
 // overlapFractions splits ONE hourly row across the sub-hour axis buckets
 // overlapping the WINDOW [since, until), returning [axisIndex, fraction]
-// pairs. A row covers [hour, hour+1h) — on a DST fall-back night the
-// repeated hour's real coverage from rowCoverage (120 contiguous minutes
-// for whole-hour shifts like New York; 90 for half-hour Lord Howe; two
-// runs with a gap for the 45-minute-misaligned Chatham shift) — but only
-// up to `cutoff`: the
+// pairs. A normal row covers [hour, hour+1h). On DST transitions its real
+// coverage comes from rowCoverage: a fall-back may have 120 contiguous
+// minutes (or two runs with a gap for the 45-minute-misaligned Chatham
+// shift), while a spring-forward row may be shorter than an hour. It is
+// still capped at `cutoff`: the
 // time its value was recorded: the current hour accumulates live usage, so
 // a PAST window (previous period, calendar preset) shares its boundary hour
 // with the live window, and that hour's value must be divided by its real
@@ -957,7 +1032,7 @@ function overlapFractions(
   liveCell: boolean,
 ): Array<[number, number]> {
   const h = dayjs(hourBucket).startOf('hour');
-  const row = rowCoverage(h, 'hour', cutoff);
+  const row = rowCoverage(h, 'hour', cutoff, hourFieldFromBucket(hourBucket));
   if (row.coverage <= 0) return [];
   const perMin = 1 / row.coverage;
   const out: Array<[number, number]> = [];
@@ -1042,6 +1117,7 @@ function overlapFractions(
     for (const [i, c] of counts) out.push([i, c / coverageMs]);
     return out;
   }
+  const covStart = row.runs[0].from;
   const covEnd = row.runs[0].to;
   for (let i = 0; i < starts.length; i++) {
     const s = starts[i];
@@ -1050,7 +1126,7 @@ function overlapFractions(
     // recorded slice reaches to the row's coverage end, not to `until`.
     const clampEnd = s.valueOf() >= until.valueOf() ? covEnd : until.valueOf();
     const overlap = Math.min(e.valueOf(), covEnd, clampEnd)
-      - Math.max(s.valueOf(), h.valueOf(), since.valueOf());
+      - Math.max(s.valueOf(), covStart, since.valueOf());
     if (overlap > 0) out.push([i, perMin * (overlap / 60000)]);
   }
   return out;
@@ -1114,7 +1190,7 @@ export function bucketWindowShare(
   // hour; using the containing day/month here makes every row on a boundary
   // inherit the same calendar share.
   const start = h.startOf('hour');
-  const row = rowCoverage(start, 'hour', cutoff);
+  const row = rowCoverage(start, 'hour', cutoff, hourFieldFromBucket(hourBucket));
   const coverage = row.coverage;
   if (coverage <= 0) return 0;
   // The live cell exists when the row's recorded slice reaches past `until`
