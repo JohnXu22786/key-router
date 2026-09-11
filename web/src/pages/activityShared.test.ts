@@ -150,7 +150,7 @@ describe('series — continuous axis bucketing', () => {
 
     const ySince = dayjs('2026-01-01T00:00:00');
     const yUntil = dayjs('2026-03-01T23:59:59');
-    const yOut = series([row('2026-01-15T00:00:00'), row('2026-03-02T00:00:00')], () => 7, ySince, yUntil, yUntil, 'month');
+    const yOut = series([row('2026-01-15T00:00:00'), row('2026-03-01T12:00:00'), row('2026-03-02T00:00:00')], () => 7, ySince, yUntil, yUntil, 'month');
     expect(yOut.map(p => p.label)).toEqual(['2026-01', '2026-02', '2026-03']);
     expect(yOut.map(p => p.value)).toEqual([7, 0, 7]);
   });
@@ -531,7 +531,10 @@ describe('prevWindowUntil — the previous-period query keeps the mid-bucket sin
     // First day [Apr 30]: [09:30, 24:00) = 14.5/24; last day May 10:
     // [00:00, 09:30) = 9.5/24; interior days unchanged.
     expect(prevOut.series.map(p => p.value)).toEqual([29, 48, 48, 48, 48, 48, 48, 48, 48, 48, 19]);
-    expect(bucketWindowShare('2026-05-10T00:00:00', prevSince, since, cutoff, gran, false)).toBeCloseTo(9.5 / 24, 10);
+    // The Overview receives hourly rows, so the 00:00 row is wholly inside
+    // the previous window even though the server's daily aggregate is
+    // prorated to 9.5/24 above.
+    expect(bucketWindowShare('2026-05-10T00:00:00', prevSince, since, cutoff, gran, false)).toBe(1);
     // The current period takes the rest of May 10: [09:30, 24:00) = 14.5/24;
     // prev + cur tile the full day exactly (no gap, no double count).
     const curResp = serverResp(gran, since, queryWindowUntil({ key: CUSTOM_KEY, since, until, granularity: gran }, gran), 48);
@@ -626,16 +629,32 @@ describe('bucketWindowShare — rolling windows prorate boundary buckets', () =>
     expect(bucketWindowShare('2026-08-13T16:00:00', since, dayjs('2026-08-13T15:30:00'), dayjs('2026-08-13T16:05:00'), 'hour')).toBe(0);
   });
 
-  it('prorates day and month boundary buckets', () => {
+  it('prorates daily charts per hourly row at a custom boundary', () => {
     const since = dayjs('2026-08-10T12:00:00');
     const until = dayjs('2026-08-13T12:00:00');
-    // The 10th's usage before noon lies outside the window.
-    expect(bucketWindowShare('2026-08-10T00:00:00', since, until, until, 'day')).toBeCloseTo(12 / 24, 10);
-    expect(bucketWindowShare('2026-08-11T00:00:00', since, until, until, 'day')).toBe(1);
+    // Hourly rows are not daily totals: the row before noon is outside the
+    // window, while the row after noon is fully inside it.
+    expect(bucketWindowShare('2026-08-10T10:00:00', since, until, until, 'day')).toBe(0);
+    expect(bucketWindowShare('2026-08-10T13:00:00', since, until, until, 'day')).toBe(1);
+    const out = series([
+      { hour_bucket: '2026-08-10T10:00:00', v: 3 },
+      { hour_bucket: '2026-08-10T13:00:00', v: 5 },
+      { hour_bucket: '2026-08-11T00:00:00', v: 7 },
+    ], r => r.v, since, until, until, 'day', false);
+    expect(out.map(p => p.value)).toEqual([5, 7, 0, 0]);
+  });
+
+  it('prorates monthly charts per hourly row at custom month boundaries', () => {
     const mSince = dayjs('2026-01-10T00:00:00');
     const mUntil = dayjs('2026-03-20T00:00:00');
-    expect(bucketWindowShare('2026-01-01T00:00:00', mSince, mUntil, mUntil, 'month')).toBeCloseTo(22 / 31, 10);
-    expect(bucketWindowShare('2026-02-01T00:00:00', mSince, mUntil, mUntil, 'month')).toBe(1);
+    const out = series([
+      { hour_bucket: '2026-01-01T00:00:00', v: 3 },
+      { hour_bucket: '2026-01-10T13:00:00', v: 5 },
+      { hour_bucket: '2026-02-01T00:00:00', v: 7 },
+      { hour_bucket: '2026-03-19T23:00:00', v: 11 },
+      { hour_bucket: '2026-03-20T00:00:00', v: 13 },
+    ], r => r.v, mSince, mUntil, mUntil, 'month', false);
+    expect(out.map(p => p.value)).toEqual([5, 7, 11]);
   });
 
   it('prev and current windows never double-count the shared boundary hour', () => {

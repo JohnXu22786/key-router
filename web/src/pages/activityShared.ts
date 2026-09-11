@@ -1058,9 +1058,8 @@ function overlapFractions(
 
 // bucketWindowShare returns the fraction of a bucket's recorded value that
 // lies inside [since, until]. hour_bucket rows are truncated to the LOCAL
-// hour; the "bucket" is the containing hour/day/month for the corresponding
-// granularity — sub-hour windows (minute/min15) still have HOURLY rows, so
-// they share the 'hour' math (rowCoverageEnd's coverage, generalized).
+// hour; chart granularity only chooses the axis bucket. Every chart scale
+// therefore shares the same hourly-row coverage math.
 //
 // A bucket covers [start, start+unit); its recorded value only covers up to
 // `cutoff` (the fetch time) — the bucket containing cutoff accumulates live
@@ -1110,11 +1109,12 @@ export function bucketWindowShare(
   liveExtend = true,
 ): number {
   const h = dayjs(hourBucket);
-  // Rows are always hourly; day/month granularity aggregates the containing
-  // calendar unit, sub-hour (minute/min15) stays on the hour.
-  const rowUnit = granularity === 'day' ? 'day' : granularity === 'month' ? 'month' : 'hour';
-  const start = rowUnit === 'hour' ? h.startOf('hour') : rowUnit === 'day' ? h.startOf('day') : h.startOf('month');
-  const row = rowCoverage(start, rowUnit, cutoff);
+  // The API returns one row per hour even when the chart aggregates those
+  // rows into daily or monthly points. Prorate each row against its actual
+  // hour; using the containing day/month here makes every row on a boundary
+  // inherit the same calendar share.
+  const start = h.startOf('hour');
+  const row = rowCoverage(start, 'hour', cutoff);
   const coverage = row.coverage;
   if (coverage <= 0) return 0;
   // The live cell exists when the row's recorded slice reaches past `until`
