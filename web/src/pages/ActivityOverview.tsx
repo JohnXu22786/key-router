@@ -196,13 +196,17 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
         // that coverage. Preset bounds are already snapped in Activity.tsx;
         // keep the query at the displayed end boundary so the client can
         // discard the boundary bucket and never count outside the range.
-        const cutoff = dayjs();
         const [curRes, prevRes, keyRes] = await Promise.all([
           getConsumptions({ since: range.since.toISOString(), until: range.until.toISOString(), filter_type: filter?.type, filter_value: filter?.value }),
           getConsumptions({ since: prevSince.toISOString(), until: range.since.toISOString(), filter_type: filter?.type, filter_value: filter?.value }),
           getKeys(),
         ]);
         if (cancelled) return;
+        // Capture the response-time cutoff: a slow request can include usage
+        // recorded after it started, so the request-time cutoff would make
+        // the live boundary bucket's coverage too small and its value too
+        // large.
+        const cutoff = dayjs();
         setCurList(curRes.data);
         setPrevList(prevRes.data);
         setKeys(keyRes.data);

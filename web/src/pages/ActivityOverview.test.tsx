@@ -84,7 +84,40 @@ beforeEach(() => {
   vi.mocked(getKeys).mockResolvedValue({ data: [] } as unknown as Awaited<ReturnType<typeof getKeys>>);
 });
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
+
+describe('ActivityOverview response-time cutoff', () => {
+  it('uses the response-time cutoff for a slow response', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const requestStartedAt = dayjs('2026-08-13T10:00:00');
+    const responseAt = dayjs('2026-08-13T10:30:00');
+    vi.setSystemTime(requestStartedAt.toDate());
+
+    const requests: Array<ReturnType<typeof deferred<ConsumptionResponse>>> = [];
+    vi.mocked(getConsumptions).mockImplementation(() => {
+      const request = deferred<ConsumptionResponse>();
+      requests.push(request);
+      return request.promise;
+    });
+
+    render(<ActivityOverview range={customRange(
+      dayjs('2026-08-09T00:00:00'),
+      responseAt,
+    )} />);
+    await waitFor(() => expect(requests).toHaveLength(2));
+
+    vi.setSystemTime(responseAt.toDate());
+    await act(async () => {
+      requests[0].resolve(response([makeConsumption(100, '2026-08-13T10:00:00')]));
+      requests[1].resolve(response([]));
+    });
+
+    expect(await screen.findByText('$100.00')).not.toBeNull();
+  });
+});
 
 describe('ActivityOverview custom range refresh', () => {
   it('clears the previous snapshot when a custom range bound changes', async () => {
