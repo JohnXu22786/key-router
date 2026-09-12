@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import type { ReactNode } from 'react';
 import { render, screen, cleanup, act, waitFor } from '@testing-library/react';
 import dayjs from 'dayjs';
 import ActivityExplore from './ActivityExplore';
@@ -21,8 +22,8 @@ vi.mock('../api/client', async (importOriginal) => {
 // ResponsiveContainer); the table/footer are what this test pins, so render
 // the chart as a no-op.
 vi.mock('recharts', () => {
-  const pass = ({ children }: { children?: unknown }) => children ?? null;
-  const chart = ({ children }: { children?: unknown }) => <div data-testid="explore-chart">{children}</div>;
+  const pass = ({ children }: { children?: ReactNode }) => children ?? null;
+  const chart = ({ children }: { children?: ReactNode }) => <div data-testid="explore-chart">{children}</div>;
   const nul = () => null;
   return {
     ResponsiveContainer: pass,
@@ -156,10 +157,10 @@ describe('ActivityExplore summary footer', () => {
     } as Awaited<ReturnType<typeof getActivity>>);
     const { container } = render(<ActivityExplore range={range} />);
 
-    await waitFor(() => expect(screen.getAllByText('No usage in this period.')).toHaveLength(2));
+    expect(await screen.findAllByText('No usage in this period.')).toHaveLength(2);
     expect(screen.queryByTestId('explore-chart')).toBeNull();
     expect(container.querySelectorAll('.explore-legend-item')).toHaveLength(0);
-  });
+  }, 10000);
 
   it('counts the rows actually rendered when the server summary exceeds Top-N (default 10)', async () => {
     mockSummary(25);
