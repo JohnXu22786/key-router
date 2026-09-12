@@ -2560,14 +2560,26 @@ func buildActivityAxis(since, until time.Time, rollup string) []string {
 	case "hour":
 		// Keep the label cursor in UTC so a nonexistent local hour that
 		// normalizes backwards cannot make the loop repeat forever. Compare
-		// these wall-clock labels to the endpoint too: a spring-forward hour
-		// can normalize to a later instant (Chatham's 03:00 becomes 04:00),
-		// even though it is the bucket containing the requested endpoint.
+		// each resolved bucket start with the endpoint in real time: during
+		// Chatham's 45-minute fall-back, the first 03:00 precedes the second
+		// occurrence of 02:45 even though its wall-clock label is later.
 		loc := since.Location()
 		start := time.Date(since.Year(), since.Month(), since.Day(), since.Hour(), 0, 0, 0, time.UTC)
-		end := time.Date(until.Year(), until.Month(), until.Day(), until.Hour(), 0, 0, 0, time.UTC)
-		for label := start; !label.After(end); label = label.Add(time.Hour) {
+		for label := start; ; label = label.Add(time.Hour) {
 			t := time.Date(label.Year(), label.Month(), label.Day(), label.Hour(), 0, 0, 0, loc)
+			hasOverlap := false
+			for _, run := range activityHourRunsInLocation(t, loc) {
+				if !run.from.After(until) && run.to.After(since) {
+					hasOverlap = true
+					break
+				}
+			}
+			if !hasOverlap && t.After(until) {
+				break
+			}
+			if !hasOverlap {
+				continue
+			}
 			if b := bucketOf(t); len(bucketOrder) == 0 || bucketOrder[len(bucketOrder)-1] != b {
 				bucketOrder = append(bucketOrder, b)
 			}

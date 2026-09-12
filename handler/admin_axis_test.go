@@ -116,6 +116,30 @@ func TestBuildActivityAxisChathamSpringForward(t *testing.T) {
 	}
 }
 
+// TestBuildActivityAxisChathamFallBackKeepsEmptyFirstThreeBucket verifies
+// that a precise window ending in the second occurrence of 02:45 still
+// includes the persisted 03:00 label, even when no row exists to seed it.
+func TestBuildActivityAxisChathamFallBackKeepsEmptyFirstThreeBucket(t *testing.T) {
+	chatham, err := time.LoadLocation("Pacific/Chatham")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	since := time.Date(2026, 4, 5, 1, 30, 0, 0, chatham)
+	until := time.Date(2026, 4, 5, 2, 45, 0, 0,
+		time.FixedZone("CHAST", 12*60*60+45*60))
+
+	got := buildActivityAxis(since, until.Add(-time.Nanosecond), "hour")
+	want := []string{
+		"2026-04-05 01:00",
+		"2026-04-05 02:00",
+		"2026-04-05 03:00",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Chatham fall-back hour axis = %v, want %v", got, want)
+	}
+}
+
 func hasUnique(s []string) bool {
 	seen := make(map[string]bool, len(s))
 	for _, v := range s {
