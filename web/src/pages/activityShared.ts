@@ -444,6 +444,25 @@ function hourWallRunsForBucket(hourBucket: string): HourWallCoverage[] {
   });
 }
 
+// hourSortForWindow keeps a normalized spring-forward row on the wall-hour
+// label whose recorded run overlaps the requested window. On Chatham, a
+// persisted 04:00 row can contain both the normalized 03:00 alias
+// (03:45..04:00) and the real 04:00 hour. If a window ends at 03:50, the
+// serialized 04:00 label is outside the window and the visible data belongs
+// under 03:00 instead. Once the serialized label itself overlaps, it remains
+// authoritative so one merged row is not shown in two buckets.
+export function hourSortForWindow(hourBucket: string, since: dayjs.Dayjs, until: dayjs.Dayjs): string {
+  const serializedSort = hourSortFromBucket(hourBucket) ?? dayjs(hourBucket).format('YYYY-MM-DD HH:00');
+  const labels = hourWallRunsForBucket(hourBucket);
+  if (labels.length <= 1) return serializedSort;
+
+  const overlaps = (label: HourWallCoverage): boolean => label.runs.some(run =>
+    run.from < until.valueOf() && run.to > since.valueOf(),
+  );
+  if (labels.some(label => label.sort === serializedSort && overlaps(label))) return serializedSort;
+  return labels.find(overlaps)?.sort ?? serializedSort;
+}
+
 function clampCoverageRuns(
   base: Array<{ from: number; to: number }>,
   cutoff: dayjs.Dayjs,
