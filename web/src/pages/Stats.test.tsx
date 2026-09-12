@@ -73,7 +73,13 @@ const deferred = <T,>(): Deferred<T> => {
   return { promise, resolve, reject };
 };
 
-const response = <T,>(data: T) => ({ data }) as unknown as { data: T };
+const response = <T,>(data: T, headers: Record<string, string> = {}) => ({
+  data,
+  headers: {
+    ...headers,
+    get: (name: string) => headers[name.toLowerCase()],
+  },
+}) as unknown as { data: T };
 
 const makeConsumption = (keyId: number, cost: number, hourBucket = '2026-08-13T10:00:00Z'): Consumption => ({
   id: keyId,
@@ -260,6 +266,40 @@ describe('Stats range request races', () => {
     expect(screen.queryByText(/50\.0%/)).toBeNull();
     expect(screen.queryByText(/100\.0%/)).toBeNull();
     expect(screen.getAllByText('$0.00').length).toBeGreaterThan(0);
+  });
+});
+
+describe('Stats truncated responses', () => {
+  const resolveStatsRequests = () => {
+    requests.keys[0].resolve(response([makeKey(1, 'stats-key', 1)]) as KeysResponse);
+    requests.providers[0].resolve(response([makeProvider(1, 'stats-provider')]) as ProvidersResponse);
+  };
+
+  it('warns when the current-period response is truncated', async () => {
+    render(<Stats />);
+    await waitFor(() => expect(requests.consumptions).toHaveLength(2));
+
+    await act(async () => {
+      requests.consumptions[0].resolve(response([makeConsumption(1, 1)], { 'x-consumptions-truncated': 'true' }) as ConsumptionResponse);
+      requests.consumptions[1].resolve(response([] as Consumption[]) as ConsumptionResponse);
+      resolveStatsRequests();
+    });
+
+    expect(await screen.findByText(/activity data is incomplete/i)).not.toBeNull();
+    expect(screen.getByText(/narrow the time range or add a filter/i)).not.toBeNull();
+  });
+
+  it('warns when the previous-period response is truncated', async () => {
+    render(<Stats />);
+    await waitFor(() => expect(requests.consumptions).toHaveLength(2));
+
+    await act(async () => {
+      requests.consumptions[0].resolve(response([makeConsumption(1, 1)]) as ConsumptionResponse);
+      requests.consumptions[1].resolve(response([] as Consumption[], { 'x-consumptions-truncated': 'true' }) as ConsumptionResponse);
+      resolveStatsRequests();
+    });
+
+    expect(await screen.findByText(/activity data is incomplete/i)).not.toBeNull();
   });
 });
 

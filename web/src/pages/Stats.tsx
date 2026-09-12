@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import {
-  Card, Table, Typography, Spin, message, Row, Col, Button, Segmented, Space,
+  Alert, Card, Table, Typography, Spin, message, Row, Col, Button, Segmented, Space,
   Modal, Tabs,
 } from 'antd';
 import { ReloadOutlined } from '@ant-design/icons';
@@ -44,6 +44,16 @@ const COLORS = ['#6d5cff', '#22c1a3', '#ffb020', '#ff5f6d', '#3b82f6', '#a855f7'
 const hourlyBucketKey = (hourBucket: string, since: dayjs.Dayjs, until: dayjs.Dayjs): string =>
   hourSortForWindow(hourBucket, since, until);
 
+const responseWasTruncated = (response: Awaited<ReturnType<typeof getConsumptions>>) => {
+  const header = typeof response.headers?.get === 'function'
+    ? response.headers.get('X-Consumptions-Truncated')
+    : undefined;
+  const fallbackHeader = header
+    ?? response.headers?.['x-consumptions-truncated']
+    ?? response.headers?.['X-Consumptions-Truncated'];
+  return fallbackHeader === 'true' || fallbackHeader === true;
+};
+
 // ---- time ranges: Today / 24h / 3d / 7d / 30d (OpenRouter-style selector) ----
 const RANGES = [
   { key: 'today', label: 'Today', since: () => dayjs().startOf('day'), granularity: 'hour', granularityLabel: 'hourly' },
@@ -73,6 +83,7 @@ const Stats: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState(false);
+  const [truncated, setTruncated] = useState(false);
   const [statsWindow, setStatsWindow] = useState<{ since: dayjs.Dayjs; until: dayjs.Dayjs } | null>(null);
   const requestIdRef = useRef(0);
   // Detail modal: { metric, name } opens a per-dimension breakdown
@@ -107,6 +118,7 @@ const Stats: React.FC = () => {
       if (requestId !== requestIdRef.current) return;
       setConsumptions(prorateStatsConsumptions(curRes.data, sinceValue, untilValue, cutoff, r.granularity));
       setPrevConsumptions(prorateStatsConsumptions(prevRes.data, prevSinceValue, sinceValue, cutoff, r.granularity));
+      setTruncated(responseWasTruncated(curRes) || responseWasTruncated(prevRes));
       setStatsWindow({ since: sinceValue, until: untilValue });
       setKeys(keyRes.data);
       setProviders(provRes.data);
@@ -115,6 +127,7 @@ const Stats: React.FC = () => {
       if (requestId !== requestIdRef.current) return;
       setConsumptions([]);
       setPrevConsumptions([]);
+      setTruncated(false);
       setError(true);
       message.error('Failed to load stats');
     } finally {
@@ -280,6 +293,16 @@ const Stats: React.FC = () => {
 
       {error && (
         <Card style={{ marginBottom: 16 }}><Text type="danger">Failed to load stats — check the log file.</Text></Card>
+      )}
+
+      {truncated && (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 16 }}
+          title="Activity data is incomplete"
+          description="Totals and charts may be understated for this window. Narrow the time range or add a filter to see complete statistics."
+        />
       )}
 
       {/* KPI cards with "vs prev period" deltas */}
