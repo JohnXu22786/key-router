@@ -2558,14 +2558,16 @@ func buildActivityAxis(since, until time.Time, rollup string) []string {
 	var bucketOrder []string
 	switch rollup {
 	case "hour":
-		start := time.Date(since.Year(), since.Month(), since.Day(), since.Hour(), 0, 0, 0, since.Location())
 		// Keep the label cursor in UTC so a nonexistent local hour that
-		// normalizes backwards cannot make the loop repeat forever.
-		for label := time.Date(start.Year(), start.Month(), start.Day(), start.Hour(), 0, 0, 0, time.UTC); ; label = label.Add(time.Hour) {
-			t := time.Date(label.Year(), label.Month(), label.Day(), label.Hour(), 0, 0, 0, start.Location())
-			if t.After(until) {
-				break
-			}
+		// normalizes backwards cannot make the loop repeat forever. Compare
+		// these wall-clock labels to the endpoint too: a spring-forward hour
+		// can normalize to a later instant (Chatham's 03:00 becomes 04:00),
+		// even though it is the bucket containing the requested endpoint.
+		loc := since.Location()
+		start := time.Date(since.Year(), since.Month(), since.Day(), since.Hour(), 0, 0, 0, time.UTC)
+		end := time.Date(until.Year(), until.Month(), until.Day(), until.Hour(), 0, 0, 0, time.UTC)
+		for label := start; !label.After(end); label = label.Add(time.Hour) {
+			t := time.Date(label.Year(), label.Month(), label.Day(), label.Hour(), 0, 0, 0, loc)
 			if b := bucketOf(t); len(bucketOrder) == 0 || bucketOrder[len(bucketOrder)-1] != b {
 				bucketOrder = append(bucketOrder, b)
 			}
