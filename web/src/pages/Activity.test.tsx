@@ -49,9 +49,12 @@ const makeConsumption = (model_name: string, hour_bucket: string): Consumption =
   cost_usd: 1,
 });
 
-const response = (rows: Consumption[]) => ({
+const response = (rows: Consumption[], headers: Record<string, string> = {}) => ({
   data: rows,
-  headers: { get: () => undefined },
+  headers: {
+    ...headers,
+    get: (name: string) => headers[name.toLowerCase()],
+  },
 } as unknown as Awaited<ReturnType<typeof getConsumptions>>);
 
 beforeEach(() => {
@@ -80,6 +83,24 @@ describe('Activity filter candidates', () => {
     fireEvent.mouseDown(screen.getByRole('combobox'));
     expect((await screen.findAllByText('in-range-model')).length).toBeGreaterThan(0);
     expect(screen.queryByText('boundary-model')).toBeNull();
+  });
+
+  it('warns when truncated consumption rows may omit filter candidates', async () => {
+    vi.mocked(getConsumptions).mockResolvedValueOnce(response(
+      [makeConsumption('returned-model', '2026-08-13T15:00:00')],
+      { 'x-consumptions-truncated': 'true' },
+    ));
+
+    render(<Activity />);
+
+    fireEvent.click(screen.getByRole('button', { name: /filter filter/i }));
+    await waitFor(() => expect(getConsumptions).toHaveBeenCalledTimes(1));
+
+    expect(await screen.findByText(/filter options may be incomplete/i)).not.toBeNull();
+    expect(screen.getByText(/narrow the time range/i)).not.toBeNull();
+
+    fireEvent.mouseDown(screen.getByRole('combobox'));
+    expect((await screen.findAllByText('returned-model')).length).toBeGreaterThan(0);
   });
 
   it('refreshes candidates when the active time window changes', async () => {

@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useCallback, useMemo } from 'react';
-import { Typography, Space, Button, Spin, Popover, Segmented, Select, DatePicker, theme, message } from 'antd';
+import { Alert, Typography, Space, Button, Spin, Popover, Segmented, Select, DatePicker, theme, message } from 'antd';
 import { ReloadOutlined, CalendarOutlined, FilterOutlined, DownOutlined } from '@ant-design/icons';
 import dayjs from 'dayjs';
 import ActivityOverview from './ActivityOverview';
@@ -35,6 +35,16 @@ const Chip: React.FC<{ children: React.ReactNode }> = ({ children }) => (
 
 const rangeText = (r: DateRange): string =>
   `${r.since.format('MMM D, h:mm a')} – ${r.until.format('MMM D, h:mm a')}`;
+
+const responseWasTruncated = (response: Awaited<ReturnType<typeof getConsumptions>>) => {
+  const header = typeof response.headers?.get === 'function'
+    ? response.headers.get('X-Consumptions-Truncated')
+    : undefined;
+  const fallbackHeader = header
+    ?? response.headers?.['x-consumptions-truncated']
+    ?? response.headers?.['X-Consumptions-Truncated'];
+  return fallbackHeader === 'true' || fallbackHeader === true;
+};
 
 // EntityIcon renders a model's vendor favicon (or a letter avatar fallback)
 // in the filter panel's option list, matching the Explore/Trends rows.
@@ -84,6 +94,7 @@ const Activity: React.FC = () => {
   // refetch them constantly.
   const [filterOpts, setFilterOpts] = useState<{ models: string[]; apps: string[]; keys: Key[] } | null>(null);
   const [filterOptsLoading, setFilterOptsLoading] = useState(false);
+  const [filterOptsTruncated, setFilterOptsTruncated] = useState(false);
   const [rangeOpen, setRangeOpen] = useState(false);
 
   const range = useMemo<DateRange>(() => {
@@ -150,6 +161,7 @@ const Activity: React.FC = () => {
     let cancelled = false;
     const optionRange = range;
     setFilterOpts(null);
+    setFilterOptsTruncated(false);
     setFilterOptsLoading(true);
     Promise.all([
       getConsumptions({ since: optionRange.since.toISOString(), until: optionRange.until.toISOString() }),
@@ -177,10 +189,12 @@ const Activity: React.FC = () => {
         const keys = [...k.data].sort((a, b) =>
           (a.name || `Key #${a.id}`).localeCompare(b.name || `Key #${b.id}`));
         setFilterOpts({ models, apps, keys });
+        setFilterOptsTruncated(responseWasTruncated(c));
       })
       .catch(() => {
         if (cancelled) return;
         setFilterOpts(null);
+        setFilterOptsTruncated(false);
         message.error('Failed to load filter options');
       })
       .finally(() => { if (!cancelled) setFilterOptsLoading(false); });
@@ -274,6 +288,15 @@ const Activity: React.FC = () => {
           applyFilter(v, label);
         }}
       />
+      {filterOptsTruncated && (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginTop: 10 }}
+          title="Filter options may be incomplete"
+          description="Some older models or apps may be missing. Narrow the time range to load complete filter options."
+        />
+      )}
       {filter && (
         <div style={{ marginTop: 12, paddingTop: 10, borderTop: `1px solid rgba(120,120,140,0.14)`, display: 'flex', alignItems: 'center', gap: 8 }}>
           <span style={{ width: 8, height: 8, borderRadius: '50%', background: token.colorPrimary, flexShrink: 0 }} />
