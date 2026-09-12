@@ -198,9 +198,9 @@ describe('ActivityExplore summary footer', () => {
     expect(footer).toBeTruthy();
     expect(vi.mocked(getActivity)).toHaveBeenCalledWith(expect.objectContaining({ rollup: 'hour' }));
     // The hourly response sums to $130, while the 15-minute window contains
-    // only the corresponding slice ($21 with the fixed fixture and the
+    // only the corresponding slice ($20.8 with the fixed fixture and the
     // current-range live-minute behavior).
-    expect(container.textContent).toContain('$21');
+    expect(container.textContent).toContain('$20.8');
     expect(container.textContent).not.toContain('$130');
   });
 
