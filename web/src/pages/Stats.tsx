@@ -9,7 +9,7 @@ import {
   BarChart, Bar,
 } from 'recharts';
 import { getConsumptions, getOverview, getKeys, getProviders, Consumption, OverviewStats, Key, Provider } from '../api/client';
-import { cacheHitRate } from './activityShared';
+import { cacheHitRate, hourSortForWindow } from './activityShared';
 import { prorateStatsConsumptions } from './statsAggregation';
 import dayjs from 'dayjs';
 
@@ -41,6 +41,9 @@ const GRID = 'rgba(120,120,140,0.14)';
 const AXIS = 'rgba(120,120,140,0.75)';
 const COLORS = ['#6d5cff', '#22c1a3', '#ffb020', '#ff5f6d', '#3b82f6', '#a855f7', '#14b8a6', '#f59e0b'];
 
+const hourlyBucketKey = (hourBucket: string, since: dayjs.Dayjs, until: dayjs.Dayjs): string =>
+  hourSortForWindow(hourBucket, since, until);
+
 // ---- time ranges: Today / 24h / 3d / 7d / 30d (OpenRouter-style selector) ----
 const RANGES = [
   { key: 'today', label: 'Today', since: () => dayjs().startOf('day'), granularity: 'hour', granularityLabel: 'hourly' },
@@ -71,6 +74,7 @@ const Stats: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState(false);
+  const [statsWindow, setStatsWindow] = useState<{ since: dayjs.Dayjs; until: dayjs.Dayjs } | null>(null);
   const requestIdRef = useRef(0);
   // Detail modal: { metric, name } opens a per-dimension breakdown
   const [detail, setDetail] = useState<{ title: string; keyId?: number } | null>(null);
@@ -105,6 +109,7 @@ const Stats: React.FC = () => {
       if (requestId !== requestIdRef.current) return;
       setConsumptions(prorateStatsConsumptions(curRes.data, sinceValue, untilValue, cutoff, r.granularity));
       setPrevConsumptions(prorateStatsConsumptions(prevRes.data, prevSinceValue, sinceValue, cutoff, r.granularity));
+      setStatsWindow({ since: sinceValue, until: untilValue });
       setOverview(ovRes.data);
       setKeys(keyRes.data);
       setProviders(provRes.data);
@@ -133,12 +138,16 @@ const Stats: React.FC = () => {
 
   // ---- bucket key: hour or day depending on range granularity ----
   const bucketKey = useCallback((c: Consumption) => {
-    if (range.granularity === 'hour') return dayjs(c.hour_bucket).format('YYYY-MM-DD HH:00');
+    if (range.granularity === 'hour') {
+      const since = statsWindow?.since ?? range.since();
+      const until = statsWindow?.until ?? dayjs();
+      return hourlyBucketKey(c.hour_bucket, since, until);
+    }
     return dayjs(c.hour_bucket).format('YYYY-MM-DD');
-  }, [range.granularity]);
+  }, [range, statsWindow]);
 
   const bucketLabel = useCallback((k: string) => {
-    if (range.granularity === 'hour') return dayjs(k).format('MM-DD HH:00');
+    if (range.granularity === 'hour') return `${k.slice(5, 10)} ${k.slice(11)}`;
     return dayjs(k).format('MM-DD');
   }, [range.granularity]);
 
@@ -200,10 +209,12 @@ const Stats: React.FC = () => {
     // narrow to a single model's share of the hour. Hours are the unit (not
     // the chart's day buckets), matching the pre-split behavior of one row per
     // key+hour so the numbers keep their old meaning on every range.
+    const since = statsWindow?.since ?? range.since();
+    const until = statsWindow?.until ?? dayjs();
     const byHour = new Map<string, { key_id: number; name: string; total: number }>();
     for (const c of consumptions) {
       const v = metric === 'cost' ? c.cost_usd : metric === 'tokens' ? c.input_tokens + c.output_tokens : metric === 'requests' ? c.request_count : c.cache_hit_tokens;
-      const k = `${c.key_id}|${dayjs(c.hour_bucket).format('YYYY-MM-DD HH:00')}`;
+      const k = `${c.key_id}|${hourlyBucketKey(c.hour_bucket, since, until)}`;
       const e = byHour.get(k) || { key_id: c.key_id, name: keyName(c.key_id), total: 0 };
       e.total += v;
       byHour.set(k, e);
@@ -225,7 +236,7 @@ const Stats: React.FC = () => {
     }));
     rows.sort((a, b) => b.sum - a.sum);
     return rows;
-  }, [consumptions, metric, keyName]);
+  }, [consumptions, metric, keyName, range, statsWindow]);
 
   // ---- per-provider breakdown (Explore-style) ----
   const providerRows = useMemo(() => {

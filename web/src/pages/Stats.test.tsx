@@ -24,10 +24,13 @@ vi.mock('../api/client', async (importOriginal) => {
 
 vi.mock('recharts', () => {
   const pass = ({ children }: { children?: ReactNode }) => children ?? null;
+  const areaChart = ({ children, data }: { children?: ReactNode; data?: unknown }) => (
+    <div data-testid="area-chart" data-series={JSON.stringify(data ?? [])}>{children}</div>
+  );
   const nul = () => null;
   return {
     ResponsiveContainer: pass,
-    AreaChart: pass,
+    AreaChart: areaChart,
     Area: nul,
     XAxis: nul,
     YAxis: nul,
@@ -131,6 +134,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+  vi.unstubAllEnvs();
 });
 
 describe('Stats range request races', () => {
@@ -247,5 +251,57 @@ describe('Stats range request races', () => {
     expect(screen.queryByText(/50\.0%/)).toBeNull();
     expect(screen.queryByText(/100\.0%/)).toBeNull();
     expect(screen.getAllByText('$0.00').length).toBeGreaterThan(0);
+  });
+});
+
+describe('Stats Chatham spring-forward aggregation', () => {
+  it('keeps clipped 03:45-03:50 usage under the pre-normalization 03:00 bucket', async () => {
+    vi.stubEnv('TZ', 'Pacific/Chatham');
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-09-26T14:05:00.000Z')); // 03:50 +13:45
+
+    render(<Stats />);
+    await waitFor(() => {
+      expect(requests.consumptions).toHaveLength(2);
+      expect(requests.keys).toHaveLength(1);
+      expect(requests.overview).toHaveLength(1);
+      expect(requests.providers).toHaveLength(1);
+    });
+
+    await act(async () => {
+      requests.consumptions[0].resolve(response([] as Consumption[]) as ConsumptionResponse);
+      requests.consumptions[1].resolve(response([] as Consumption[]) as ConsumptionResponse);
+      requests.keys[0].resolve(response([makeKey(1, 'chatham-key', 1)]) as KeysResponse);
+      requests.overview[0].resolve(response({} as OverviewStats) as OverviewResponse);
+      requests.providers[0].resolve(response([makeProvider(1, 'chatham-provider')]) as ProvidersResponse);
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('3 days'));
+    });
+    await waitFor(() => {
+      expect(requests.consumptions).toHaveLength(4);
+      expect(requests.keys).toHaveLength(2);
+      expect(requests.overview).toHaveLength(2);
+      expect(requests.providers).toHaveLength(2);
+    });
+
+    await act(async () => {
+      requests.consumptions[2].resolve(response([makeConsumption(1, 60, '2026-09-27T04:00:00+13:45')]) as ConsumptionResponse);
+      requests.consumptions[3].resolve(response([] as Consumption[]) as ConsumptionResponse);
+      requests.keys[1].resolve(response([makeKey(1, 'chatham-key', 1)]) as KeysResponse);
+      requests.overview[1].resolve(response({} as OverviewStats) as OverviewResponse);
+      requests.providers[1].resolve(response([makeProvider(1, 'chatham-provider')]) as ProvidersResponse);
+    });
+
+    const series = JSON.parse((await screen.findByTestId('area-chart')).getAttribute('data-series')!);
+    expect(series).toEqual([{
+      t: '2026-09-27 03:00',
+      cost: 60,
+      tokens: 200,
+      requests: 1,
+      cache: 0,
+      label: '09-27 03:00',
+    }]);
   });
 });
