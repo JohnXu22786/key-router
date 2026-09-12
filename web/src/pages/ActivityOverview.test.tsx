@@ -50,15 +50,15 @@ if (typeof (window as unknown as { ResizeObserver?: unknown }).ResizeObserver !=
   };
 }
 
-const makeConsumption = (cost: number, hourBucket: string): Consumption => ({
+const makeConsumption = (cost: number, hourBucket: string, inputTokens = 100, outputTokens = 100): Consumption => ({
   id: 1,
   key_id: 1,
   hour_bucket: hourBucket,
   model_name: 'model',
   app_name: 'app',
   request_count: 1,
-  input_tokens: 100,
-  output_tokens: 100,
+  input_tokens: inputTokens,
+  output_tokens: outputTokens,
   cache_hit_tokens: 0,
   cache_write_tokens: 0,
   cost_usd: cost,
@@ -191,6 +191,27 @@ describe('ActivityOverview empty state', () => {
     expect(screen.queryByText('Key #1')).toBeNull();
     expect(screen.queryByText('app')).toBeNull();
     expect(screen.queryAllByText('Other')).toHaveLength(0);
+    expect(screen.queryAllByText('Prompt')).toHaveLength(0);
+    expect(screen.queryAllByText('Completion')).toHaveLength(0);
+    expect(screen.queryAllByText('Cached')).toHaveLength(0);
+    expect(screen.queryAllByText('Uncached')).toHaveLength(0);
+  });
+
+  it('uses a token-specific empty state when in-range usage has no tokens', async () => {
+    vi.mocked(getConsumptions)
+      .mockResolvedValueOnce(response([makeConsumption(100, '2026-08-01T12:00:00', 0, 0)]))
+      .mockResolvedValueOnce(response([]));
+
+    render(
+      <ActivityOverview
+        range={customRange(
+          dayjs('2026-08-01T00:00:00'),
+          dayjs('2026-08-02T00:00:00'),
+        )}
+      />,
+    );
+
+    await waitFor(() => expect(screen.getAllByText('No usage in this period.')).toHaveLength(4));
     expect(screen.queryAllByText('Prompt')).toHaveLength(0);
     expect(screen.queryAllByText('Completion')).toHaveLength(0);
     expect(screen.queryAllByText('Cached')).toHaveLength(0);
