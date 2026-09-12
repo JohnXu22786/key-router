@@ -64,7 +64,13 @@ const makeConsumption = (cost: number, hourBucket: string): Consumption => ({
   cost_usd: cost,
 });
 
-const response = (rows: Consumption[]) => ({ data: rows }) as unknown as ConsumptionResponse;
+const response = (rows: Consumption[], headers: Record<string, string> = {}) => ({
+  data: rows,
+  headers: {
+    ...headers,
+    get: (name: string) => headers[name.toLowerCase()],
+  },
+}) as unknown as ConsumptionResponse;
 
 const deferred = <T,>() => {
   let resolve!: (value: T) => void;
@@ -116,5 +122,34 @@ describe('ActivityOverview custom range refresh', () => {
       requests[3].resolve(response([]));
     });
     expect(await screen.findByText('$200.00')).not.toBeNull();
+  });
+});
+
+describe('ActivityOverview truncated responses', () => {
+  it('warns when the server truncates consumption rows', async () => {
+    vi.mocked(getConsumptions)
+      .mockResolvedValueOnce(response([makeConsumption(1, '2026-08-01T12:00:00')], { 'x-consumptions-truncated': 'true' }))
+      .mockResolvedValueOnce(response([]));
+
+    render(<ActivityOverview range={customRange(
+      dayjs('2026-08-01T00:00:00'),
+      dayjs('2026-08-02T00:00:00'),
+    )} />);
+
+    expect(await screen.findByText(/activity data is incomplete/i)).not.toBeNull();
+    expect(screen.getByText(/narrow the time range or add a filter/i)).not.toBeNull();
+  });
+
+  it('warns when the previous-period response is truncated', async () => {
+    vi.mocked(getConsumptions)
+      .mockResolvedValueOnce(response([makeConsumption(1, '2026-08-01T12:00:00')]))
+      .mockResolvedValueOnce(response([], { 'x-consumptions-truncated': 'true' }));
+
+    render(<ActivityOverview range={customRange(
+      dayjs('2026-08-01T00:00:00'),
+      dayjs('2026-08-02T00:00:00'),
+    )} />);
+
+    expect(await screen.findByText(/activity data is incomplete/i)).not.toBeNull();
   });
 });

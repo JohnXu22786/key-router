@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Card, Row, Col, Typography, Spin, message, theme } from 'antd';
+import { Alert, Card, Row, Col, Typography, Spin, message, theme } from 'antd';
 import { RightOutlined, PicRightOutlined, PicLeftOutlined } from '@ant-design/icons';
 import {
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -28,6 +28,16 @@ let keysRefForOverview = new Map<string, string>();
 
 const deltaPct = (cur: number, prev: number) =>
   prev > 0 ? ((cur - prev) / prev) * 100 : (cur > 0 ? 100 : 0);
+
+const responseWasTruncated = (response: Awaited<ReturnType<typeof getConsumptions>>) => {
+  const header = typeof response.headers?.get === 'function'
+    ? response.headers.get('X-Consumptions-Truncated')
+    : undefined;
+  const fallbackHeader = header
+    ?? response.headers?.['x-consumptions-truncated']
+    ?? response.headers?.['X-Consumptions-Truncated'];
+  return fallbackHeader === 'true' || fallbackHeader === true;
+};
 
 // ExploreLink: the card-header "Explore ›" link, like the reference page's
 // underlined Explore anchor on every chart/card header.
@@ -141,6 +151,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
   const [keys, setKeys] = useState<Key[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
+  const [truncated, setTruncated] = useState(false);
   // Last SUCCESSFUL fetch snapshot: while a refetch fails (server down, the
   // 30s slide keeps sliding "now"), the stale data stays rendered against
   // the window AND the fetch time it actually covers instead of being
@@ -175,6 +186,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
       setCurList([]);
       setPrevList([]);
       setWin(null);
+      setTruncated(false);
     }
     const fetch = async () => {
       setLoading(true);
@@ -194,6 +206,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
         setCurList(curRes.data);
         setPrevList(prevRes.data);
         setKeys(keyRes.data);
+        setTruncated(responseWasTruncated(curRes) || responseWasTruncated(prevRes));
         setWin({ since: range.since, until: range.until, granularity: range.granularity, prevSince, cutoff });
         keysRefForOverview = new Map(keyRes.data.map(k => [k.name || `Key #${k.id}`, k.key_value || '']));
       } catch { if (!cancelled) { setError(true); message.error('Failed to load activity'); } }
@@ -363,6 +376,15 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
 
   return (
     <div>
+      {truncated && (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 16 }}
+          title="Activity data is incomplete"
+          description="Totals and charts may be understated for this window. Narrow the time range or add a filter to see complete statistics."
+        />
+      )}
       {/* KPI cards with vs-prev chips + sparkline (OR: all sparklines #FF2D55).
           The whole card is a link to Explore, like the reference. */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 12, marginBottom: 16 }}>
