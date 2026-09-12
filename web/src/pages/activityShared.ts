@@ -946,10 +946,12 @@ function bucketStarts(since: dayjs.Dayjs, until: dayjs.Dayjs, granularity: Granu
       continue;
     }
     const next = cur.add(1, unit);
-    if (granularity === 'hour' && findFallBackBefore(cur) && next.minute() !== 0) {
-      // A fractional fall-back can leave the elapsed next hour inside the
-      // next wall-clock hour (Chatham: 02:45 -> 03:45). Advance to that
-      // hour's real start so an empty response bucket is still represented.
+    if (granularity === 'hour' && next.minute() !== 0
+      && (findFallBackBefore(cur) || findSpringForwardBefore(cur))) {
+      // A fractional DST transition can leave the elapsed next hour inside
+      // the next wall-clock hour (Chatham fall-back: 02:45 -> 03:45; Lord
+      // Howe spring-forward: 02:30 -> 03:30). Advance to that hour's real
+      // start so an empty response bucket is still represented.
       cur = next.subtract(next.minute(), 'minute');
     } else {
       cur = next;
