@@ -6,7 +6,7 @@ import {
   Tooltip as RTooltip, ResponsiveContainer,
 } from 'recharts';
 import { getActivity, getKeys, ActivityResponse } from '../api/client';
-import { DateRange, ActivityFilter, CUSTOM_KEY, filterKey, fmtUSD, fmtUSDInt, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtTick, fmtBucket, ExploreOpts, maskKey, toChartData, computeTrending, modelFavicon, ActivityOutputRollup, Granularity, activitySourcePlan, normalizeActivitySourceResponse, limitActivityResponse, liveExtensionEligible } from './activityShared';
+import { DateRange, ActivityFilter, filterKey, fmtUSD, fmtUSDInt, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtTick, fmtBucket, ExploreOpts, maskKey, toChartData, computeTrending, modelFavicon, ActivityOutputRollup, Granularity, activitySourcePlan, normalizeActivitySourceResponse, limitActivityResponse, liveExtensionEligible } from './activityShared';
 import dayjs from 'dayjs';
 const { Text } = Typography;
 
@@ -85,7 +85,7 @@ const TrendSection: React.FC<SectionProps> = ({ title, groupBy, range, filter, o
   // 30s range slide (same fetch key) keeps the previous chart while
   // refetching. Compared inside the effect: render-time ref writes would be
   // defeated by StrictMode's double render.
-  const fetchKey = `${range.key}|${groupBy}|${metric}|${filterKey(filter)}|${range.key === CUSTOM_KEY ? `${range.since.valueOf()}|${range.until.valueOf()}` : ''}`;
+  const fetchKey = `${range.key}|${groupBy}|${metric}|${filterKey(filter)}|${range.since.valueOf()}|${range.until.valueOf()}`;
   const prevKeyRef = useRef<string | null>(null);
   const [hidden, setHidden] = useState<Set<string>>(new Set());
   const [chartType, setChartType] = useState<ChartType>('bar');

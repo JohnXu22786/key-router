@@ -82,6 +82,15 @@ const range = (until: string): DateRange => ({
   granularity: 'day',
 });
 
+const presetRange = (since: string, until: string): DateRange => ({
+  key: 'today',
+  label: 'Today',
+  badge: '24h',
+  since: dayjs(since),
+  until: dayjs(until),
+  granularity: 'hour',
+});
+
 beforeEach(() => {
   vi.mocked(getActivity).mockReset();
   vi.mocked(getKeys).mockReset();
@@ -112,6 +121,41 @@ describe('ActivityTrends custom range refresh', () => {
     rerender(<ActivityTrends range={range('2026-08-15T00:00:00')} />);
     await waitFor(() => expect(requests).toHaveLength(12));
     expect(screen.queryAllByText('model-1')).toHaveLength(0);
+
+    await act(async () => {
+      requests.slice(6).forEach(request => request.reject(new Error('offline')));
+      await Promise.all(requests.slice(6).map(request => request.promise.catch(() => undefined)));
+    });
+    expect(screen.getAllByText(/Failed to load Models trends/).length).toBeGreaterThan(0);
+    expect(screen.queryAllByText('model-1')).toHaveLength(0);
+  });
+});
+
+describe('ActivityTrends preset range refresh', () => {
+  it('clears stale data when preset bounds advance and the replacement requests fail', async () => {
+    type ActivityResult = Awaited<ReturnType<typeof getActivity>>;
+    const requests: Array<ReturnType<typeof deferred<ActivityResult>>> = [];
+    vi.mocked(getActivity).mockImplementation(() => {
+      const request = deferred<ActivityResult>();
+      requests.push(request);
+      return request.promise;
+    });
+
+    const { rerender } = render(
+      <ActivityTrends range={presetRange('2026-08-14T00:00:00', '2026-08-15T00:00:00')} />,
+    );
+    await waitFor(() => expect(requests).toHaveLength(6));
+
+    await act(async () => {
+      requests.forEach(request => request.resolve({ data: response } as ActivityResult));
+      await Promise.all(requests.map(request => request.promise));
+    });
+    expect(screen.getAllByText('model-1').length).toBeGreaterThan(0);
+
+    rerender(
+      <ActivityTrends range={presetRange('2026-08-15T00:00:00', '2026-08-16T00:00:00')} />,
+    );
+    await waitFor(() => expect(requests).toHaveLength(12));
 
     await act(async () => {
       requests.slice(6).forEach(request => request.reject(new Error('offline')));
