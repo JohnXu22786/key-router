@@ -55,6 +55,7 @@ const response = (rows: Consumption[]) => ({
 } as unknown as Awaited<ReturnType<typeof getConsumptions>>);
 
 beforeEach(() => {
+  vi.resetAllMocks();
   vi.useFakeTimers({ toFake: ['Date'] });
   vi.setSystemTime(dayjs('2026-08-13T16:00:00').toDate());
   vi.mocked(getConsumptions).mockResolvedValue(response([
@@ -79,5 +80,44 @@ describe('Activity filter candidates', () => {
     fireEvent.mouseDown(screen.getByRole('combobox'));
     expect((await screen.findAllByText('in-range-model')).length).toBeGreaterThan(0);
     expect(screen.queryByText('boundary-model')).toBeNull();
+  });
+
+  it('refreshes candidates when the active time window changes', async () => {
+    vi.mocked(getConsumptions)
+      .mockResolvedValueOnce(response([makeConsumption('old-window-model', '2026-08-13T15:00:00')]))
+      .mockResolvedValueOnce(response([makeConsumption('new-window-model', '2026-08-13T14:00:00')]));
+
+    render(<Activity />);
+
+    fireEvent.click(screen.getByRole('button', { name: /filter filter/i }));
+    await waitFor(() => expect(getConsumptions).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole('button', { name: /^1d/ }));
+    fireEvent.click(screen.getByRole('button', { name: /Past 48 Hours/i }));
+    await waitFor(() => expect(getConsumptions).toHaveBeenCalledTimes(2));
+
+    fireEvent.mouseDown(screen.getByRole('combobox'));
+    expect((await screen.findAllByText('new-window-model')).length).toBeGreaterThan(0);
+    expect(screen.queryByText('old-window-model')).toBeNull();
+  });
+
+  it('clears stale candidates when a refresh fails', async () => {
+    vi.mocked(getConsumptions)
+      .mockResolvedValueOnce(response([makeConsumption('stale-model', '2026-08-13T15:00:00')]))
+      .mockRejectedValueOnce(new Error('filter options unavailable'));
+
+    render(<Activity />);
+
+    fireEvent.click(screen.getByRole('button', { name: /filter filter/i }));
+    await waitFor(() => expect(getConsumptions).toHaveBeenCalledTimes(1));
+    fireEvent.mouseDown(screen.getByRole('combobox'));
+    expect((await screen.findAllByText('stale-model')).length).toBeGreaterThan(0);
+
+    fireEvent.click(screen.getByRole('button', { name: /filter filter/i }));
+    fireEvent.click(screen.getByRole('button', { name: /filter filter/i }));
+    await waitFor(() => expect(getConsumptions).toHaveBeenCalledTimes(2));
+
+    fireEvent.mouseDown(screen.getByRole('combobox'));
+    await waitFor(() => expect(screen.queryAllByText('stale-model')).toHaveLength(0));
   });
 });
