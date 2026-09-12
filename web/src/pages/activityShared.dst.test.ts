@@ -161,6 +161,23 @@ describe('bucketStarts — DST axes under the half-open window', () => {
     expect(sorts).toEqual([...new Set(sorts)]);
     expect(sorts.every((s, i) => i === 0 || s > sorts[i - 1])).toBe(true);
   });
+
+  it('keeps a short axis inside the second occurrence on its true instant', () => {
+    // 01:15 EST .. 01:30 EST is 06:15Z .. 06:30Z. Flooring through the
+    // local wall fields would re-anchor the start to 01:15 EDT (05:15Z),
+    // causing the axis to include the wrong occurrence and the monotonic
+    // guard to discard the actual repeated labels.
+    const since = dayjs('2026-11-01T06:15:00.000Z');
+    const until = dayjs('2026-11-01T06:30:00.000Z');
+    const out = bucketAxis(since, until, 'minute');
+    expect(out.map(p => p.sort)).toEqual([
+      '2026-11-01 01:15', '2026-11-01 01:16', '2026-11-01 01:17',
+      '2026-11-01 01:18', '2026-11-01 01:19', '2026-11-01 01:20',
+      '2026-11-01 01:21', '2026-11-01 01:22', '2026-11-01 01:23',
+      '2026-11-01 01:24', '2026-11-01 01:25', '2026-11-01 01:26',
+      '2026-11-01 01:27', '2026-11-01 01:28', '2026-11-01 01:29',
+    ]);
+  });
 });
 
 // series() on a sub-hour axis must split the repeated row with the SAME real

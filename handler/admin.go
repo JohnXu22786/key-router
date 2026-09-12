@@ -2253,7 +2253,10 @@ type activityTimeRun struct {
 // or skipped wall-clock fields exactly while keeping long-range Activity
 // queries inexpensive.
 func activityHourRuns(hourBucket time.Time) []activityTimeRun {
-	loc := time.Local
+	return activityHourRunsInLocation(hourBucket, time.Local)
+}
+
+func activityHourRunsInLocation(hourBucket time.Time, loc *time.Location) []activityTimeRun {
 	year, month, day, hour := hourBucket.Year(), hourBucket.Month(), hourBucket.Day(), hourBucket.Hour()
 	start := time.Date(year, month, day, hour, 0, 0, 0, loc)
 	// A row cannot be persisted for a nonexistent wall-clock hour, but guard
@@ -2360,6 +2363,36 @@ func activityRowWindowShare(hourBucket, since, until, cutoff time.Time) float64 
 	return float64(overlap) / float64(coverage)
 }
 
+// activityHourQueryEnd returns the first persisted local-hour bucket label
+// whose resolved instant is after until and whose row cannot contain data in
+// [since, until). A local wall-clock hour can repeat during a DST fall-back,
+// and time.Date resolves an ambiguous label to one occurrence. Adding an
+// elapsed hour to that value can therefore produce an end before until: in
+// Pacific/Chatham, second-occurrence 02:45 follows the persisted 03:00 label,
+// even though time.Date(02:00).Add(time.Hour) resolves to an earlier instant.
+// Walk local hour labels and inspect their represented epoch runs so every
+// source row that can overlap the requested endpoint is fetched, while
+// ordinary zones retain the existing one-hour widening.
+func activityHourQueryEnd(since, until time.Time) time.Time {
+	loc := until.Location()
+	candidate := time.Date(until.Year(), until.Month(), until.Day(), until.Hour()+1, 0, 0, 0, loc)
+	for {
+		if candidate.After(until) {
+			needsCandidate := false
+			for _, run := range activityHourRunsInLocation(candidate, loc) {
+				if run.from.Before(until) && run.to.After(since) {
+					needsCandidate = true
+					break
+				}
+			}
+			if !needsCandidate {
+				return candidate
+			}
+		}
+		candidate = time.Date(candidate.Year(), candidate.Month(), candidate.Day(), candidate.Hour()+1, 0, 0, 0, loc)
+	}
+}
+
 // activityWindow widens a query range to the rollup buckets CONTAINING its
 // endpoints. hour_bucket rows are truncated to the LOCAL hour, so a window
 // starting at 16:05 must still match the 16:00 bucket (it holds the
@@ -2381,7 +2414,7 @@ func activityWindow(since, until time.Time, rollup string) (from, to time.Time) 
 		// to whole containing months and pull out-of-range usage into the
 		// single Total bucket.
 		from = time.Date(since.Year(), since.Month(), since.Day(), since.Hour(), 0, 0, 0, loc)
-		to = time.Date(until.Year(), until.Month(), until.Day(), until.Hour(), 0, 0, 0, loc).Add(time.Hour)
+		to = activityHourQueryEnd(since, until)
 	case "day":
 		from = time.Date(since.Year(), since.Month(), since.Day(), 0, 0, 0, 0, loc)
 		to = time.Date(until.Year(), until.Month(), until.Day(), 0, 0, 0, 0, loc).AddDate(0, 0, 1)

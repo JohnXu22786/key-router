@@ -122,6 +122,35 @@ func TestActivityWindowLocalHourFloor(t *testing.T) {
 	}
 }
 
+// TestActivityWindowSecondOccurrenceIncludesFollowingBucket verifies that an
+// hourly query ending during Pacific/Chatham's misaligned fall-back repeat
+// still fetches the row whose persisted 03:00 label starts before the second
+// occurrence of 02:45 in epoch time. Resolving the ambiguous 02:00 wall time
+// first and then adding an elapsed hour ends at 03:00 and omits that row.
+func TestActivityWindowSecondOccurrenceIncludesFollowingBucket(t *testing.T) {
+	oldLocal := time.Local
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	chatham, err := time.LoadLocation("Pacific/Chatham")
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Local = chatham
+
+	// The second occurrence of 02:45 is the transition instant, represented
+	// explicitly with Chatham's post-fallback fixed offset so time.Date cannot
+	// choose the first occurrence of the ambiguous wall time.
+	until := time.Date(2026, 4, 5, 2, 45, 0, 0, time.FixedZone("CHAST", 12*60*60+45*60)).In(chatham)
+	from, to := activityWindow(time.Date(2026, 4, 5, 1, 30, 0, 0, chatham), until, "hour")
+
+	if wantFrom := time.Date(2026, 4, 5, 1, 0, 0, 0, chatham); !from.Equal(wantFrom) {
+		t.Fatalf("hour window from = %v, want %v", from, wantFrom)
+	}
+	if wantTo := time.Date(2026, 4, 5, 4, 0, 0, 0, chatham); !to.Equal(wantTo) {
+		t.Fatalf("hour window to = %v, want %v (the 03:00 source row must be fetched)", to, wantTo)
+	}
+}
+
 // TestActivityRowWindowShareDSTReconstructsFixedOffsetBucket verifies the
 // precise Activity path against the way SQLite serializes HourBucket values:
 // the loaded time has a fixed offset even though RecordConsumption merged the

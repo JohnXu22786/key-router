@@ -776,16 +776,17 @@ function bucketLabel(granularity: Granularity, t: dayjs.Dayjs): { label: string;
 // time) — for hour granularity the repeat is consecutive ("01:00" twice),
 // for minute steps the whole repeated hour re-appears non-consecutively
 // ("01:59" then "01:00" again) — dropping the repeats keeps the axis
-// monotonic and the repeated hour's usage lands on its first occurrence.
-// (Rows serialized with the second occurrence's offset are re-anchored by
-// dayjs to the first occurrence's hour — the chart and the KPI proration
-// shift identically, so the totals stay consistent.)
+// monotonic and the repeated hour's usage lands on its first occurrence. The
+// initial floor must preserve the instant, however: startOf('minute')/
+// startOf('hour') reconstructs an ambiguous second-occurrence wall time as
+// the first occurrence, moving a short window such as [01:15 EST, 01:30 EST)
+// onto the wrong axis.
 function bucketStarts(since: dayjs.Dayjs, until: dayjs.Dayjs, granularity: Granularity): dayjs.Dayjs[] {
   const stepMin = STEP_MIN[granularity];
   const unit = granularity === 'hour' ? 'hour' : granularity === 'day' ? 'day' : 'month';
   const out: dayjs.Dayjs[] = [];
-  let cur = stepMin != null ? since.startOf('minute')
-    : granularity === 'hour' ? since.startOf('hour')
+  let cur = stepMin != null ? floorMinute(since)
+    : granularity === 'hour' ? floorWindowUntil(since, 'hour')
     : granularity === 'day' ? since.startOf('day')
     : since.startOf('month');
   if (granularity === 'min15') cur = cur.subtract(cur.minute() % 15, 'minute');
