@@ -922,7 +922,19 @@ function bucketStarts(since: dayjs.Dayjs, until: dayjs.Dayjs, granularity: Granu
   while (cur.isBefore(until)) {
     const sort = bucketLabel(granularity, cur).sort;
     if (sort > prevSort) { out.push(cur); prevSort = sort; }
-    cur = stepMin != null ? cur.add(stepMin, 'minute') : cur.add(1, unit);
+    if (stepMin != null) {
+      cur = cur.add(stepMin, 'minute');
+      continue;
+    }
+    const next = cur.add(1, unit);
+    if (granularity === 'hour' && findFallBackBefore(cur) && next.minute() !== 0) {
+      // A fractional fall-back can leave the elapsed next hour inside the
+      // next wall-clock hour (Chatham: 02:45 -> 03:45). Advance to that
+      // hour's real start so an empty response bucket is still represented.
+      cur = next.subtract(next.minute(), 'minute');
+    } else {
+      cur = next;
+    }
   }
   return out;
 }
