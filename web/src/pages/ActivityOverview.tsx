@@ -310,7 +310,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
   // Usage by model (spend, stacked bars, top-5 + Other like OR)
   const modelSpend = groupTotals(curList, c => c.model_name || 'Unknown', c => c.cost_usd, share);
   const topModels = modelSpend.slice(0, 5).map(([m]) => m);
-  const hasUsage = curList.length > 0;
+  const hasUsage = curList.some(c => share(c) > 0);
   const usageByModel = stackedData(curList, [...topModels, 'Other'], c => c.model_name || 'Unknown', c => c.cost_usd, axSince, axUntil, cutNow, gran);
   // Fold everything below top-5 into "Other" per bucket.
   const otherModelSet = new Set(modelSpend.slice(5).map(([m]) => m));
