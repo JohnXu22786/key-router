@@ -151,6 +151,31 @@ func TestActivityWindowSecondOccurrenceIncludesFollowingBucket(t *testing.T) {
 	}
 }
 
+// TestActivityWindowSpringForwardDoesNotStall verifies that the hourly query
+// end advances past a nonexistent local 02:00 label instead of reconstructing
+// the same normalized 01:00 candidate forever. Hourly and total rollups share
+// this boundary calculation.
+func TestActivityWindowSpringForwardDoesNotStall(t *testing.T) {
+	oldLocal := time.Local
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	newYork, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Local = newYork
+	since := time.Date(2026, 3, 8, 0, 30, 0, 0, newYork)
+	until := time.Date(2026, 3, 8, 1, 30, 0, 0, newYork)
+	wantFrom := time.Date(2026, 3, 8, 0, 0, 0, 0, newYork)
+	wantTo := time.Date(2026, 3, 8, 3, 0, 0, 0, newYork)
+	for _, rollup := range []string{"hour", "total"} {
+		from, to := activityWindow(since, until, rollup)
+		if !from.Equal(wantFrom) || !to.Equal(wantTo) {
+			t.Fatalf("%s window = %v..%v, want %v..%v", rollup, from, to, wantFrom, wantTo)
+		}
+	}
+}
+
 // TestActivityRowWindowShareDSTReconstructsFixedOffsetBucket verifies the
 // precise Activity path against the way SQLite serializes HourBucket values:
 // the loaded time has a fixed offset even though RecordConsumption merged the

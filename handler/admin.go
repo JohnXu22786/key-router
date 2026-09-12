@@ -2375,8 +2375,13 @@ func activityRowWindowShare(hourBucket, since, until, cutoff time.Time) float64 
 // ordinary zones retain the existing one-hour widening.
 func activityHourQueryEnd(since, until time.Time) time.Time {
 	loc := until.Location()
-	candidate := time.Date(until.Year(), until.Month(), until.Day(), until.Hour()+1, 0, 0, 0, loc)
+	// Keep the wall-clock label cursor in UTC. Constructing the next label from
+	// the previous candidate's normalized fields can repeat forever when a
+	// spring-forward gap makes time.Date(02:00, loc) resolve to 01:00. UTC has
+	// no local-time normalization, so each label advances exactly one hour.
+	label := time.Date(until.Year(), until.Month(), until.Day(), until.Hour()+1, 0, 0, 0, time.UTC)
 	for {
+		candidate := time.Date(label.Year(), label.Month(), label.Day(), label.Hour(), 0, 0, 0, loc)
 		if candidate.After(until) {
 			needsCandidate := false
 			for _, run := range activityHourRunsInLocation(candidate, loc) {
@@ -2389,7 +2394,7 @@ func activityHourQueryEnd(since, until time.Time) time.Time {
 				return candidate
 			}
 		}
-		candidate = time.Date(candidate.Year(), candidate.Month(), candidate.Day(), candidate.Hour()+1, 0, 0, 0, loc)
+		label = label.Add(time.Hour)
 	}
 }
 
