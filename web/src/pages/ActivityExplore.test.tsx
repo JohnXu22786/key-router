@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, cleanup, act } from '@testing-library/react';
+import { render, screen, cleanup, act, waitFor } from '@testing-library/react';
 import dayjs from 'dayjs';
 import ActivityExplore from './ActivityExplore';
 import { getActivity } from '../api/client';
@@ -117,6 +117,16 @@ const mockSummary = (n: number) => {
   } as Awaited<ReturnType<typeof getActivity>>);
 };
 
+const deferred = <T,>() => {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+};
+
 beforeEach(() => {
   vi.mocked(getActivity).mockReset();
 });
@@ -220,5 +230,48 @@ describe('ActivityExplore summary footer', () => {
     const calls = vi.mocked(getActivity).mock.calls;
     expect(calls.map(([params]) => params.metric).sort()).toEqual(['spend', 'tokens']);
     expect(calls.every(([params]) => params.rank_by === 'blended')).toBe(true);
+  });
+
+  it('clears stale data when custom bounds change and the replacement request fails', async () => {
+    type ActivityResult = Awaited<ReturnType<typeof getActivity>>;
+    const requests: Array<ReturnType<typeof deferred<ActivityResult>>> = [];
+    vi.mocked(getActivity).mockImplementation(() => {
+      const request = deferred<ActivityResult>();
+      requests.push(request);
+      return request.promise;
+    });
+
+    const firstRange: DateRange = {
+      key: 'custom',
+      label: 'Custom',
+      badge: '',
+      since: dayjs('2026-08-12T00:00:00'),
+      until: dayjs('2026-08-14T00:00:00'),
+      granularity: 'day',
+    };
+    const nextRange: DateRange = {
+      ...firstRange,
+      until: dayjs('2026-08-15T00:00:00'),
+    };
+
+    const { rerender } = render(<ActivityExplore range={firstRange} />);
+    await waitFor(() => expect(requests).toHaveLength(1));
+
+    await act(async () => {
+      requests[0].resolve({ data: makeResponse(1) } as ActivityResult);
+      await requests[0].promise;
+    });
+    expect(screen.getAllByText('model-1').length).toBeGreaterThan(0);
+
+    rerender(<ActivityExplore range={nextRange} />);
+    await waitFor(() => expect(requests).toHaveLength(2));
+    expect(screen.queryAllByText('model-1')).toHaveLength(0);
+
+    await act(async () => {
+      requests[1].reject(new Error('offline'));
+      await requests[1].promise.catch(() => undefined);
+    });
+    expect(screen.getAllByText(/Failed to load explore/).length).toBeGreaterThan(0);
+    expect(screen.queryAllByText('model-1')).toHaveLength(0);
   });
 });

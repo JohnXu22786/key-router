@@ -12,7 +12,7 @@ import {
 } from '@ant-design/icons';
 import { getActivity, ActivityResponse, ActivityGroupSummary } from '../api/client';
 import {
-  DateRange, ActivityFilter, filterKey, fmtUSDInt, fmtTokens, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS,
+  DateRange, ActivityFilter, CUSTOM_KEY, filterKey, fmtUSDInt, fmtTokens, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS,
   fmtPercent, fmt3sig, fmtTick, fmtBucket, modelFavicon, Granularity,
   ActivityOutputRollup, activitySourcePlan, liveExtensionEligible,
   normalizeActivitySourceResponse, combineBlendedResponses,
@@ -131,7 +131,7 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
   // 60s range slide (same fetch key) keeps the previous chart while
   // refetching. Compared inside the effect: render-time ref writes would be
   // defeated by StrictMode's double render.
-  const fetchKey = `${range.key}|${metric}|${groupBy}|${subgroup}|${rollup}|${topN}|${rankBy}|${filterKey(filter)}`;
+  const fetchKey = `${range.key}|${metric}|${groupBy}|${subgroup}|${rollup}|${topN}|${rankBy}|${filterKey(filter)}|${range.key === CUSTOM_KEY ? `${range.since.valueOf()}|${range.until.valueOf()}` : ''}`;
   const prevKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
