@@ -217,3 +217,78 @@ func TestActivityRowWindowShareDSTReconstructsFixedOffsetBucket(t *testing.T) {
 		t.Fatalf("Lord Howe repeated-hour share = %v, want 2/3", shareLordHowe)
 	}
 }
+
+// TestActivitySpringForwardNormalizedBuckets verifies the timestamps that
+// RecordConsumption persists when the requested local hour begins inside a
+// spring-forward gap. time.Date normalizes Lord Howe's 02:00 to 02:30 and
+// Chatham's 03:00 to 04:00; both rows must still retain their real epoch
+// coverage for precise windows and query widening.
+func TestActivitySpringForwardNormalizedBuckets(t *testing.T) {
+	oldLocal := time.Local
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	lordHowe, err := time.LoadLocation("Australia/Lord_Howe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Local = lordHowe
+	normalizedLordHowe := time.Date(2026, 10, 4, 2, 0, 0, 0, lordHowe)
+	if normalizedLordHowe.Hour() != 2 || normalizedLordHowe.Minute() != 30 {
+		t.Fatalf("Lord Howe normalized bucket = %v, want 02:30", normalizedLordHowe)
+	}
+	// GORM/SQLite returns the persisted timestamp with a fixed offset rather
+	// than the IANA location used while recording it.
+	persistedLordHowe := normalizedLordHowe.In(time.FixedZone("LHDT", 11*60*60))
+	lordHoweRuns := activityHourRunsInLocation(persistedLordHowe, lordHowe)
+	if len(lordHoweRuns) != 1 ||
+		!lordHoweRuns[0].from.Equal(time.Date(2026, 10, 4, 2, 30, 0, 0, lordHowe)) ||
+		!lordHoweRuns[0].to.Equal(time.Date(2026, 10, 4, 3, 0, 0, 0, lordHowe)) {
+		t.Fatalf("Lord Howe runs = %+v, want 02:30..03:00", lordHoweRuns)
+	}
+	lordHoweShare := activityRowWindowShare(
+		persistedLordHowe,
+		time.Date(2026, 10, 4, 2, 45, 0, 0, lordHowe),
+		time.Date(2026, 10, 4, 3, 0, 0, 0, lordHowe),
+		time.Date(2026, 10, 4, 4, 0, 0, 0, lordHowe),
+	)
+	if math.Abs(lordHoweShare-0.5) > 1e-9 {
+		t.Fatalf("Lord Howe spring-forward share = %v, want 0.5", lordHoweShare)
+	}
+
+	chatham, err := time.LoadLocation("Pacific/Chatham")
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Local = chatham
+	normalizedChatham := time.Date(2026, 9, 27, 3, 0, 0, 0, chatham)
+	if normalizedChatham.Hour() != 4 || normalizedChatham.Minute() != 0 {
+		t.Fatalf("Chatham normalized bucket = %v, want 04:00", normalizedChatham)
+	}
+	persistedChatham := normalizedChatham.In(time.FixedZone("CHADT", 13*60*60+45*60))
+	chathamRuns := activityHourRunsInLocation(persistedChatham, chatham)
+	if len(chathamRuns) != 1 ||
+		!chathamRuns[0].from.Equal(time.Date(2026, 9, 27, 3, 45, 0, 0, chatham)) ||
+		!chathamRuns[0].to.Equal(time.Date(2026, 9, 27, 5, 0, 0, 0, chatham)) {
+		t.Fatalf("Chatham runs = %+v, want 03:45..05:00", chathamRuns)
+	}
+	chathamShare := activityRowWindowShare(
+		persistedChatham,
+		time.Date(2026, 9, 27, 3, 45, 0, 0, chatham),
+		time.Date(2026, 9, 27, 4, 0, 0, 0, chatham),
+		time.Date(2026, 9, 27, 6, 0, 0, 0, chatham),
+	)
+	if math.Abs(chathamShare-0.2) > 1e-9 {
+		t.Fatalf("Chatham spring-forward share = %v, want 0.2", chathamShare)
+	}
+
+	// The 03:45–04:00 portion is stored under the 04:00 key. The query end
+	// must therefore pass the following 05:00 label so that SQL includes it.
+	_, to := activityWindow(
+		time.Date(2026, 9, 27, 3, 45, 0, 0, chatham),
+		time.Date(2026, 9, 27, 3, 50, 0, 0, chatham),
+		"hour",
+	)
+	if want := time.Date(2026, 9, 27, 5, 0, 0, 0, chatham); !to.Equal(want) {
+		t.Fatalf("Chatham spring-forward query end = %v, want %v", to, want)
+	}
+}

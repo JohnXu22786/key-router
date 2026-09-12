@@ -2251,53 +2251,121 @@ type activityTimeRun struct {
 // Ordinary rows use one Add(time.Hour) interval. Only rows within four hours
 // of a timezone transition take the minute walk; the walk preserves repeated
 // or skipped wall-clock fields exactly while keeping long-range Activity
-// queries inexpensive.
+// queries inexpensive. During a spring-forward gap, time.Date can normalize
+// the requested hour to a later wall time before it is persisted. The
+// normalized timestamp is therefore also matched back to every local hour
+// label that resolves to that instant (Chatham's 03:00 and 04:00 labels are
+// one such collision).
 func activityHourRuns(hourBucket time.Time) []activityTimeRun {
 	return activityHourRunsInLocation(hourBucket, time.Local)
 }
 
 func activityHourRunsInLocation(hourBucket time.Time, loc *time.Location) []activityTimeRun {
-	year, month, day, hour := hourBucket.Year(), hourBucket.Month(), hourBucket.Day(), hourBucket.Hour()
+	localBucket := hourBucket.In(loc)
+	year, month, day := localBucket.Date()
+	hour := localBucket.Hour()
 	start := time.Date(year, month, day, hour, 0, 0, 0, loc)
-	// A row cannot be persisted for a nonexistent wall-clock hour, but guard
-	// against a malformed/future row rather than assigning it to a different
-	// local hour after time.Date normalizes it across a spring gap.
-	wall := start.In(loc)
-	if wall.Year() != year || wall.Month() != month || wall.Day() != day || wall.Hour() != hour || wall.Minute() != 0 {
-		return nil
-	}
 
 	const transitionWindow = 4 * time.Hour
 	zoneStart, zoneEnd := start.ZoneBounds()
 	nearTransition := (!zoneStart.IsZero() && start.Sub(zoneStart) <= transitionWindow) ||
 		(!zoneEnd.IsZero() && zoneEnd.Sub(start) <= transitionWindow)
+	wall := start.In(loc)
+	validWallHour := wall.Year() == year && wall.Month() == month && wall.Day() == day &&
+		wall.Hour() == hour && wall.Minute() == 0
 	if !nearTransition {
+		// A normal persisted bucket is minute-aligned and cannot have any
+		// spring-forward aliases away from a transition.
+		if !validWallHour || localBucket.Minute() != 0 || localBucket.Second() != 0 || localBucket.Nanosecond() != 0 {
+			return nil
+		}
 		return []activityTimeRun{{from: start, to: start.Add(time.Hour)}}
 	}
 
-	// All current timezone transitions occur on a whole-minute boundary. The
-	// scan is anchored to the persisted hour's minute-zero instant, so every
-	// transition boundary remains exact and the returned runs are epoch ranges.
-	scanStart := start.Add(-transitionWindow)
-	scanEnd := start.Add(transitionWindow)
-	runs := make([]activityTimeRun, 0, 2)
-	var runStart time.Time
-	inRun := false
-	for t := scanStart; t.Before(scanEnd); t = t.Add(time.Minute) {
-		local := t.In(loc)
-		matches := local.Year() == year && local.Month() == month && local.Day() == day && local.Hour() == hour
-		if matches && !inRun {
-			runStart = t
-			inRun = true
-		} else if !matches && inRun {
-			runs = append(runs, activityTimeRun{from: runStart, to: t})
-			inRun = false
+	type wallHour struct {
+		year  int
+		month time.Month
+		day   int
+		hour  int
+	}
+	wallHours := make(map[wallHour]struct{}, 2)
+	addWallHour := func(y int, m time.Month, d, h int) {
+		if h < 0 || h > 23 {
+			return
+		}
+		wallHours[wallHour{year: y, month: m, day: d, hour: h}] = struct{}{}
+	}
+
+	// Keep the ordinary wall fields for a minute-aligned row. This is
+	// necessary for a fixed-offset value representing the second occurrence
+	// of an ambiguous fall-back hour: time.Date may resolve the same label to
+	// the other occurrence, but the row still represents both passes.
+	if validWallHour && localBucket.Minute() == 0 && localBucket.Second() == 0 && localBucket.Nanosecond() == 0 {
+		addWallHour(year, month, day, hour)
+	}
+
+	// Find spring-forward-normalized labels and any colliding valid label by
+	// comparing their resolved instants with the persisted timestamp. Search
+	// adjacent dates as well: a timezone transition may normalize a label
+	// across midnight, while ordinary dates are still handled by the direct
+	// wall-field path above.
+	for dayDelta := -1; dayDelta <= 1; dayDelta++ {
+		date := time.Date(year, month, day+dayDelta, 0, 0, 0, 0, loc)
+		for h := 0; h < 24; h++ {
+			candidate := time.Date(date.Year(), date.Month(), date.Day(), h, 0, 0, 0, loc)
+			if candidate.Equal(hourBucket) {
+				addWallHour(date.Year(), date.Month(), date.Day(), h)
+			}
 		}
 	}
-	if inRun {
-		runs = append(runs, activityTimeRun{from: runStart, to: scanEnd})
+	if len(wallHours) == 0 {
+		return nil
 	}
-	return runs
+
+	// A transition-near row needs the wall-label scan below. It is important
+	// to scan each alias separately: a normalized Chatham 04:00 row contains
+	// both the real 03:45–04:00 portion of the skipped 03:00 label and the
+	// following 04:00–05:00 hour, which are one persisted row after upsert.
+	runs := make([]activityTimeRun, 0, len(wallHours)*2)
+	for label := range wallHours {
+		labelStart := time.Date(label.year, label.month, label.day, label.hour, 0, 0, 0, loc)
+		scanStart := labelStart.Add(-transitionWindow)
+		scanEnd := labelStart.Add(transitionWindow)
+		var runStart time.Time
+		inRun := false
+		for t := scanStart; t.Before(scanEnd); t = t.Add(time.Minute) {
+			local := t.In(loc)
+			matches := local.Year() == label.year && local.Month() == label.month && local.Day() == label.day && local.Hour() == label.hour
+			if matches && !inRun {
+				runStart = t
+				inRun = true
+			} else if !matches && inRun {
+				runs = append(runs, activityTimeRun{from: runStart, to: t})
+				inRun = false
+			}
+		}
+		if inRun {
+			runs = append(runs, activityTimeRun{from: runStart, to: scanEnd})
+		}
+	}
+
+	// Alias runs can touch at a spring-forward normalization boundary. Merge
+	// them so coverage is counted once when a row holds both source labels.
+	sort.Slice(runs, func(i, j int) bool { return runs[i].from.Before(runs[j].from) })
+	merged := runs[:0]
+	for _, run := range runs {
+		if !run.to.After(run.from) {
+			continue
+		}
+		if len(merged) > 0 && !run.from.After(merged[len(merged)-1].to) {
+			if run.to.After(merged[len(merged)-1].to) {
+				merged[len(merged)-1].to = run.to
+			}
+			continue
+		}
+		merged = append(merged, run)
+	}
+	return merged
 }
 
 // activityRecordedHourRuns caps the row's represented runs at the response
