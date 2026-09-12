@@ -50,15 +50,15 @@ if (typeof (window as unknown as { ResizeObserver?: unknown }).ResizeObserver !=
   };
 }
 
-const makeConsumption = (cost: number, hourBucket: string): Consumption => ({
+const makeConsumption = (cost: number, hourBucket: string, inputTokens = 100, outputTokens = 100): Consumption => ({
   id: 1,
   key_id: 1,
   hour_bucket: hourBucket,
   model_name: 'model',
   app_name: 'app',
   request_count: 1,
-  input_tokens: 100,
-  output_tokens: 100,
+  input_tokens: inputTokens,
+  output_tokens: outputTokens,
   cache_hit_tokens: 0,
   cache_write_tokens: 0,
   cost_usd: cost,
@@ -151,5 +151,88 @@ describe('ActivityOverview truncated responses', () => {
     )} />);
 
     expect(await screen.findByText(/activity data is incomplete/i)).not.toBeNull();
+  });
+});
+
+describe('ActivityOverview empty state', () => {
+  it('shows the empty state for charts when the successful response has no usage', async () => {
+    vi.mocked(getConsumptions).mockResolvedValue(response([]));
+
+    render(
+      <ActivityOverview
+        range={customRange(
+          dayjs('2026-08-01T00:00:00'),
+          dayjs('2026-08-02T00:00:00'),
+        )}
+      />,
+    );
+
+    await waitFor(() => expect(screen.getAllByText('No usage in this period.')).toHaveLength(6));
+    expect(screen.queryAllByText('Other')).toHaveLength(0);
+    expect(screen.queryAllByText('Prompt')).toHaveLength(0);
+    expect(screen.queryAllByText('Completion')).toHaveLength(0);
+    expect(screen.queryAllByText('Cached')).toHaveLength(0);
+    expect(screen.queryAllByText('Uncached')).toHaveLength(0);
+  });
+
+  it('shows the empty state consistently when the only response row starts at the exclusive end', async () => {
+    const until = dayjs('2026-08-02T00:00:00');
+    vi.mocked(getConsumptions)
+      .mockResolvedValueOnce(response([makeConsumption(100, until.format('YYYY-MM-DDTHH:mm:ss'))]))
+      .mockResolvedValueOnce(response([]));
+
+    render(
+      <ActivityOverview
+        range={customRange(dayjs('2026-08-01T00:00:00'), until)}
+      />,
+    );
+
+    await waitFor(() => expect(screen.getAllByText('No usage in this period.')).toHaveLength(6));
+    expect(screen.queryByText('Key #1')).toBeNull();
+    expect(screen.queryByText('app')).toBeNull();
+    expect(screen.queryAllByText('Other')).toHaveLength(0);
+    expect(screen.queryAllByText('Prompt')).toHaveLength(0);
+    expect(screen.queryAllByText('Completion')).toHaveLength(0);
+    expect(screen.queryAllByText('Cached')).toHaveLength(0);
+    expect(screen.queryAllByText('Uncached')).toHaveLength(0);
+  });
+
+  it('uses a token-specific empty state when in-range usage has no tokens', async () => {
+    vi.mocked(getConsumptions)
+      .mockResolvedValueOnce(response([makeConsumption(100, '2026-08-01T12:00:00', 0, 0)]))
+      .mockResolvedValueOnce(response([]));
+
+    render(
+      <ActivityOverview
+        range={customRange(
+          dayjs('2026-08-01T00:00:00'),
+          dayjs('2026-08-02T00:00:00'),
+        )}
+      />,
+    );
+
+    await waitFor(() => expect(screen.getAllByText('No usage in this period.')).toHaveLength(4));
+    expect(screen.queryAllByText('Prompt')).toHaveLength(0);
+    expect(screen.queryAllByText('Completion')).toHaveLength(0);
+    expect(screen.queryAllByText('Cached')).toHaveLength(0);
+    expect(screen.queryAllByText('Uncached')).toHaveLength(0);
+  });
+
+  it('omits zero-share model groups before selecting chart legends', async () => {
+    const until = dayjs('2026-08-02T00:00:00');
+    const inRange = { ...makeConsumption(100, '2026-08-01T12:00:00'), model_name: 'in-range-model' };
+    const atExclusiveEnd = { ...makeConsumption(100, until.format('YYYY-MM-DDTHH:mm:ss')), model_name: 'boundary-model' };
+    vi.mocked(getConsumptions)
+      .mockResolvedValueOnce(response([inRange, atExclusiveEnd]))
+      .mockResolvedValueOnce(response([]));
+
+    render(
+      <ActivityOverview
+        range={customRange(dayjs('2026-08-01T00:00:00'), until)}
+      />,
+    );
+
+    await waitFor(() => expect(screen.getAllByRole('group', { name: 'in-range-model' })).toHaveLength(2));
+    expect(screen.queryAllByRole('group', { name: 'boundary-model' })).toHaveLength(0);
   });
 });

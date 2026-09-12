@@ -254,6 +254,10 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
 
   const cur = sum(curList, axSince, axUntil, cutNow);
   const prev = sum(prevList, prevWinSince, axSince, cutNow);
+  const hasSpend = cur.spend > 0;
+  const hasRequests = cur.requests > 0;
+  const hasTokens = cur.tokens > 0;
+  const hasPromptTokens = cur.input > 0;
   // Cache hit rate = cached / total input tokens (incl. cached) — one
   // consistent formula for both the KPI value and the sparkline.
   const rateFor = (l: Consumption[], since: dayjs.Dayjs, until: dayjs.Dayjs, cutoff: dayjs.Dayjs) => {
@@ -308,7 +312,8 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
 
   // --- Charts ---
   // Usage by model (spend, stacked bars, top-5 + Other like OR)
-  const modelSpend = groupTotals(curList, c => c.model_name || 'Unknown', c => c.cost_usd, share);
+  const modelSpend = groupTotals(curList, c => c.model_name || 'Unknown', c => c.cost_usd, share)
+    .filter(([, value]) => value > 0);
   const topModels = modelSpend.slice(0, 5).map(([m]) => m);
   const usageByModel = stackedData(curList, [...topModels, 'Other'], c => c.model_name || 'Unknown', c => c.cost_usd, axSince, axUntil, cutNow, gran);
   // Fold everything below top-5 into "Other" per bucket.
@@ -320,7 +325,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
     }
     (row as any).Other = sum;
   });
-  const modelGroups: LegendGroup[] = [...topModels, 'Other'].map((m, i) => ({
+  const modelGroups: LegendGroup[] = (hasSpend ? [...topModels, 'Other'] : []).map((m, i) => ({
     name: m,
     color: m === 'Other' ? OTHER_COLOR : CHART_COLORS[i % CHART_COLORS.length],
   }));
@@ -328,7 +333,8 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
   const modelColor = new Map(modelGroups.map(g => [g.name, g.color]));
 
   // Request volume by model (stacked bars, top-5 + Other)
-  const modelReqs = groupTotals(curList, c => c.model_name || 'Unknown', c => c.request_count, share);
+  const modelReqs = groupTotals(curList, c => c.model_name || 'Unknown', c => c.request_count, share)
+    .filter(([, value]) => value > 0);
   const topReqModels = modelReqs.slice(0, 5).map(([m]) => m);
   const reqByModel = stackedData(curList, [...topReqModels, 'Other'], c => c.model_name || 'Unknown', c => c.request_count, axSince, axUntil, cutNow, gran);
   const otherReqSet = new Set(modelReqs.slice(5).map(([m]) => m));
@@ -339,7 +345,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
     }
     (row as any).Other = sum;
   });
-  const reqGroups: LegendGroup[] = [...topReqModels, 'Other'].map((m, i) => ({
+  const reqGroups: LegendGroup[] = (hasRequests ? [...topReqModels, 'Other'] : []).map((m, i) => ({
     name: m,
     color: m === 'Other' ? OTHER_COLOR : CHART_COLORS[i % CHART_COLORS.length],
   }));
@@ -366,10 +372,11 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
   const keyTokens = groupTotals(curList, c => {
     const k = keys.find(x => x.id === c.key_id);
     return k?.name || `Key #${c.key_id}`;
-  }, c => c.input_tokens + c.output_tokens, share);
+  }, c => c.input_tokens + c.output_tokens, share).filter(([, value]) => value > 0);
   const topKeys = keyTokens.slice(0, 5);
 
-  const appTokens = groupTotals(curList, c => c.app_name || 'Unknown', c => c.input_tokens + c.output_tokens, share);
+  const appTokens = groupTotals(curList, c => c.app_name || 'Unknown', c => c.input_tokens + c.output_tokens, share)
+    .filter(([, value]) => value > 0);
   const topApps = appTokens.slice(0, 5);
 
   const kpiColors = ['#FF2D55', '#FF2D55', '#FF2D55', '#FF2D55', '#FF2D55'];
@@ -529,7 +536,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
           <ChartCard
             title="Token breakdown"
             extra={<ExploreLink onClick={() => goExplore({ metric: 'tokens' })} />}
-            groups={[{ name: 'Completion', color: '#a855f7' }, { name: 'Prompt', color: '#3b82f6' }]}
+            groups={hasTokens ? [{ name: 'Completion', color: '#a855f7' }, { name: 'Prompt', color: '#3b82f6' }] : []}
             renderChart={(vis) => (
               <ResponsiveContainer width="100%" height={260}>
                 <BarChart data={tokenBreakdown} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
@@ -550,7 +557,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
           <ChartCard
             title="Prompt token caching"
             extra={<ExploreLink onClick={() => goExplore({ metric: 'tokens' })} />}
-            groups={[{ name: 'Uncached', color: '#94a3b8' }, { name: 'Cached', color: '#f59e0b' }]}
+            groups={hasPromptTokens ? [{ name: 'Uncached', color: '#94a3b8' }, { name: 'Cached', color: '#f59e0b' }] : []}
             renderChart={(vis) => (
               <ResponsiveContainer width="100%" height={260}>
                 <BarChart data={caching} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
