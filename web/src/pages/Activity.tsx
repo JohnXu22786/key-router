@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
+import React, { useEffect, useState, useCallback, useMemo } from 'react';
 import { Typography, Space, Button, Spin, Popover, Segmented, Select, DatePicker, theme, message } from 'antd';
 import { ReloadOutlined, CalendarOutlined, FilterOutlined, DownOutlined } from '@ant-design/icons';
 import dayjs from 'dayjs';
@@ -139,17 +139,17 @@ const Activity: React.FC = () => {
 
   // --- Filter panel --------------------------------------------------------
 
-  // Fetch the entity options when the panel opens: models/apps are derived
-  // from the consumption rows of the CURRENT window (only entities with
-  // usage can be filtered), keys from the key table. The window is captured
-  // at open time — `range` stays OUT of the deps so the 30s slide doesn't
-  // refetch (and flicker the spinner) while the panel stays open.
-  const rangeRef = useRef(range);
-  rangeRef.current = range;
+  // Fetch the entity options when the panel opens or the effective window
+  // changes: models/apps are derived from the consumption rows of the
+  // CURRENT window (only entities with usage can be filtered), keys from the
+  // key table. Use the effective bounds as the dependency so a 30s tick that
+  // stays within the same bucket does not refetch needlessly.
+  const filterRangeKey = `${range.key}|${range.since.valueOf()}|${range.until.valueOf()}|${range.granularity}`;
   useEffect(() => {
     if (!filterOpen) return;
     let cancelled = false;
-    const optionRange = rangeRef.current;
+    const optionRange = range;
+    setFilterOpts(null);
     setFilterOptsLoading(true);
     Promise.all([
       getConsumptions({ since: optionRange.since.toISOString(), until: optionRange.until.toISOString() }),
@@ -178,10 +178,14 @@ const Activity: React.FC = () => {
           (a.name || `Key #${a.id}`).localeCompare(b.name || `Key #${b.id}`));
         setFilterOpts({ models, apps, keys });
       })
-      .catch(() => { if (!cancelled) message.error('Failed to load filter options'); })
+      .catch(() => {
+        if (cancelled) return;
+        setFilterOpts(null);
+        message.error('Failed to load filter options');
+      })
       .finally(() => { if (!cancelled) setFilterOptsLoading(false); });
     return () => { cancelled = true; };
-  }, [filterOpen]);
+  }, [filterOpen, filterRangeKey]);
 
   const onFilterOpenChange = (open: boolean) => {
     setFilterOpen(open);
