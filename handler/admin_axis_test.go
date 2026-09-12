@@ -98,6 +98,24 @@ func TestBuildActivityAxisLordHoweSpringForward(t *testing.T) {
 	}
 }
 
+// TestBuildActivityAxisChathamSpringForward keeps a precise window that lies
+// entirely inside Chatham's nonexistent 03:00 hour visible as the normalized
+// 04:00 bucket, even when there is no consumption row to seed the axis.
+func TestBuildActivityAxisChathamSpringForward(t *testing.T) {
+	chatham, err := time.LoadLocation("Pacific/Chatham")
+	if err != nil {
+		t.Fatal(err)
+	}
+	since := time.Date(2024, 9, 29, 3, 45, 0, 0, chatham)
+	until := time.Date(2024, 9, 29, 3, 50, 0, 0, chatham)
+
+	got := buildActivityAxis(since, until.Add(-time.Nanosecond), "hour")
+	want := []string{"2024-09-29 04:00"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Chatham spring-forward hour axis = %v, want %v", got, want)
+	}
+}
+
 func hasUnique(s []string) bool {
 	seen := make(map[string]bool, len(s))
 	for _, v := range s {
