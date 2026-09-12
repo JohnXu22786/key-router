@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"reflect"
 	"testing"
 	"time"
 )
@@ -68,6 +69,32 @@ func TestBuildActivityAxisLocalHourFloor(t *testing.T) {
 	axis := buildActivityAxis(since, since.Add(2*time.Hour), "hour")
 	if len(axis) != 3 || axis[0] != "2026-08-13 15:00" || axis[2] != "2026-08-13 17:00" {
 		t.Fatalf("hour axis = %v, want 15:00..17:00 local", axis)
+	}
+}
+
+// TestBuildActivityAxisLordHoweSpringForward pins local wall-clock stepping
+// across Lord Howe's 30-minute spring-forward gap. Persisted rows after the
+// transition use 03:00 and 04:00 labels; advancing by elapsed hours instead
+// produces 03:30 and 04:30 buckets that cannot contain those rows.
+func TestBuildActivityAxisLordHoweSpringForward(t *testing.T) {
+	lordHowe, err := time.LoadLocation("Australia/Lord_Howe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	since := time.Date(2026, 10, 4, 0, 0, 0, 0, lordHowe)
+	until := time.Date(2026, 10, 4, 5, 0, 0, 0, lordHowe)
+
+	got := buildActivityAxis(since, until, "hour")
+	want := []string{
+		"2026-10-04 00:00",
+		"2026-10-04 01:00",
+		"2026-10-04 02:00",
+		"2026-10-04 03:00",
+		"2026-10-04 04:00",
+		"2026-10-04 05:00",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Lord Howe spring-forward hour axis = %v, want %v", got, want)
 	}
 }
 

@@ -2538,7 +2538,8 @@ func activityWindow(since, until time.Time, rollup string) (from, to time.Time) 
 // requested rollup (hour|day|week|month|total), so days/hours without traffic
 // still appear (OR renders the full range). Hour buckets are floored to the
 // LOCAL hour (billing truncates hour_bucket to the local hour too — UTC
-// Truncate would misalign in half-hour-offset zones like +05:30); day/week
+// Truncate would misalign in half-hour-offset zones like +05:30); the hour
+// cursor advances through local wall-clock labels; day/week
 // step calendar-wise (AddDate) so a 25-hour DST fall-back day neither
 // duplicates a date label nor skips a week; the repeated wall-clock hour of
 // a fall-back keeps a single bucket (both passes aggregate into it by
@@ -2552,7 +2553,13 @@ func buildActivityAxis(since, until time.Time, rollup string) []string {
 	switch rollup {
 	case "hour":
 		start := time.Date(since.Year(), since.Month(), since.Day(), since.Hour(), 0, 0, 0, since.Location())
-		for t := start; !t.After(until); t = t.Add(time.Hour) {
+		// Keep the label cursor in UTC so a nonexistent local hour that
+		// normalizes backwards cannot make the loop repeat forever.
+		for label := time.Date(start.Year(), start.Month(), start.Day(), start.Hour(), 0, 0, 0, time.UTC); ; label = label.Add(time.Hour) {
+			t := time.Date(label.Year(), label.Month(), label.Day(), label.Hour(), 0, 0, 0, start.Location())
+			if t.After(until) {
+				break
+			}
 			if b := bucketOf(t); len(bucketOrder) == 0 || bucketOrder[len(bucketOrder)-1] != b {
 				bucketOrder = append(bucketOrder, b)
 			}
