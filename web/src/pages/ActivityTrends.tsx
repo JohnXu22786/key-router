@@ -6,7 +6,7 @@ import {
   Tooltip as RTooltip, ResponsiveContainer,
 } from 'recharts';
 import { getActivity, getKeys, ActivityResponse } from '../api/client';
-import { DateRange, ActivityFilter, filterKey, fmtUSD, fmtUSDInt, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtTick, fmtBucket, ExploreOpts, maskKey, toChartData, computeTrending, modelFavicon, ActivityOutputRollup, Granularity, activitySourcePlan, activitySourceQueryUntil, normalizeActivitySourceResponse, limitActivityResponse, prevWindowUntil, liveExtensionEligible } from './activityShared';
+import { DateRange, ActivityFilter, filterKey, fmtUSD, fmtUSDInt, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtTick, fmtBucket, ExploreOpts, maskKey, toChartData, computeTrending, modelFavicon, ActivityOutputRollup, Granularity, activitySourcePlan, normalizeActivitySourceResponse, limitActivityResponse, liveExtensionEligible } from './activityShared';
 import dayjs from 'dayjs';
 const { Text } = Typography;
 
@@ -128,26 +128,29 @@ const TrendSection: React.FC<SectionProps> = ({ title, groupBy, range, filter, o
         // `since` so the bucket CONTAINING it stays in the prev response and
         // its in-window slice [floor(since), since) is normalized (see
         // prevWindowUntil / normalizeHourlyResponse).
-        const queryCutoff = dayjs();
-        const curUntil = activitySourceQueryUntil(range, sourceRollup, queryCutoff, liveExtend);
-        const prevUntil = prevWindowUntil(range.since, previousPlan.sourceRollup as Granularity);
+        // Precise requests trim every hourly source row before rollup,
+        // ranking, and rate calculation. Pass the displayed half-open bounds
+        // directly; exclusive-until adjustments are only for raw responses
+        // and would remove the last recorded second from a precise response.
+        const curUntil = range.until;
+        const prevUntil = range.since;
         const fetchSource = async (
           plan: ReturnType<typeof activitySourcePlan>,
           sourceSince: dayjs.Dayjs,
           sourceUntil: dayjs.Dayjs,
         ) => {
-          const base = await getActivity({ metric, group_by: groupBy, rollup: plan.sourceRollup, top: 0, since: sourceSince.toISOString(), until: sourceUntil.toISOString(), filter_type: filter?.type, filter_value: filter?.value });
-          const boundary = await Promise.all((plan.boundary ?? []).map(edge => getActivity({
+          const base = await getActivity({
             metric,
             group_by: groupBy,
-            rollup: 'hour',
+            rollup: plan.sourceRollup,
             top: 0,
-            since: edge.since.toISOString(),
-            until: edge.until.toISOString(),
+            since: sourceSince.toISOString(),
+            until: sourceUntil.toISOString(),
+            precise: true,
             filter_type: filter?.type,
             filter_value: filter?.value,
-          })));
-          return { base: base.data, boundary: boundary.map(response => response.data) };
+          });
+          return { base: base.data, boundary: [] as ActivityResponse[] };
         };
         const [curRes, prevRes] = await Promise.all([
           fetchSource(currentPlan, range.since, curUntil),
@@ -176,6 +179,7 @@ const TrendSection: React.FC<SectionProps> = ({ title, groupBy, range, filter, o
           currentPlan.sourceRollup,
           outputRollup,
           liveExtend,
+          true,
         );
         const prevNormalized = normalizeActivitySourceResponse(
           prevRes.base,
@@ -187,6 +191,7 @@ const TrendSection: React.FC<SectionProps> = ({ title, groupBy, range, filter, o
           previousPlan.sourceRollup,
           outputRollup,
           false,
+          true,
         );
         setCur(limitActivityResponse(curNormalized, 5));
         setPrev(prevNormalized);

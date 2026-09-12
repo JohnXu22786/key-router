@@ -94,17 +94,21 @@ const makeResponse = (n: number): ActivityResponse => ({
   totals: { spend: n * 10, tokens: 0, requests: 0, cache: 0 },
 });
 
+// Explore requests the hourly source with precise=true, so the fixture's
+// boundary rows already contain their [15:50, 16:05) shares: 120 * 10/60
+// and 10 * 5/60. The client must re-bucket these values without prorating
+// them a second time.
 const makeHourlyResponse = (): ActivityResponse => ({
   metric: 'spend',
   group_by: 'model',
   rollup: 'hour',
   buckets: ['2026-08-13 15:00', '2026-08-13 16:00'],
   series: [
-    { bucket: '2026-08-13 15:00', group: 'model-1', value: 120, is_zero: false },
-    { bucket: '2026-08-13 16:00', group: 'model-1', value: 10, is_zero: false },
+    { bucket: '2026-08-13 15:00', group: 'model-1', value: 20, is_zero: false },
+    { bucket: '2026-08-13 16:00', group: 'model-1', value: 5 / 6, is_zero: false },
   ],
-  summary: [{ group: 'model-1', min: 10, max: 120, avg: 65, sum: 130, value: 10, percent: 100 }],
-  totals: { spend: 130, tokens: 0, requests: 0, cache: 0 },
+  summary: [{ group: 'model-1', min: 5 / 6, max: 20, avg: 125 / 12, sum: 125 / 6, value: 5 / 6, percent: 100 }],
+  totals: { spend: 125 / 6, tokens: 0, requests: 0, cache: 0 },
 });
 
 const mockSummary = (n: number) => {
@@ -196,10 +200,9 @@ describe('ActivityExplore summary footer', () => {
 
     const footer = await screen.findByText(/rows ·/);
     expect(footer).toBeTruthy();
-    expect(vi.mocked(getActivity)).toHaveBeenCalledWith(expect.objectContaining({ rollup: 'hour' }));
-    // The hourly response sums to $130, while the 15-minute window contains
-    // only the corresponding slice ($20.8 with the fixed fixture and the
-    // current-range live-minute behavior).
+    expect(vi.mocked(getActivity)).toHaveBeenCalledWith(expect.objectContaining({ rollup: 'hour', precise: true }));
+    // The precise hourly response sums to $20.833..., matching only the
+    // corresponding slice of the original $130 widened-hour fixture.
     expect(container.textContent).toContain('$20.8');
     expect(container.textContent).not.toContain('$130');
   });

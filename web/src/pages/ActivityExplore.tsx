@@ -14,7 +14,7 @@ import { getActivity, ActivityResponse, ActivityGroupSummary } from '../api/clie
 import {
   DateRange, ActivityFilter, filterKey, fmtUSDInt, fmtTokens, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS,
   fmtPercent, fmt3sig, fmtTick, fmtBucket, modelFavicon, Granularity,
-  ActivityOutputRollup, activitySourcePlan, activitySourceQueryUntil, liveExtensionEligible,
+  ActivityOutputRollup, activitySourcePlan, liveExtensionEligible,
   normalizeActivitySourceResponse, combineBlendedResponses,
   limitActivityResponse,
 } from './activityShared';
@@ -161,12 +161,12 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
         const liveExtend = liveExtensionEligible(range);
         const sourcePlan = activitySourcePlan(range, outputRollup, liveExtend);
         const requestRollup = sourcePlan.sourceRollup;
-        const queryCutoff = dayjs();
-        // A current-period range fetches through the current minute so a
-        // coarse source contains the live source bucket; the normalizer clips
-        // it to the selected range. Past/custom ranges retain the requested
-        // endpoint and are clipped by the boundary merge.
-        const curUntil = activitySourceQueryUntil(range, requestRollup, queryCutoff, liveExtend);
+        // Precise requests trim every hourly source row before the selected
+        // rollup, ranking, and blended-rate calculation. The endpoint still
+        // widens its SQL window to find boundary rows, so pass the displayed
+        // half-open end itself; an exclusive-until workaround would remove
+        // the final recorded second from an already precise row.
+        const curUntil = range.until;
         const responses = await Promise.all(sourceMetrics.map(async sourceMetric => {
           const base = await getActivity({
             metric: sourceMetric,
@@ -177,22 +177,11 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
             top: 0,
             since: range.since.toISOString(),
             until: curUntil.toISOString(),
+            precise: true,
             filter_type: filter?.type,
             filter_value: filter?.value,
           });
-          const boundary = await Promise.all((sourcePlan.boundary ?? []).map(edge => getActivity({
-            metric: sourceMetric,
-            group_by: groupBy,
-            subgroup: subgroup || undefined,
-            rollup: 'hour',
-            rank_by: sourceRankBy,
-            top: 0,
-            since: edge.since.toISOString(),
-            until: edge.until.toISOString(),
-            filter_type: filter?.type,
-            filter_value: filter?.value,
-          }))); 
-          return { base: base.data, boundary: boundary.map(response => response.data) };
+          return { base: base.data, boundary: [] as ActivityResponse[] };
         }));
         if (cancelled) return;
         // Capture the response-time cutoff: a slow request can include usage
@@ -212,6 +201,7 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
             sourcePlan.sourceRollup,
             outputRollup,
             liveExtend,
+            true,
           ));
         });
         const spend = normalizedByMetric.get('spend');

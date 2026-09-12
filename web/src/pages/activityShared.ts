@@ -339,6 +339,134 @@ function hourSortFromBucket(hourBucket: string): string | undefined {
   return `${match[1]} ${match[2]}:00`;
 }
 
+interface HourWallLabel {
+  field: number;
+  start: dayjs.Dayjs;
+}
+
+// hourWallLabelsForInstant reconstructs every local hour label that resolves
+// to the persisted bucket's instant. RecordConsumption builds HourBucket with
+// time.Date in the IANA local zone, so a spring-gap label can be normalized to
+// a later valid label (Lord Howe 02:00 -> 02:30; Chatham 03:00 -> 04:00).
+// The serialized value only contains the normalized timestamp; matching local
+// hour candidates back to that instant recovers both the source label and any
+// colliding valid label. The scan is limited to transition-near rows so normal
+// activity responses do not pay for a 72-candidate search per row.
+function hourWallLabelsForInstant(start: dayjs.Dayjs, wallField?: number): HourWallLabel[] {
+  const instant = start.valueOf();
+  const local = dayjs(instant);
+  const labels: HourWallLabel[] = [];
+  const seen = new Set<string>();
+  const add = (field: number, labelStart: dayjs.Dayjs) => {
+    if (field < 0 || field >= 24 * 60 || field % 60 !== 0) return;
+    const key = `${field}:${labelStart.valueOf()}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    labels.push({ field, start: labelStart });
+  };
+
+  // A minute-aligned serialized label is still useful as a direct fallback
+  // (and preserves the existing fixed-offset fall-back convention). A
+  // normalized spring label such as 02:30 is deliberately not treated as an
+  // ordinary 02:30 hour; the candidate scan below supplies its source 02:00
+  // field instead.
+  if (wallField !== undefined && wallField % 60 === 0) {
+    const hour = wallField / 60;
+    const labelStart = dayjs(new Date(local.year(), local.month(), local.date(), hour, 0, 0, 0));
+    add(wallField, labelStart);
+    // A hand-built/legacy response can retain a nonexistent source label
+    // (for example Chatham 03:00) even though Date normalizes its instant to
+    // 04:00. In that shape the serialized field is the authoritative source
+    // label. A real persisted normalized row either has a non-zero minute
+    // (Lord Howe 02:30) or has the normalized field itself (Chatham 04:00),
+    // both of which continue through the alias scan below.
+    if (wallField !== local.hour() * 60) return labels;
+  }
+
+  const nearTransition = dayjs(instant - 4 * 60 * 60 * 1000).utcOffset()
+    !== dayjs(instant + 4 * 60 * 60 * 1000).utcOffset();
+  if (nearTransition) {
+    // Date's local-field constructor has the same DST normalization rules as
+    // RecordConsumption's time.Date. Compare epochs, not formatted strings,
+    // so a normalized candidate and a valid colliding candidate are both
+    // retained when they resolve to this persisted instant.
+    for (let dayDelta = -1; dayDelta <= 1; dayDelta++) {
+      for (let hour = 0; hour < 24; hour++) {
+        const candidate = new Date(
+          local.year(), local.month(), local.date() + dayDelta, hour, 0, 0, 0,
+        );
+        if (candidate.valueOf() === instant) {
+          add(hour * 60, dayjs(candidate));
+        }
+      }
+    }
+  }
+
+  if (labels.length === 0) {
+    add(local.hour() * 60, dayjs(new Date(local.year(), local.month(), local.date(), local.hour(), 0, 0, 0)));
+  }
+  return labels.sort((a, b) => a.field - b.field || a.start.valueOf() - b.start.valueOf());
+}
+
+function mergeCoverageRuns(runs: Array<{ from: number; to: number }>): Array<{ from: number; to: number }> {
+  const sorted = runs
+    .filter(run => run.to > run.from)
+    .sort((a, b) => a.from - b.from || a.to - b.to);
+  const merged: Array<{ from: number; to: number }> = [];
+  for (const run of sorted) {
+    const last = merged[merged.length - 1];
+    if (last && run.from <= last.to) {
+      last.to = Math.max(last.to, run.to);
+    } else {
+      merged.push({ ...run });
+    }
+  }
+  return merged;
+}
+
+interface HourWallCoverage {
+  sort: string;
+  runs: Array<{ from: number; to: number }>;
+}
+
+function hourWallRunsForBucket(hourBucket: string): HourWallCoverage[] {
+  const start = dayjs(hourBucket).startOf('hour');
+  const date = /^(\d{4}-\d{2}-\d{2})/.exec(hourBucket)?.[1] ?? start.format('YYYY-MM-DD');
+  return hourWallLabelsForInstant(start, hourFieldFromBucket(hourBucket)).map(label => {
+    const repeated = repeatRuns(label.start);
+    const spring = repeated ? null : springRuns(label.start, label.field);
+    const runs = repeated ?? spring ?? [{
+      from: label.start.valueOf(),
+      to: label.start.add(1, 'hour').valueOf(),
+    }];
+    const hour = String(Math.floor(label.field / 60)).padStart(2, '0');
+    return { sort: `${date} ${hour}:00`, runs };
+  });
+}
+
+function clampCoverageRuns(
+  base: Array<{ from: number; to: number }>,
+  cutoff: dayjs.Dayjs,
+): Array<{ from: number; to: number }> {
+  const clamp = floorMinute(cutoff).valueOf();
+  const runs: Array<{ from: number; to: number }> = [];
+  for (const run of base) {
+    const to = Math.min(run.to, clamp);
+    if (to > run.from) {
+      runs.push({ from: run.from, to });
+      continue;
+    }
+    // A row created inside the first minute of a run is still represented by
+    // one recorded minute. Apply that rule per run: a normalized spring row
+    // can have a later alias run beginning exactly at the cutoff boundary.
+    if (cutoff.isAfter(run.from)) {
+      const rescuedTo = Math.min(run.to, run.from + 60000);
+      if (rescuedTo > run.from) runs.push({ from: run.from, to: rescuedTo });
+    }
+  }
+  return mergeCoverageRuns(runs);
+}
+
 // floorWindowUntil snaps a time to the START of the bucket that contains it
 // at the given granularity. Preset windows snap BOTH bounds to the bucket
 // grid so the window keeps its exact nominal length and the COMPLETED cells
@@ -873,18 +1001,32 @@ function axisForRows<T extends BucketedRow>(
   const axis = bucketAxis(since, until, granularity);
   if (granularity !== 'hour' || list.length === 0) return axis;
 
-  const sinceStart = floorWindowUntil(since, granularity);
-  const untilStart = floorWindowUntil(until, granularity);
-  const sinceSort = bucketLabel(granularity, sinceStart).sort;
-  const untilSort = bucketLabel(granularity, untilStart).sort;
-  const untilIsBoundary = untilStart.isSame(until);
   const points = new Map(axis.map(p => [p.sort, p]));
 
   for (const row of list) {
-    const sort = hourSortFromBucket(row.hour_bucket);
-    if (sort === undefined || sort < sinceSort || (untilIsBoundary ? sort >= untilSort : sort > untilSort)) continue;
-    if (!points.has(sort)) {
-      points.set(sort, { label: `${sort.slice(5, 10)} ${sort.slice(11)}`, sort, value: 0 });
+    // Use the real coverage runs rather than lexicographic wall-clock bounds.
+    // A normalized Chatham 04:00 row has a 03:00 alias beginning at the spring
+    // transition, even when the serialized 04:00 label is at the window end.
+    const labels = hourWallRunsForBucket(row.hour_bucket);
+    const serializedSort = hourSortFromBucket(row.hour_bucket);
+    const serializedOverlaps = serializedSort !== undefined
+      && labels.some(label => label.sort === serializedSort
+        && label.runs.some(run => run.from < until.valueOf() && run.to > since.valueOf()));
+    for (const label of labels) {
+      // A normalized row is indistinguishable from a valid row once the API
+      // formats it as `YYYY-MM-DD HH:00`. If the serialized label itself has
+      // visible coverage, keep that label authoritative; only expose an
+      // alias when the serialized label starts at the displayed end and the
+      // alias is the part of the merged row inside the window.
+      if (serializedOverlaps && label.sort !== serializedSort) continue;
+      if (!label.runs.some(run => run.from < until.valueOf() && run.to > since.valueOf())) continue;
+      if (!points.has(label.sort)) {
+        points.set(label.sort, {
+          label: `${label.sort.slice(5, 10)} ${label.sort.slice(11)}`,
+          sort: label.sort,
+          value: 0,
+        });
+      }
     }
   }
   return [...points.values()].sort((a, b) => a.sort.localeCompare(b.sort));
@@ -944,25 +1086,30 @@ export function rowCoverage(
   cutoff: dayjs.Dayjs,
   wallField?: number,
 ): RowCoverage {
-  const base = rowUnit === 'hour'
-    ? repeatRuns(start) ?? springRuns(start, wallField) ?? [{ from: start.valueOf(), to: start.add(1, 'hour').valueOf() }]
-    : [{ from: start.valueOf(), to: start.add(1, rowUnit).valueOf() }];
-  const clamp = floorMinute(cutoff).valueOf();
-  const runs: Array<{ from: number; to: number }> = [];
-  for (const r of base) {
-    const to = Math.min(r.to, clamp);
-    if (to > r.from) runs.push({ from: r.from, to });
+  let base: Array<{ from: number; to: number }>;
+  if (rowUnit !== 'hour') {
+    base = [{ from: start.valueOf(), to: start.add(1, rowUnit).valueOf() }];
+  } else {
+    // A normalized spring-forward bucket can represent more than one local
+    // label at the same instant. Build each label's real epoch coverage and
+    // merge touching runs: Lord Howe's normalized 02:30 row is 30 minutes,
+    // while Chatham's normalized 04:00 row combines 03:45..04:00 with the
+    // valid 04:00..05:00 hour for a 75-minute run.
+    base = mergeCoverageRuns(
+      hourWallLabelsForInstant(start, wallField).flatMap(label => {
+        const repeated = repeatRuns(label.start);
+        const spring = repeated ? null : springRuns(label.start, label.field);
+        return repeated ?? spring ?? [{
+          from: label.start.valueOf(),
+          to: label.start.add(1, 'hour').valueOf(),
+        }];
+      }),
+    );
   }
-  // Whole-minute extent (see floorMinute above): a cutoff inside the unit's
-  // FIRST minute floors to the unit start and would drop a row that
-  // demonstrably holds data — read at least the first whole minute then (a
-  // cutoff at or before the unit start still reads as no recorded data).
-  // For a spring-forward row, `start` may be V8's rolled-forward value, so
-  // use the first real run as the extent anchor. An entirely skipped row has
-  // no base run and must remain empty.
-  if (base.length > 0 && runs.length === 0 && cutoff.isAfter(base[0].from)) {
-    runs.push({ from: base[0].from, to: base[0].from + 60000 });
-  }
+  // Whole-minute extent (see floorMinute above): a cutoff inside any run's
+  // first minute must retain one minute of that run. This also keeps the UI
+  // and backend in sync when a spring-normalized row has multiple aliases.
+  const runs = clampCoverageRuns(base, cutoff);
   let coverage = 0;
   for (const r of runs) coverage += (r.to - r.from) / 60000;
   return { runs, coverage };
@@ -975,6 +1122,96 @@ export function rowCoverage(
 function rowCoverageEnd(start: dayjs.Dayjs, rowUnit: 'hour' | 'day' | 'week' | 'month', cutoff: dayjs.Dayjs): dayjs.Dayjs {
   const { runs } = rowCoverage(start, rowUnit, cutoff);
   return runs.length > 0 ? dayjs(runs[runs.length - 1].to) : dayjs(start.valueOf());
+}
+
+function hourAxisStarts<T extends BucketedRow>(
+  list: T[],
+  since: dayjs.Dayjs,
+  until: dayjs.Dayjs,
+  axis: SeriesPoint[],
+): Array<dayjs.Dayjs | undefined> {
+  const starts = new Map<string, dayjs.Dayjs>();
+  for (const start of bucketStarts(since, until, 'hour')) {
+    starts.set(bucketLabel('hour', start).sort, start);
+  }
+  for (const row of list) {
+    for (const label of hourWallRunsForBucket(row.hour_bucket)) {
+      if (!label.runs.length || starts.has(label.sort)) continue;
+      starts.set(label.sort, dayjs(label.runs[0].from));
+    }
+  }
+  // A live extension may append the point at `until` after axisForRows has
+  // built its row-derived map. Its instant is unambiguous because the point
+  // was created from the range boundary itself.
+  const untilSort = bucketLabel('hour', until).sort;
+  if (!starts.has(untilSort)) starts.set(untilSort, until);
+  return axis.map(point => starts.get(point.sort));
+}
+
+function hourlyAxisFractions<T extends BucketedRow>(
+  row: T,
+  since: dayjs.Dayjs,
+  until: dayjs.Dayjs,
+  cutoff: dayjs.Dayjs,
+  axis: SeriesPoint[],
+  starts: Array<dayjs.Dayjs | undefined>,
+  liveCell: boolean,
+): Array<[number, number]> {
+  const start = dayjs(row.hour_bucket).startOf('hour');
+  const coverage = rowCoverage(start, 'hour', cutoff, hourFieldFromBucket(row.hour_bucket));
+  if (coverage.coverage <= 0) return [];
+  const fractions = new Map<number, number>();
+  const addOverlap = (index: number, lo: number, hi: number) => {
+    if (hi > lo) fractions.set(index, (fractions.get(index) ?? 0) + (hi - lo) / 60000 / coverage.coverage);
+  };
+
+  const serializedSort = hourSortFromBucket(row.hour_bucket);
+  const serializedIndex = serializedSort === undefined
+    ? -1
+    : axis.findIndex(point => point.sort === serializedSort);
+  if (serializedIndex >= 0) {
+    let overlap = 0;
+    for (const run of coverage.runs) {
+      overlap += Math.max(0, Math.min(run.to, until.valueOf()) - Math.max(run.from, since.valueOf()));
+    }
+    if (liveCell) {
+      const cellEnd = until.add(1, 'hour').valueOf();
+      for (const run of coverage.runs) {
+        overlap += Math.max(0, Math.min(run.to, cellEnd) - Math.max(run.from, until.valueOf()));
+      }
+    }
+    if (overlap > 0) return [[serializedIndex, overlap / 60000 / coverage.coverage]];
+    return [];
+  }
+
+  // The serialized label is outside the half-open axis. This is the
+  // normalized Chatham shape: the persisted 04:00 label starts at the end of
+  // the skipped 03:00 row, while its alias carries the visible boundary
+  // slice. Split only this fallback by real coverage intervals.
+  for (const [index, cellStart] of starts.entries()) {
+    if (!cellStart) continue;
+    const cellEnd = starts[index + 1]?.valueOf() ?? cellStart.add(1, 'hour').valueOf();
+    if (cellEnd <= cellStart.valueOf()) continue;
+    for (const run of coverage.runs) {
+      addOverlap(
+        index,
+        Math.max(run.from, since.valueOf(), cellStart.valueOf()),
+        Math.min(run.to, until.valueOf(), cellEnd),
+      );
+    }
+  }
+
+  if (liveCell) {
+    const liveSort = bucketLabel('hour', until).sort;
+    const index = axis.findIndex(point => point.sort === liveSort);
+    if (index >= 0) {
+      const cellEnd = until.add(1, 'hour').valueOf();
+      for (const run of coverage.runs) {
+        addOverlap(index, Math.max(run.from, until.valueOf()), Math.min(run.to, cellEnd));
+      }
+    }
+  }
+  return [...fractions.entries()];
 }
 
 // overlapFractions splits ONE hourly row across the sub-hour axis buckets
@@ -1019,6 +1256,35 @@ function overlapFractions(
   if (row.coverage <= 0) return [];
   const perMin = 1 / row.coverage;
   const out: Array<[number, number]> = [];
+
+  // A normalized spring row is already aggregated under its serialized
+  // successor label by the API. When that label is visible, keep the whole
+  // corrected row on that source label rather than moving its pre-successor
+  // alias onto a different minute cell. If the source label is outside the
+  // half-open axis, the ordinary run-based fallback below places the visible
+  // boundary slice on the axis instead.
+  const labels = hourWallRunsForBucket(hourBucket);
+  const serializedSort = hourSortFromBucket(hourBucket);
+  if (labels.length > 1 && serializedSort !== undefined) {
+    const target = starts.findIndex(start =>
+      dayjs(start).format('YYYY-MM-DD HH:00') === serializedSort,
+    );
+    if (target >= 0) {
+      let overlap = 0;
+      for (const run of row.runs) {
+        overlap += Math.max(0, Math.min(run.to, until.valueOf()) - Math.max(run.from, since.valueOf()));
+      }
+      if (liveCell) {
+        const cellEnd = until.add(stepMin, 'minute').valueOf();
+        for (const run of row.runs) {
+          overlap += Math.max(0, Math.min(run.to, cellEnd) - Math.max(run.from, until.valueOf()));
+        }
+      }
+      if (overlap > 0) return [[target, overlap / 60000 * perMin]];
+      return [];
+    }
+  }
+
   if (isRepeatHour(h) || isRepeatHour(h.subtract(1, 'hour'))) {
     // DST fall-back: the repeated wall-clock hour covers two elapsed hours
     // (a non-contiguous pair of runs for the 15-minute-misaligned Chatham
@@ -1212,6 +1478,16 @@ export function series<T extends BucketedRow>(
   const liveP = livePoint(until, since, cutoff, granularity, new Set(axis.map(p => p.label)), liveExtend);
   if (liveP) axis.push(liveP);
   const stepMin = STEP_MIN[granularity];
+  if (granularity === 'hour') {
+    const starts = hourAxisStarts(list, since, until, axis);
+    const liveCell = hasLiveCell(until, since, cutoff, granularity, liveExtend);
+    for (const r of list) {
+      for (const [i, f] of hourlyAxisFractions(r, since, until, cutoff, axis, starts, liveCell)) {
+        axis[i].value += valFn(r) * f;
+      }
+    }
+    return axis;
+  }
   if (stepMin != null) {
     // Sub-hour axis: the rows are hourly, so distribute each row's value
     // over the minute buckets overlapping its hour.
@@ -1226,7 +1502,6 @@ export function series<T extends BucketedRow>(
     return axis;
   }
   const keyOf = (hourBucket: string): string => {
-    if (granularity === 'hour') return hourSortFromBucket(hourBucket) ?? dayjs(hourBucket).format('YYYY-MM-DD HH:00');
     const t = dayjs(hourBucket);
     return granularity === 'day' ? t.format('YYYY-MM-DD') : t.format('YYYY-MM');
   };
@@ -1266,6 +1541,18 @@ export function stackedData<T extends BucketedRow>(
     return row;
   });
   const stepMin = STEP_MIN[granularity];
+  if (granularity === 'hour') {
+    const starts = hourAxisStarts(list, since, until, axis);
+    const liveCell = hasLiveCell(until, since, cutoff, granularity, liveExtend);
+    for (const r of list) {
+      const g = keyFn(r);
+      const v = valFn(r);
+      for (const [i, f] of hourlyAxisFractions(r, since, until, cutoff, axis, starts, liveCell)) {
+        rows[i][g] = (rows[i][g] ?? 0) + v * f;
+      }
+    }
+    return rows;
+  }
   if (stepMin != null) {
     // Sub-hour axis: distribute each hourly row over its overlapping
     // minute buckets (see series).
@@ -1282,7 +1569,6 @@ export function stackedData<T extends BucketedRow>(
     return rows;
   }
   const keyOf = (hourBucket: string): string => {
-    if (granularity === 'hour') return hourSortFromBucket(hourBucket) ?? dayjs(hourBucket).format('YYYY-MM-DD HH:00');
     const t = dayjs(hourBucket);
     return granularity === 'day' ? t.format('YYYY-MM-DD') : t.format('YYYY-MM');
   };
@@ -1526,7 +1812,9 @@ function recomputeBlendedFromSeries(
 // ranked 6+ under top-5) are moved to the same scale by the grid's
 // aggregate factor inside recomputeFromSeries — without that, their raw
 // widened-window sums inflated the deltas against the previous period's
-// fully re-sampled ones.
+// fully re-sampled ones. `sourcePrecise` is used when the server has already
+// applied the hourly window share: visible overlap fractions are then
+// normalized by their sum instead of applying the boundary share again.
 export function resampleResponse(
   resp: ActivityResponse,
   since: dayjs.Dayjs,
@@ -1534,6 +1822,7 @@ export function resampleResponse(
   cutoff: dayjs.Dayjs,
   granularity: 'minute' | 'min15',
   liveExtend = false,
+  sourcePrecise = false,
 ): ActivityResponse {
   const stepMin = STEP_MIN[granularity]!;
   const starts = bucketStarts(since, until, granularity);
@@ -1556,6 +1845,9 @@ export function resampleResponse(
     const key = seriesCellKey(p.group, p.subgroup);
     let base = acc.get(key);
     if (!base) { base = new Map(); acc.set(key, base); }
+    const windowShare = sourcePrecise
+      ? bucketWindowShare(p.bucket, since, until, cutoff, granularity, liveExtend)
+      : 1;
     for (const [i, f] of overlapFractions(p.bucket, since, until, cutoff, starts, stepMin, liveCell)) {
       const b = buckets[i];
       let cellPresent = present.get(key);
@@ -1568,7 +1860,8 @@ export function resampleResponse(
         // rate as the number of cells grows.
         base.set(b, base.get(b) ?? p.value);
       } else {
-        base.set(b, (base.get(b) ?? 0) + p.value * f);
+        const factor = sourcePrecise ? (windowShare > 0 ? f / windowShare : 0) : f;
+        base.set(b, (base.get(b) ?? 0) + p.value * factor);
       }
     }
   }
@@ -1709,12 +2002,76 @@ export function activitySourceQueryUntil(
   return now.isBefore(unitEnd) ? now : unitEnd;
 }
 
+function rebucketHourlyResponse(
+  resp: ActivityResponse,
+  since: dayjs.Dayjs,
+  until: dayjs.Dayjs,
+  cutoff: dayjs.Dayjs,
+  liveExtend: boolean,
+  sourcePrecise: boolean,
+): ActivityResponse {
+  const rows = resp.series.map(point => ({ hour_bucket: point.bucket }));
+  const axis = axisForRows(rows, since, until, 'hour');
+  const liveP = livePoint(until, since, cutoff, 'hour', new Set(axis.map(point => point.label)), liveExtend);
+  if (liveP) axis.push(liveP);
+  const starts = hourAxisStarts(rows, since, until, axis);
+  const cells = collectSeriesCells(resp.series);
+  const includePresence = hasPresenceMetadata(resp.series);
+  const acc = new Map<string, Map<string, number>>();
+  const present = new Map<string, Set<string>>();
+
+  for (const point of resp.series) {
+    if (!seriesPointHasData(point)) continue;
+    const sourceRow = { hour_bucket: point.bucket };
+    const windowShare = sourcePrecise
+      ? bucketWindowShare(point.bucket, since, until, cutoff, 'hour', liveExtend)
+      : 1;
+    if (sourcePrecise && windowShare <= 0) continue;
+    const factorFor = (fraction: number) => sourcePrecise ? fraction / windowShare : fraction;
+    const key = seriesCellKey(point.group, point.subgroup);
+    let base = acc.get(key);
+    if (!base) { base = new Map(); acc.set(key, base); }
+    for (const [index, fraction] of hourlyAxisFractions(
+      sourceRow, since, until, cutoff, axis, starts,
+      hasLiveCell(until, since, cutoff, 'hour', liveExtend),
+    )) {
+      const bucket = axis[index].sort;
+      base.set(bucket, (base.get(bucket) ?? 0) + point.value * factorFor(fraction));
+      let cellPresent = present.get(key);
+      if (!cellPresent) { cellPresent = new Set(); present.set(key, cellPresent); }
+      cellPresent.add(bucket);
+    }
+  }
+
+  // Activity API responses use year-qualified hourly bucket labels. Keep that
+  // shape here even though the chart-axis helper also carries short labels.
+  const buckets = axis.map(point => point.sort);
+  const series: ActivitySeriesPoint[] = [];
+  for (const bucket of buckets) {
+    for (const cell of cells) {
+      const value = acc.get(cell.key)?.get(bucket) ?? 0;
+      series.push(addPresence({
+        bucket,
+        group: cell.group,
+        ...(cell.subgroup ? { subgroup: cell.subgroup } : {}),
+        value,
+        is_zero: value === 0,
+      }, includePresence, present.get(cell.key)?.has(bucket) ?? false));
+    }
+  }
+  const normalized: ActivityResponse = { ...resp, rollup: 'hour', buckets, series };
+  const { summary, totals } = recomputeFromSeries(normalized, series, buckets);
+  return { ...normalized, summary, totals };
+}
+
 // aggregateHourlyResponse converts an hourly response into the selected
 // calendar rollup after applying the exact hourly-window share to each row.
 // The server's day/week/month/total aggregates have already lost the hourly
 // distribution, so their single elapsed-time ratio cannot be correct for
 // non-uniform traffic. This helper keeps every hourly cell until after the
 // boundary trim, then recomputes the selected metric's summaries and totals.
+// When `sourcePrecise` is true, the server has already applied that share and
+// this function only re-buckets the corrected values.
 // It is intentionally additive-only; blended responses are built from the
 // separately normalized spend and token responses below.
 export function aggregateHourlyResponse(
@@ -1725,15 +2082,19 @@ export function aggregateHourlyResponse(
   rangeGranularity: Granularity,
   rollup: ActivityRollup,
   liveExtend = false,
+  sourcePrecise = false,
 ): ActivityResponse {
   if (resp.metric === 'blended' || resp.rollup !== 'hour') return resp;
+  if (rollup === 'hour') {
+    return rebucketHourlyResponse(resp, since, until, cutoff, liveExtend, sourcePrecise);
+  }
 
   const sourceBuckets = [...resp.buckets];
   for (const p of resp.series) {
     if (!sourceBuckets.includes(p.bucket)) sourceBuckets.push(p.bucket);
   }
   const includedSourceBuckets = sourceBuckets.filter(bucket =>
-    rollup === 'total' || bucketWindowShare(
+    sourcePrecise || rollup === 'total' || bucketWindowShare(
       bucket, since, until, cutoff, rangeGranularity, liveExtend,
     ) > 0,
   );
@@ -1746,7 +2107,9 @@ export function aggregateHourlyResponse(
   const present = new Map<string, Set<string>>();
   for (const p of resp.series) {
     if (!seriesPointHasData(p)) continue;
-    const share = bucketWindowShare(p.bucket, since, until, cutoff, rangeGranularity, liveExtend);
+    const share = sourcePrecise
+      ? 1
+      : bucketWindowShare(p.bucket, since, until, cutoff, rangeGranularity, liveExtend);
     if (share <= 0) continue;
     const bucket = rollupBucketLabel(p.bucket, rollup);
     const key = seriesCellKey(p.group, p.subgroup);
@@ -1779,7 +2142,10 @@ export function aggregateHourlyResponse(
 // so callers must retain hourly cells until after the requested window has
 // been applied. Sub-hour charts request an explicit minute/min15 output
 // rollup; all other rollups aggregate corrected hourly cells directly. The
-// range granularity alone must not override an Explore rollup selection.
+// range granularity alone must not override an Explore rollup selection. A
+// precise server response has already applied the row share; it still needs
+// client re-bucketing for short-range output, but must never be prorated a
+// second time.
 export function normalizeHourlyResponse(
   resp: ActivityResponse,
   since: dayjs.Dayjs,
@@ -1788,11 +2154,12 @@ export function normalizeHourlyResponse(
   rangeGranularity: Granularity,
   rollup: ActivityOutputRollup,
   liveExtend = false,
+  sourcePrecise = false,
 ): ActivityResponse {
   if (rollup === 'minute' || rollup === 'min15') {
-    return resampleResponse(resp, since, until, cutoff, rollup, liveExtend);
+    return resampleResponse(resp, since, until, cutoff, rollup, liveExtend, sourcePrecise);
   }
-  return aggregateHourlyResponse(resp, since, until, cutoff, rangeGranularity, rollup, liveExtend);
+  return aggregateHourlyResponse(resp, since, until, cutoff, rangeGranularity, rollup, liveExtend, sourcePrecise);
 }
 
 function seriesPointMap(resp: ActivityResponse): Map<string, ActivitySeriesPoint> {
@@ -2164,10 +2531,11 @@ export function normalizeActivitySourceResponse(
   sourceRollup: ActivityRollup,
   outputRollup: ActivityOutputRollup,
   liveExtend = false,
+  sourcePrecise = false,
 ): ActivityResponse {
   if (resp.rollup === 'hour') {
     return normalizeHourlyResponse(
-      resp, since, until, cutoff, rangeGranularity, outputRollup, liveExtend,
+      resp, since, until, cutoff, rangeGranularity, outputRollup, liveExtend, sourcePrecise,
     );
   }
   const merged = mergeActivityBoundaryResponses(

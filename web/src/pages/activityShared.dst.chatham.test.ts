@@ -16,7 +16,7 @@
 // Australia/Lord_Howe via activityShared.dst.lordhowe.test.ts).
 import { describe, it, expect, vi, beforeAll } from 'vitest';
 import dayjs from 'dayjs';
-import { bucketWindowShare, floorWindowUntil, rowCoverage, series, stackedData, prorateBoundaryBuckets } from './activityShared';
+import { bucketWindowShare, floorWindowUntil, rowCoverage, series, stackedData, prorateBoundaryBuckets, normalizeHourlyResponse } from './activityShared';
 import type { ActivityResponse } from '../api/client';
 
 beforeAll(() => {
@@ -265,7 +265,49 @@ describe('prorateBoundaryBuckets — Chatham boundary buckets', () => {
     const buckets = ['2026-09-27 03:00', '2026-09-27 04:00'];
     const out = prorateBoundaryBuckets(resp(buckets, [900, 60]), since, until, until, cutoff, 'hour', 'hour');
 
-    expect(out.series.map(p => p.value)).toEqual([0, 20]);
+    // The real persisted 04:00 row also contains the normalized 03:00
+    // label's 03:45..04:00 slice, so its 20-minute window overlap is 20/75
+    // of the row rather than 20/60.
+    expect(out.series.map(p => p.value)).toEqual([0, 16]);
+  });
+});
+
+describe('normalized Chatham spring-forward buckets', () => {
+  it('reconstructs the persisted 04:00 row from the 03:00 alias', () => {
+    const bucket = '2026-09-27T04:00:00+13:45';
+    const cutoff = dayjs('2026-09-27T06:00:00');
+    const coverage = rowCoverage(dayjs(bucket), 'hour', cutoff);
+    expect(coverage.coverage).toBe(75);
+    expect(coverage.runs).toEqual([{
+      from: dayjs('2026-09-26T14:00:00.000Z').valueOf(),
+      to: dayjs('2026-09-26T15:15:00.000Z').valueOf(),
+    }]);
+
+    const since = dayjs('2026-09-26T14:00:00.000Z');
+    const until = dayjs('2026-09-26T14:15:00.000Z');
+    expect(bucketWindowShare(bucket, since, until, cutoff, 'hour')).toBeCloseTo(0.2, 10);
+    const chart = series([{ hour_bucket: bucket, value: 75 }], r => r.value, since, until, cutoff, 'hour');
+    expect(chart.map(point => point.value)).toEqual([15]);
+  });
+
+  it('keeps a precise normalized response on the visible boundary axis', () => {
+    const response: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'hour',
+      buckets: ['2026-09-27 04:00'],
+      series: [{ bucket: '2026-09-27 04:00', group: 'a', value: 15, is_zero: false }],
+      summary: [{ group: 'a', min: 15, max: 15, avg: 15, sum: 15, value: 15, percent: 100 }],
+      totals: { spend: 15, tokens: 0, requests: 0, cache: 0 },
+    };
+    const out = normalizeHourlyResponse(
+      response,
+      dayjs('2026-09-26T14:00:00.000Z'),
+      dayjs('2026-09-26T14:15:00.000Z'),
+      dayjs('2026-09-26T15:00:00.000Z'),
+      'hour', 'hour', false, true,
+    );
+    expect(out.buckets).toEqual(['2026-09-27 03:00']);
+    expect(out.series.map(point => point.value)).toEqual([15]);
+    expect(out.totals.spend).toBe(15);
   });
 });
 
@@ -393,7 +435,9 @@ describe('series — a window crossing the Chatham spring keeps chart total == K
     const cutoff = dayjs('2026-09-26T15:45:00.000Z');
     const out = series(ROWS, r => r.v, since, until, cutoff, 'min15', false);
     const kpi = ROWS.reduce((a, r) => a + r.v * bucketWindowShare(r.hour_bucket, since, until, cutoff, 'hour', false), 0);
-    expect(kpi).toBeCloseTo(1515, 10);
+    // The normalized 04:00 row includes 03:45..04:00 as well as its valid
+    // 04:00..05:00 coverage, so 30 of its 75 minutes are in-window.
+    expect(kpi).toBeCloseTo(1524, 10);
     expect(out.reduce((a, p) => a + p.value, 0)).toBeCloseTo(kpi, 10);
     // The exact axis values for clarity; use numeric tolerance for the
     // repeated 600 / 3 calculation.
@@ -402,7 +446,7 @@ describe('series — a window crossing the Chatham spring keeps chart total == K
     expect(out[1].value).toBeCloseTo(200, 10);
     expect(out[2].value).toBeCloseTo(200, 10);
     expect(out[3].value).toBeCloseTo(900, 10);
-    expect(out[4].value).toBeCloseTo(15, 10);
+    expect(out[4].value).toBeCloseTo(24, 10);
   });
 });
 
