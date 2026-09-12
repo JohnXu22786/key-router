@@ -273,6 +273,7 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
 
   // NOTE: all hooks must be called before any early return below.
   const summary = (data?.summary ?? []).slice(0, topN);
+  const empty = data !== null && (data.buckets.length === 0 || data.series.length === 0 || summary.length === 0);
   const sorted = useMemo(() => {
     if (!sortKey) return summary;
     const dir = sortOrder === 'asc' ? 1 : -1;
@@ -499,7 +500,7 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
 
       {/* Chart + custom legend (OR: no inline legend, hide/show-only dots below) */}
       <Card style={{ borderRadius: 12, marginBottom: 16 }}>
-        {legendPos === 'right' ? (
+        {empty ? <Text type="secondary">No usage in this period.</Text> : legendPos === 'right' ? (
           <div style={{ display: 'flex', gap: 16 }}>
             <div style={{ flex: 1, minWidth: 0 }}>{chart}</div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 180, maxHeight: chartHeight, overflowY: 'auto' }}>

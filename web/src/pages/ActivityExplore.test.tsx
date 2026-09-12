@@ -22,14 +22,15 @@ vi.mock('../api/client', async (importOriginal) => {
 // the chart as a no-op.
 vi.mock('recharts', () => {
   const pass = ({ children }: { children?: unknown }) => children ?? null;
+  const chart = ({ children }: { children?: unknown }) => <div data-testid="explore-chart">{children}</div>;
   const nul = () => null;
   return {
     ResponsiveContainer: pass,
-    BarChart: pass,
+    BarChart: chart,
     Bar: nul,
-    AreaChart: pass,
+    AreaChart: chart,
     Area: nul,
-    LineChart: pass,
+    LineChart: chart,
     Line: nul,
     XAxis: nul,
     YAxis: nul,
@@ -111,6 +112,16 @@ const makeHourlyResponse = (): ActivityResponse => ({
   totals: { spend: 125 / 6, tokens: 0, requests: 0, cache: 0 },
 });
 
+const emptyResponse: ActivityResponse = {
+  metric: 'spend',
+  group_by: 'model',
+  rollup: 'day',
+  buckets: [],
+  series: [],
+  summary: [],
+  totals: { spend: 0, tokens: 0, requests: 0, cache: 0 },
+};
+
 const mockSummary = (n: number) => {
   vi.mocked(getActivity).mockResolvedValue({
     data: makeResponse(n),
@@ -139,6 +150,17 @@ afterEach(() => {
 });
 
 describe('ActivityExplore summary footer', () => {
+  it('shows the empty state instead of an empty chart and legend', async () => {
+    vi.mocked(getActivity).mockResolvedValue({
+      data: emptyResponse,
+    } as Awaited<ReturnType<typeof getActivity>>);
+    const { container } = render(<ActivityExplore range={range} />);
+
+    await waitFor(() => expect(screen.getAllByText('No usage in this period.')).toHaveLength(2));
+    expect(screen.queryByTestId('explore-chart')).toBeNull();
+    expect(container.querySelectorAll('.explore-legend-item')).toHaveLength(0);
+  });
+
   it('counts the rows actually rendered when the server summary exceeds Top-N (default 10)', async () => {
     mockSummary(25);
     const { container } = render(<ActivityExplore range={range} />);
