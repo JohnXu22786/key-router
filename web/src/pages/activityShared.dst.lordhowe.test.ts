@@ -7,7 +7,7 @@
 // America/New_York via activityShared.dst.test.ts).
 import { describe, it, expect, vi, beforeAll } from 'vitest';
 import dayjs from 'dayjs';
-import { bucketWindowShare, floorWindowUntil, rowCoverage, series } from './activityShared';
+import { bucketAxis, bucketWindowShare, floorWindowUntil, rowCoverage, series } from './activityShared';
 
 beforeAll(() => {
   vi.stubEnv('TZ', 'Australia/Lord_Howe');
@@ -107,6 +107,36 @@ describe('normalized Lord Howe spring-forward buckets', () => {
     expect(bucketWindowShare(bucket, since, until, cutoff, 'hour')).toBeCloseTo(0.5, 10);
     const chart = series([{ hour_bucket: bucket, value: 30 }], r => r.value, since, until, cutoff, 'hour');
     expect(chart.map(point => point.value)).toEqual([15]);
+  });
+});
+
+describe('hourly axes — Lord Howe spring-forward wall-clock boundary', () => {
+  it('keeps the empty 03:00 bucket in a window starting inside 02:00', () => {
+    // The 02:00 wall hour starts at 02:30 after the 30-minute spring gap.
+    // [02:40, 03:10) therefore contains the empty 03:00 wall-clock bucket,
+    // even though an elapsed one-hour step from 02:30 lands at 03:30.
+    const since = dayjs('2026-10-04T02:40:00');
+    const until = dayjs('2026-10-04T03:10:00');
+    const out = series(
+      [{ hour_bucket: '2026-10-04T02:30:00+11:00', value: 30 }],
+      row => row.value,
+      since,
+      until,
+      until,
+      'hour',
+    );
+    expect(out.map(point => point.sort)).toEqual([
+      '2026-10-04 02:00',
+      '2026-10-04 03:00',
+    ]);
+    expect(out.map(point => point.value)).toEqual([20, 0]);
+
+    // Keep the direct axis assertion close to the regression: the missing
+    // point is caused by bucketStarts, before row values are assigned.
+    expect(bucketAxis(since, until, 'hour').map(point => point.sort)).toEqual([
+      '2026-10-04 02:00',
+      '2026-10-04 03:00',
+    ]);
   });
 });
 
