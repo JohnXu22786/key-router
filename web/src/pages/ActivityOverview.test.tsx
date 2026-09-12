@@ -175,7 +175,7 @@ describe('ActivityOverview empty state', () => {
     expect(screen.queryAllByText('Uncached')).toHaveLength(0);
   });
 
-  it('shows the empty state when the only response row starts at the exclusive end', async () => {
+  it('shows the empty state consistently when the only response row starts at the exclusive end', async () => {
     const until = dayjs('2026-08-02T00:00:00');
     vi.mocked(getConsumptions)
       .mockResolvedValueOnce(response([makeConsumption(100, until.format('YYYY-MM-DDTHH:mm:ss'))]))
@@ -187,7 +187,9 @@ describe('ActivityOverview empty state', () => {
       />,
     );
 
-    await waitFor(() => expect(screen.getAllByText('No usage in this period.')).toHaveLength(4));
+    await waitFor(() => expect(screen.getAllByText('No usage in this period.')).toHaveLength(6));
+    expect(screen.queryByText('Key #1')).toBeNull();
+    expect(screen.queryByText('app')).toBeNull();
     expect(screen.queryAllByText('Other')).toHaveLength(0);
     expect(screen.queryAllByText('Prompt')).toHaveLength(0);
     expect(screen.queryAllByText('Completion')).toHaveLength(0);

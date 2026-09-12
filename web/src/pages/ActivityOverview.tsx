@@ -367,10 +367,11 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
   const keyTokens = groupTotals(curList, c => {
     const k = keys.find(x => x.id === c.key_id);
     return k?.name || `Key #${c.key_id}`;
-  }, c => c.input_tokens + c.output_tokens, share);
+  }, c => c.input_tokens + c.output_tokens, share).filter(([, value]) => value > 0);
   const topKeys = keyTokens.slice(0, 5);
 
-  const appTokens = groupTotals(curList, c => c.app_name || 'Unknown', c => c.input_tokens + c.output_tokens, share);
+  const appTokens = groupTotals(curList, c => c.app_name || 'Unknown', c => c.input_tokens + c.output_tokens, share)
+    .filter(([, value]) => value > 0);
   const topApps = appTokens.slice(0, 5);
 
   const kpiColors = ['#FF2D55', '#FF2D55', '#FF2D55', '#FF2D55', '#FF2D55'];
