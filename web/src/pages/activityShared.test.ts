@@ -1561,8 +1561,8 @@ describe('hourly activity normalization', () => {
     const resp: ActivityResponse = {
       metric: 'spend', group_by: 'model', rollup: 'hour',
       series: [
-        { bucket: '2026-08-13 15:00', group: 'a', value: 0, is_zero: true },
-        { bucket: '2026-08-13 16:00', group: 'a', value: 100, is_zero: false },
+        { bucket: '2026-08-13 15:00', group: 'a', value: 0, is_zero: true, has_data: true },
+        { bucket: '2026-08-13 16:00', group: 'a', value: 100, is_zero: false, has_data: true },
       ],
       summary: [{ group: 'a', min: 0, max: 100, avg: 50, sum: 100, value: 100, percent: 100 }],
       buckets: ['2026-08-13 15:00', '2026-08-13 16:00'],
@@ -1576,6 +1576,28 @@ describe('hourly activity normalization', () => {
       'hour', 'hour', false,
     );
     expect(out.summary[0]).toMatchObject({ min: 0, avg: 50, max: 100 });
+  });
+
+  it('excludes missing dense-grid cells from additive summary statistics', () => {
+    const resp: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'hour',
+      series: [
+        { bucket: '2026-08-13 15:00', group: 'a', value: 0, is_zero: true, has_data: false },
+        { bucket: '2026-08-13 16:00', group: 'a', value: 100, is_zero: false, has_data: true },
+      ],
+      summary: [{ group: 'a', min: 100, max: 100, avg: 100, sum: 100, value: 100, percent: 100 }],
+      buckets: ['2026-08-13 15:00', '2026-08-13 16:00'],
+      totals: { spend: 100, tokens: 0, requests: 0, cache: 0 },
+    };
+    const out = aggregateHourlyResponse(
+      resp,
+      dayjs('2026-08-13T15:00:00'),
+      dayjs('2026-08-13T17:00:00'),
+      dayjs('2026-08-13T17:00:00'),
+      'hour', 'hour', false,
+    );
+    expect(out.series.map(point => point.has_data)).toEqual([false, true]);
+    expect(out.summary[0]).toMatchObject({ min: 100, avg: 100, max: 100, sum: 100 });
   });
 
   it('includes zero-valued cells in blended summary statistics', () => {
@@ -1601,6 +1623,46 @@ describe('hourly activity normalization', () => {
     expect(summary.min).toBe(0);
     expect(summary.avg).toBe(50);
     expect(summary.max).toBe(100);
+  });
+
+  it('excludes missing cells from blended summary statistics', () => {
+    const buckets = ['2026-08-13 15:00', '2026-08-13 16:00'];
+    const make = (metric: 'spend' | 'tokens', firstHasData: boolean): ActivityResponse => {
+      const values = metric === 'spend' ? [0, 100] : [1, 1];
+      return {
+        metric, group_by: 'model', rollup: 'hour', buckets,
+        series: buckets.map((bucket, i) => ({
+          bucket,
+          group: 'a',
+          value: values[i],
+          is_zero: values[i] === 0,
+          has_data: i === 0 ? firstHasData : true,
+        })),
+        summary: [{ group: 'a', min: 0, max: 100, avg: 50, sum: 100, value: 100, percent: 100 }],
+        totals: {
+          spend: metric === 'spend' ? 100 : 0,
+          tokens: metric === 'tokens' ? 2 : 0,
+          requests: 0,
+          cache: 0,
+        },
+      };
+    };
+    const explicitZero = combineBlendedResponses(make('spend', true), make('tokens', true));
+    const missing = combineBlendedResponses(make('spend', false), make('tokens', false));
+    const expectedRate = 100 * 1e6;
+    expect(explicitZero.summary[0]).toMatchObject({ min: 0, avg: expectedRate / 2, max: expectedRate });
+    expect(missing.summary[0]).toMatchObject({ min: expectedRate, avg: expectedRate, max: expectedRate });
+    expect(missing.series.map(point => point.has_data)).toEqual([false, true]);
+
+    const resampled = resampleResponse(
+      missing,
+      dayjs('2026-08-13T15:00:00'),
+      dayjs('2026-08-13T17:00:00'),
+      dayjs('2026-08-13T17:00:00'),
+      'min15',
+      false,
+    );
+    expect(resampled.summary[0]).toMatchObject({ min: expectedRate, avg: expectedRate, max: expectedRate });
   });
 
   it('keeps blended rates constant when an hourly response is resampled', () => {

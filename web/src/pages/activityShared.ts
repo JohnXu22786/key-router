@@ -1409,6 +1409,27 @@ interface SeriesCell {
 
 const seriesCellKey = (group: string, subgroup?: string): string => `${group}\u0000${subgroup ?? ''}`;
 
+// Activity responses use a dense bucket x group grid, so a zero-valued point
+// can either be an actual consumption cell or a zero-fill for a missing cell.
+// `has_data` distinguishes those cases on current API responses. Treat an
+// omitted marker as present so hand-built fixtures and older responses keep
+// their historical semantics.
+function seriesPointHasData(point: ActivitySeriesPoint | undefined): boolean {
+  return point !== undefined && point.has_data !== false;
+}
+
+function hasPresenceMetadata(series: ActivitySeriesPoint[]): boolean {
+  return series.some(point => point.has_data !== undefined);
+}
+
+function addPresence<T extends ActivitySeriesPoint>(
+  point: T,
+  includePresence: boolean,
+  hasData: boolean,
+): T {
+  return includePresence ? { ...point, has_data: hasData } : point;
+}
+
 function collectSeriesCells(series: ActivitySeriesPoint[]): SeriesCell[] {
   const cells = new Map<string, SeriesCell>();
   for (const p of series) {
@@ -1422,10 +1443,10 @@ function collectSeriesCells(series: ActivitySeriesPoint[]): SeriesCell[] {
 
 // recomputeFromSeries rebuilds a response's summary and metric total from
 // its bucket x group series grid, following the server's aggregation shape
-// (see admin.go): min/max/avg over every represented bucket, including
-// explicit zero-valued cells, value = the LAST bucket, percent = the group's
-// share of the grid's total (top-N + Other; the server divides by every
-// group's total).
+// (see admin.go): min/max/avg over every represented data cell, including
+// explicit zero-valued cells but excluding dense-grid zero-fills, value = the
+// LAST bucket, percent = the group's share of the grid's total (top-N + Other;
+// the server divides by every group's total).
 // Shared by resampleResponse, aggregateHourlyResponse, and
 // prorateBoundaryBuckets — all modify the
 // series values and must re-derive the summed fields so every consumer
@@ -1444,10 +1465,15 @@ function recomputeFromSeries(
 ): { summary: ActivityGroupSummary[]; totals: ActivityResponse['totals'] } {
   const groups = Array.from(new Set(series.map(s => s.group)));
   const acc = new Map<string, Map<string, number>>();
+  const present = new Map<string, Set<string>>();
   for (const p of series) {
+    if (!seriesPointHasData(p)) continue;
     let base = acc.get(p.group);
     if (!base) { base = new Map(); acc.set(p.group, base); }
     base.set(p.bucket, (base.get(p.bucket) ?? 0) + p.value);
+    let groupPresent = present.get(p.group);
+    if (!groupPresent) { groupPresent = new Set(); present.set(p.group, groupPresent); }
+    groupPresent.add(p.bucket);
   }
   const groupSum = new Map<string, number>();
   let totalSum = 0;
@@ -1457,7 +1483,9 @@ function recomputeFromSeries(
     totalSum += s;
   }
   const summary: ActivityGroupSummary[] = groups.map(g => {
-    const vals = buckets.map(b => acc.get(g)?.get(b) ?? 0);
+    const vals = buckets
+      .filter(b => present.get(g)?.has(b))
+      .map(b => acc.get(g)?.get(b) ?? 0);
     const sum = groupSum.get(g) ?? 0;
     return {
       group: g,
@@ -1465,7 +1493,7 @@ function recomputeFromSeries(
       max: vals.length ? Math.max(...vals) : 0,
       avg: vals.length ? sum / vals.length : 0,
       sum,
-      value: vals[vals.length - 1] ?? 0,
+      value: buckets.length ? acc.get(g)?.get(buckets[buckets.length - 1]) ?? 0 : 0,
       percent: totalSum > 0 ? (sum / totalSum) * 100 : 0,
     };
   });
@@ -1548,6 +1576,16 @@ function recomputeBlendedFromSeries(
   const groups = Array.from(new Set(series.map(s => s.group)));
   const hasSubgroups = series.some(s => Boolean(s.subgroup));
   const original = new Map(resp.summary.map(s => [s.group, s]));
+  const values = new Map<string, number>();
+  const present = new Map<string, Set<string>>();
+  for (const point of series) {
+    if (!seriesPointHasData(point)) continue;
+    const key = `${point.group}\u0001${point.bucket}`;
+    values.set(key, (values.get(key) ?? 0) + point.value);
+    let groupPresent = present.get(point.group);
+    if (!groupPresent) { groupPresent = new Set(); present.set(point.group, groupPresent); }
+    groupPresent.add(point.bucket);
+  }
   const summary: ActivityGroupSummary[] = groups.map(group => {
     const source = original.get(group);
     if (hasSubgroups) {
@@ -1558,16 +1596,15 @@ function recomputeBlendedFromSeries(
         group, min: 0, max: 0, avg: 0, sum: 0, value: 0, percent: 0,
       };
     }
-    const values = buckets.map(bucket =>
-      series.find(p => p.group === group && p.bucket === bucket)?.value ?? 0,
-    );
+    const activeBuckets = buckets.filter(bucket => present.get(group)?.has(bucket));
+    const rates = activeBuckets.map(bucket => values.get(`${group}\u0001${bucket}`) ?? 0);
     return {
       group,
-      min: values.length ? Math.min(...values) : 0,
-      max: values.length ? Math.max(...values) : 0,
-      avg: values.length ? values.reduce((a, v) => a + v, 0) / values.length : 0,
+      min: rates.length ? Math.min(...rates) : 0,
+      max: rates.length ? Math.max(...rates) : 0,
+      avg: rates.length ? rates.reduce((a, v) => a + v, 0) / rates.length : 0,
       sum: source?.sum ?? 0,
-      value: values[values.length - 1] ?? source?.value ?? 0,
+      value: buckets.length ? values.get(`${group}\u0001${buckets[buckets.length - 1]}`) ?? 0 : source?.value ?? 0,
       percent: source?.percent ?? 0,
     };
   });
@@ -1582,8 +1619,9 @@ function recomputeBlendedFromSeries(
 // for raw rows (cutoff = the fetch time, see overlapFractions); every group
 // stays zero-filled per bucket (the server emits full bucket x group grids
 // with is_zero flags). Summary and totals are RECOMPUTED from the resampled
-// buckets (server semantics: min/max/avg over represented buckets, including
-// explicit zero-valued cells, value = last bucket, percent of the total) so
+// buckets (server semantics: min/max/avg over represented data cells,
+// including explicit zero-valued cells but excluding zero-fills, value = last
+// bucket, percent of the total) so
 // the Trends "Trending" deltas agree
 // with the re-bucketed chart; summary rows beyond the series grid (groups
 // ranked 6+ under top-5) are moved to the same scale by the grid's
@@ -1610,15 +1648,21 @@ export function resampleResponse(
     buckets.push(liveP.label);
   }
   const cells = collectSeriesCells(resp.series);
+  const includePresence = hasPresenceMetadata(resp.series);
   // (group, subgroup) -> bucket label -> value
   const acc = new Map<string, Map<string, number>>();
+  const present = new Map<string, Set<string>>();
   const liveCell = hasLiveCell(until, since, cutoff, granularity, liveExtend);
   for (const p of resp.series) {
+    if (!seriesPointHasData(p)) continue;
     const key = seriesCellKey(p.group, p.subgroup);
     let base = acc.get(key);
     if (!base) { base = new Map(); acc.set(key, base); }
     for (const [i, f] of overlapFractions(p.bucket, since, until, cutoff, starts, stepMin, liveCell)) {
       const b = buckets[i];
+      let cellPresent = present.get(key);
+      if (!cellPresent) { cellPresent = new Set(); present.set(key, cellPresent); }
+      cellPresent.add(b);
       if (resp.metric === 'blended') {
         // A blended value is a rate, not an hourly amount. The hourly rate is
         // the value for every overlapping sub-hour cell; multiplying it by a
@@ -1634,13 +1678,13 @@ export function resampleResponse(
   for (const b of buckets) {
     for (const cell of cells) {
       const v = acc.get(cell.key)?.get(b) ?? 0;
-      series.push({
+      series.push(addPresence({
         bucket: b,
         group: cell.group,
         ...(cell.subgroup ? { subgroup: cell.subgroup } : {}),
         value: v,
         is_zero: v === 0,
-      });
+      }, includePresence, present.get(cell.key)?.has(b) ?? false));
     }
   }
   const { summary, totals } = resp.metric === 'blended'
@@ -1692,8 +1736,11 @@ export function aggregateHourlyResponse(
     ? ['Total']
     : [...new Set(includedSourceBuckets.map(b => rollupBucketLabel(b, rollup)))];
   const cells = collectSeriesCells(resp.series);
+  const includePresence = hasPresenceMetadata(resp.series);
   const acc = new Map<string, Map<string, number>>();
+  const present = new Map<string, Set<string>>();
   for (const p of resp.series) {
+    if (!seriesPointHasData(p)) continue;
     const share = bucketWindowShare(p.bucket, since, until, cutoff, rangeGranularity, liveExtend);
     if (share <= 0) continue;
     const bucket = rollupBucketLabel(p.bucket, rollup);
@@ -1701,18 +1748,21 @@ export function aggregateHourlyResponse(
     let base = acc.get(key);
     if (!base) { base = new Map(); acc.set(key, base); }
     base.set(bucket, (base.get(bucket) ?? 0) + p.value * share);
+    let cellPresent = present.get(key);
+    if (!cellPresent) { cellPresent = new Set(); present.set(key, cellPresent); }
+    cellPresent.add(bucket);
   }
   const series: ActivitySeriesPoint[] = [];
   for (const bucket of buckets) {
     for (const cell of cells) {
       const value = acc.get(cell.key)?.get(bucket) ?? 0;
-      series.push({
+      series.push(addPresence({
         bucket,
         group: cell.group,
         ...(cell.subgroup ? { subgroup: cell.subgroup } : {}),
         value,
         is_zero: value === 0,
-      });
+      }, includePresence, present.get(cell.key)?.has(bucket) ?? false));
     }
   }
   const { summary, totals } = recomputeFromSeries(resp, series, buckets);
@@ -1740,12 +1790,12 @@ export function normalizeHourlyResponse(
   return aggregateHourlyResponse(resp, since, until, cutoff, rangeGranularity, rollup, liveExtend);
 }
 
-function seriesValueMap(resp: ActivityResponse): Map<string, number> {
-  const values = new Map<string, number>();
-  for (const p of resp.series) {
-    values.set(`${p.bucket}\u0001${seriesCellKey(p.group, p.subgroup)}`, p.value);
+function seriesPointMap(resp: ActivityResponse): Map<string, ActivitySeriesPoint> {
+  const points = new Map<string, ActivitySeriesPoint>();
+  for (const point of resp.series) {
+    points.set(`${point.bucket}\u0001${seriesCellKey(point.group, point.subgroup)}`, point);
   }
-  return values;
+  return points;
 }
 
 // combineBlendedResponses derives rates from normalized spend and token cells.
@@ -1762,49 +1812,65 @@ export function combineBlendedResponses(
     if (!buckets.includes(bucket)) buckets.push(bucket);
   }
   const cells = collectSeriesCells([...spend.series, ...tokens.series]);
-  const spendValues = seriesValueMap(spend);
-  const tokenValues = seriesValueMap(tokens);
+  const includePresence = hasPresenceMetadata(spend.series) || hasPresenceMetadata(tokens.series);
+  const spendPoints = seriesPointMap(spend);
+  const tokenPoints = seriesPointMap(tokens);
   const series: ActivitySeriesPoint[] = [];
   for (const bucket of buckets) {
     for (const cell of cells) {
       const key = `${bucket}\u0001${cell.key}`;
-      const spendValue = spendValues.get(key) ?? 0;
-      const tokenValue = tokenValues.get(key) ?? 0;
+      const spendPoint = spendPoints.get(key);
+      const tokenPoint = tokenPoints.get(key);
+      const spendValue = seriesPointHasData(spendPoint) ? spendPoint!.value : 0;
+      const tokenValue = seriesPointHasData(tokenPoint) ? tokenPoint!.value : 0;
       const value = tokenValue > 0 ? (spendValue / tokenValue) * 1e6 : 0;
-      series.push({
+      series.push(addPresence({
         bucket,
         group: cell.group,
         ...(cell.subgroup ? { subgroup: cell.subgroup } : {}),
         value,
         is_zero: value === 0,
-      });
+      }, includePresence, seriesPointHasData(spendPoint) || seriesPointHasData(tokenPoint)));
     }
   }
 
   const groups = Array.from(new Set(cells.map(c => c.group)));
   const groupSpend = new Map<string, number>();
   const groupTokens = new Map<string, number>();
-  const bucketRates = new Map<string, number[]>();
+  const groupPresent = new Map<string, Set<string>>();
+  const bucketRates = new Map<string, Map<string, number>>();
   for (const group of groups) {
-    const rates: number[] = [];
+    const rates = new Map<string, number>();
     for (const bucket of buckets) {
       let spendValue = 0;
       let tokenValue = 0;
+      let hasData = false;
       for (const cell of cells) {
         if (cell.group !== group) continue;
         const key = `${bucket}\u0001${cell.key}`;
-        spendValue += spendValues.get(key) ?? 0;
-        tokenValue += tokenValues.get(key) ?? 0;
+        const spendPoint = spendPoints.get(key);
+        const tokenPoint = tokenPoints.get(key);
+        if (seriesPointHasData(spendPoint)) spendValue += spendPoint!.value;
+        if (seriesPointHasData(tokenPoint)) tokenValue += tokenPoint!.value;
+        hasData = hasData || seriesPointHasData(spendPoint) || seriesPointHasData(tokenPoint);
       }
       groupSpend.set(group, (groupSpend.get(group) ?? 0) + spendValue);
       groupTokens.set(group, (groupTokens.get(group) ?? 0) + tokenValue);
-      rates.push(tokenValue > 0 ? (spendValue / tokenValue) * 1e6 : 0);
+      if (hasData) {
+        let groupBuckets = groupPresent.get(group);
+        if (!groupBuckets) { groupBuckets = new Set(); groupPresent.set(group, groupBuckets); }
+        groupBuckets.add(bucket);
+        rates.set(bucket, tokenValue > 0 ? (spendValue / tokenValue) * 1e6 : 0);
+      }
     }
     bucketRates.set(group, rates);
   }
   const totalSpend = [...groupSpend.values()].reduce((a, v) => a + v, 0);
   const summary: ActivityGroupSummary[] = groups.map(group => {
-    const rates = bucketRates.get(group) ?? [];
+    const ratesByBucket = bucketRates.get(group) ?? new Map<string, number>();
+    const rates = buckets
+      .filter(bucket => groupPresent.get(group)?.has(bucket))
+      .map(bucket => ratesByBucket.get(bucket) ?? 0);
     const sum = blendedRate(groupSpend.get(group) ?? 0, groupTokens.get(group) ?? 0);
     return {
       group,
@@ -1812,7 +1878,7 @@ export function combineBlendedResponses(
       max: rates.length ? Math.max(...rates) : 0,
       avg: rates.length ? rates.reduce((a, v) => a + v, 0) / rates.length : 0,
       sum,
-      value: rates[rates.length - 1] ?? 0,
+      value: buckets.length ? ratesByBucket.get(buckets[buckets.length - 1]) ?? 0 : 0,
       percent: totalSpend > 0 ? ((groupSpend.get(group) ?? 0) / totalSpend) * 100 : 0,
     };
   });
@@ -1878,26 +1944,36 @@ export function limitActivityResponse(
   const cells = collectSeriesCells(resp.series)
     .filter(c => topSet.has(c.group))
     .sort((a, b) => (rankIndex.get(a.group)! - rankIndex.get(b.group)!));
-  const values = seriesValueMap(resp);
+  const includePresence = hasPresenceMetadata(resp.series);
+  const points = seriesPointMap(resp);
   const buckets = [...resp.buckets];
   const series: ActivitySeriesPoint[] = [];
   for (const bucket of buckets) {
     for (const cell of cells) {
-      const value = values.get(`${bucket}\u0001${cell.key}`) ?? 0;
-      series.push({
+      const point = points.get(`${bucket}\u0001${cell.key}`);
+      const value = seriesPointHasData(point) ? point!.value : 0;
+      series.push(addPresence({
         bucket,
         group: cell.group,
         ...(cell.subgroup ? { subgroup: cell.subgroup } : {}),
         value,
         is_zero: value === 0,
-      });
+      }, includePresence, seriesPointHasData(point)));
     }
     if (tailSet.size > 0) {
       let value = 0;
+      let hasData = false;
       for (const p of resp.series) {
-        if (p.bucket === bucket && tailSet.has(p.group)) value += p.value;
+        if (p.bucket === bucket && tailSet.has(p.group) && seriesPointHasData(p)) {
+          value += p.value;
+          hasData = true;
+        }
       }
-      series.push({ bucket, group: 'Other', value, is_zero: value === 0 });
+      series.push(addPresence(
+        { bucket, group: 'Other', value, is_zero: value === 0 },
+        includePresence,
+        hasData,
+      ));
     }
   }
   const folded: ActivityResponse = { ...resp, series };
@@ -1970,15 +2046,22 @@ export function prorateBoundaryBuckets(
 export function aggregateTotalResponse(resp: ActivityResponse): ActivityResponse {
   if (resp.metric === 'blended' || resp.rollup === 'total') return resp;
 
+  const includePresence = hasPresenceMetadata(resp.series);
   const byCell = new Map<string, ActivitySeriesPoint>();
   for (const p of resp.series) {
     const key = `${p.group}\u0000${p.subgroup ?? ''}`;
     const current = byCell.get(key);
     if (current) {
-      current.value += p.value;
+      if (seriesPointHasData(p)) current.value += p.value;
       current.is_zero = current.value === 0;
+      if (includePresence) current.has_data = seriesPointHasData(current) || seriesPointHasData(p);
     } else {
-      byCell.set(key, { ...p, bucket: 'Total', is_zero: p.value === 0 });
+      byCell.set(key, addPresence({
+        ...p,
+        bucket: 'Total',
+        value: seriesPointHasData(p) ? p.value : 0,
+        is_zero: p.value === 0,
+      }, includePresence, seriesPointHasData(p)));
     }
   }
   const series = [...byCell.values()];

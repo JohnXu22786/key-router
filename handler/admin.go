@@ -1530,7 +1530,8 @@ type ActivitySeriesPoint struct {
 	Group    string  `json:"group"`              // model name / key name / app name
 	Subgroup string  `json:"subgroup,omitempty"` // second dimension (empty when no subgroup)
 	Value    float64 `json:"value"`
-	IsZero   bool    `json:"is_zero"` // explicit zero for chart stacking
+	IsZero   bool    `json:"is_zero"`  // explicit zero for chart stacking
+	HasData  bool    `json:"has_data"` // true when this cell has consumption rows
 }
 
 // activityAcc accumulates one (bucket, group) cell. sum is the selected
@@ -1988,8 +1989,10 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 			if subgroup != "" {
 				for _, sg := range subgroupOrder[g] {
 					v := float64(0)
+					hasData := false
 					if m, ok := subAgg[b][g]; ok {
 						if a, ok := m[sg]; ok {
+							hasData = true
 							v = accValue(metric, a)
 						}
 					}
@@ -1999,19 +2002,23 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 						Subgroup: sg,
 						Value:    v,
 						IsZero:   v == 0,
+						HasData:  hasData,
 					})
 				}
 				continue
 			}
 			v := float64(0)
+			hasData := false
 			if m, ok := agg[b][g]; ok {
+				hasData = true
 				v = accValue(metric, m)
 			}
 			resp.Series = append(resp.Series, ActivitySeriesPoint{
-				Bucket: b,
-				Group:  g,
-				Value:  v,
-				IsZero: v == 0,
+				Bucket:  b,
+				Group:   g,
+				Value:   v,
+				IsZero:  v == 0,
+				HasData: hasData,
 			})
 		}
 		if otherActive {
@@ -2019,10 +2026,12 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 			// the blended rate the fold combines spend AND tokens first and
 			// derives the rate at the end (a sum of rates is not a rate).
 			var ov float64
+			hasData := false
 			if metric == "blended" {
 				var spend, tokens float64
 				for _, g := range groupOrder[topN:] {
 					if m, ok := agg[b][g]; ok {
+						hasData = true
 						spend += m.spend
 						tokens += m.tokens
 					}
@@ -2031,15 +2040,17 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 			} else {
 				for _, g := range groupOrder[topN:] {
 					if m, ok := agg[b][g]; ok {
+						hasData = true
 						ov += m.sum
 					}
 				}
 			}
 			resp.Series = append(resp.Series, ActivitySeriesPoint{
-				Bucket: b,
-				Group:  "Other",
-				Value:  ov,
-				IsZero: ov == 0,
+				Bucket:  b,
+				Group:   "Other",
+				Value:   ov,
+				IsZero:  ov == 0,
+				HasData: hasData,
 			})
 		}
 	}
