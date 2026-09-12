@@ -61,20 +61,22 @@ if (typeof (window as unknown as { ResizeObserver?: unknown }).ResizeObserver !=
 type Deferred<T> = {
   promise: Promise<T>;
   resolve: (value: T) => void;
+  reject: (reason?: unknown) => void;
 };
 
 const deferred = <T,>(): Deferred<T> => {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>(res => { resolve = res; });
-  return { promise, resolve };
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
 };
 
 const response = <T,>(data: T) => ({ data }) as unknown as { data: T };
 
-const makeConsumption = (keyId: number, cost: number): Consumption => ({
+const makeConsumption = (keyId: number, cost: number, hourBucket = '2026-08-13T10:00:00Z'): Consumption => ({
   id: keyId,
   key_id: keyId,
-  hour_bucket: '2026-08-13T10:00:00Z',
+  hour_bucket: hourBucket,
   model_name: 'model',
   app_name: 'app',
   request_count: 1,
@@ -199,5 +201,51 @@ describe('Stats range request races', () => {
     expect(screen.queryByText('stale-key')).toBeNull();
     expect(screen.queryByText('stale-provider')).toBeNull();
     expect(document.querySelector('.ant-spin-spinning')).toBeNull();
+  });
+
+  it('clears current and previous data when the newly selected range fails', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-08-13T12:00:00Z'));
+    render(<Stats />);
+    await waitFor(() => {
+      expect(requests.consumptions).toHaveLength(2);
+      expect(requests.keys).toHaveLength(1);
+      expect(requests.overview).toHaveLength(1);
+      expect(requests.providers).toHaveLength(1);
+    });
+
+    await act(async () => {
+      requests.consumptions[0].resolve(response([makeConsumption(1, 1)]) as ConsumptionResponse);
+      requests.consumptions[1].resolve(response([makeConsumption(1, 2, '2026-08-05T10:00:00Z')]) as ConsumptionResponse);
+      requests.keys[0].resolve(response([makeKey(1, 'initial-key', 1)]) as KeysResponse);
+      requests.overview[0].resolve(response({} as OverviewStats) as OverviewResponse);
+      requests.providers[0].resolve(response([makeProvider(1, 'initial-provider')]) as ProvidersResponse);
+    });
+    expect(await screen.findByText('initial-key')).not.toBeNull();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('30 days'));
+    });
+    await waitFor(() => {
+      expect(requests.consumptions).toHaveLength(4);
+      expect(requests.keys).toHaveLength(2);
+      expect(requests.overview).toHaveLength(2);
+      expect(requests.providers).toHaveLength(2);
+    });
+
+    await act(async () => {
+      requests.consumptions[2].reject(new Error('latest range failed'));
+      requests.consumptions[3].resolve(response([] as Consumption[]) as ConsumptionResponse);
+      requests.keys[1].resolve(response([makeKey(1, 'new-range-key', 1)]) as KeysResponse);
+      requests.overview[1].resolve(response({} as OverviewStats) as OverviewResponse);
+      requests.providers[1].resolve(response([makeProvider(1, 'new-range-provider')]) as ProvidersResponse);
+    });
+
+    expect(await screen.findByText('Failed to load stats — check the log file.')).not.toBeNull();
+    expect(screen.queryByText('initial-key')).toBeNull();
+    expect(screen.queryByText('initial-provider')).toBeNull();
+    expect(screen.queryByText(/50\.0%/)).toBeNull();
+    expect(screen.queryByText(/100\.0%/)).toBeNull();
+    expect(screen.getAllByText('$0.00').length).toBeGreaterThan(0);
   });
 });

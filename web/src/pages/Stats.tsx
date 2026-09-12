@@ -111,6 +111,8 @@ const Stats: React.FC = () => {
       setSelectedKey(null);
     } catch {
       if (requestId !== requestIdRef.current) return;
+      setConsumptions([]);
+      setPrevConsumptions([]);
       setError(true);
       message.error('Failed to load stats');
     } finally {
