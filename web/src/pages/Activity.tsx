@@ -11,7 +11,7 @@ import ActivityExplore from './ActivityExplore';
 // constants and crash the page.
 import {
   makeRanges, customRange, CUSTOM_KEY, CUSTOM_LABEL, floorWindowUntil, ExploreOpts,
-  ActivityFilter, ActivityFilterType, FILTER_TYPES, modelFavicon, maskKey,
+  ActivityFilter, ActivityFilterType, FILTER_TYPES, modelFavicon, maskKey, bucketWindowShare,
 } from './activityShared';
 import type { DateRange } from './activityShared';
 import { getConsumptions, getKeys, Key } from '../api/client';
@@ -149,16 +149,31 @@ const Activity: React.FC = () => {
   useEffect(() => {
     if (!filterOpen) return;
     let cancelled = false;
+    const optionRange = rangeRef.current;
     setFilterOptsLoading(true);
     Promise.all([
-      getConsumptions({ since: rangeRef.current.since.toISOString(), until: rangeRef.current.until.toISOString() }),
+      getConsumptions({ since: optionRange.since.toISOString(), until: optionRange.until.toISOString() }),
       getKeys(),
     ])
       .then(([c, k]) => {
         if (cancelled) return;
         const cmp = (a: string, b: string) => a.localeCompare(b);
-        const models = [...new Set(c.data.map(x => x.model_name || 'Unknown'))].sort(cmp);
-        const apps = [...new Set(c.data.map(x => x.app_name || 'Unknown'))].sort(cmp);
+        // The consumptions endpoint widens hourly queries to complete buckets,
+        // so a row starting exactly at the displayed end is outside the
+        // half-open Activity window even though it is present in the response.
+        // Keep filter candidates in lockstep with the charts' precise window
+        // semantics; otherwise selecting a boundary-only entity produces an
+        // empty Trends chart.
+        const cutoff = dayjs();
+        const inWindow = c.data.filter(x => bucketWindowShare(
+          x.hour_bucket,
+          optionRange.since,
+          optionRange.until,
+          cutoff,
+          optionRange.granularity,
+        ) > 0);
+        const models = [...new Set(inWindow.map(x => x.model_name || 'Unknown'))].sort(cmp);
+        const apps = [...new Set(inWindow.map(x => x.app_name || 'Unknown'))].sort(cmp);
         const keys = [...k.data].sort((a, b) =>
           (a.name || `Key #${a.id}`).localeCompare(b.name || `Key #${b.id}`));
         setFilterOpts({ models, apps, keys });
