@@ -117,6 +117,42 @@ describe('ActivityOverview response-time cutoff', () => {
 
     expect(await screen.findByText('$100.00')).not.toBeNull();
   });
+
+  it('captures the cutoff when current consumption resolves before the other requests', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const requestStartedAt = dayjs('2026-08-13T10:00:00');
+    const currentResponseAt = dayjs('2026-08-13T10:30:00');
+    const delayedResponseAt = dayjs('2026-08-13T11:30:00');
+    vi.setSystemTime(requestStartedAt.toDate());
+
+    const requests: Array<ReturnType<typeof deferred<ConsumptionResponse>>> = [];
+    const keysResponse = deferred<Awaited<ReturnType<typeof getKeys>>>();
+    vi.mocked(getConsumptions).mockImplementation(() => {
+      const request = deferred<ConsumptionResponse>();
+      requests.push(request);
+      return request.promise;
+    });
+    vi.mocked(getKeys).mockImplementation(() => keysResponse.promise);
+
+    render(<ActivityOverview range={customRange(
+      dayjs('2026-08-13T09:00:00'),
+      currentResponseAt,
+    )} />);
+    await waitFor(() => expect(requests).toHaveLength(2));
+
+    vi.setSystemTime(currentResponseAt.toDate());
+    await act(async () => {
+      requests[0].resolve(response([makeConsumption(100, '2026-08-13T10:00:00')]));
+    });
+
+    vi.setSystemTime(delayedResponseAt.toDate());
+    await act(async () => {
+      requests[1].resolve(response([]));
+      keysResponse.resolve({ data: [] } as unknown as Awaited<ReturnType<typeof getKeys>>);
+    });
+
+    expect(await screen.findByText('$100.00')).not.toBeNull();
+  });
 });
 
 describe('ActivityOverview custom range refresh', () => {
