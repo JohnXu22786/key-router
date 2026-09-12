@@ -222,6 +222,28 @@ describe('bucketWindowShare — hour-granularity live window on the Chatham repe
   });
 });
 
+// The elapsed hour walk starts at the second occurrence of 02:45 (14:00Z)
+// and its next step is 03:45 (15:00Z). The wall-clock 03:00 bucket actually
+// starts at 14:15Z, so a short response window can contain that empty bucket
+// even though neither the elapsed walk nor axisForRows sees a response row
+// to seed it.
+describe('hourly axes — Chatham fall-back empty wall-clock bucket', () => {
+  it('keeps the empty 03:00 bucket when the response has no 03:00 row', () => {
+    const rows = [{ hour_bucket: '2026-04-05T02:00:00', v: 75 }];
+    const since = dayjs('2026-04-04T14:00:00.000Z'); // second 02:45
+    const until = dayjs('2026-04-04T14:45:00.000Z'); // 03:30 +12:45
+    const cutoff = dayjs('2026-04-04T15:45:00.000Z');
+
+    const out = series(rows, r => r.v, since, until, cutoff, 'hour', false);
+
+    expect(out.map(point => point.sort)).toEqual([
+      '2026-04-05 02:00',
+      '2026-04-05 03:00',
+    ]);
+    expect(out.map(point => point.value)).toEqual([15, 0]);
+  });
+});
+
 // prorateBoundaryBuckets mirrors the Overview per-row proration on the
 // server-bucketed custom-range responses. On the Chatham repeat the LAST
 // bucket of a range ending mid-second-pass starts at the FIXED floor
