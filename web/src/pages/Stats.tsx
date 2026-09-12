@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback, useMemo } from 'react';
+import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import {
   Card, Table, Typography, Spin, message, Row, Col, Button, Segmented, Space,
   Modal, Tabs,
@@ -71,12 +71,14 @@ const Stats: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState(false);
+  const requestIdRef = useRef(0);
   // Detail modal: { metric, name } opens a per-dimension breakdown
   const [detail, setDetail] = useState<{ title: string; keyId?: number } | null>(null);
 
   const range = RANGES[rangeIdx];
 
   const fetch = useCallback(async (isRefresh = false) => {
+    const requestId = ++requestIdRef.current;
     if (isRefresh) setRefreshing(true);
     else setLoading(true);
     setError(false);
@@ -100,14 +102,23 @@ const Stats: React.FC = () => {
         getProviders(),
       ]);
       const { curRes, cutoff } = current;
+      if (requestId !== requestIdRef.current) return;
       setConsumptions(prorateStatsConsumptions(curRes.data, sinceValue, untilValue, cutoff, r.granularity));
       setPrevConsumptions(prorateStatsConsumptions(prevRes.data, prevSinceValue, sinceValue, cutoff, r.granularity));
       setOverview(ovRes.data);
       setKeys(keyRes.data);
       setProviders(provRes.data);
       setSelectedKey(null);
-    } catch { setError(true); message.error('Failed to load stats'); }
-    finally { setLoading(false); setRefreshing(false); }
+    } catch {
+      if (requestId !== requestIdRef.current) return;
+      setError(true);
+      message.error('Failed to load stats');
+    } finally {
+      if (requestId === requestIdRef.current) {
+        setLoading(false);
+        setRefreshing(false);
+      }
+    }
   }, [rangeIdx]);
 
   useEffect(() => { fetch(); }, [fetch]);
