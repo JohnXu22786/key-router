@@ -24,6 +24,10 @@ func TestBucketBound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	chatham, err := time.LoadLocation("Pacific/Chatham")
+	if err != nil {
+		t.Fatal(err)
+	}
 	cases := []struct {
 		name         string
 		since, until time.Time
@@ -43,6 +47,9 @@ func TestBucketBound(t *testing.T) {
 		{"fractional spring-forward keeps every local bucket",
 			time.Date(2026, 10, 4, 2, 45, 0, 0, lordHowe),
 			time.Date(2026, 10, 4, 4, 0, 0, 0, lordHowe), 3},
+		{"Chatham spring-forward legal window is not reversed by the missing 03:00 label",
+			time.Date(2024, 9, 29, 3, 45, 0, 0, chatham),
+			time.Date(2024, 9, 29, 3, 50, 0, 0, chatham), 1},
 		{"four-hour custom window",
 			mk(2026, 1, 1, 16, 15), mk(2026, 1, 1, 20, 0), 5},
 		{"reversed window returns 0",

@@ -1215,14 +1215,17 @@ func (h *AdminHandler) GetKeyDetail(c *gin.Context) {
 // fractional DST transition can put adjacent local bucket starts less than a
 // real hour apart. The since is floored to the local hour grid; using the raw
 // since would undercount the bucket containing it. The query end is exclusive,
-// so its local-hour label is not counted. A reversed window returns 0.
+// so its local-hour label is not counted. Compare the unrounded local
+// endpoints before flooring: a missing wall-clock hour can normalize the
+// floor past a valid later endpoint. A reversed window returns 0.
 func bucketBound(since, until time.Time) int64 {
 	loc := since.Location()
-	flooredSince := time.Date(since.Year(), since.Month(), since.Day(), since.Hour(), 0, 0, 0, loc)
+	localSince := since.In(loc)
 	localUntil := until.In(loc)
-	if localUntil.Before(flooredSince) {
+	if localUntil.Before(localSince) {
 		return 0
 	}
+	flooredSince := time.Date(localSince.Year(), localSince.Month(), localSince.Day(), localSince.Hour(), 0, 0, 0, loc)
 
 	queryEnd := activityHourQueryEnd(flooredSince, localUntil)
 	startLabel := time.Date(flooredSince.Year(), flooredSince.Month(), flooredSince.Day(), flooredSince.Hour(), 0, 0, 0, time.UTC)
@@ -1248,7 +1251,7 @@ func (h *AdminHandler) GetStatsConsumptions(c *gin.Context) {
 		return
 	}
 	query = filtered
-	// The parsed window bounds (local), kept for the range-aware cap below;
+	// The parsed, unrounded window bounds (local), kept for the range-aware cap below;
 	// the source query uses the same local-hour widening as Activity.
 	var sinceTime, untilTime *time.Time
 	if since := c.Query("since"); since != "" {
@@ -1259,7 +1262,7 @@ func (h *AdminHandler) GetStatsConsumptions(c *gin.Context) {
 			// most of the hour (the chart axis floors the same way).
 			l := t.Local()
 			floored := time.Date(l.Year(), l.Month(), l.Day(), l.Hour(), 0, 0, 0, l.Location())
-			sinceTime = &floored
+			sinceTime = &l
 			query = query.Where("hour_bucket >= ?", floored)
 		} else {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid since parameter"})
