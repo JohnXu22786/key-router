@@ -1210,22 +1210,25 @@ func (h *AdminHandler) GetKeyDetail(c *gin.Context) {
 }
 
 // bucketBound returns an upper bound on the number of distinct hour buckets
-// matching a (since, until) window. Matched buckets are ≥ 1 real hour apart
-// (hourly rows — DST included), so the count is (until − flooredSince)/1h + 1.
-// The since is truncated to the hour grid; using the raw since would
-// undercount by one bucket whenever until is exactly on an hour boundary
-// (the WHERE clause hour_bucket <= until then matches the boundary bucket
-// the raw-since d/1h+1 omits). The until is intentionally NOT floored:
-// flooring the until inside a DST-repeated hour would be ambiguous, while
-// the raw instant keeps the real-time distance exact. A reversed window
-// (until < flooredSince) returns 0.
+// matching a (since, until) window. The bound counts local-hour labels in the
+// same widened source-query window rather than relying on elapsed time: a
+// fractional DST transition can put adjacent local bucket starts less than a
+// real hour apart. The since is floored to the local hour grid; using the raw
+// since would undercount the bucket containing it. The query end is exclusive,
+// so its local-hour label is not counted. A reversed window returns 0.
 func bucketBound(since, until time.Time) int64 {
-	flooredSince := time.Date(since.Year(), since.Month(), since.Day(), since.Hour(), 0, 0, 0, since.Location())
-	d := until.Sub(flooredSince)
-	if d < 0 {
+	loc := since.Location()
+	flooredSince := time.Date(since.Year(), since.Month(), since.Day(), since.Hour(), 0, 0, 0, loc)
+	localUntil := until.In(loc)
+	if localUntil.Before(flooredSince) {
 		return 0
 	}
-	return int64(d/time.Hour) + 1
+
+	queryEnd := activityHourQueryEnd(flooredSince, localUntil)
+	startLabel := time.Date(flooredSince.Year(), flooredSince.Month(), flooredSince.Day(), flooredSince.Hour(), 0, 0, 0, time.UTC)
+	endLocal := queryEnd.In(loc)
+	endLabel := time.Date(endLocal.Year(), endLocal.Month(), endLocal.Day(), endLocal.Hour(), 0, 0, 0, time.UTC)
+	return int64(endLabel.Sub(startLabel) / time.Hour)
 }
 
 // GetStatsConsumptions returns consumption records

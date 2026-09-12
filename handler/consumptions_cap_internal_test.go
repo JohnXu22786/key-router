@@ -20,6 +20,10 @@ func TestBucketBound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	lordHowe, err := time.LoadLocation("Australia/Lord_Howe")
+	if err != nil {
+		t.Fatal(err)
+	}
 	cases := []struct {
 		name         string
 		since, until time.Time
@@ -36,6 +40,9 @@ func TestBucketBound(t *testing.T) {
 		{"half-hour local offset stays on local hour grid",
 			time.Date(2026, 1, 1, 15, 0, 0, 0, kolkata),
 			time.Date(2026, 1, 1, 18, 30, 0, 0, kolkata), 4},
+		{"fractional spring-forward keeps every local bucket",
+			time.Date(2026, 10, 4, 2, 45, 0, 0, lordHowe),
+			time.Date(2026, 10, 4, 4, 0, 0, 0, lordHowe), 3},
 		{"four-hour custom window",
 			mk(2026, 1, 1, 16, 15), mk(2026, 1, 1, 20, 0), 5},
 		{"reversed window returns 0",
