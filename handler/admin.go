@@ -1245,8 +1245,8 @@ func (h *AdminHandler) GetStatsConsumptions(c *gin.Context) {
 		return
 	}
 	query = filtered
-	// The parsed window bounds (local), kept for the range-aware cap below
-	// (the WHERE clauses are applied inline, exactly as before).
+	// The parsed window bounds (local), kept for the range-aware cap below;
+	// the source query uses the same local-hour widening as Activity.
 	var sinceTime, untilTime *time.Time
 	if since := c.Query("since"); since != "" {
 		if t, err := time.Parse(time.RFC3339, since); err == nil {
@@ -1267,7 +1267,16 @@ func (h *AdminHandler) GetStatsConsumptions(c *gin.Context) {
 		if t, err := time.Parse(time.RFC3339, until); err == nil {
 			l := t.Local()
 			untilTime = &l
-			query = query.Where("hour_bucket <= ?", l)
+			// Keep the complete local-hour row containing until, including a
+			// spring-forward-normalized bucket whose persisted timestamp can be
+			// later than the requested wall-clock instant. The Activity overview
+			// applies the exact half-open share client-side, so this only widens
+			// the source query to the first row that cannot overlap the window.
+			querySince := time.Time{}
+			if sinceTime != nil {
+				querySince = *sinceTime
+			}
+			query = query.Where("hour_bucket < ?", activityHourQueryEnd(querySince, l))
 		} else {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid until parameter"})
 			return
@@ -1648,6 +1657,10 @@ func applyActivityFilter(q *gorm.DB, filterType, filterValue string) (*gorm.DB, 
 //	          order) by the given metric, which may differ from the charted
 //	          one. For the blended RATE metrics the rank uses the group's
 //	          overall rate — sums of per-bucket rates are not rates)
+//	precise:   when true, prorate each hourly source row to [since, until)
+//	          before rollup, ranking, and blended-rate calculation. This is
+//	          used by Activity views whose displayed window can cut a bucket;
+//	          the default keeps the raw widened-bucket API behavior.
 //	since / until: RFC3339, inclusive range
 //	filter_type / filter_value: restrict rows to one entity before
 //	          aggregating (the Activity page's filter button). filter_type is
@@ -1660,6 +1673,7 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 	subgroup := c.DefaultQuery("subgroup", "")
 	rollup := c.DefaultQuery("rollup", "day")
 	rankBy := c.DefaultQuery("rank_by", "current")
+	precise := c.Query("precise") == "1" || strings.EqualFold(c.Query("precise"), "true")
 	// Top-N for the chart: series beyond this many groups are folded into an
 	// "Other" series (#94a3b8) like OpenRouter. 0 = no folding.
 	topN := 0
@@ -1807,12 +1821,41 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 		}
 	}
 
+	// A precise Activity request uses the widened query only as a source of
+	// hourly rows. Each row is reduced to the part that overlaps the requested
+	// half-open window before any rollup, ranking, or rate calculation. Doing
+	// this before aggregation is important: scaling a daily/weekly/monthly
+	// aggregate would assume uniform usage across all of its hours, and
+	// ranking the raw widened rows can put the wrong group in Top-N.
+	var rowShares []float64
+	if precise {
+		cutoff := time.Now()
+		rowShares = make([]float64, len(rows))
+		for i := range rows {
+			rowShares[i] = activityRowWindowShare(rows[i].HourBucket, since, until, cutoff)
+		}
+	}
+	rowShare := func(i int) float64 {
+		if !precise {
+			return 1
+		}
+		return rowShares[i]
+	}
+
 	// Aggregate: bucket -> group -> sum.
 	agg := make(map[string]map[string]*activityAcc)
 	// Bucket labels are year-qualified ("YYYY-MM-DD", "YYYY-MM-DD 15:00",
 	// "2006-01-02", "YYYY-MM") so a long or year-spanning range never
 	// collides two same-month-day buckets into one aggregate.
-	bucketOrder := buildActivityAxis(since, until, rollup)
+	axisUntil := until
+	if precise {
+		// buildActivityAxis is inclusive because the legacy endpoint returns
+		// the bucket containing its until parameter. Precise consumers use a
+		// genuinely half-open axis, while the widened query still includes the
+		// source row needed to trim a boundary bucket.
+		axisUntil = until.Add(-time.Nanosecond)
+	}
+	bucketOrder := buildActivityAxis(since, axisUntil, rollup)
 	// bucketOf labels a consumption row's hour bucket; must match the axis
 	// labels exactly (shared formatter) so rows land on the axis.
 	bucketOf := func(t time.Time) string {
@@ -1824,19 +1867,38 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 	for _, b := range bucketOrder {
 		agg[b] = make(map[string]*activityAcc)
 	}
+	ensureAggBucket := func(bucket string) {
+		if _, ok := agg[bucket]; ok {
+			return
+		}
+		// A precise Chatham spring row can have a positive overlap in the
+		// normalized 04:00 bucket even when the half-open axis ends in the
+		// preceding 03:45..04:00 alias. Keep that row visible instead of
+		// indexing a missing map entry (which would panic).
+		index := sort.SearchStrings(bucketOrder, bucket)
+		bucketOrder = append(bucketOrder, "")
+		copy(bucketOrder[index+1:], bucketOrder[index:])
+		bucketOrder[index] = bucket
+		agg[bucket] = make(map[string]*activityAcc)
+	}
 
 	for i := range rows {
+		share := rowShare(i)
+		if share <= 0 {
+			continue
+		}
 		b := bucketOf(rows[i].HourBucket)
+		ensureAggBucket(b)
 		g := groupOf(&rows[i])
 		if _, ok := agg[b][g]; !ok {
 			agg[b][g] = &activityAcc{}
 		}
 		a := agg[b][g]
-		a.sum += valueOf(&rows[i])
-		a.spend += rows[i].CostUSD
-		a.tokens += float64(rows[i].InputTokens + rows[i].OutputTokens)
-		a.requests += float64(rows[i].RequestCount)
-		a.cache += float64(rows[i].CacheHitTokens)
+		a.sum += valueOf(&rows[i]) * share
+		a.spend += rows[i].CostUSD * share
+		a.tokens += float64(rows[i].InputTokens+rows[i].OutputTokens) * share
+		a.requests += float64(rows[i].RequestCount) * share
+		a.cache += float64(rows[i].CacheHitTokens) * share
 		if !seenGroup[g] {
 			seenGroup[g] = true
 			groupOrder = append(groupOrder, g)
@@ -1851,6 +1913,10 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 	if subgroup != "" {
 		seenSubgroup := make(map[string]bool)
 		for i := range rows {
+			share := rowShare(i)
+			if share <= 0 {
+				continue
+			}
 			b := bucketOf(rows[i].HourBucket)
 			g := groupOf(&rows[i])
 			sg := subgroupOf(&rows[i])
@@ -1863,11 +1929,11 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 			if subAgg[b][g][sg] == nil {
 				subAgg[b][g][sg] = &activityAcc{}
 			}
-			subAgg[b][g][sg].sum += valueOf(&rows[i])
+			subAgg[b][g][sg].sum += valueOf(&rows[i]) * share
 			// Spend/tokens are always tracked so subgroup series can derive
 			// rate metrics (blended $/1M) the same way the main cells do.
-			subAgg[b][g][sg].spend += rows[i].CostUSD
-			subAgg[b][g][sg].tokens += float64(rows[i].InputTokens + rows[i].OutputTokens)
+			subAgg[b][g][sg].spend += rows[i].CostUSD * share
+			subAgg[b][g][sg].tokens += float64(rows[i].InputTokens+rows[i].OutputTokens) * share
 			if !seenSubgroup[g+"\x00"+sg] {
 				seenSubgroup[g+"\x00"+sg] = true
 				subgroupOrder[g] = append(subgroupOrder[g], sg)
@@ -1968,10 +2034,11 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 		Totals:  map[string]float64{"spend": 0, "tokens": 0, "requests": 0, "cache": 0},
 	}
 	for i := range rows {
-		resp.Totals["spend"] += rows[i].CostUSD
-		resp.Totals["tokens"] += float64(rows[i].InputTokens + rows[i].OutputTokens)
-		resp.Totals["requests"] += float64(rows[i].RequestCount)
-		resp.Totals["cache"] += float64(rows[i].CacheHitTokens)
+		share := rowShare(i)
+		resp.Totals["spend"] += rows[i].CostUSD * share
+		resp.Totals["tokens"] += float64(rows[i].InputTokens+rows[i].OutputTokens) * share
+		resp.Totals["requests"] += float64(rows[i].RequestCount) * share
+		resp.Totals["cache"] += float64(rows[i].CacheHitTokens) * share
 	}
 
 	// Series: for each bucket, for each group. Groups beyond the Top-N are
@@ -2188,6 +2255,241 @@ func activityBucketLabel(t time.Time, rollup string) string {
 	}
 }
 
+// activityTimeRun is one contiguous epoch interval represented by a local
+// wall-clock bucket. A fall-back can give one hourly row two runs when the
+// offset change is not aligned to an hour (for example, Pacific/Chatham's
+// 45-minute transition).
+type activityTimeRun struct {
+	from time.Time
+	to   time.Time
+}
+
+// activityHourRuns returns the epoch runs represented by one persisted hourly
+// row. The database serializes time.Time values with a fixed offset, so using
+// hourBucket.Location() here loses the application's IANA transition rules:
+// New York's repeated 01:00 row is then treated as 60 minutes instead of 120,
+// and Lord Howe's as 60 instead of 90. Rebuild the persisted wall fields in
+// time.Local, whose rules are the same rules RecordConsumption used when it
+// created the bucket.
+//
+// Ordinary rows use one Add(time.Hour) interval. Only rows within four hours
+// of a timezone transition take the minute walk; the walk preserves repeated
+// or skipped wall-clock fields exactly while keeping long-range Activity
+// queries inexpensive. During a spring-forward gap, time.Date can normalize
+// the requested hour to a later wall time before it is persisted. The
+// normalized timestamp is therefore also matched back to every local hour
+// label that resolves to that instant (Chatham's 03:00 and 04:00 labels are
+// one such collision).
+func activityHourRuns(hourBucket time.Time) []activityTimeRun {
+	return activityHourRunsInLocation(hourBucket, time.Local)
+}
+
+func activityHourRunsInLocation(hourBucket time.Time, loc *time.Location) []activityTimeRun {
+	localBucket := hourBucket.In(loc)
+	year, month, day := localBucket.Date()
+	hour := localBucket.Hour()
+	start := time.Date(year, month, day, hour, 0, 0, 0, loc)
+
+	const transitionWindow = 4 * time.Hour
+	zoneStart, zoneEnd := start.ZoneBounds()
+	nearTransition := (!zoneStart.IsZero() && start.Sub(zoneStart) <= transitionWindow) ||
+		(!zoneEnd.IsZero() && zoneEnd.Sub(start) <= transitionWindow)
+	wall := start.In(loc)
+	validWallHour := wall.Year() == year && wall.Month() == month && wall.Day() == day &&
+		wall.Hour() == hour && wall.Minute() == 0
+	if !nearTransition {
+		// A normal persisted bucket is minute-aligned and cannot have any
+		// spring-forward aliases away from a transition.
+		if !validWallHour || localBucket.Minute() != 0 || localBucket.Second() != 0 || localBucket.Nanosecond() != 0 {
+			return nil
+		}
+		return []activityTimeRun{{from: start, to: start.Add(time.Hour)}}
+	}
+
+	type wallHour struct {
+		year  int
+		month time.Month
+		day   int
+		hour  int
+	}
+	wallHours := make(map[wallHour]struct{}, 2)
+	addWallHour := func(y int, m time.Month, d, h int) {
+		if h < 0 || h > 23 {
+			return
+		}
+		wallHours[wallHour{year: y, month: m, day: d, hour: h}] = struct{}{}
+	}
+
+	// Keep the ordinary wall fields for a minute-aligned row. This is
+	// necessary for a fixed-offset value representing the second occurrence
+	// of an ambiguous fall-back hour: time.Date may resolve the same label to
+	// the other occurrence, but the row still represents both passes.
+	if validWallHour && localBucket.Minute() == 0 && localBucket.Second() == 0 && localBucket.Nanosecond() == 0 {
+		addWallHour(year, month, day, hour)
+	}
+
+	// Find spring-forward-normalized labels and any colliding valid label by
+	// comparing their resolved instants with the persisted timestamp. Search
+	// adjacent dates as well: a timezone transition may normalize a label
+	// across midnight, while ordinary dates are still handled by the direct
+	// wall-field path above.
+	for dayDelta := -1; dayDelta <= 1; dayDelta++ {
+		date := time.Date(year, month, day+dayDelta, 0, 0, 0, 0, loc)
+		for h := 0; h < 24; h++ {
+			candidate := time.Date(date.Year(), date.Month(), date.Day(), h, 0, 0, 0, loc)
+			if candidate.Equal(hourBucket) {
+				addWallHour(date.Year(), date.Month(), date.Day(), h)
+			}
+		}
+	}
+	if len(wallHours) == 0 {
+		return nil
+	}
+
+	// A transition-near row needs the wall-label scan below. It is important
+	// to scan each alias separately: a normalized Chatham 04:00 row contains
+	// both the real 03:45–04:00 portion of the skipped 03:00 label and the
+	// following 04:00–05:00 hour, which are one persisted row after upsert.
+	runs := make([]activityTimeRun, 0, len(wallHours)*2)
+	for label := range wallHours {
+		labelStart := time.Date(label.year, label.month, label.day, label.hour, 0, 0, 0, loc)
+		scanStart := labelStart.Add(-transitionWindow)
+		scanEnd := labelStart.Add(transitionWindow)
+		var runStart time.Time
+		inRun := false
+		for t := scanStart; t.Before(scanEnd); t = t.Add(time.Minute) {
+			local := t.In(loc)
+			matches := local.Year() == label.year && local.Month() == label.month && local.Day() == label.day && local.Hour() == label.hour
+			if matches && !inRun {
+				runStart = t
+				inRun = true
+			} else if !matches && inRun {
+				runs = append(runs, activityTimeRun{from: runStart, to: t})
+				inRun = false
+			}
+		}
+		if inRun {
+			runs = append(runs, activityTimeRun{from: runStart, to: scanEnd})
+		}
+	}
+
+	// Alias runs can touch at a spring-forward normalization boundary. Merge
+	// them so coverage is counted once when a row holds both source labels.
+	sort.Slice(runs, func(i, j int) bool { return runs[i].from.Before(runs[j].from) })
+	merged := runs[:0]
+	for _, run := range runs {
+		if !run.to.After(run.from) {
+			continue
+		}
+		if len(merged) > 0 && !run.from.After(merged[len(merged)-1].to) {
+			if run.to.After(merged[len(merged)-1].to) {
+				merged[len(merged)-1].to = run.to
+			}
+			continue
+		}
+		merged = append(merged, run)
+	}
+	return merged
+}
+
+// activityRecordedHourRuns caps the row's represented runs at the response
+// time. Consumption values are recorded through the whole minute containing
+// cutoff; preserve the existing one-minute minimum when cutoff falls inside a
+// newly-created run so a non-zero row is never divided by zero.
+func activityRecordedHourRuns(hourBucket, cutoff time.Time) []activityTimeRun {
+	runs := activityHourRuns(hourBucket)
+	if len(runs) == 0 {
+		return nil
+	}
+	recordedEnd := cutoff.Truncate(time.Minute)
+	recorded := make([]activityTimeRun, 0, len(runs))
+	for _, run := range runs {
+		to := run.to
+		if recordedEnd.Before(to) {
+			to = recordedEnd
+		}
+		if to.After(run.from) {
+			recorded = append(recorded, activityTimeRun{from: run.from, to: to})
+			continue
+		}
+		if cutoff.After(run.from) {
+			to = run.from.Add(time.Minute)
+			if to.After(run.to) {
+				to = run.to
+			}
+			if to.After(run.from) {
+				recorded = append(recorded, activityTimeRun{from: run.from, to: to})
+			}
+		}
+	}
+	return recorded
+}
+
+// activityRowWindowShare returns the fraction of one hourly consumption row
+// that belongs to the requested half-open window. Consumption is stored at
+// hourly resolution, so this is the finest boundary correction the server
+// can make: only the boundary hour is assumed uniform. Importantly, the
+// correction is applied to each source row before any daily/weekly/monthly
+// aggregation, rather than scaling an already mixed aggregate.
+func activityRowWindowShare(hourBucket, since, until, cutoff time.Time) float64 {
+	recorded := activityRecordedHourRuns(hourBucket, cutoff)
+	coverage := time.Duration(0)
+	overlap := time.Duration(0)
+	for _, run := range recorded {
+		coverage += run.to.Sub(run.from)
+		overlapStart := run.from
+		if since.After(overlapStart) {
+			overlapStart = since
+		}
+		overlapEnd := run.to
+		if until.Before(overlapEnd) {
+			overlapEnd = until
+		}
+		if overlapEnd.After(overlapStart) {
+			overlap += overlapEnd.Sub(overlapStart)
+		}
+	}
+	if coverage <= 0 || overlap <= 0 {
+		return 0
+	}
+	return float64(overlap) / float64(coverage)
+}
+
+// activityHourQueryEnd returns the first persisted local-hour bucket label
+// whose resolved instant is after until and whose row cannot contain data in
+// [since, until). A local wall-clock hour can repeat during a DST fall-back,
+// and time.Date resolves an ambiguous label to one occurrence. Adding an
+// elapsed hour to that value can therefore produce an end before until: in
+// Pacific/Chatham, second-occurrence 02:45 follows the persisted 03:00 label,
+// even though time.Date(02:00).Add(time.Hour) resolves to an earlier instant.
+// Walk local hour labels and inspect their represented epoch runs so every
+// source row that can overlap the requested endpoint is fetched, while
+// ordinary zones retain the existing one-hour widening.
+func activityHourQueryEnd(since, until time.Time) time.Time {
+	loc := until.Location()
+	// Keep the wall-clock label cursor in UTC. Constructing the next label from
+	// the previous candidate's normalized fields can repeat forever when a
+	// spring-forward gap makes time.Date(02:00, loc) resolve to 01:00. UTC has
+	// no local-time normalization, so each label advances exactly one hour.
+	label := time.Date(until.Year(), until.Month(), until.Day(), until.Hour()+1, 0, 0, 0, time.UTC)
+	for {
+		candidate := time.Date(label.Year(), label.Month(), label.Day(), label.Hour(), 0, 0, 0, loc)
+		if candidate.After(until) {
+			needsCandidate := false
+			for _, run := range activityHourRunsInLocation(candidate, loc) {
+				if run.from.Before(until) && run.to.After(since) {
+					needsCandidate = true
+					break
+				}
+			}
+			if !needsCandidate {
+				return candidate
+			}
+		}
+		label = label.Add(time.Hour)
+	}
+}
+
 // activityWindow widens a query range to the rollup buckets CONTAINING its
 // endpoints. hour_bucket rows are truncated to the LOCAL hour, so a window
 // starting at 16:05 must still match the 16:00 bucket (it holds the
@@ -2209,7 +2511,7 @@ func activityWindow(since, until time.Time, rollup string) (from, to time.Time) 
 		// to whole containing months and pull out-of-range usage into the
 		// single Total bucket.
 		from = time.Date(since.Year(), since.Month(), since.Day(), since.Hour(), 0, 0, 0, loc)
-		to = time.Date(until.Year(), until.Month(), until.Day(), until.Hour(), 0, 0, 0, loc).Add(time.Hour)
+		to = activityHourQueryEnd(since, until)
 	case "day":
 		from = time.Date(since.Year(), since.Month(), since.Day(), 0, 0, 0, 0, loc)
 		to = time.Date(until.Year(), until.Month(), until.Day(), 0, 0, 0, 0, loc).AddDate(0, 0, 1)

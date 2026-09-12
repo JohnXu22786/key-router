@@ -945,6 +945,106 @@ func TestActivityWeekRollupMonthBoundary(t *testing.T) {
 	}
 }
 
+// TestActivityPreciseWindow normalizes hourly source rows before the selected
+// rollup is built. This protects short/coarse Explore windows from three
+// related regressions: a non-uniform daily bucket must not be scaled as one
+// aggregate, a blended rate must use only the in-window spend/tokens mix, and
+// Top-N must rank after the outside-window rows have been removed.
+func TestActivityPreciseWindow(t *testing.T) {
+	e := bootstrapActivity(t)
+	t.Cleanup(func() {
+		if sqlDB, err := db.GetDB().DB(); err == nil {
+			sqlDB.Close()
+		}
+	})
+
+	var key model.Key
+	if err := db.GetDB().Where("name = ?", "k1").First(&key).Error; err != nil {
+		t.Fatal(err)
+	}
+	loc := time.Local
+	since := time.Date(2026, 8, 13, 12, 0, 0, 0, loc)
+	until := time.Date(2026, 8, 13, 14, 0, 0, 0, loc)
+	insert := func(hour time.Time, group string, cost float64, tokens int64) {
+		db.GetDB().Create(&model.Consumption{
+			KeyID: key.ID, HourBucket: hour, ModelName: group,
+			RequestCount: 1, InputTokens: tokens, CostUSD: cost,
+		})
+	}
+	// The first three rows all share one daily rollup bucket. Only the rows
+	// at 12:00 belong to [12:00, 14:00); the large outside row must not win
+	// Top-N or contribute to the totals.
+	insert(time.Date(2026, 8, 13, 18, 0, 0, 0, loc), "outside", 1000, 1000)
+	insert(time.Date(2026, 8, 13, 12, 0, 0, 0, loc), "inside", 10, 100)
+	insert(time.Date(2026, 8, 13, 12, 0, 0, 0, loc), "other", 5, 50)
+	// This group proves the blended rate is derived from the corrected
+	// spend/tokens mix rather than the complete widened day.
+	insert(time.Date(2026, 8, 13, 12, 0, 0, 0, loc), "mixed", 1, 100)
+	insert(time.Date(2026, 8, 13, 18, 0, 0, 0, loc), "mixed", 100, 100)
+
+	qs := fmt.Sprintf("metric=spend&group_by=model&rollup=day&top=1&precise=true&since=%s&until=%s",
+		url.QueryEscape(since.Format(time.RFC3339)), url.QueryEscape(until.Format(time.RFC3339)))
+	req := httptest.NewRequest("GET", "/api/stats/activity?"+qs, nil)
+	req.Host = "localhost:9999"
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("precise spend status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var spend struct {
+		Series []struct {
+			Group string  `json:"group"`
+			Value float64 `json:"value"`
+		} `json:"series"`
+		Summary []summaryRow       `json:"summary"`
+		Totals  map[string]float64 `json:"totals"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &spend); err != nil {
+		t.Fatalf("bad precise spend json: %v", err)
+	}
+	if len(spend.Summary) == 0 || spend.Summary[0].Group != "inside" {
+		t.Fatalf("precise Top-N order = %v, want inside first", summaryGroups(spend.Summary))
+	}
+	if spend.Totals["spend"] != 16 {
+		t.Fatalf("precise spend total = %v, want 16", spend.Totals["spend"])
+	}
+	other := 0.0
+	for _, point := range spend.Series {
+		if point.Group == "Other" {
+			other += point.Value
+		}
+	}
+	if other != 6 {
+		t.Fatalf("precise Other spend = %v, want 6", other)
+	}
+
+	blendQS := fmt.Sprintf("metric=blended&group_by=model&rollup=day&precise=1&since=%s&until=%s",
+		url.QueryEscape(since.Format(time.RFC3339)), url.QueryEscape(until.Format(time.RFC3339)))
+	blendReq := httptest.NewRequest("GET", "/api/stats/activity?"+blendQS, nil)
+	blendReq.Host = "localhost:9999"
+	blendRec := httptest.NewRecorder()
+	e.ServeHTTP(blendRec, blendReq)
+	if blendRec.Code != 200 {
+		t.Fatalf("precise blended status = %d: %s", blendRec.Code, blendRec.Body.String())
+	}
+	var blended struct {
+		Summary []summaryRow `json:"summary"`
+	}
+	if err := json.Unmarshal(blendRec.Body.Bytes(), &blended); err != nil {
+		t.Fatalf("bad precise blended json: %v", err)
+	}
+	var mixedSum float64
+	for _, row := range blended.Summary {
+		if row.Group == "mixed" {
+			mixedSum = row.Sum
+			break
+		}
+	}
+	if math.Abs(mixedSum-10000) > 1e-9 {
+		t.Fatalf("precise mixed blended rate = %v, want 10000", mixedSum)
+	}
+}
+
 // TestActivityWeekRollupPastPeriodExcludesBoundaryWeek pins the week-rollup
 // boundary contract the client fix (queryWindowUntil's week-grid exclusion)
 // relies on: for a PAST-period range (Prev Month) + rollup=week, the whole

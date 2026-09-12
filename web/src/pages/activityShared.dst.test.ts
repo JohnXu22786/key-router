@@ -161,6 +161,23 @@ describe('bucketStarts — DST axes under the half-open window', () => {
     expect(sorts).toEqual([...new Set(sorts)]);
     expect(sorts.every((s, i) => i === 0 || s > sorts[i - 1])).toBe(true);
   });
+
+  it('keeps a short axis inside the second occurrence on its true instant', () => {
+    // 01:15 EST .. 01:30 EST is 06:15Z .. 06:30Z. Flooring through the
+    // local wall fields would re-anchor the start to 01:15 EDT (05:15Z),
+    // causing the axis to include the wrong occurrence and the monotonic
+    // guard to discard the actual repeated labels.
+    const since = dayjs('2026-11-01T06:15:00.000Z');
+    const until = dayjs('2026-11-01T06:30:00.000Z');
+    const out = bucketAxis(since, until, 'minute');
+    expect(out.map(p => p.sort)).toEqual([
+      '2026-11-01 01:15', '2026-11-01 01:16', '2026-11-01 01:17',
+      '2026-11-01 01:18', '2026-11-01 01:19', '2026-11-01 01:20',
+      '2026-11-01 01:21', '2026-11-01 01:22', '2026-11-01 01:23',
+      '2026-11-01 01:24', '2026-11-01 01:25', '2026-11-01 01:26',
+      '2026-11-01 01:27', '2026-11-01 01:28', '2026-11-01 01:29',
+    ]);
+  });
 });
 
 // series() on a sub-hour axis must split the repeated row with the SAME real
@@ -471,12 +488,12 @@ describe('window-side floors on the fall-back night — epoch grid', () => {
     // The window holds 75 of the row's 80 recorded minutes and the live
     // cell holds the other 5 ([01:15 EST, 01:20 EST)): the share is the
     // whole row, not 30/80 from a first-occurrence-placed window.
-    const share = bucketWindowShare(ROW, since, until, nowEst(), 'min15');
+    const share = bucketWindowShare(ROW, since, until, nowEst(), 'min15', true);
     expect(share).toBeCloseTo(1, 10);
     // Chart: no duplicate tick is appended (01:15 EST would collide with
     // the axis's 01:15 EDT tick), but the cell's 5 recorded minutes still
     // fold onto that tick, so the line total equals the KPI share.
-    const out = series([{ hour_bucket: ROW }], () => 1200, since, until, nowEst(), 'min15');
+    const out = series([{ hour_bucket: ROW }], () => 1200, since, until, nowEst(), 'min15', true);
     expect(out.map(p => p.value)).toEqual([0, 0, 0, 0, 0, 0, 0, 450, 300, 225, 225]);
     expect(out.reduce((a, p) => a + p.value, 0)).toBeCloseTo(1200 * share, 10);
   });
@@ -490,7 +507,7 @@ describe('window-side floors on the fall-back night — epoch grid', () => {
       // The row's whole recorded extent [01:00 EDT, 01:20 EST) lies inside
       // the live hour [01:00 EST, 02:00 EST): share must be 1, not the
       // 60/80 a first-occurrence-anchored cell reads.
-      expect(bucketWindowShare(ROW, since, until, now, 'hour')).toBeCloseTo(1, 10);
+      expect(bucketWindowShare(ROW, since, until, now, 'hour', true)).toBeCloseTo(1, 10);
     }
   });
 
@@ -507,17 +524,17 @@ describe('window-side floors on the fall-back night — epoch grid', () => {
     const since30 = floorWindowUntil(now.subtract(30, 'minute'), 'minute'); // 01:50 EDT (05:50Z)
     const until30 = floorWindowUntil(now, 'minute'); // 01:20 EST (06:20Z)
     expect(until30.toISOString()).toBe('2026-11-01T06:20:00.000Z');
-    const out30 = series([{ hour_bucket: ROW }], () => 1200, since30, until30, now, 'minute');
+    const out30 = series([{ hour_bucket: ROW }], () => 1200, since30, until30, now, 'minute', true);
     expect(out30.map(p => p.value)).toEqual([...Array(10).fill(45)]);
-    const kpi30 = bucketWindowShare(ROW, since30, until30, now, 'minute');
+    const kpi30 = bucketWindowShare(ROW, since30, until30, now, 'minute', true);
     expect(kpi30).toBeCloseTo(30 / 80, 10);
     expect(out30.reduce((a, p) => a + p.value, 0)).toBeCloseTo(1200 * kpi30, 10);
     // 1h: window [01:20 EDT, 01:20 EST) covers the first occurrence's last
     // 40 minutes plus the second occurrence's first 20: share 60/80 =
     // 0.75, shown equally by the chart and the KPI.
     const since60 = floorWindowUntil(now.subtract(1, 'hour'), 'minute'); // 01:20 EDT (05:20Z)
-    const out60 = series([{ hour_bucket: ROW }], () => 1200, since60, until30, now, 'minute');
-    const kpi60 = bucketWindowShare(ROW, since60, until30, now, 'minute');
+    const out60 = series([{ hour_bucket: ROW }], () => 1200, since60, until30, now, 'minute', true);
+    const kpi60 = bucketWindowShare(ROW, since60, until30, now, 'minute', true);
     expect(kpi60).toBeCloseTo(0.75, 10);
     expect(out60.reduce((a, p) => a + p.value, 0)).toBeCloseTo(1200 * kpi60, 10);
   });
@@ -534,7 +551,7 @@ describe('window-side floors on the fall-back night — epoch grid', () => {
     // the coverage to 20 minutes) — share 1, exactly as before the fix.
     const since = floorWindowUntil(dayjs('2026-10-31T01:20:30').subtract(24, 'hour'), 'hour'); // 01:00 EDT Oct 30
     const until = floorWindowUntil(dayjs('2026-10-31T01:20:30'), 'hour'); // 01:00 EDT Oct 31
-    const share = bucketWindowShare('2026-10-31T01:00:00', since, until, dayjs('2026-10-31T01:20:30'), 'hour');
+    const share = bucketWindowShare('2026-10-31T01:00:00', since, until, dayjs('2026-10-31T01:20:30'), 'hour', true);
     expect(share).toBeCloseTo(1, 10);
   });
 });

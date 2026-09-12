@@ -7,7 +7,7 @@
 // America/New_York via activityShared.dst.test.ts).
 import { describe, it, expect, vi, beforeAll } from 'vitest';
 import dayjs from 'dayjs';
-import { bucketWindowShare, floorWindowUntil } from './activityShared';
+import { bucketWindowShare, floorWindowUntil, rowCoverage, series } from './activityShared';
 
 beforeAll(() => {
   vi.stubEnv('TZ', 'Australia/Lord_Howe');
@@ -86,8 +86,27 @@ describe('floorWindowUntil hour branch — Lord Howe spring-forward gap', () => 
     const until = floorWindowUntil(now, 'hour');
     const since = floorWindowUntil(now.subtract(24, 'hour'), 'hour');
     expect(until.toISOString()).toBe('2026-10-03T15:30:00.000Z');
-    const share = bucketWindowShare('2026-10-04T02:00:00', since, until, now, 'hour');
+    const share = bucketWindowShare('2026-10-04T02:00:00', since, until, now, 'hour', true);
     expect(share).toBeCloseTo(1, 10);
+  });
+});
+
+describe('normalized Lord Howe spring-forward buckets', () => {
+  it('treats the persisted 02:30 label as the normalized 02:00 row', () => {
+    const bucket = '2026-10-04T02:30:00+11:00';
+    const cutoff = dayjs('2026-10-04T04:00:00');
+    const coverage = rowCoverage(dayjs(bucket), 'hour', cutoff);
+    expect(coverage.coverage).toBe(30);
+    expect(coverage.runs).toEqual([{
+      from: dayjs('2026-10-03T15:30:00.000Z').valueOf(),
+      to: dayjs('2026-10-03T16:00:00.000Z').valueOf(),
+    }]);
+
+    const since = dayjs('2026-10-03T15:30:00.000Z');
+    const until = dayjs('2026-10-03T15:45:00.000Z');
+    expect(bucketWindowShare(bucket, since, until, cutoff, 'hour')).toBeCloseTo(0.5, 10);
+    const chart = series([{ hour_bucket: bucket, value: 30 }], r => r.value, since, until, cutoff, 'hour');
+    expect(chart.map(point => point.value)).toEqual([15]);
   });
 });
 
@@ -108,7 +127,7 @@ describe('bucketWindowShare — Lord Howe hour-granularity live window on the re
     const until = floorWindowUntil(now, 'hour');
     const since = floorWindowUntil(now.subtract(24, 'hour'), 'hour');
     expect(until.toISOString()).toBe('2026-04-04T15:00:00.000Z');
-    const share = bucketWindowShare('2026-04-05T01:00:00', since, until, now, 'hour');
+    const share = bucketWindowShare('2026-04-05T01:00:00', since, until, now, 'hour', true);
     expect(share).toBeCloseTo(1, 10);
   });
 
@@ -122,7 +141,7 @@ describe('bucketWindowShare — Lord Howe hour-granularity live window on the re
     const until = floorWindowUntil(now, 'hour');
     const since = floorWindowUntil(now.subtract(24, 'hour'), 'hour');
     expect(until.toISOString()).toBe('2026-04-07T14:30:00.000Z');
-    const share = bucketWindowShare('2026-04-08T01:00:00', since, until, now, 'hour');
+    const share = bucketWindowShare('2026-04-08T01:00:00', since, until, now, 'hour', true);
     expect(share).toBeCloseTo(1, 10);
   });
 });
