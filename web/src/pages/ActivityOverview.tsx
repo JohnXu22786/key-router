@@ -312,7 +312,8 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
 
   // --- Charts ---
   // Usage by model (spend, stacked bars, top-5 + Other like OR)
-  const modelSpend = groupTotals(curList, c => c.model_name || 'Unknown', c => c.cost_usd, share);
+  const modelSpend = groupTotals(curList, c => c.model_name || 'Unknown', c => c.cost_usd, share)
+    .filter(([, value]) => value > 0);
   const topModels = modelSpend.slice(0, 5).map(([m]) => m);
   const usageByModel = stackedData(curList, [...topModels, 'Other'], c => c.model_name || 'Unknown', c => c.cost_usd, axSince, axUntil, cutNow, gran);
   // Fold everything below top-5 into "Other" per bucket.
@@ -332,7 +333,8 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
   const modelColor = new Map(modelGroups.map(g => [g.name, g.color]));
 
   // Request volume by model (stacked bars, top-5 + Other)
-  const modelReqs = groupTotals(curList, c => c.model_name || 'Unknown', c => c.request_count, share);
+  const modelReqs = groupTotals(curList, c => c.model_name || 'Unknown', c => c.request_count, share)
+    .filter(([, value]) => value > 0);
   const topReqModels = modelReqs.slice(0, 5).map(([m]) => m);
   const reqByModel = stackedData(curList, [...topReqModels, 'Other'], c => c.model_name || 'Unknown', c => c.request_count, axSince, axUntil, cutNow, gran);
   const otherReqSet = new Set(modelReqs.slice(5).map(([m]) => m));

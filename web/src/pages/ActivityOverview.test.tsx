@@ -217,4 +217,22 @@ describe('ActivityOverview empty state', () => {
     expect(screen.queryAllByText('Cached')).toHaveLength(0);
     expect(screen.queryAllByText('Uncached')).toHaveLength(0);
   });
+
+  it('omits zero-share model groups before selecting chart legends', async () => {
+    const until = dayjs('2026-08-02T00:00:00');
+    const inRange = { ...makeConsumption(100, '2026-08-01T12:00:00'), model_name: 'in-range-model' };
+    const atExclusiveEnd = { ...makeConsumption(100, until.format('YYYY-MM-DDTHH:mm:ss')), model_name: 'boundary-model' };
+    vi.mocked(getConsumptions)
+      .mockResolvedValueOnce(response([inRange, atExclusiveEnd]))
+      .mockResolvedValueOnce(response([]));
+
+    render(
+      <ActivityOverview
+        range={customRange(dayjs('2026-08-01T00:00:00'), until)}
+      />,
+    );
+
+    await waitFor(() => expect(screen.getAllByRole('group', { name: 'in-range-model' })).toHaveLength(2));
+    expect(screen.queryAllByRole('group', { name: 'boundary-model' })).toHaveLength(0);
+  });
 });
