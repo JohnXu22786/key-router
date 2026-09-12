@@ -98,6 +98,24 @@ func TestBuildActivityAxisLordHoweSpringForward(t *testing.T) {
 	}
 }
 
+// TestActivityHourAxisLabelUsesWallClockHour verifies that a normalized
+// fractional spring-forward timestamp does not leak its minute into the axis
+// label when it remains in the requested wall-clock hour.
+func TestActivityHourAxisLabelUsesWallClockHour(t *testing.T) {
+	lordHowe, err := time.LoadLocation("Australia/Lord_Howe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	label := time.Date(2026, 10, 4, 2, 0, 0, 0, time.UTC)
+	normalized := time.Date(2026, 10, 4, 2, 0, 0, 0, lordHowe)
+	if normalized.Hour() != 2 || normalized.Minute() != 30 {
+		t.Fatalf("Lord Howe normalized candidate = %v, want 02:30", normalized)
+	}
+	if got, want := activityHourAxisLabel(label, normalized), "2026-10-04 02:00"; got != want {
+		t.Fatalf("Lord Howe axis label = %q, want %q", got, want)
+	}
+}
+
 // TestBuildActivityAxisChathamSpringForward keeps a precise window that lies
 // entirely inside Chatham's nonexistent 03:00 hour visible as the normalized
 // 04:00 bucket, even when there is no consumption row to seed the axis.

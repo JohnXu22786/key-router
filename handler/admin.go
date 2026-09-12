@@ -2261,6 +2261,18 @@ func activityBucketLabel(t time.Time, rollup string) string {
 	}
 }
 
+// activityHourAxisLabel keeps an hourly axis label tied to its wall-clock
+// cursor when a fractional spring-forward gap normalizes that cursor to a
+// later minute in the same hour. Gaps that normalize across an hour retain
+// the persisted bucket label (for example, Chatham's 03:00 -> 04:00).
+func activityHourAxisLabel(label, resolved time.Time) string {
+	if resolved.Year() == label.Year() && resolved.Month() == label.Month() &&
+		resolved.Day() == label.Day() && resolved.Hour() == label.Hour() && resolved.Minute() != 0 {
+		return label.Format("2006-01-02 15:00")
+	}
+	return activityBucketLabel(resolved, "hour")
+}
+
 // activityTimeRun is one contiguous epoch interval represented by a local
 // wall-clock bucket. A fall-back can give one hourly row two runs when the
 // offset change is not aligned to an hour (for example, Pacific/Chatham's
@@ -2580,7 +2592,8 @@ func buildActivityAxis(since, until time.Time, rollup string) []string {
 			if !hasOverlap {
 				continue
 			}
-			if b := bucketOf(t); len(bucketOrder) == 0 || bucketOrder[len(bucketOrder)-1] != b {
+			b := activityHourAxisLabel(label, t)
+			if len(bucketOrder) == 0 || bucketOrder[len(bucketOrder)-1] != b {
 				bucketOrder = append(bucketOrder, b)
 			}
 		}
