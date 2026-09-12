@@ -16,6 +16,10 @@ func TestBucketBound(t *testing.T) {
 	mk := func(y, mo, d, h, mi int) time.Time {
 		return time.Date(y, time.Month(mo), d, h, mi, 0, 0, time.UTC)
 	}
+	kolkata, err := time.LoadLocation("Asia/Kolkata")
+	if err != nil {
+		t.Fatal(err)
+	}
 	cases := []struct {
 		name         string
 		since, until time.Time
@@ -29,6 +33,9 @@ func TestBucketBound(t *testing.T) {
 			mk(2026, 1, 1, 16, 31), mk(2026, 1, 1, 18, 29), 3},
 		{"on-grid since, mid-hour until",
 			mk(2026, 1, 1, 16, 0), mk(2026, 1, 1, 18, 30), 3},
+		{"half-hour local offset stays on local hour grid",
+			time.Date(2026, 1, 1, 15, 0, 0, 0, kolkata),
+			time.Date(2026, 1, 1, 18, 30, 0, 0, kolkata), 4},
 		{"four-hour custom window",
 			mk(2026, 1, 1, 16, 15), mk(2026, 1, 1, 20, 0), 5},
 		{"reversed window returns 0",

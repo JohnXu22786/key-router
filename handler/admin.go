@@ -1220,7 +1220,7 @@ func (h *AdminHandler) GetKeyDetail(c *gin.Context) {
 // the raw instant keeps the real-time distance exact. A reversed window
 // (until < flooredSince) returns 0.
 func bucketBound(since, until time.Time) int64 {
-	flooredSince := since.Truncate(time.Hour)
+	flooredSince := time.Date(since.Year(), since.Month(), since.Day(), since.Hour(), 0, 0, 0, since.Location())
 	d := until.Sub(flooredSince)
 	if d < 0 {
 		return 0
