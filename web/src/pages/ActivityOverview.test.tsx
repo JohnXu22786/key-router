@@ -153,3 +153,25 @@ describe('ActivityOverview truncated responses', () => {
     expect(await screen.findByText(/activity data is incomplete/i)).not.toBeNull();
   });
 });
+
+describe('ActivityOverview empty state', () => {
+  it('shows the empty state for charts when the successful response has no usage', async () => {
+    vi.mocked(getConsumptions).mockResolvedValue(response([]));
+
+    render(
+      <ActivityOverview
+        range={customRange(
+          dayjs('2026-08-01T00:00:00'),
+          dayjs('2026-08-02T00:00:00'),
+        )}
+      />,
+    );
+
+    await waitFor(() => expect(screen.getAllByText('No usage in this period.')).toHaveLength(6));
+    expect(screen.queryAllByText('Other')).toHaveLength(0);
+    expect(screen.queryAllByText('Prompt')).toHaveLength(0);
+    expect(screen.queryAllByText('Completion')).toHaveLength(0);
+    expect(screen.queryAllByText('Cached')).toHaveLength(0);
+    expect(screen.queryAllByText('Uncached')).toHaveLength(0);
+  });
+});
