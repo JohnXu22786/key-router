@@ -10,6 +10,7 @@ import {
 } from 'recharts';
 import { getConsumptions, getOverview, getKeys, getProviders, Consumption, OverviewStats, Key, Provider } from '../api/client';
 import { cacheHitRate } from './activityShared';
+import { prorateStatsConsumptions } from './statsAggregation';
 import dayjs from 'dayjs';
 
 const { Title, Text } = Typography;
@@ -47,7 +48,7 @@ const RANGES = [
   { key: '3d', label: '3 days', since: () => dayjs().subtract(3, 'day'), granularity: 'hour', granularityLabel: 'hourly' },
   { key: '7d', label: '7 days', since: () => dayjs().subtract(7, 'day'), granularity: 'day', granularityLabel: 'daily' },
   { key: '30d', label: '30 days', since: () => dayjs().subtract(30, 'day'), granularity: 'day', granularityLabel: 'daily' },
-];
+] as const;
 
 const METRICS = [
   { key: 'cost', label: 'Spend', color: ACCENT, fmt: fmtUSD },
@@ -81,20 +82,26 @@ const Stats: React.FC = () => {
     setError(false);
     try {
       const r = RANGES[rangeIdx];
-      const since = r.since().toISOString();
-      const now = dayjs().toISOString();
+      const sinceValue = r.since();
+      const untilValue = dayjs();
+      const since = sinceValue.toISOString();
+      const now = untilValue.toISOString();
       // Previous period of equal length (for KPI deltas)
-      const prevLen = dayjs(now).diff(since, 'millisecond');
-      const prevSince = dayjs(since).subtract(prevLen, 'millisecond').toISOString();
-      const [curRes, prevRes, ovRes, keyRes, provRes] = await Promise.all([
-        getConsumptions({ since, until: now }),
+      const prevLen = untilValue.diff(sinceValue, 'millisecond');
+      const prevSinceValue = sinceValue.subtract(prevLen, 'millisecond');
+      const prevSince = prevSinceValue.toISOString();
+      const currentResponse = getConsumptions({ since, until: now })
+        .then(curRes => ({ curRes, cutoff: dayjs() }));
+      const [current, prevRes, ovRes, keyRes, provRes] = await Promise.all([
+        currentResponse,
         getConsumptions({ since: prevSince, until: since }),
         getOverview(),
         getKeys(),
         getProviders(),
       ]);
-      setConsumptions(curRes.data);
-      setPrevConsumptions(prevRes.data);
+      const { curRes, cutoff } = current;
+      setConsumptions(prorateStatsConsumptions(curRes.data, sinceValue, untilValue, cutoff, r.granularity));
+      setPrevConsumptions(prorateStatsConsumptions(prevRes.data, prevSinceValue, sinceValue, cutoff, r.granularity));
       setOverview(ovRes.data);
       setKeys(keyRes.data);
       setProviders(provRes.data);
