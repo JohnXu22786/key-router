@@ -8,6 +8,7 @@ import {
   computeTrending, toChartData, cacheHitRate, resampleResponse, liveExtensionEligible,
   prorateBoundaryBuckets, aggregateTotalResponse, aggregateHourlyResponse,
   normalizeHourlyResponse, combineBlendedResponses, limitActivityResponse,
+  activitySourcePlan, mergeActivityBoundaryResponses, normalizeActivitySourceResponse,
 } from './activityShared';
 import type { ActivityResponse } from '../api/client';
 import type { Granularity } from './activityShared';
@@ -1878,6 +1879,84 @@ describe('hourly activity normalization', () => {
     // expensive per token and must lead the blended-current ranking.
     expect(out.summary.map(s => s.group)).toEqual(['rate-first', 'spend-first']);
     expect(out.series.map(s => s.group)).toEqual(['rate-first', 'spend-first']);
+  });
+});
+
+describe('bounded activity source planning', () => {
+  it('uses a coarse source for long ranges without creating boundary requests when aligned', () => {
+    const range = {
+      since: dayjs('2025-08-01T00:00:00'),
+      until: dayjs('2026-08-01T00:00:00'),
+      granularity: 'month' as Granularity,
+    };
+    expect(activitySourcePlan(range, 'day', true)).toMatchObject({ sourceRollup: 'day' });
+    expect(activitySourcePlan(range, 'day', true).boundary).toBeUndefined();
+    expect(activitySourcePlan(range, 'total', true)).toMatchObject({ sourceRollup: 'month' });
+  });
+
+  it('keeps separated first and last coarse boundaries in separate hourly requests', () => {
+    const range = {
+      since: dayjs('2025-08-13T12:00:00'),
+      until: dayjs('2026-08-13T12:00:00'),
+      granularity: 'month' as Granularity,
+    };
+    const plan = activitySourcePlan(range, 'month', false);
+    expect(plan.sourceRollup).toBe('month');
+    expect(plan.boundary).toHaveLength(2);
+    expect(plan.boundary!.map(edge => edge.bucket)).toEqual(['2025-08', '2026-08']);
+    expect(plan.boundary!.every(edge => edge.until.diff(edge.since, 'day', true) <= 31)).toBe(true);
+  });
+
+  it('overlays normalized edge buckets while preserving coarse interior values', () => {
+    const coarseBuckets = Array.from({ length: 9 }, (_, i) => `2026-08-${String(i + 10).padStart(2, '0')}`);
+    const coarse: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'day', buckets: coarseBuckets,
+      series: coarseBuckets.map((bucket, i) => ({
+        bucket, group: 'model-a', value: i === 0 ? 1000 : i === coarseBuckets.length - 1 ? 900 : 10,
+        is_zero: false, has_data: true,
+      })),
+      summary: [{ group: 'model-a', min: 10, max: 1000, avg: 212.2, sum: 1910, value: 900, percent: 100 }],
+      totals: { spend: 1910, tokens: 0, requests: 0, cache: 0 },
+    };
+    const hourlyEdge = (day: string, value: number): ActivityResponse => {
+      const buckets = Array.from({ length: 24 }, (_, hour) => `${day} ${String(hour).padStart(2, '0')}:00`);
+      return {
+        metric: 'spend', group_by: 'model', rollup: 'hour', buckets,
+        series: buckets.map(bucket => ({ bucket, group: 'model-a', value, is_zero: false, has_data: true })),
+        summary: [{ group: 'model-a', min: value, max: value, avg: value, sum: value * 24, value, percent: 100 }],
+        totals: { spend: value * 24, tokens: 0, requests: 0, cache: 0 },
+      };
+    };
+    const since = dayjs('2026-08-10T12:00:00');
+    const until = dayjs('2026-08-18T12:00:00');
+    const cutoff = dayjs('2026-08-19T00:00:00');
+    const merged = mergeActivityBoundaryResponses(
+      coarse,
+      [hourlyEdge('2026-08-10', 1), hourlyEdge('2026-08-18', 2)],
+      since,
+      until,
+      cutoff,
+      'day',
+      'day',
+      false,
+    );
+    expect(merged.series.map(point => point.value)).toEqual([12, 10, 10, 10, 10, 10, 10, 10, 24]);
+    expect(merged.summary[0].sum).toBe(106);
+
+    const total = normalizeActivitySourceResponse(
+      coarse,
+      [hourlyEdge('2026-08-10', 1), hourlyEdge('2026-08-18', 2)],
+      since,
+      until,
+      cutoff,
+      'day',
+      'day',
+      'total',
+      false,
+    );
+    expect(total.buckets).toEqual(['Total']);
+    expect(total.series[0].value).toBe(106);
+    expect(total.totals.spend).toBe(106);
   });
 });
 

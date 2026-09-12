@@ -13,8 +13,9 @@ import {
 import { getActivity, ActivityResponse, ActivityGroupSummary } from '../api/client';
 import {
   DateRange, ActivityFilter, filterKey, fmtUSDInt, fmtTokens, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS,
-  fmtPercent, fmt3sig, fmtTick, fmtBucket, modelFavicon, Granularity, ActivityRollup,
-  queryWindowUntil, floorWindowUntil, liveExtensionEligible, normalizeHourlyResponse, combineBlendedResponses,
+  fmtPercent, fmt3sig, fmtTick, fmtBucket, modelFavicon, Granularity,
+  ActivityOutputRollup, activitySourcePlan, activitySourceQueryUntil, liveExtensionEligible,
+  normalizeActivitySourceResponse, combineBlendedResponses,
   limitActivityResponse,
 } from './activityShared';
 import dayjs from 'dayjs';
@@ -144,10 +145,10 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
       const t0 = performance.now();
       try {
         // The API stores hourly rows and widens every query to complete
-        // buckets. Fetch every source metric uncapped, then normalize the
-        // hourly cells before applying the requested rollup or Top-N set.
-        // This keeps boundary correction exact for non-uniform usage and
-        // prevents outside-window rows from deciding which groups survive.
+        // buckets. Short/fine views use those rows directly; long views use
+        // the selected coarse rollup and fetch only the edge buckets hourly
+        // so boundary correction stays exact without materializing a year's
+        // worth of hourly cells.
         const chartMetrics = metric === 'blended' ? ['spend', 'tokens'] : [metric];
         const rankMetric = rankBy === 'current' ? metric : rankBy;
         const rankMetrics = rankMetric === 'blended' ? ['spend', 'tokens'] : [rankMetric];
@@ -156,31 +157,43 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
         // together. Passing "current" to each source would rank spend and
         // token responses independently before the client combines them.
         const sourceRankBy = rankMetric === 'blended' ? 'blended' : rankBy;
-        const requestRollup = 'hour';
+        const outputRollup = rollup as ActivityOutputRollup;
+        const liveExtend = liveExtensionEligible(range);
+        const sourcePlan = activitySourcePlan(range, outputRollup, liveExtend);
+        const requestRollup = sourcePlan.sourceRollup;
         const queryCutoff = dayjs();
-        // The query window must keep every in-range bucket: a CURRENT-period
-        // preset fetches through the current minute so an hourly source still
-        // carries the complete live day/month that a calendar rollup needs;
-        // the normalizer later clips it to the range's live cell. A
-        // PAST-period boundary (yesterday, prev-week/month/year) uses the
-        // exclusive hour boundary so it never picks up the current period's
-        // buckets; custom ranges retain their chosen endpoint and are clipped
-        // exactly by the normalizer.
-        const curUntil = liveExtensionEligible(range)
-          ? floorWindowUntil(queryCutoff, 'minute')
-          : queryWindowUntil(range, requestRollup);
-        const responses = await Promise.all(sourceMetrics.map(sourceMetric => getActivity({
-          metric: sourceMetric,
-          group_by: groupBy,
-          subgroup: subgroup || undefined,
-          rollup: requestRollup,
-          rank_by: sourceRankBy,
-          top: 0,
-          since: range.since.toISOString(),
-          until: curUntil.toISOString(),
-          filter_type: filter?.type,
-          filter_value: filter?.value,
-        })));
+        // A current-period range fetches through the current minute so a
+        // coarse source contains the live source bucket; the normalizer clips
+        // it to the selected range. Past/custom ranges retain the requested
+        // endpoint and are clipped by the boundary merge.
+        const curUntil = activitySourceQueryUntil(range, requestRollup, queryCutoff, liveExtend);
+        const responses = await Promise.all(sourceMetrics.map(async sourceMetric => {
+          const base = await getActivity({
+            metric: sourceMetric,
+            group_by: groupBy,
+            subgroup: subgroup || undefined,
+            rollup: requestRollup,
+            rank_by: sourceRankBy,
+            top: 0,
+            since: range.since.toISOString(),
+            until: curUntil.toISOString(),
+            filter_type: filter?.type,
+            filter_value: filter?.value,
+          });
+          const boundary = await Promise.all((sourcePlan.boundary ?? []).map(edge => getActivity({
+            metric: sourceMetric,
+            group_by: groupBy,
+            subgroup: subgroup || undefined,
+            rollup: 'hour',
+            rank_by: sourceRankBy,
+            top: 0,
+            since: edge.since.toISOString(),
+            until: edge.until.toISOString(),
+            filter_type: filter?.type,
+            filter_value: filter?.value,
+          })));
+          return { base: base.data, boundary: boundary.map(response => response.data) };
+        }));
         if (cancelled) return;
         // Capture the response-time cutoff: a slow request can include usage
         // recorded after it started, so the request-time cutoff would make
@@ -189,14 +202,16 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
         const cutoff = dayjs();
         const normalizedByMetric = new Map<string, ActivityResponse>();
         sourceMetrics.forEach((sourceMetric, i) => {
-          normalizedByMetric.set(sourceMetric, normalizeHourlyResponse(
-            responses[i].data,
+          normalizedByMetric.set(sourceMetric, normalizeActivitySourceResponse(
+            responses[i].base,
+            responses[i].boundary,
             range.since,
             range.until,
             cutoff,
             range.granularity,
-            rollup as ActivityRollup,
-            liveExtensionEligible(range),
+            sourcePlan.sourceRollup,
+            outputRollup,
+            liveExtend,
           ));
         });
         const spend = normalizedByMetric.get('spend');

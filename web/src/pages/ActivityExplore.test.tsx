@@ -132,6 +132,7 @@ describe('ActivityExplore summary footer', () => {
     const footer = await screen.findByText(/rows ·/);
     expect(footer.textContent).toMatch(/^10 rows · \d+ms$/);
     expect(container.querySelectorAll('.ant-table-tbody .ant-table-row')).toHaveLength(10);
+    expect(vi.mocked(getActivity)).toHaveBeenCalledWith(expect.objectContaining({ rollup: 'day' }));
   });
 
   it('keeps matching when the summary fits inside Top-N', async () => {

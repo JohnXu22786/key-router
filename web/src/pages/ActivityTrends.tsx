@@ -6,7 +6,7 @@ import {
   Tooltip as RTooltip, ResponsiveContainer,
 } from 'recharts';
 import { getActivity, getKeys, ActivityResponse } from '../api/client';
-import { DateRange, ActivityFilter, filterKey, fmtUSD, fmtUSDInt, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtTick, fmtBucket, ExploreOpts, maskKey, toChartData, computeTrending, modelFavicon, normalizeHourlyResponse, limitActivityResponse, prevWindowUntil, queryWindowUntil, floorWindowUntil, liveExtensionEligible } from './activityShared';
+import { DateRange, ActivityFilter, filterKey, fmtUSD, fmtUSDInt, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtTick, fmtBucket, ExploreOpts, maskKey, toChartData, computeTrending, modelFavicon, ActivityOutputRollup, Granularity, activitySourcePlan, activitySourceQueryUntil, normalizeActivitySourceResponse, limitActivityResponse, prevWindowUntil, liveExtensionEligible } from './activityShared';
 import dayjs from 'dayjs';
 const { Text } = Typography;
 
@@ -101,11 +101,19 @@ const TrendSection: React.FC<SectionProps> = ({ title, groupBy, range, filter, o
       try {
         const len = range.until.diff(range.since, 'millisecond');
         const prevSince = range.since.subtract(len, 'millisecond');
-        // The API aggregates stored hourly rows. Always fetch the hourly
-        // cells so boundary correction can happen before any day/week/month
-        // aggregation, and so the current Top-N set is chosen from the
-        // requested window rather than widened boundary rows.
-        const sourceRollup = 'hour';
+        // The API aggregates stored hourly rows. Short ranges keep the
+        // hourly source so boundary correction can happen before the fine
+        // rollup; long ranges use the selected coarse source and fetch only
+        // the edge buckets hourly, avoiding an unbounded hourly payload.
+        const outputRollup = range.granularity as ActivityOutputRollup;
+        const liveExtend = liveExtensionEligible(range);
+        const currentPlan = activitySourcePlan(range, outputRollup, liveExtend);
+        const previousPlan = activitySourcePlan(
+          { since: prevSince, until: range.since, granularity: range.granularity },
+          outputRollup,
+          false,
+        );
+        const sourceRollup = currentPlan.sourceRollup;
         // Current chart folds beyond top-5 into "Other" like the reference;
         // the previous period carries the same entity filter so sparklines
         // and deltas stay consistent with the filtered rows. A CURRENT-period
@@ -121,13 +129,29 @@ const TrendSection: React.FC<SectionProps> = ({ title, groupBy, range, filter, o
         // its in-window slice [floor(since), since) is normalized (see
         // prevWindowUntil / normalizeHourlyResponse).
         const queryCutoff = dayjs();
-        const curUntil = liveExtensionEligible(range)
-          ? floorWindowUntil(queryCutoff, 'minute')
-          : queryWindowUntil(range, sourceRollup);
-        const prevUntil = prevWindowUntil(range.since, sourceRollup);
+        const curUntil = activitySourceQueryUntil(range, sourceRollup, queryCutoff, liveExtend);
+        const prevUntil = prevWindowUntil(range.since, previousPlan.sourceRollup as Granularity);
+        const fetchSource = async (
+          plan: ReturnType<typeof activitySourcePlan>,
+          sourceSince: dayjs.Dayjs,
+          sourceUntil: dayjs.Dayjs,
+        ) => {
+          const base = await getActivity({ metric, group_by: groupBy, rollup: plan.sourceRollup, top: 0, since: sourceSince.toISOString(), until: sourceUntil.toISOString(), filter_type: filter?.type, filter_value: filter?.value });
+          const boundary = await Promise.all((plan.boundary ?? []).map(edge => getActivity({
+            metric,
+            group_by: groupBy,
+            rollup: 'hour',
+            top: 0,
+            since: edge.since.toISOString(),
+            until: edge.until.toISOString(),
+            filter_type: filter?.type,
+            filter_value: filter?.value,
+          })));
+          return { base: base.data, boundary: boundary.map(response => response.data) };
+        };
         const [curRes, prevRes] = await Promise.all([
-          getActivity({ metric, group_by: groupBy, rollup: sourceRollup, top: 0, since: range.since.toISOString(), until: curUntil.toISOString(), filter_type: filter?.type, filter_value: filter?.value }),
-          getActivity({ metric, group_by: groupBy, rollup: sourceRollup, top: 0, since: prevSince.toISOString(), until: prevUntil.toISOString(), filter_type: filter?.type, filter_value: filter?.value }),
+          fetchSource(currentPlan, range.since, curUntil),
+          fetchSource(previousPlan, prevSince, prevUntil),
         ]);
         if (cancelled) return;
         // cutNow: the rows' values were recorded up to NOW — the previous
@@ -142,14 +166,26 @@ const TrendSection: React.FC<SectionProps> = ({ title, groupBy, range, filter, o
         // admin.go), so normalizing first keeps the boundary bars, summaries,
         // and totals consistent with Overview.
         const cutNow = dayjs();
-        const curNormalized = normalizeHourlyResponse(
-          curRes.data, range.since, range.until, cutNow,
-          range.granularity, range.granularity,
-          liveExtensionEligible(range),
+        const curNormalized = normalizeActivitySourceResponse(
+          curRes.base,
+          curRes.boundary,
+          range.since,
+          range.until,
+          cutNow,
+          range.granularity,
+          currentPlan.sourceRollup,
+          outputRollup,
+          liveExtend,
         );
-        const prevNormalized = normalizeHourlyResponse(
-          prevRes.data, prevSince, range.since, cutNow,
-          range.granularity, range.granularity,
+        const prevNormalized = normalizeActivitySourceResponse(
+          prevRes.base,
+          prevRes.boundary,
+          prevSince,
+          range.since,
+          cutNow,
+          range.granularity,
+          previousPlan.sourceRollup,
+          outputRollup,
           false,
         );
         setCur(limitActivityResponse(curNormalized, 5));

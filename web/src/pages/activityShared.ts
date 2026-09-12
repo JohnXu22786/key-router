@@ -1704,6 +1704,113 @@ function rollupBucketLabel(bucket: string, rollup: ActivityRollup): string {
   return rollup === 'day' ? t.format('YYYY-MM-DD') : t.format('YYYY-MM');
 }
 
+// A long-range chart should not force the client to materialize every stored
+// hourly cell. Coarse output is bounded by the requested rollup; only the
+// target buckets whose edges cut the requested window need hourly rows for
+// exact boundary correction.
+const MAX_FULL_HOURLY_SOURCE_HOURS = 7 * 24;
+
+function rollupForGranularity(granularity: Granularity): ActivityRollup {
+  if (granularity === 'month') return 'month';
+  return 'day';
+}
+
+function rollupBucketStart(time: dayjs.Dayjs, rollup: ActivityRollup): dayjs.Dayjs {
+  if (rollup === 'hour') return floorWindowUntil(time, 'hour');
+  if (rollup === 'day') return time.startOf('day');
+  if (rollup === 'week') return mondayOf(time);
+  return time.startOf('month');
+}
+
+function rollupBucketEnd(start: dayjs.Dayjs, rollup: ActivityRollup): dayjs.Dayjs {
+  if (rollup === 'hour') return start.add(1, 'hour');
+  if (rollup === 'day') return start.add(1, 'day');
+  if (rollup === 'week') return start.add(7, 'day');
+  return start.add(1, 'month');
+}
+
+export interface ActivitySourcePlan {
+  sourceRollup: ActivityRollup;
+  // When set, this small hourly query covers only the source buckets whose
+  // coarse values may include data outside the requested window.
+  boundary?: Array<{ bucket: string; since: dayjs.Dayjs; until: dayjs.Dayjs }>;
+}
+
+// activitySourcePlan chooses a bounded source response for an activity view.
+// Hourly data remains the source for short/fine views, where the output itself
+// is small. For long day/week/month/total views, the selected coarse rollup is
+// fetched across the range and an optional hourly boundary query corrects the
+// first/last coarse buckets before the caller renders or collapses Total.
+export function activitySourcePlan(
+  range: Pick<DateRange, 'since' | 'until' | 'granularity'>,
+  outputRollup: ActivityOutputRollup,
+  liveExtend: boolean,
+): ActivitySourcePlan {
+  const hours = range.until.diff(range.since, 'hour', true);
+  const fullHourly = hours <= MAX_FULL_HOURLY_SOURCE_HOURS;
+  if (fullHourly || outputRollup === 'hour' || outputRollup === 'minute' || outputRollup === 'min15') {
+    return { sourceRollup: 'hour' };
+  }
+
+  // Total needs a rollup that still has multiple buckets so interior values
+  // are preserved; aggregateTotalResponse collapses the corrected result only
+  // after the boundary merge.
+  const sourceRollup = outputRollup === 'total'
+    ? rollupForGranularity(range.granularity)
+    : outputRollup;
+  const boundaryStarts: dayjs.Dayjs[] = [];
+  const addBoundary = (start: dayjs.Dayjs) => {
+    if (!boundaryStarts.some(existing => existing.valueOf() === start.valueOf())) {
+      boundaryStarts.push(start);
+    }
+  };
+  const sinceStart = rollupBucketStart(range.since, sourceRollup);
+  if (!range.since.isSame(sinceStart)) addBoundary(sinceStart);
+
+  const untilStart = rollupBucketStart(range.until, sourceRollup);
+  // An aligned live boundary is intentional: the coarse query contains the
+  // current live unit only up to the fetch cutoff, so there is no outside
+  // value to remove. An unaligned end always needs the containing bucket.
+  if (!range.until.isSame(untilStart)) addBoundary(untilStart);
+
+  if (boundaryStarts.length === 0) return { sourceRollup };
+  boundaryStarts.sort((a, b) => a.valueOf() - b.valueOf());
+  // Keep the first and last coarse buckets as separate requests. Combining
+  // them into one hourly range would turn a one-year custom month query back
+  // into roughly 8,760 hourly cells and recreate the regression this plan is
+  // meant to avoid.
+  return {
+    sourceRollup,
+    boundary: boundaryStarts.map(start => ({
+      bucket: rollupBucketLabel(start.format('YYYY-MM-DD HH:mm:ss'), sourceRollup),
+      since: start,
+      // The activity endpoint widens its upper bound to the containing hour.
+      // Stop one second before the coarse boundary so the hourly query
+      // contains the final needed hour without adding the next one.
+      until: rollupBucketEnd(start, sourceRollup).subtract(1, 'second'),
+    })),
+  };
+}
+
+// activitySourceQueryUntil keeps a current-period source query inside the
+// live range unit. This matters when a request crosses a clock rollover after
+// the range was rendered: a stale range must not fetch the newly-started day,
+// month, or other source bucket just because the request resolves later.
+export function activitySourceQueryUntil(
+  range: Pick<DateRange, 'key' | 'since' | 'until' | 'granularity'>,
+  sourceRollup: ActivityRollup,
+  cutoff: dayjs.Dayjs,
+  liveExtend: boolean,
+): dayjs.Dayjs {
+  if (!liveExtend) return queryWindowUntil(range, sourceRollup);
+  const unitEnd = range.until.add(
+    range.granularity === 'month' ? 1 : range.granularity === 'day' ? 1 : range.granularity === 'hour' ? 1 : range.granularity === 'min15' ? 15 : 1,
+    range.granularity === 'month' ? 'month' : range.granularity === 'day' ? 'day' : range.granularity === 'hour' ? 'hour' : 'minute',
+  ).subtract(1, 'second');
+  const now = floorWindowUntil(cutoff, 'minute');
+  return now.isBefore(unitEnd) ? now : unitEnd;
+}
+
 // aggregateHourlyResponse converts an hourly response into the selected
 // calendar rollup after applying the exact hourly-window share to each row.
 // The server's day/week/month/total aggregates have already lost the hourly
@@ -2073,6 +2180,103 @@ export function aggregateTotalResponse(resp: ActivityResponse): ActivityResponse
   };
   const { summary, totals } = recomputeFromSeries(totalResp, series, totalResp.buckets);
   return { ...totalResp, summary, totals };
+}
+
+// mergeActivityBoundaryResponses overlays corrected hourly boundary buckets
+// onto a coarse response. The coarse response supplies all interior buckets;
+// the hourly responses supply only the first/last buckets whose aggregate
+// values include rows outside the requested range. Rebuilding a dense grid
+// here keeps explicit zero cells and has_data presence intact for summaries.
+export function mergeActivityBoundaryResponses(
+  coarse: ActivityResponse,
+  boundaryResponses: ActivityResponse[],
+  since: dayjs.Dayjs,
+  until: dayjs.Dayjs,
+  cutoff: dayjs.Dayjs,
+  rangeGranularity: Granularity,
+  sourceRollup: ActivityRollup,
+  liveExtend = false,
+): ActivityResponse {
+  if (coarse.metric === 'blended' || boundaryResponses.length === 0) return coarse;
+
+  const corrected = boundaryResponses.map(resp => aggregateHourlyResponse(
+    resp, since, until, cutoff, rangeGranularity, sourceRollup, liveExtend,
+  ));
+  const boundaryBuckets = new Set(corrected.flatMap(resp => resp.buckets));
+  if (boundaryBuckets.size === 0) return coarse;
+
+  const buckets = [...coarse.buckets];
+  for (const bucket of boundaryBuckets) {
+    if (buckets.includes(bucket)) continue;
+    const index = buckets.findIndex(existing => existing.localeCompare(bucket) > 0);
+    if (index < 0) buckets.push(bucket);
+    else buckets.splice(index, 0, bucket);
+  }
+
+  const cells = collectSeriesCells([
+    ...coarse.series,
+    ...corrected.flatMap(resp => resp.series),
+  ]);
+  const coarsePoints = seriesPointMap(coarse);
+  const boundaryPoints = new Map<string, ActivitySeriesPoint>();
+  for (const resp of corrected) {
+    for (const point of resp.series) {
+      boundaryPoints.set(`${point.bucket}\u0001${seriesCellKey(point.group, point.subgroup)}`, point);
+    }
+  }
+  const includePresence = hasPresenceMetadata(coarse.series)
+    || corrected.some(resp => hasPresenceMetadata(resp.series));
+  const series: ActivitySeriesPoint[] = [];
+  for (const bucket of buckets) {
+    const points = boundaryBuckets.has(bucket) ? boundaryPoints : coarsePoints;
+    for (const cell of cells) {
+      const point = points.get(`${bucket}\u0001${cell.key}`);
+      const hasData = seriesPointHasData(point);
+      const value = hasData ? point!.value : 0;
+      series.push(addPresence({
+        bucket,
+        group: cell.group,
+        ...(cell.subgroup ? { subgroup: cell.subgroup } : {}),
+        value,
+        is_zero: value === 0,
+      }, includePresence, hasData));
+    }
+  }
+  const merged: ActivityResponse = {
+    ...coarse,
+    rollup: sourceRollup,
+    buckets,
+    series,
+  };
+  const { summary, totals } = recomputeFromSeries(merged, series, buckets);
+  return { ...merged, summary, totals };
+}
+
+// normalizeActivitySourceResponse handles both bounded coarse sources and
+// the existing short-range hourly source. Long ranges keep their selected
+// source rollup for interior buckets, overlay corrected boundary responses,
+// and collapse to Total only after that merge.
+export function normalizeActivitySourceResponse(
+  resp: ActivityResponse,
+  boundaryResponses: ActivityResponse[],
+  since: dayjs.Dayjs,
+  until: dayjs.Dayjs,
+  cutoff: dayjs.Dayjs,
+  rangeGranularity: Granularity,
+  sourceRollup: ActivityRollup,
+  outputRollup: ActivityOutputRollup,
+  liveExtend = false,
+): ActivityResponse {
+  if (resp.rollup === 'hour') {
+    return normalizeHourlyResponse(
+      resp, since, until, cutoff, rangeGranularity, outputRollup, liveExtend,
+    );
+  }
+  const merged = mergeActivityBoundaryResponses(
+    resp, boundaryResponses, since, until, cutoff,
+    rangeGranularity, sourceRollup, liveExtend,
+  );
+  return outputRollup === 'total' ? aggregateTotalResponse(merged) : merged;
 }
 
 // groupTotals sums a metric per group, sorted descending. An optional
