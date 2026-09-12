@@ -1245,8 +1245,8 @@ func (h *AdminHandler) GetStatsConsumptions(c *gin.Context) {
 		return
 	}
 	query = filtered
-	// The parsed window bounds (local), kept for the range-aware cap below
-	// (the WHERE clauses are applied inline, exactly as before).
+	// The parsed window bounds (local), kept for the range-aware cap below;
+	// the source query uses the same local-hour widening as Activity.
 	var sinceTime, untilTime *time.Time
 	if since := c.Query("since"); since != "" {
 		if t, err := time.Parse(time.RFC3339, since); err == nil {
@@ -1267,7 +1267,16 @@ func (h *AdminHandler) GetStatsConsumptions(c *gin.Context) {
 		if t, err := time.Parse(time.RFC3339, until); err == nil {
 			l := t.Local()
 			untilTime = &l
-			query = query.Where("hour_bucket <= ?", l)
+			// Keep the complete local-hour row containing until, including a
+			// spring-forward-normalized bucket whose persisted timestamp can be
+			// later than the requested wall-clock instant. The Activity overview
+			// applies the exact half-open share client-side, so this only widens
+			// the source query to the first row that cannot overlap the window.
+			querySince := time.Time{}
+			if sinceTime != nil {
+				querySince = *sinceTime
+			}
+			query = query.Where("hour_bucket < ?", activityHourQueryEnd(querySince, l))
 		} else {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid until parameter"})
 			return
@@ -1858,6 +1867,20 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 	for _, b := range bucketOrder {
 		agg[b] = make(map[string]*activityAcc)
 	}
+	ensureAggBucket := func(bucket string) {
+		if _, ok := agg[bucket]; ok {
+			return
+		}
+		// A precise Chatham spring row can have a positive overlap in the
+		// normalized 04:00 bucket even when the half-open axis ends in the
+		// preceding 03:45..04:00 alias. Keep that row visible instead of
+		// indexing a missing map entry (which would panic).
+		index := sort.SearchStrings(bucketOrder, bucket)
+		bucketOrder = append(bucketOrder, "")
+		copy(bucketOrder[index+1:], bucketOrder[index:])
+		bucketOrder[index] = bucket
+		agg[bucket] = make(map[string]*activityAcc)
+	}
 
 	for i := range rows {
 		share := rowShare(i)
@@ -1865,6 +1888,7 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 			continue
 		}
 		b := bucketOf(rows[i].HourBucket)
+		ensureAggBucket(b)
 		g := groupOf(&rows[i])
 		if _, ok := agg[b][g]; !ok {
 			agg[b][g] = &activityAcc{}
