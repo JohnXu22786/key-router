@@ -139,4 +139,17 @@ describe('ActivityOverview truncated responses', () => {
     expect(await screen.findByText(/activity data is incomplete/i)).not.toBeNull();
     expect(screen.getByText(/narrow the time range or add a filter/i)).not.toBeNull();
   });
+
+  it('warns when the previous-period response is truncated', async () => {
+    vi.mocked(getConsumptions)
+      .mockResolvedValueOnce(response([makeConsumption(1, '2026-08-01T12:00:00')]))
+      .mockResolvedValueOnce(response([], { 'x-consumptions-truncated': 'true' }));
+
+    render(<ActivityOverview range={customRange(
+      dayjs('2026-08-01T00:00:00'),
+      dayjs('2026-08-02T00:00:00'),
+    )} />);
+
+    expect(await screen.findByText(/activity data is incomplete/i)).not.toBeNull();
+  });
 });
