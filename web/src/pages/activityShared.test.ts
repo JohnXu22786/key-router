@@ -6,7 +6,9 @@ import {
   prevWindowUntil,
   fmtTick, fmtBucket, fmtDayLabel, CUSTOM_KEY,
   computeTrending, toChartData, cacheHitRate, resampleResponse, liveExtensionEligible,
-  prorateBoundaryBuckets,
+  prorateBoundaryBuckets, aggregateTotalResponse, aggregateHourlyResponse,
+  normalizeHourlyResponse, combineBlendedResponses, limitActivityResponse,
+  activitySourcePlan, mergeActivityBoundaryResponses, normalizeActivitySourceResponse,
 } from './activityShared';
 import type { ActivityResponse } from '../api/client';
 import type { Granularity } from './activityShared';
@@ -552,19 +554,18 @@ describe('prevWindowUntil — the previous-period query keeps the mid-bucket sin
     const prevResp = serverResp(gran, prevSince, prevWindowUntil(since, gran), 48);
     expect(prevResp.buckets).toContain('2026-05-10'); // the containing day is in the response
     const prevOut = prorateBoundaryBuckets(prevResp, prevSince, since, prevWindowUntil(since, gran), cutoff, gran, gran);
-    // First day [Apr 30]: [09:30, 24:00) = 14.5/24; last day May 10:
-    // [00:00, 09:30) = 9.5/24; interior days unchanged.
-    expect(prevOut.series.map(p => p.value)).toEqual([29, 48, 48, 48, 48, 48, 48, 48, 48, 48, 19]);
+    // A daily response has already lost the hourly distribution. It must not
+    // be scaled by one elapsed-time ratio; the caller now fetches hourly
+    // cells and aggregates them after applying bucketWindowShare.
+    expect(prevOut).toBe(prevResp);
     // The Overview receives hourly rows, so the 00:00 row is wholly inside
-    // the previous window even though the server's daily aggregate is
-    // prorated to 9.5/24 above.
+    // the previous window.
     expect(bucketWindowShare('2026-05-10T00:00:00', prevSince, since, cutoff, gran, false)).toBe(1);
-    // The current period takes the rest of May 10: [09:30, 24:00) = 14.5/24;
-    // prev + cur tile the full day exactly (no gap, no double count).
+    // The current period's daily response is also left untouched; its exact
+    // boundary correction happens in the hourly normalization pipeline.
     const curResp = serverResp(gran, since, queryWindowUntil({ key: CUSTOM_KEY, since, until, granularity: gran }, gran), 48);
     const curOut = prorateBoundaryBuckets(curResp, since, until, queryWindowUntil({ key: CUSTOM_KEY, since, until, granularity: gran }, gran), cutoff, gran, gran);
-    expect(curOut.series[0].value).toBe(29);
-    expect(prevOut.series[10].value + curOut.series[0].value).toBeCloseTo(48, 10);
+    expect(curOut).toBe(curResp);
   });
 
   it('keeps preset behavior byte-identical: snapped since still excludes the since-aligned bucket', () => {
@@ -1530,6 +1531,435 @@ describe('resampleResponse — Trends hourly rollup onto a sub-hour axis', () =>
   });
 });
 
+describe('hourly activity normalization', () => {
+  it('honors the selected rollup instead of the range granularity', () => {
+    const resp: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'hour',
+      series: [
+        { bucket: '2026-08-13 15:00', group: 'a', value: 60, is_zero: false },
+        { bucket: '2026-08-13 16:00', group: 'a', value: 60, is_zero: false },
+      ],
+      summary: [{ group: 'a', min: 60, max: 60, avg: 60, sum: 120, value: 60, percent: 100 }],
+      buckets: ['2026-08-13 15:00', '2026-08-13 16:00'],
+      totals: { spend: 120, tokens: 0, requests: 0, cache: 0 },
+    };
+    const since = dayjs('2026-08-13T15:50:00');
+    const until = dayjs('2026-08-13T16:05:00');
+    const cutoff = dayjs('2026-08-13T17:00:00');
+
+    const daily = normalizeHourlyResponse(resp, since, until, cutoff, 'minute', 'day', false);
+    expect(daily.rollup).toBe('day');
+    expect(daily.buckets).toEqual(['2026-08-13']);
+    expect(daily.series).toEqual([{ bucket: '2026-08-13', group: 'a', value: 15, is_zero: false }]);
+
+    const hourly = normalizeHourlyResponse(resp, since, until, cutoff, 'minute', 'hour', false);
+    expect(hourly.rollup).toBe('hour');
+    expect(hourly.buckets).toEqual(['2026-08-13 15:00', '2026-08-13 16:00']);
+    expect(hourly.series.map(p => p.value)).toEqual([10, 5]);
+  });
+
+  it('includes explicit zero-valued cells in additive summary statistics', () => {
+    const resp: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'hour',
+      series: [
+        { bucket: '2026-08-13 15:00', group: 'a', value: 0, is_zero: true, has_data: true },
+        { bucket: '2026-08-13 16:00', group: 'a', value: 100, is_zero: false, has_data: true },
+      ],
+      summary: [{ group: 'a', min: 0, max: 100, avg: 50, sum: 100, value: 100, percent: 100 }],
+      buckets: ['2026-08-13 15:00', '2026-08-13 16:00'],
+      totals: { spend: 100, tokens: 0, requests: 0, cache: 0 },
+    };
+    const out = aggregateHourlyResponse(
+      resp,
+      dayjs('2026-08-13T15:00:00'),
+      dayjs('2026-08-13T17:00:00'),
+      dayjs('2026-08-13T17:00:00'),
+      'hour', 'hour', false,
+    );
+    expect(out.summary[0]).toMatchObject({ min: 0, avg: 50, max: 100 });
+  });
+
+  it('excludes missing dense-grid cells from additive summary statistics', () => {
+    const resp: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'hour',
+      series: [
+        { bucket: '2026-08-13 15:00', group: 'a', value: 0, is_zero: true, has_data: false },
+        { bucket: '2026-08-13 16:00', group: 'a', value: 100, is_zero: false, has_data: true },
+      ],
+      summary: [{ group: 'a', min: 100, max: 100, avg: 100, sum: 100, value: 100, percent: 100 }],
+      buckets: ['2026-08-13 15:00', '2026-08-13 16:00'],
+      totals: { spend: 100, tokens: 0, requests: 0, cache: 0 },
+    };
+    const out = aggregateHourlyResponse(
+      resp,
+      dayjs('2026-08-13T15:00:00'),
+      dayjs('2026-08-13T17:00:00'),
+      dayjs('2026-08-13T17:00:00'),
+      'hour', 'hour', false,
+    );
+    expect(out.series.map(point => point.has_data)).toEqual([false, true]);
+    expect(out.summary[0]).toMatchObject({ min: 100, avg: 100, max: 100, sum: 100 });
+  });
+
+  it('includes zero-valued cells in blended summary statistics', () => {
+    const resp: ActivityResponse = {
+      metric: 'blended', group_by: 'model', rollup: 'hour',
+      series: [
+        { bucket: '2026-08-13 15:00', group: 'a', value: 0, is_zero: true },
+        { bucket: '2026-08-13 16:00', group: 'a', value: 100, is_zero: false },
+      ],
+      summary: [{ group: 'a', min: 0, max: 100, avg: 50, sum: 50, value: 100, percent: 100 }],
+      buckets: ['2026-08-13 15:00', '2026-08-13 16:00'],
+      totals: { spend: 0, tokens: 0, requests: 0, cache: 0 },
+    };
+    const out = resampleResponse(
+      resp,
+      dayjs('2026-08-13T15:00:00'),
+      dayjs('2026-08-13T17:00:00'),
+      dayjs('2026-08-13T17:00:00'),
+      'min15',
+      false,
+    );
+    const summary = out.summary[0];
+    expect(summary.min).toBe(0);
+    expect(summary.avg).toBe(50);
+    expect(summary.max).toBe(100);
+  });
+
+  it('excludes missing cells from blended summary statistics', () => {
+    const buckets = ['2026-08-13 15:00', '2026-08-13 16:00'];
+    const make = (metric: 'spend' | 'tokens', firstHasData: boolean): ActivityResponse => {
+      const values = metric === 'spend' ? [0, 100] : [1, 1];
+      return {
+        metric, group_by: 'model', rollup: 'hour', buckets,
+        series: buckets.map((bucket, i) => ({
+          bucket,
+          group: 'a',
+          value: values[i],
+          is_zero: values[i] === 0,
+          has_data: i === 0 ? firstHasData : true,
+        })),
+        summary: [{ group: 'a', min: 0, max: 100, avg: 50, sum: 100, value: 100, percent: 100 }],
+        totals: {
+          spend: metric === 'spend' ? 100 : 0,
+          tokens: metric === 'tokens' ? 2 : 0,
+          requests: 0,
+          cache: 0,
+        },
+      };
+    };
+    const explicitZero = combineBlendedResponses(make('spend', true), make('tokens', true));
+    const missing = combineBlendedResponses(make('spend', false), make('tokens', false));
+    const expectedRate = 100 * 1e6;
+    expect(explicitZero.summary[0]).toMatchObject({ min: 0, avg: expectedRate / 2, max: expectedRate });
+    expect(missing.summary[0]).toMatchObject({ min: expectedRate, avg: expectedRate, max: expectedRate });
+    expect(missing.series.map(point => point.has_data)).toEqual([false, true]);
+
+    const resampled = resampleResponse(
+      missing,
+      dayjs('2026-08-13T15:00:00'),
+      dayjs('2026-08-13T17:00:00'),
+      dayjs('2026-08-13T17:00:00'),
+      'min15',
+      false,
+    );
+    expect(resampled.summary[0]).toMatchObject({ min: expectedRate, avg: expectedRate, max: expectedRate });
+  });
+
+  it('keeps blended rates constant when an hourly response is resampled', () => {
+    const resp: ActivityResponse = {
+      metric: 'blended', group_by: 'model', rollup: 'hour',
+      series: [
+        { bucket: '2026-08-13 15:00', group: 'a', value: 2.5, is_zero: false },
+        { bucket: '2026-08-13 16:00', group: 'a', value: 2.5, is_zero: false },
+      ],
+      summary: [{ group: 'a', min: 2.5, max: 2.5, avg: 2.5, sum: 2.5, value: 2.5, percent: 100 }],
+      buckets: ['2026-08-13 15:00', '2026-08-13 16:00'],
+      totals: { spend: 0, tokens: 0, requests: 0, cache: 0 },
+    };
+    const out = normalizeHourlyResponse(
+      resp,
+      dayjs('2026-08-13T15:50:00'),
+      dayjs('2026-08-13T16:05:00'),
+      dayjs('2026-08-13T16:05:00'),
+      'minute',
+      'minute',
+      false,
+    );
+    expect(out.series.filter(p => p.group === 'a').map(p => p.value)).toEqual(Array(15).fill(2.5));
+  });
+
+  it('preserves subgroup cells instead of merging them into the primary group', () => {
+    const resp: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'hour',
+      series: [
+        { bucket: '2026-08-13 15:00', group: 'a', subgroup: 'key-1', value: 60, is_zero: false },
+        { bucket: '2026-08-13 15:00', group: 'a', subgroup: 'key-2', value: 30, is_zero: false },
+      ],
+      summary: [{ group: 'a', min: 90, max: 90, avg: 90, sum: 90, value: 90, percent: 100 }],
+      buckets: ['2026-08-13 15:00'],
+      totals: { spend: 90, tokens: 0, requests: 0, cache: 0 },
+    };
+    const out = normalizeHourlyResponse(
+      resp,
+      dayjs('2026-08-13T15:15:00'),
+      dayjs('2026-08-13T15:45:00'),
+      dayjs('2026-08-13T16:00:00'),
+      'min15',
+      'min15',
+      false,
+    );
+    expect(out.series.filter(p => p.subgroup === 'key-1').map(p => p.value)).toEqual([15, 15]);
+    expect(out.series.filter(p => p.subgroup === 'key-2').map(p => p.value)).toEqual([7.5, 7.5]);
+    expect(out.series.every(p => p.subgroup)).toBe(true);
+    expect(out.summary[0].sum).toBeCloseTo(45, 10);
+  });
+
+  it('derives a blended Total from boundary-corrected spend and token cells', () => {
+    const buckets = ['2026-08-13 14:00', '2026-08-13 15:00', '2026-08-13 16:00', '2026-08-13 17:00', '2026-08-13 18:00'];
+    const make = (metric: 'spend' | 'tokens', values: number[]): ActivityResponse => ({
+      metric, group_by: 'model', rollup: 'hour',
+      series: buckets.map((bucket, i) => ({ bucket, group: 'a', value: values[i], is_zero: false })),
+      summary: [{ group: 'a', min: Math.min(...values), max: Math.max(...values), avg: values.reduce((a, v) => a + v, 0) / values.length, sum: values.reduce((a, v) => a + v, 0), value: values[values.length - 1], percent: 100 }],
+      buckets,
+      totals: { spend: metric === 'spend' ? values.reduce((a, v) => a + v, 0) : 0, tokens: metric === 'tokens' ? values.reduce((a, v) => a + v, 0) : 0, requests: 0, cache: 0 },
+    });
+    const since = dayjs('2026-08-13T14:37:00');
+    const until = dayjs('2026-08-13T18:22:00');
+    const spend = aggregateHourlyResponse(
+      make('spend', [60, 100, 20, 30, 40]), since, until,
+      dayjs('2026-08-13T19:00:00'), 'hour', 'total', false,
+    );
+    const tokens = aggregateHourlyResponse(
+      make('tokens', [60, 100, 20, 30, 80]), since, until,
+      dayjs('2026-08-13T19:00:00'), 'hour', 'total', false,
+    );
+    const out = combineBlendedResponses(spend, tokens);
+    const expectedSpend = 60 * (23 / 60) + 100 + 20 + 30 + 40 * (22 / 60);
+    const expectedTokens = 60 * (23 / 60) + 100 + 20 + 30 + 80 * (22 / 60);
+    const expectedRate = (expectedSpend / expectedTokens) * 1e6;
+    expect(out.buckets).toEqual(['Total']);
+    expect(out.series[0].value).toBeCloseTo(expectedRate, 10);
+    expect(out.summary[0].sum).toBeCloseTo(expectedRate, 10);
+    expect(out.totals.spend).toBeCloseTo(expectedSpend, 10);
+    expect(out.totals.tokens).toBeCloseTo(expectedTokens, 10);
+  });
+
+  it('aggregates non-uniform hourly boundaries before a calendar rollup', () => {
+    const buckets = ['2026-08-13 14:00', '2026-08-13 15:00', '2026-08-13 16:00', '2026-08-13 17:00', '2026-08-13 18:00'];
+    const values = [600, 1, 1, 1, 60];
+    const resp: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'hour',
+      series: buckets.map((bucket, i) => ({ bucket, group: 'a', value: values[i], is_zero: false })),
+      summary: [{ group: 'a', min: 1, max: 600, avg: 132.6, sum: 663, value: 60, percent: 100 }],
+      buckets,
+      totals: { spend: 663, tokens: 0, requests: 0, cache: 0 },
+    };
+    const out = aggregateHourlyResponse(
+      resp,
+      dayjs('2026-08-13T14:37:00'),
+      dayjs('2026-08-13T18:22:00'),
+      dayjs('2026-08-13T19:00:00'),
+      'hour',
+      'day',
+      false,
+    );
+    const expected = 600 * (23 / 60) + 1 + 1 + 1 + 60 * (22 / 60);
+    expect(out.buckets).toEqual(['2026-08-13']);
+    expect(out.series[0].value).toBeCloseTo(expected, 10);
+    expect(out.summary[0].sum).toBeCloseTo(expected, 10);
+    expect(out.totals.spend).toBeCloseTo(expected, 10);
+  });
+
+  it('chooses Top-N after boundary normalization', () => {
+    const resp: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'hour',
+      series: [
+        { bucket: '2026-08-13 14:00', group: 'outside-heavy', value: 200, is_zero: false },
+        { bucket: '2026-08-13 15:00', group: 'outside-heavy', value: 0, is_zero: true },
+        { bucket: '2026-08-13 16:00', group: 'outside-heavy', value: 0, is_zero: true },
+        { bucket: '2026-08-13 14:00', group: 'inside-heavy', value: 0, is_zero: true },
+        { bucket: '2026-08-13 15:00', group: 'inside-heavy', value: 100, is_zero: false },
+        { bucket: '2026-08-13 16:00', group: 'inside-heavy', value: 0, is_zero: true },
+      ],
+      summary: [
+        { group: 'outside-heavy', min: 0, max: 200, avg: 200, sum: 200, value: 0, percent: 66.7 },
+        { group: 'inside-heavy', min: 0, max: 100, avg: 100, sum: 100, value: 0, percent: 33.3 },
+      ],
+      buckets: ['2026-08-13 14:00', '2026-08-13 15:00', '2026-08-13 16:00'],
+      totals: { spend: 300, tokens: 0, requests: 0, cache: 0 },
+    };
+    const normalized = aggregateHourlyResponse(
+      resp,
+      dayjs('2026-08-13T14:50:00'),
+      dayjs('2026-08-13T16:10:00'),
+      dayjs('2026-08-13T17:00:00'),
+      'hour',
+      'hour',
+      false,
+    );
+    const out = limitActivityResponse(normalized, 1);
+    expect(out.summary[0].group).toBe('inside-heavy');
+    expect(out.series.some(p => p.group === 'inside-heavy')).toBe(true);
+    expect(out.series.some(p => p.group === 'Other')).toBe(true);
+    expect(out.summary.find(s => s.group === 'inside-heavy')!.sum).toBe(100);
+  });
+
+  it('retains normalized tail summaries for trending while folding their chart cells', () => {
+    const resp: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'hour',
+      series: [
+        { bucket: '2026-08-13 14:00', group: 'top', value: 10, is_zero: false },
+        { bucket: '2026-08-13 15:00', group: 'top', value: 10, is_zero: false },
+        { bucket: '2026-08-13 14:00', group: 'tail', value: 2, is_zero: false },
+        { bucket: '2026-08-13 15:00', group: 'tail', value: 3, is_zero: false },
+      ],
+      summary: [
+        { group: 'top', min: 10, max: 10, avg: 10, sum: 20, value: 10, percent: 80 },
+        { group: 'tail', min: 2, max: 3, avg: 2.5, sum: 5, value: 3, percent: 20 },
+      ],
+      buckets: ['2026-08-13 14:00', '2026-08-13 15:00'],
+      totals: { spend: 25, tokens: 0, requests: 0, cache: 0 },
+    };
+    const out = limitActivityResponse(resp, 1);
+    expect(out.series.map(p => p.group)).toEqual(['top', 'Other', 'top', 'Other']);
+    expect(out.summary.map(s => s.group)).toEqual(['top', 'Other', 'tail']);
+    expect(out.summary.find(s => s.group === 'tail')!.sum).toBe(5);
+  });
+
+  it('orders summaries and chart cells by normalized rank even when no fold is needed', () => {
+    const resp: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'hour',
+      series: [
+        { bucket: '2026-08-13 15:00', group: 'spend-first', value: 100, is_zero: false },
+        { bucket: '2026-08-13 15:00', group: 'window-first', value: 10, is_zero: false },
+      ],
+      summary: [
+        { group: 'spend-first', min: 100, max: 100, avg: 100, sum: 100, value: 100, percent: 90 },
+        { group: 'window-first', min: 10, max: 10, avg: 10, sum: 10, value: 10, percent: 10 },
+      ],
+      buckets: ['2026-08-13 15:00'],
+      totals: { spend: 110, tokens: 0, requests: 0, cache: 0 },
+    };
+    const rankResponse: ActivityResponse = {
+      ...resp,
+      summary: [
+        { group: 'window-first', min: 100, max: 100, avg: 100, sum: 100, value: 100, percent: 90 },
+        { group: 'spend-first', min: 10, max: 10, avg: 10, sum: 10, value: 10, percent: 10 },
+      ],
+    };
+    const out = limitActivityResponse(resp, 10, rankResponse);
+    expect(out.summary.map(s => s.group)).toEqual(['window-first', 'spend-first']);
+    expect(out.series.map(s => s.group)).toEqual(['window-first', 'spend-first']);
+
+    const folded = limitActivityResponse(resp, 1, rankResponse);
+    expect(folded.summary.map(s => s.group)).toEqual(['window-first', 'Other', 'spend-first']);
+    expect(folded.series.map(s => s.group)).toEqual(['window-first', 'Other']);
+  });
+
+  it('ranks blended current-metric results by the combined rate', () => {
+    const buckets = ['2026-08-13 15:00'];
+    const make = (metric: 'spend' | 'tokens', values: number[]): ActivityResponse => ({
+      metric, group_by: 'model', rollup: 'hour', buckets,
+      series: [
+        { bucket: buckets[0], group: 'spend-first', value: values[0], is_zero: values[0] === 0 },
+        { bucket: buckets[0], group: 'rate-first', value: values[1], is_zero: values[1] === 0 },
+      ],
+      summary: [
+        { group: 'spend-first', min: values[0], max: values[0], avg: values[0], sum: values[0], value: values[0], percent: 0 },
+        { group: 'rate-first', min: values[1], max: values[1], avg: values[1], sum: values[1], value: values[1], percent: 0 },
+      ],
+      totals: { spend: metric === 'spend' ? values.reduce((a, v) => a + v, 0) : 0, tokens: metric === 'tokens' ? values.reduce((a, v) => a + v, 0) : 0, requests: 0, cache: 0 },
+    });
+    const spend = make('spend', [100, 10]);
+    const tokens = make('tokens', [100, 1]);
+    const blended = combineBlendedResponses(spend, tokens);
+    const out = limitActivityResponse(blended, 10, blended);
+    // spend-first has the larger spend total, but rate-first is 10x more
+    // expensive per token and must lead the blended-current ranking.
+    expect(out.summary.map(s => s.group)).toEqual(['rate-first', 'spend-first']);
+    expect(out.series.map(s => s.group)).toEqual(['rate-first', 'spend-first']);
+  });
+});
+
+describe('bounded activity source planning', () => {
+  it('uses a coarse source for long ranges without creating boundary requests when aligned', () => {
+    const range = {
+      since: dayjs('2025-08-01T00:00:00'),
+      until: dayjs('2026-08-01T00:00:00'),
+      granularity: 'month' as Granularity,
+    };
+    expect(activitySourcePlan(range, 'day', true)).toMatchObject({ sourceRollup: 'day' });
+    expect(activitySourcePlan(range, 'day', true).boundary).toBeUndefined();
+    expect(activitySourcePlan(range, 'total', true)).toMatchObject({ sourceRollup: 'month' });
+  });
+
+  it('keeps separated first and last coarse boundaries in separate hourly requests', () => {
+    const range = {
+      since: dayjs('2025-08-13T12:00:00'),
+      until: dayjs('2026-08-13T12:00:00'),
+      granularity: 'month' as Granularity,
+    };
+    const plan = activitySourcePlan(range, 'month', false);
+    expect(plan.sourceRollup).toBe('month');
+    expect(plan.boundary).toHaveLength(2);
+    expect(plan.boundary!.map(edge => edge.bucket)).toEqual(['2025-08', '2026-08']);
+    expect(plan.boundary!.every(edge => edge.until.diff(edge.since, 'day', true) <= 31)).toBe(true);
+  });
+
+  it('overlays normalized edge buckets while preserving coarse interior values', () => {
+    const coarseBuckets = Array.from({ length: 9 }, (_, i) => `2026-08-${String(i + 10).padStart(2, '0')}`);
+    const coarse: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'day', buckets: coarseBuckets,
+      series: coarseBuckets.map((bucket, i) => ({
+        bucket, group: 'model-a', value: i === 0 ? 1000 : i === coarseBuckets.length - 1 ? 900 : 10,
+        is_zero: false, has_data: true,
+      })),
+      summary: [{ group: 'model-a', min: 10, max: 1000, avg: 212.2, sum: 1910, value: 900, percent: 100 }],
+      totals: { spend: 1910, tokens: 0, requests: 0, cache: 0 },
+    };
+    const hourlyEdge = (day: string, value: number): ActivityResponse => {
+      const buckets = Array.from({ length: 24 }, (_, hour) => `${day} ${String(hour).padStart(2, '0')}:00`);
+      return {
+        metric: 'spend', group_by: 'model', rollup: 'hour', buckets,
+        series: buckets.map(bucket => ({ bucket, group: 'model-a', value, is_zero: false, has_data: true })),
+        summary: [{ group: 'model-a', min: value, max: value, avg: value, sum: value * 24, value, percent: 100 }],
+        totals: { spend: value * 24, tokens: 0, requests: 0, cache: 0 },
+      };
+    };
+    const since = dayjs('2026-08-10T12:00:00');
+    const until = dayjs('2026-08-18T12:00:00');
+    const cutoff = dayjs('2026-08-19T00:00:00');
+    const merged = mergeActivityBoundaryResponses(
+      coarse,
+      [hourlyEdge('2026-08-10', 1), hourlyEdge('2026-08-18', 2)],
+      since,
+      until,
+      cutoff,
+      'day',
+      'day',
+      false,
+    );
+    expect(merged.series.map(point => point.value)).toEqual([12, 10, 10, 10, 10, 10, 10, 10, 24]);
+    expect(merged.summary[0].sum).toBe(106);
+
+    const total = normalizeActivitySourceResponse(
+      coarse,
+      [hourlyEdge('2026-08-10', 1), hourlyEdge('2026-08-18', 2)],
+      since,
+      until,
+      cutoff,
+      'day',
+      'day',
+      'total',
+      false,
+    );
+    expect(total.buckets).toEqual(['Total']);
+    expect(total.series[0].value).toBe(106);
+    expect(total.totals.spend).toBe(106);
+  });
+});
+
 describe('prorateBoundaryBuckets — server-bucketed custom ranges', () => {
   // The exact shape the activity endpoint returns for a custom range whose
   // bounds cut mid-bucket: the server widened the query window to the
@@ -1597,7 +2027,7 @@ describe('prorateBoundaryBuckets — server-bucketed custom ranges', () => {
     expect(out).toBe(r);
   });
 
-  it('prorates the Explore equal-rollup case (day-granularity custom, day rollup)', () => {
+  it('leaves a coarser daily response unchanged because its hourly distribution is unavailable', () => {
     const since = dayjs('2026-08-10T14:00:00');
     const until = dayjs('2026-08-14T12:30:00');
     expect(granularityFor(since, until)).toBe('day');
@@ -1610,37 +2040,123 @@ describe('prorateBoundaryBuckets — server-bucketed custom ranges', () => {
       totals: { spend: 240, tokens: 0, requests: 0, cache: 0 },
     };
     const out = prorateBoundaryBuckets(r, since, until, until, dayjs('2026-08-15T10:00:00'), 'day', 'day');
-    // First day [Aug 10 00:00, Aug 11 00:00): [14:00, 24:00) = 10/24; last
-    // day: [00:00, 12:30) = 12.5/24 (the fetch on Aug 15 means the boundary
-    // days' rows are complete); interior days unchanged.
-    expect(out.series.map(p => p.value)).toEqual([20, 48, 48, 48, 25]);
-    expect(out.summary[0].sum).toBeCloseTo(189, 10);
-    expect(out.summary[0].value).toBe(25);
-    expect(out.summary[0].min).toBe(20);
-    expect(out.totals.spend).toBeCloseTo(189, 10);
+    expect(out).toBe(r);
   });
 
-  it('leaves coarser AND finer rollups untouched (accepted residual behavior)', () => {
+  it('leaves a short range daily aggregate unchanged', () => {
     const since = dayjs('2026-08-13T14:37:00');
     const until = dayjs('2026-08-13T18:22:00');
-    const r = hourResp([60, 60, 60, 60, 60]);
-    const cutoff = dayjs('2026-08-13T19:00:00');
-    // Explore's day/week/total rollup over an hour-granularity range: whole
-    // boundary days in the boundary bars by design — never prorated.
-    expect(prorateBoundaryBuckets(r, since, until, until, cutoff, 'hour', 'day')).toBe(r);
-    expect(prorateBoundaryBuckets(r, since, until, until, cutoff, 'hour', 'week')).toBe(r);
-    expect(prorateBoundaryBuckets(r, since, until, until, cutoff, 'hour', 'total')).toBe(r);
-    // A FINER rollup (hour over a day-granularity range) overcounts its own
-    // hourly boundary bars the same way but is outside this fix's scope —
-    // the response must stay exactly as the server returned it. The bounds
-    // are MID-DAY so the first/last-bucket conditions would fire if the
-    // gate were removed — this pins the gate itself.
-    const daySince = dayjs('2026-08-10T14:00:00');
-    const dayUntil = dayjs('2026-08-14T12:30:00');
-    expect(prorateBoundaryBuckets(r, daySince, dayUntil, dayUntil, cutoff, 'day', 'hour')).toBe(r);
+    const r: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'day',
+      series: [{ bucket: '2026-08-13', group: 'a', value: 1440, is_zero: false }],
+      summary: [{ group: 'a', min: 1440, max: 1440, avg: 1440, sum: 1440, value: 1440, percent: 100 }],
+      buckets: ['2026-08-13'],
+      totals: { spend: 1440, tokens: 0, requests: 0, cache: 0 },
+    };
+    const out = prorateBoundaryBuckets(r, since, until, until, dayjs('2026-08-14T00:00:00'), 'hour', 'day');
+    expect(out).toBe(r);
   });
 
-  it('prorates a month-granularity custom range at the month scale', () => {
+  it('leaves a short range monthly aggregate unchanged', () => {
+    const since = dayjs('2026-08-10T14:00:00');
+    const until = dayjs('2026-08-14T12:30:00');
+    const r: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'month',
+      series: [{ bucket: '2026-08', group: 'a', value: 31, is_zero: false }],
+      summary: [{ group: 'a', min: 31, max: 31, avg: 31, sum: 31, value: 31, percent: 100 }],
+      buckets: ['2026-08'],
+      totals: { spend: 31, tokens: 0, requests: 0, cache: 0 },
+    };
+    const out = prorateBoundaryBuckets(r, since, until, until, dayjs('2026-09-01T00:00:00'), 'day', 'month');
+    expect(out).toBe(r);
+  });
+
+  it('does not infer a current live cell from a coarser response', () => {
+    const since = dayjs('2026-08-12T16:00:00');
+    const until = dayjs('2026-08-13T16:00:00');
+    const r: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'day',
+      series: [
+        { bucket: '2026-08-12', group: 'a', value: 24, is_zero: false },
+        { bucket: '2026-08-13', group: 'a', value: 5, is_zero: false },
+      ],
+      summary: [{ group: 'a', min: 5, max: 24, avg: 14.5, sum: 29, value: 5, percent: 100 }],
+      buckets: ['2026-08-12', '2026-08-13'],
+      totals: { spend: 29, tokens: 0, requests: 0, cache: 0 },
+    };
+    const out = prorateBoundaryBuckets(
+      r, since, until, until, dayjs('2026-08-13T16:05:00'), 'hour', 'day', true,
+    );
+    expect(out).toBe(r);
+  });
+
+  it('prorates a finer hourly rollup over a day-granularity range', () => {
+    const since = dayjs('2026-08-10T14:00:00');
+    const until = dayjs('2026-08-14T12:30:00');
+    const buckets = ['2026-08-10 14:00', '2026-08-14 12:00'];
+    const r: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'hour',
+      series: buckets.map(b => ({ bucket: b, group: 'a', value: 60, is_zero: false })),
+      summary: [{ group: 'a', min: 60, max: 60, avg: 60, sum: 120, value: 60, percent: 100 }],
+      buckets,
+      totals: { spend: 120, tokens: 0, requests: 0, cache: 0 },
+    };
+    const out = prorateBoundaryBuckets(r, since, until, until, dayjs('2026-08-15T00:00:00'), 'day', 'hour');
+    expect(out.series.map(p => p.value)).toEqual([60, 30]);
+    expect(out.totals.spend).toBe(90);
+  });
+
+  it('prorates week and total responses at their own boundary scales', () => {
+    const since = dayjs('2026-08-12T14:00:00');
+    const until = dayjs('2026-08-14T18:00:00');
+    const week: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'week',
+      series: [{ bucket: '2026-08-10', group: 'a', value: 168, is_zero: false }],
+      summary: [{ group: 'a', min: 168, max: 168, avg: 168, sum: 168, value: 168, percent: 100 }],
+      buckets: ['2026-08-10'],
+      totals: { spend: 168, tokens: 0, requests: 0, cache: 0 },
+    };
+    const weekOut = prorateBoundaryBuckets(week, since, until, until, dayjs('2026-08-18T00:00:00'), 'hour', 'week');
+    expect(weekOut).toBe(week);
+
+    // Total views fetch the hourly cells and correct them before collapsing.
+    // A single aggregate ratio would incorrectly scale the interior 15:00-
+    // 17:00 values as well, which is visible with non-uniform hourly usage.
+    const hourly: ActivityResponse = {
+      metric: 'spend', group_by: 'model', rollup: 'hour',
+      series: [
+        { bucket: '2026-08-14 14:00', group: 'a', value: 60, is_zero: false },
+        { bucket: '2026-08-14 15:00', group: 'a', value: 100, is_zero: false },
+        { bucket: '2026-08-14 16:00', group: 'a', value: 20, is_zero: false },
+        { bucket: '2026-08-14 17:00', group: 'a', value: 30, is_zero: false },
+        { bucket: '2026-08-14 18:00', group: 'a', value: 40, is_zero: false },
+      ],
+      summary: [{ group: 'a', min: 20, max: 100, avg: 50, sum: 250, value: 40, percent: 100 }],
+      buckets: ['2026-08-14 14:00', '2026-08-14 15:00', '2026-08-14 16:00', '2026-08-14 17:00', '2026-08-14 18:00'],
+      totals: { spend: 250, tokens: 0, requests: 0, cache: 0 },
+    };
+    const totalSince = dayjs('2026-08-14T14:37:00');
+    const totalUntil = dayjs('2026-08-14T18:22:00');
+    const corrected = prorateBoundaryBuckets(
+      hourly, totalSince, totalUntil, totalUntil,
+      dayjs('2026-08-14T19:00:00'), 'hour', 'hour', false,
+    );
+    const totalOut = aggregateTotalResponse(corrected);
+    // 14:00 contributes 23/60 of 60 and 18:00 contributes 22/60 of 40;
+    // the three interior hours remain exactly 100, 20 and 30.
+    const want = 60 * (23 / 60) + 100 + 20 + 30 + 40 * (22 / 60);
+    expect(totalOut.buckets).toEqual(['Total']);
+    expect(totalOut.series).toEqual([
+      { bucket: 'Total', group: 'a', value: want, is_zero: false },
+    ]);
+    expect(totalOut.summary[0].sum).toBeCloseTo(want, 10);
+    expect(totalOut.summary[0].value).toBeCloseTo(want, 10);
+    expect(totalOut.summary[0].min).toBeCloseTo(want, 10);
+    expect(totalOut.summary[0].max).toBeCloseTo(want, 10);
+    expect(totalOut.totals.spend).toBeCloseTo(want, 10);
+  });
+
+  it('leaves a coarser monthly response unchanged', () => {
     const since = dayjs('2026-03-15T00:00:00');
     const until = dayjs('2026-06-20T00:00:00');
     expect(granularityFor(since, until)).toBe('month');
@@ -1653,18 +2169,10 @@ describe('prorateBoundaryBuckets — server-bucketed custom ranges', () => {
       totals: { spend: 248, tokens: 0, requests: 0, cache: 0 },
     };
     const out = prorateBoundaryBuckets(r, since, until, until, dayjs('2026-07-01T00:00:00'), 'month', 'month');
-    // March: [Mar 15, Apr 1) = 17/31; June: [Jun 1, Jun 20) = 19/30; the
-    // boundary months' rows are complete (fetch on Jul 1).
-    expect(out.series.map(p => p.value)).toEqual([
-      62 * (17 / 31),
-      62,
-      62,
-      62 * (19 / 30),
-    ]);
-    expect(out.summary[0].sum).toBeCloseTo(62 * (17 / 31) + 62 + 62 + 62 * (19 / 30), 10);
+    expect(out).toBe(r);
   });
 
-  it('keeps the last boundary DAY at its full recorded value when the cutoff lies inside it', () => {
+  it('does not scale an aggregate day when the cutoff lies inside it', () => {
     // The day-scale twin of the live-hour test: [Aug 10 14:00, Aug 14 12:30)
     // viewed at Aug 14 11:00 — the last day's rows hold only [00:00, 11:00)
     // of recorded usage, all of it in-window, so the share is 1 and the day
@@ -1681,7 +2189,7 @@ describe('prorateBoundaryBuckets — server-bucketed custom ranges', () => {
       totals: { spend: 240, tokens: 0, requests: 0, cache: 0 },
     };
     const out = prorateBoundaryBuckets(r, since, until, until, cutoff, 'day', 'day');
-    expect(out.series.map(p => p.value)).toEqual([20, 48, 48, 48, 48]);
+    expect(out).toBe(r);
     // The same share the Overview flow gives that day's rows.
     expect(bucketWindowShare('2026-08-14T00:00:00', since, until, cutoff, 'day', false)).toBe(1);
   });
@@ -1790,7 +2298,7 @@ describe('prorateBoundaryBuckets — server-bucketed custom ranges', () => {
     const until = dayjs('2026-08-13T19:22:00');
     const cutoff = dayjs('2026-08-13T19:10:00');
     const out = prorateBoundaryBuckets(hourResp([60, 60, 60, 60, 60]), since, until, until, cutoff, 'hour', 'hour');
-    expect(out.series.filter(p => p.group === 'a').map(p => p.value)).toEqual([23, 60, 60, 60, 60]);
+    expect(out.series.filter(p => p.group === 'a').map(p => p.value)).toEqual([0, 0, 23, 60, 60]);
     expect(bucketWindowShare('2026-08-13T19:00:00', since, until, cutoff, 'hour', false)).toBe(1);
   });
 });

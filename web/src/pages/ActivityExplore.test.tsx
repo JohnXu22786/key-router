@@ -59,8 +59,8 @@ if (typeof (window as unknown as { ResizeObserver?: unknown }).ResizeObserver !=
   };
 }
 
-// A 1y rolling range: granularity 'month' vs the page's default 'day' rollup
-// makes prorateBoundaryBuckets pass the response through untouched.
+// A 1y rolling range whose bounds are aligned to the response's day buckets
+// remains unchanged by boundary normalization.
 const range: DateRange = {
   key: '1y',
   label: 'Past 1 Year',
@@ -68,6 +68,15 @@ const range: DateRange = {
   since: dayjs('2025-08-13T00:00:00'),
   until: dayjs('2026-08-13T00:00:00'),
   granularity: 'month',
+};
+
+const shortRange: DateRange = {
+  key: '15m',
+  label: 'Past 15 Minutes',
+  badge: '15m',
+  since: dayjs('2026-08-13T15:50:00'),
+  until: dayjs('2026-08-13T16:05:00'),
+  granularity: 'minute',
 };
 
 const makeResponse = (n: number): ActivityResponse => ({
@@ -83,6 +92,19 @@ const makeResponse = (n: number): ActivityResponse => ({
     min: 1, max: 2, avg: 1.5, sum: i + 1, value: i + 1, percent: 100 / n,
   })),
   totals: { spend: n * 10, tokens: 0, requests: 0, cache: 0 },
+});
+
+const makeHourlyResponse = (): ActivityResponse => ({
+  metric: 'spend',
+  group_by: 'model',
+  rollup: 'hour',
+  buckets: ['2026-08-13 15:00', '2026-08-13 16:00'],
+  series: [
+    { bucket: '2026-08-13 15:00', group: 'model-1', value: 120, is_zero: false },
+    { bucket: '2026-08-13 16:00', group: 'model-1', value: 10, is_zero: false },
+  ],
+  summary: [{ group: 'model-1', min: 10, max: 120, avg: 65, sum: 130, value: 10, percent: 100 }],
+  totals: { spend: 130, tokens: 0, requests: 0, cache: 0 },
 });
 
 const mockSummary = (n: number) => {
@@ -110,6 +132,7 @@ describe('ActivityExplore summary footer', () => {
     const footer = await screen.findByText(/rows ·/);
     expect(footer.textContent).toMatch(/^10 rows · \d+ms$/);
     expect(container.querySelectorAll('.ant-table-tbody .ant-table-row')).toHaveLength(10);
+    expect(vi.mocked(getActivity)).toHaveBeenCalledWith(expect.objectContaining({ rollup: 'day' }));
   });
 
   it('keeps matching when the summary fits inside Top-N', async () => {
@@ -120,7 +143,6 @@ describe('ActivityExplore summary footer', () => {
     expect(footer.textContent).toMatch(/^5 rows · \d+ms$/);
     expect(container.querySelectorAll('.ant-table-tbody .ant-table-row')).toHaveLength(5);
   });
-
   it('uses the response-time cutoff for a slow custom-range response', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     const requestStartedAt = dayjs('2026-08-13T10:00:00');
@@ -138,22 +160,17 @@ describe('ActivityExplore summary footer', () => {
       label: 'Custom',
       badge: '',
       since: dayjs('2026-08-09T00:00:00'),
-      until: requestStartedAt,
+      until: responseAt,
       granularity: 'day',
     };
     const response: ActivityResponse = {
       metric: 'spend',
       group_by: 'model',
-      rollup: 'day',
-      buckets: ['2026-08-09', '2026-08-10', '2026-08-11', '2026-08-12', '2026-08-13'],
-      series: [
-        ...['2026-08-09', '2026-08-10', '2026-08-11', '2026-08-12'].map(bucket => ({
-          bucket, group: 'model-1', value: 1, is_zero: false,
-        })),
-        { bucket: '2026-08-13', group: 'model-1', value: 100, is_zero: false },
-      ],
-      summary: [{ group: 'model-1', min: 1, max: 100, avg: 20.8, sum: 104, value: 100, percent: 100 }],
-      totals: { spend: 104, tokens: 0, requests: 0, cache: 0 },
+      rollup: 'hour',
+      buckets: ['2026-08-13 10:00'],
+      series: [{ bucket: '2026-08-13 10:00', group: 'model-1', value: 100, is_zero: false }],
+      summary: [{ group: 'model-1', min: 100, max: 100, avg: 100, sum: 100, value: 100, percent: 100 }],
+      totals: { spend: 100, tokens: 0, requests: 0, cache: 0 },
     };
 
     render(<ActivityExplore range={slowRange} />);
@@ -165,10 +182,40 @@ describe('ActivityExplore summary footer', () => {
       await pending;
     });
 
-    // At request start the live day had 10h of recorded coverage, so using
-    // that stale cutoff would leave the full $100 row untouched. At response
-    // time it has 10.5h, and the selected 10h slice is $95.2.
-    expect(screen.getAllByText('$95.2')).toHaveLength(2);
-    expect(screen.queryByText('$100')).toBeNull();
+    // The hourly source row is only partially recorded at request start. The
+    // response-time cutoff sees its 30 recorded minutes and keeps the full
+    // selected slice instead of dropping it as empty.
+    expect(screen.getAllByText('$100').length).toBeGreaterThan(0);
+  });
+
+  it('uses hourly data and re-samples short ranges instead of showing a full daily bucket', async () => {
+    vi.mocked(getActivity).mockResolvedValue({
+      data: makeHourlyResponse(),
+    } as Awaited<ReturnType<typeof getActivity>>);
+    const { container } = render(<ActivityExplore range={shortRange} />);
+
+    const footer = await screen.findByText(/rows ·/);
+    expect(footer).toBeTruthy();
+    expect(vi.mocked(getActivity)).toHaveBeenCalledWith(expect.objectContaining({ rollup: 'hour' }));
+    // The hourly response sums to $130, while the 15-minute window contains
+    // only the corresponding slice ($21 with the fixed fixture and the
+    // current-range live-minute behavior).
+    expect(container.textContent).toContain('$21');
+    expect(container.textContent).not.toContain('$130');
+  });
+
+  it('requests blended source metrics with blended ranking for the current metric', async () => {
+    vi.mocked(getActivity).mockImplementation(async (params) => ({
+      data: {
+        ...makeHourlyResponse(),
+        metric: params.metric!,
+      },
+    } as Awaited<ReturnType<typeof getActivity>>));
+    render(<ActivityExplore range={shortRange} initialMetric="blended" />);
+
+    await screen.findByText(/rows ·/);
+    const calls = vi.mocked(getActivity).mock.calls;
+    expect(calls.map(([params]) => params.metric).sort()).toEqual(['spend', 'tokens']);
+    expect(calls.every(([params]) => params.rank_by === 'blended')).toBe(true);
   });
 });

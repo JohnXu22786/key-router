@@ -164,7 +164,16 @@ export const getConsumptions = (params?: { key_id?: number; since?: string; unti
 export const getKeyDetail = (id: number) => api.get(`/stats/keys/${id}`);
 
 // Activity (OpenRouter-style: overview / trends / explore)
-export interface ActivitySeriesPoint { bucket: string; group: string; subgroup?: string; value: number; is_zero: boolean; }
+export interface ActivitySeriesPoint {
+  bucket: string;
+  group: string;
+  subgroup?: string;
+  value: number;
+  is_zero: boolean;
+  // Older fixtures/responses omit this field. When present, false means the
+  // dense chart cell is only a zero-fill and must not count as a statistic.
+  has_data?: boolean;
+}
 export interface ActivityGroupSummary { group: string; min: number; max: number; avg: number; sum: number; value: number; percent: number; }
 export interface ActivityResponse {
   metric: string;

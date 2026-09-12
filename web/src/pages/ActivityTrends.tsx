@@ -6,7 +6,7 @@ import {
   Tooltip as RTooltip, ResponsiveContainer,
 } from 'recharts';
 import { getActivity, getKeys, ActivityResponse } from '../api/client';
-import { DateRange, ActivityFilter, filterKey, fmtUSD, fmtUSDInt, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtTick, fmtBucket, ExploreOpts, maskKey, toChartData, computeTrending, modelFavicon, resampleResponse, prevWindowUntil, queryWindowUntil, liveExtensionEligible, prorateBoundaryBuckets } from './activityShared';
+import { DateRange, ActivityFilter, filterKey, fmtUSD, fmtUSDInt, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtTick, fmtBucket, ExploreOpts, maskKey, toChartData, computeTrending, modelFavicon, ActivityOutputRollup, Granularity, activitySourcePlan, activitySourceQueryUntil, normalizeActivitySourceResponse, limitActivityResponse, prevWindowUntil, liveExtensionEligible } from './activityShared';
 import dayjs from 'dayjs';
 const { Text } = Typography;
 
@@ -101,14 +101,19 @@ const TrendSection: React.FC<SectionProps> = ({ title, groupBy, range, filter, o
       try {
         const len = range.until.diff(range.since, 'millisecond');
         const prevSince = range.since.subtract(len, 'millisecond');
-        // Roll up at the range's granularity: 24h -> hourly, a month ->
-        // daily, a year -> monthly (OR buckets the chart by the view scale).
-        // The API rolls up at most hourly, so sub-hour ranges (15m/30m/1h ->
-        // minute, 3h -> 15 min) fetch the hourly rollup and are re-sampled
-        // onto the client's minute axis below.
-        const subGran: 'minute' | 'min15' | null =
-          range.granularity === 'minute' || range.granularity === 'min15' ? range.granularity : null;
-        const rollup = subGran ? 'hour' : range.granularity;
+        // The API aggregates stored hourly rows. Short ranges keep the
+        // hourly source so boundary correction can happen before the fine
+        // rollup; long ranges use the selected coarse source and fetch only
+        // the edge buckets hourly, avoiding an unbounded hourly payload.
+        const outputRollup = range.granularity as ActivityOutputRollup;
+        const liveExtend = liveExtensionEligible(range);
+        const currentPlan = activitySourcePlan(range, outputRollup, liveExtend);
+        const previousPlan = activitySourcePlan(
+          { since: prevSince, until: range.since, granularity: range.granularity },
+          outputRollup,
+          false,
+        );
+        const sourceRollup = currentPlan.sourceRollup;
         // Current chart folds beyond top-5 into "Other" like the reference;
         // the previous period carries the same entity filter so sparklines
         // and deltas stay consistent with the filtered rows. A CURRENT-period
@@ -121,13 +126,32 @@ const TrendSection: React.FC<SectionProps> = ({ title, groupBy, range, filter, o
         // the previous period never picks up the current period's buckets —
         // while a mid-bucket past bound (custom ranges) passes the raw
         // `since` so the bucket CONTAINING it stays in the prev response and
-        // its in-window slice [floor(since), since) is prorated (see
-        // prevWindowUntil / prorateBoundaryBuckets).
-        const curUntil = queryWindowUntil(range, rollup);
-        const prevUntil = prevWindowUntil(range.since, range.granularity);
+        // its in-window slice [floor(since), since) is normalized (see
+        // prevWindowUntil / normalizeHourlyResponse).
+        const queryCutoff = dayjs();
+        const curUntil = activitySourceQueryUntil(range, sourceRollup, queryCutoff, liveExtend);
+        const prevUntil = prevWindowUntil(range.since, previousPlan.sourceRollup as Granularity);
+        const fetchSource = async (
+          plan: ReturnType<typeof activitySourcePlan>,
+          sourceSince: dayjs.Dayjs,
+          sourceUntil: dayjs.Dayjs,
+        ) => {
+          const base = await getActivity({ metric, group_by: groupBy, rollup: plan.sourceRollup, top: 0, since: sourceSince.toISOString(), until: sourceUntil.toISOString(), filter_type: filter?.type, filter_value: filter?.value });
+          const boundary = await Promise.all((plan.boundary ?? []).map(edge => getActivity({
+            metric,
+            group_by: groupBy,
+            rollup: 'hour',
+            top: 0,
+            since: edge.since.toISOString(),
+            until: edge.until.toISOString(),
+            filter_type: filter?.type,
+            filter_value: filter?.value,
+          })));
+          return { base: base.data, boundary: boundary.map(response => response.data) };
+        };
         const [curRes, prevRes] = await Promise.all([
-          getActivity({ metric, group_by: groupBy, rollup, top: 5, since: range.since.toISOString(), until: curUntil.toISOString(), filter_type: filter?.type, filter_value: filter?.value }),
-          getActivity({ metric, group_by: groupBy, rollup, top: 0, since: prevSince.toISOString(), until: prevUntil.toISOString(), filter_type: filter?.type, filter_value: filter?.value }),
+          fetchSource(currentPlan, range.since, curUntil),
+          fetchSource(previousPlan, prevSince, prevUntil),
         ]);
         if (cancelled) return;
         // cutNow: the rows' values were recorded up to NOW — the previous
@@ -136,19 +160,36 @@ const TrendSection: React.FC<SectionProps> = ({ title, groupBy, range, filter, o
         // own end. liveExtend: only the CURRENT window extends into the live
         // bucket (its newest usage is the chart's real last point); the
         // previous period never does. The server-bucketed path (hour+ axes)
-        // wraps the response in prorateBoundaryBuckets: a custom range whose
-        // picked bounds cut mid-bucket made the endpoint return FULL boundary
-        // buckets (the widened window — see activityWindow in admin.go), so
-        // the boundary bars/summary/totals overcounted by up to a bucket; the
-        // wrapper scales them by the window overlap exactly like the Overview
-        // flow (bucketWindowShare), keeping the pages consistent.
+        // applies the hourly overlap before the requested rollup. A custom
+        // range whose picked bounds cut mid-bucket makes the endpoint return
+        // FULL boundary buckets (the widened window — see activityWindow in
+        // admin.go), so normalizing first keeps the boundary bars, summaries,
+        // and totals consistent with Overview.
         const cutNow = dayjs();
-        setCur(subGran
-          ? resampleResponse(curRes.data, range.since, range.until, cutNow, subGran, liveExtensionEligible(range))
-          : prorateBoundaryBuckets(curRes.data, range.since, range.until, curUntil, cutNow, range.granularity, rollup));
-        setPrev(subGran
-          ? resampleResponse(prevRes.data, prevSince, range.since, cutNow, subGran, false)
-          : prorateBoundaryBuckets(prevRes.data, prevSince, range.since, prevUntil, cutNow, range.granularity, rollup));
+        const curNormalized = normalizeActivitySourceResponse(
+          curRes.base,
+          curRes.boundary,
+          range.since,
+          range.until,
+          cutNow,
+          range.granularity,
+          currentPlan.sourceRollup,
+          outputRollup,
+          liveExtend,
+        );
+        const prevNormalized = normalizeActivitySourceResponse(
+          prevRes.base,
+          prevRes.boundary,
+          prevSince,
+          range.since,
+          cutNow,
+          range.granularity,
+          previousPlan.sourceRollup,
+          outputRollup,
+          false,
+        );
+        setCur(limitActivityResponse(curNormalized, 5));
+        setPrev(prevNormalized);
       } catch { if (!cancelled) { setError(true); message.error(`Failed to load ${title} trends`); } }
       finally { if (!cancelled) setLoading(false); }
     };

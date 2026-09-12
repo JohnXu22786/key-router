@@ -13,7 +13,10 @@ import {
 import { getActivity, ActivityResponse, ActivityGroupSummary } from '../api/client';
 import {
   DateRange, ActivityFilter, filterKey, fmtUSDInt, fmtTokens, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS,
-  fmtPercent, fmt3sig, fmtTick, fmtBucket, modelFavicon, Granularity, queryWindowUntil, prorateBoundaryBuckets,
+  fmtPercent, fmt3sig, fmtTick, fmtBucket, modelFavicon, Granularity,
+  ActivityOutputRollup, activitySourcePlan, activitySourceQueryUntil, liveExtensionEligible,
+  normalizeActivitySourceResponse, combineBlendedResponses,
+  limitActivityResponse,
 } from './activityShared';
 import dayjs from 'dayjs';
 import './explore.css';
@@ -141,44 +144,91 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
       setError(false);
       const t0 = performance.now();
       try {
-        // The query window must keep every in-range bucket: a CURRENT-period
-        // boundary-aligned range passes its until as-is, so the endpoint's
-        // widened window keeps the LIVE bucket (the user's newest usage is
-        // the chart's real last point — see queryWindowUntil); a PAST-period
-        // boundary (yesterday, prev-week/month/year) passes one second before
-        // it so the previous period never picks up the current period's
-        // buckets; a mid-bucket until (a coarse rollup — e.g. default day
-        // over an hour-granularity 1d/today range) is sent as-is, or the
-        // server's widened window would amputate the in-progress day the
-        // range covers.
-        const curUntil = queryWindowUntil(range, rollup);
-        const res = await getActivity({
-          metric,
-          group_by: groupBy,
-          subgroup: subgroup || undefined,
-          rollup,
-          rank_by: rankBy,
-          top: topN,
-          since: range.since.toISOString(),
-          until: curUntil.toISOString(),
-          filter_type: filter?.type,
-          filter_value: filter?.value,
-        });
+        // The API stores hourly rows and widens every query to complete
+        // buckets. Short/fine views use those rows directly; long views use
+        // the selected coarse rollup and fetch only the edge buckets hourly
+        // so boundary correction stays exact without materializing a year's
+        // worth of hourly cells.
+        const chartMetrics = metric === 'blended' ? ['spend', 'tokens'] : [metric];
+        const rankMetric = rankBy === 'current' ? metric : rankBy;
+        const rankMetrics = rankMetric === 'blended' ? ['spend', 'tokens'] : [rankMetric];
+        const sourceMetrics = [...new Set([...chartMetrics, ...rankMetrics])];
+        // A blended current-metric rank must be calculated from spend/tokens
+        // together. Passing "current" to each source would rank spend and
+        // token responses independently before the client combines them.
+        const sourceRankBy = rankMetric === 'blended' ? 'blended' : rankBy;
+        const outputRollup = rollup as ActivityOutputRollup;
+        const liveExtend = liveExtensionEligible(range);
+        const sourcePlan = activitySourcePlan(range, outputRollup, liveExtend);
+        const requestRollup = sourcePlan.sourceRollup;
+        const queryCutoff = dayjs();
+        // A current-period range fetches through the current minute so a
+        // coarse source contains the live source bucket; the normalizer clips
+        // it to the selected range. Past/custom ranges retain the requested
+        // endpoint and are clipped by the boundary merge.
+        const curUntil = activitySourceQueryUntil(range, requestRollup, queryCutoff, liveExtend);
+        const responses = await Promise.all(sourceMetrics.map(async sourceMetric => {
+          const base = await getActivity({
+            metric: sourceMetric,
+            group_by: groupBy,
+            subgroup: subgroup || undefined,
+            rollup: requestRollup,
+            rank_by: sourceRankBy,
+            top: 0,
+            since: range.since.toISOString(),
+            until: curUntil.toISOString(),
+            filter_type: filter?.type,
+            filter_value: filter?.value,
+          });
+          const boundary = await Promise.all((sourcePlan.boundary ?? []).map(edge => getActivity({
+            metric: sourceMetric,
+            group_by: groupBy,
+            subgroup: subgroup || undefined,
+            rollup: 'hour',
+            rank_by: sourceRankBy,
+            top: 0,
+            since: edge.since.toISOString(),
+            until: edge.until.toISOString(),
+            filter_type: filter?.type,
+            filter_value: filter?.value,
+          })));
+          return { base: base.data, boundary: boundary.map(response => response.data) };
+        }));
         if (cancelled) return;
         // Capture the response-time cutoff: a slow request can include usage
         // recorded after it started, so the request-time cutoff would make
         // the live boundary bucket's coverage too small and its value too
         // large.
         const cutoff = dayjs();
-        // A custom range whose picked bounds cut mid-bucket makes the endpoint
-        // return FULL boundary buckets when the selected rollup equals the
-        // range granularity (the widened query window — see activityWindow
-        // in admin.go); prorateBoundaryBuckets scales them by the window
-        // overlap like the Overview flow, so the chart, table and totals
-        // agree with it. Coarser rollups keep the accepted residual
-        // behavior, and the wrapper skips sub-hour granularities and the
-        // blended metric by design (see its gate comment).
-        setData(prorateBoundaryBuckets(res.data, range.since, range.until, curUntil, cutoff, range.granularity, rollup));
+        const normalizedByMetric = new Map<string, ActivityResponse>();
+        sourceMetrics.forEach((sourceMetric, i) => {
+          normalizedByMetric.set(sourceMetric, normalizeActivitySourceResponse(
+            responses[i].base,
+            responses[i].boundary,
+            range.since,
+            range.until,
+            cutoff,
+            range.granularity,
+            sourcePlan.sourceRollup,
+            outputRollup,
+            liveExtend,
+          ));
+        });
+        const spend = normalizedByMetric.get('spend');
+        const tokens = normalizedByMetric.get('tokens');
+        const chartResponse = metric === 'blended'
+          ? combineBlendedResponses(spend!, tokens!)
+          : normalizedByMetric.get(metric)!;
+        const rankResponse = rankMetric === 'blended'
+          ? combineBlendedResponses(spend!, tokens!)
+          : normalizedByMetric.get(rankMetric)!;
+        const normalized = limitActivityResponse(
+          chartResponse,
+          topN,
+          rankResponse,
+          metric === 'blended' ? { spend: spend!, tokens: tokens! } : undefined,
+        );
+        setData(normalized);
         setLoadMs(Math.max(1, Math.round(performance.now() - t0)));
       } catch { if (!cancelled) { setError(true); message.error('Failed to load explore'); } }
       finally { if (!cancelled) setLoading(false); }
@@ -251,6 +301,10 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
   }
 
   const fmtAxis = (v: number) => (metric === 'spend' ? fmtUSDInt(v) : metric === 'blended' ? fmt3sig(v) : fmtCompact(v));
+  const displayGranularity: Granularity =
+    data?.rollup === 'minute' || data?.rollup === 'min15'
+      ? data.rollup
+      : rollupGran(rollup);
   const fmtTable = fmtForTable(metric);
   const groupLabel = GROUP_BY.find(g => g.value === groupBy)!.label;
   const subgroupOptions = SUBGROUP_OPTIONS[groupBy];
@@ -333,9 +387,9 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
       {chartType === 'bar' && (
         <BarChart data={chartData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
           <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
-          <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={48} tickFormatter={(v) => fmtTick(rollupGran(rollup), String(v))} />
+          <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={48} tickFormatter={(v) => fmtTick(displayGranularity, String(v))} />
           <YAxis tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} width={60} tickFormatter={fmtAxis} />
-          <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(rollupGran(rollup), String(l))} />
+          <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(displayGranularity, String(l))} />
           {/* dataKey is a function accessor: recharts resolves string keys via
               lodash paths, so dots in names like "claude-3.5" would break */}
           {seriesKeys.map((sk, i) => (
@@ -346,9 +400,9 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
       {chartType === 'area' && (
         <AreaChart data={chartData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
           <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
-          <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={48} tickFormatter={(v) => fmtTick(rollupGran(rollup), String(v))} />
+          <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={48} tickFormatter={(v) => fmtTick(displayGranularity, String(v))} />
           <YAxis tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} width={60} tickFormatter={fmtAxis} />
-          <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(rollupGran(rollup), String(l))} />
+          <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(displayGranularity, String(l))} />
           {seriesKeys.map((sk, i) => (
             <Area key={sk.key} dataKey={(d: any) => d[sk.key]} name={displayFor(sk.group, sk.subgroup)} type="monotone" stackId={stackId} stroke={seriesColor(i, sk.group)} strokeWidth={1.5} fill={seriesColor(i, sk.group)} fillOpacity={0.35} dot={false} />
           ))}
@@ -357,9 +411,9 @@ const ActivityExplore: React.FC<ExploreProps> = ({ range, filter, initialMetric,
       {chartType === 'line' && (
         <LineChart data={chartData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
           <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
-          <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={48} tickFormatter={(v) => fmtTick(rollupGran(rollup), String(v))} />
+          <XAxis dataKey="label" tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} minTickGap={48} tickFormatter={(v) => fmtTick(displayGranularity, String(v))} />
           <YAxis tick={{ fill: AXIS, fontSize: 12 }} tickLine={false} axisLine={false} width={60} tickFormatter={fmtAxis} />
-          <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(rollupGran(rollup), String(l))} />
+          <ChartTip formatter={(v: any, name: any) => [fmtTable(Number(v)), String(name)]} labelStyle={{ color: AXIS }} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(displayGranularity, String(l))} />
           {seriesKeys.map((sk, i) => (
             <Line key={sk.key} dataKey={(d: any) => d[sk.key]} name={displayFor(sk.group, sk.subgroup)} type="monotone" stroke={seriesColor(i, sk.group)} strokeWidth={1.5} dot={false} />
           ))}

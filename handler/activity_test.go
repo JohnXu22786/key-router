@@ -169,6 +169,72 @@ func TestActivityEdgeCases(t *testing.T) {
 	}
 }
 
+// TestActivitySeriesPresence distinguishes an actual zero-valued consumption
+// cell from a dense-grid zero-fill. The frontend needs this distinction when
+// it recomputes summary statistics after correcting the widened hourly range.
+func TestActivitySeriesPresence(t *testing.T) {
+	e := bootstrapActivity(t)
+	t.Cleanup(func() {
+		if sqlDB, err := db.GetDB().DB(); err == nil {
+			sqlDB.Close()
+		}
+	})
+
+	now := time.Now()
+	day1 := time.Date(now.Year(), now.Month(), now.Day()-1, 0, 0, 0, 0, now.Location()).Format("2006-01-02")
+	day2 := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).Format("2006-01-02")
+	req := httptest.NewRequest("GET", "/api/stats/activity?metric=spend&group_by=model&rollup=day&"+rangeQuery(t), nil)
+	req.Host = "localhost:9999"
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Series []struct {
+			Bucket  string  `json:"bucket"`
+			Group   string  `json:"group"`
+			Value   float64 `json:"value"`
+			HasData bool    `json:"has_data"`
+		} `json:"series"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("bad json: %v\n%s", err, rec.Body.String())
+	}
+	got := make(map[string]struct {
+		value   float64
+		hasData bool
+	})
+	for _, point := range out.Series {
+		got[point.Group+"|"+point.Bucket] = struct {
+			value   float64
+			hasData bool
+		}{point.Value, point.HasData}
+	}
+	checks := []struct {
+		group, bucket string
+		value         float64
+		hasData       bool
+	}{
+		{"g1", day1, 0.03, true},
+		{"g1", day2, 0, false},
+		{"g2", day1, 0, false},
+		{"g2", day2, 0.005, true},
+		// The empty-model row has zero spend but is still an actual cell.
+		{"Unknown", day1, 0, true},
+		{"Unknown", day2, 0, false},
+	}
+	for _, check := range checks {
+		point, ok := got[check.group+"|"+check.bucket]
+		if !ok {
+			t.Fatalf("missing series point for %s/%s", check.group, check.bucket)
+		}
+		if point.value != check.value || point.hasData != check.hasData {
+			t.Fatalf("%s/%s = value %v, has_data %v; want value %v, has_data %v", check.group, check.bucket, point.value, point.hasData, check.value, check.hasData)
+		}
+	}
+}
+
 // TestActivitySubgroup exercises the optional second dimension: series must
 // be split per (group, subgroup), subgroups ordered by sum desc within each
 // group, and "Other" stays a single aggregated stack. The fixture gives g1

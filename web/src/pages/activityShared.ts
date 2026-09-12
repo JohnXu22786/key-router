@@ -616,8 +616,8 @@ export const liveExtensionEligible = (range: Pick<DateRange, 'key'>): boolean =>
 // (custom ranges) must be passed RAW instead: the bucket CONTAINING it
 // starts INSIDE the previous window, so its slice [floor(since), since) is
 // previous-period data, and only the widened window (to = floor(since) + 1
-// unit) can deliver that bucket's rows; prorateBoundaryBuckets then scales
-// them by exactly that slice's share (boundaryShare) — the same share the
+// unit) can deliver that bucket's rows; normalizeHourlyResponse then applies
+// the exact hourly slice share — the same share the
 // Overview flow's bucketWindowShare computes for the same rows. The old
 // exclusiveUntil path dropped that bucket ENTIRELY: the slice appeared in
 // NEITHER the prev nor the cur response (the cur query prorates only
@@ -989,8 +989,9 @@ function isRepeatHour(start: dayjs.Dayjs): boolean {
   return repeatRuns(start) !== null;
 }
 
-// RowCoverage is an hourly (or coarser) row's recorded extent: the epoch
-// runs (whole-minute cutoff-clamped) plus the coverage in whole minutes.
+// RowCoverage is an hourly (or coarser calendar-bucket) row's recorded
+// extent: the epoch runs (whole-minute cutoff-clamped) plus the coverage in
+// whole minutes.
 export interface RowCoverage {
   runs: Array<{ from: number; to: number }>;
   coverage: number;
@@ -1023,7 +1024,7 @@ export interface RowCoverage {
 // EST, its real minute.
 export function rowCoverage(
   start: dayjs.Dayjs,
-  rowUnit: 'hour' | 'day' | 'month',
+  rowUnit: 'hour' | 'day' | 'week' | 'month',
   cutoff: dayjs.Dayjs,
   wallField?: number,
 ): RowCoverage {
@@ -1055,7 +1056,7 @@ export function rowCoverage(
 // to: the end of its LAST coverage run (see rowCoverage), capped at `cutoff`
 // read as WHOLE MINUTES. Only the >-0 gate of hasLiveCell consumes the bare
 // instant; every extent-aware consumer reads the runs' coverage directly.
-function rowCoverageEnd(start: dayjs.Dayjs, rowUnit: 'hour' | 'day' | 'month', cutoff: dayjs.Dayjs): dayjs.Dayjs {
+function rowCoverageEnd(start: dayjs.Dayjs, rowUnit: 'hour' | 'day' | 'week' | 'month', cutoff: dayjs.Dayjs): dayjs.Dayjs {
   const { runs } = rowCoverage(start, rowUnit, cutoff);
   return runs.length > 0 ? dayjs(runs[runs.length - 1].to) : dayjs(start.valueOf());
 }
@@ -1400,15 +1401,54 @@ export function stackedData<T extends BucketedRow>(
   return rows;
 }
 
+interface SeriesCell {
+  key: string;
+  group: string;
+  subgroup?: string;
+}
+
+const seriesCellKey = (group: string, subgroup?: string): string => `${group}\u0000${subgroup ?? ''}`;
+
+// Activity responses use a dense bucket x group grid, so a zero-valued point
+// can either be an actual consumption cell or a zero-fill for a missing cell.
+// `has_data` distinguishes those cases on current API responses. Treat an
+// omitted marker as present so hand-built fixtures and older responses keep
+// their historical semantics.
+function seriesPointHasData(point: ActivitySeriesPoint | undefined): boolean {
+  return point !== undefined && point.has_data !== false;
+}
+
+function hasPresenceMetadata(series: ActivitySeriesPoint[]): boolean {
+  return series.some(point => point.has_data !== undefined);
+}
+
+function addPresence<T extends ActivitySeriesPoint>(
+  point: T,
+  includePresence: boolean,
+  hasData: boolean,
+): T {
+  return includePresence ? { ...point, has_data: hasData } : point;
+}
+
+function collectSeriesCells(series: ActivitySeriesPoint[]): SeriesCell[] {
+  const cells = new Map<string, SeriesCell>();
+  for (const p of series) {
+    const key = seriesCellKey(p.group, p.subgroup);
+    if (!cells.has(key)) {
+      cells.set(key, { key, group: p.group, ...(p.subgroup ? { subgroup: p.subgroup } : {}) });
+    }
+  }
+  return [...cells.values()];
+}
+
 // recomputeFromSeries rebuilds a response's summary and metric total from
 // its bucket x group series grid, following the server's aggregation shape
-// (see admin.go): min/max/avg over the buckets with a POSITIVE value
-// (the grid cannot distinguish a present-but-zero bucket from an absent
-// one, so "positive" is the implementable approximation — the convention
-// resampleResponse already used), value = the LAST bucket, percent = the
-// group's share of the grid's total (top-N + Other; the server divides by
-// every group's total).
-// Shared by resampleResponse and prorateBoundaryBuckets — both modify the
+// (see admin.go): min/max/avg over every represented data cell, including
+// explicit zero-valued cells but excluding dense-grid zero-fills, value = the
+// LAST bucket, percent = the group's share of the grid's total (top-N + Other;
+// the server divides by every group's total).
+// Shared by resampleResponse, aggregateHourlyResponse, and
+// prorateBoundaryBuckets — all modify the
 // series values and must re-derive the summed fields so every consumer
 // (Trends' deltas, Explore's table) reads the PRORATED numbers, never the
 // server's raw widened-window ones. Summary rows for groups OUTSIDE the
@@ -1425,11 +1465,15 @@ function recomputeFromSeries(
 ): { summary: ActivityGroupSummary[]; totals: ActivityResponse['totals'] } {
   const groups = Array.from(new Set(series.map(s => s.group)));
   const acc = new Map<string, Map<string, number>>();
+  const present = new Map<string, Set<string>>();
   for (const p of series) {
-    if (p.value === 0) continue;
+    if (!seriesPointHasData(p)) continue;
     let base = acc.get(p.group);
     if (!base) { base = new Map(); acc.set(p.group, base); }
     base.set(p.bucket, (base.get(p.bucket) ?? 0) + p.value);
+    let groupPresent = present.get(p.group);
+    if (!groupPresent) { groupPresent = new Set(); present.set(p.group, groupPresent); }
+    groupPresent.add(p.bucket);
   }
   const groupSum = new Map<string, number>();
   let totalSum = 0;
@@ -1439,16 +1483,17 @@ function recomputeFromSeries(
     totalSum += s;
   }
   const summary: ActivityGroupSummary[] = groups.map(g => {
-    const vals = buckets.map(b => acc.get(g)?.get(b) ?? 0);
-    const nonZero = vals.filter(v => v > 0);
+    const vals = buckets
+      .filter(b => present.get(g)?.has(b))
+      .map(b => acc.get(g)?.get(b) ?? 0);
     const sum = groupSum.get(g) ?? 0;
     return {
       group: g,
-      min: nonZero.length ? Math.min(...nonZero) : 0,
-      max: nonZero.length ? Math.max(...nonZero) : 0,
-      avg: nonZero.length ? sum / nonZero.length : 0,
+      min: vals.length ? Math.min(...vals) : 0,
+      max: vals.length ? Math.max(...vals) : 0,
+      avg: vals.length ? sum / vals.length : 0,
       sum,
-      value: vals[vals.length - 1] ?? 0,
+      value: buckets.length ? acc.get(g)?.get(buckets[buckets.length - 1]) ?? 0 : 0,
       percent: totalSum > 0 ? (sum / totalSum) * 100 : 0,
     };
   });
@@ -1483,9 +1528,15 @@ function recomputeFromSeries(
     let rawBasis = rawOther;
     let scaledBasis = series.reduce((a, p) => (p.group === 'Other' ? a + p.value : a), 0);
     if (rawOther <= 0) {
-      // No fold: the whole grid is the basis (raw values from resp.series —
-      // the callers leave it untouched — vs the re-derived series).
-      rawBasis = resp.series.reduce((a, p) => (gridGroups.has(p.group) ? a + p.value : a), 0);
+      // When the raw response carries cells for the groups that are now
+      // folded, use every raw cell as the basis. A top=0 response takes this
+      // path in limitActivityResponse; restricting the basis to the retained
+      // groups would make the newly-created Other value look artificially
+      // larger than its raw tail. If the raw response has no beyond-grid
+      // cells, retain the legacy grid-only basis for hand-built top-N data.
+      const rawGroups = new Set(resp.series.map(p => p.group));
+      const hasRawBeyond = [...rawGroups].some(g => !gridGroups.has(g));
+      rawBasis = resp.series.reduce((a, p) => hasRawBeyond || gridGroups.has(p.group) ? a + p.value : a, 0);
       scaledBasis = series.reduce((a, p) => (gridGroups.has(p.group) ? a + p.value : a), 0);
     }
     if (rawBasis > 0 && scaledBasis !== rawBasis) {
@@ -1506,6 +1557,61 @@ function recomputeFromSeries(
   return { summary, totals };
 }
 
+function blendedRate(spend: number, tokens: number): number {
+  return tokens > 0 ? (spend / tokens) * 1e6 : 0;
+}
+
+// Blended cells are rates. A resampled rate can keep the source hourly rate
+// for every overlapping output cell, but the rate-only response does not carry
+// the spend/token weights needed to derive a new primary-group total rate.
+// Preserve that aggregate rate and percent from the server while recomputing
+// the min/max/avg of the visible non-subgroup rate cells. The main blended
+// Explore path combines normalized spend and token responses instead, so it
+// can derive every rate exactly after boundary trimming.
+function recomputeBlendedFromSeries(
+  resp: ActivityResponse,
+  series: ActivitySeriesPoint[],
+  buckets: string[],
+): { summary: ActivityGroupSummary[]; totals: ActivityResponse['totals'] } {
+  const groups = Array.from(new Set(series.map(s => s.group)));
+  const hasSubgroups = series.some(s => Boolean(s.subgroup));
+  const original = new Map(resp.summary.map(s => [s.group, s]));
+  const values = new Map<string, number>();
+  const present = new Map<string, Set<string>>();
+  for (const point of series) {
+    if (!seriesPointHasData(point)) continue;
+    const key = `${point.group}\u0001${point.bucket}`;
+    values.set(key, (values.get(key) ?? 0) + point.value);
+    let groupPresent = present.get(point.group);
+    if (!groupPresent) { groupPresent = new Set(); present.set(point.group, groupPresent); }
+    groupPresent.add(point.bucket);
+  }
+  const summary: ActivityGroupSummary[] = groups.map(group => {
+    const source = original.get(group);
+    if (hasSubgroups) {
+      // A primary group's overall rate cannot be reconstructed from subgroup
+      // rates without their token weights. The source summary already has the
+      // correct aggregate values for the same server response.
+      return source ? { ...source } : {
+        group, min: 0, max: 0, avg: 0, sum: 0, value: 0, percent: 0,
+      };
+    }
+    const activeBuckets = buckets.filter(bucket => present.get(group)?.has(bucket));
+    const rates = activeBuckets.map(bucket => values.get(`${group}\u0001${bucket}`) ?? 0);
+    return {
+      group,
+      min: rates.length ? Math.min(...rates) : 0,
+      max: rates.length ? Math.max(...rates) : 0,
+      avg: rates.length ? rates.reduce((a, v) => a + v, 0) / rates.length : 0,
+      sum: source?.sum ?? 0,
+      value: buckets.length ? values.get(`${group}\u0001${buckets[buckets.length - 1]}`) ?? 0 : source?.value ?? 0,
+      percent: source?.percent ?? 0,
+    };
+  });
+  summary.push(...resp.summary.filter(s => !groups.includes(s.group)));
+  return { summary, totals: { ...resp.totals } };
+}
+
 // resampleResponse re-samples an HOURLY-rolled ActivityResponse onto a
 // sub-hour client axis (the Trends/Explore API rolls up at most hourly —
 // see activityWindow in admin.go). Every hourly series point is distributed
@@ -1513,8 +1619,10 @@ function recomputeFromSeries(
 // for raw rows (cutoff = the fetch time, see overlapFractions); every group
 // stays zero-filled per bucket (the server emits full bucket x group grids
 // with is_zero flags). Summary and totals are RECOMPUTED from the resampled
-// buckets (server semantics: min/max/avg over non-empty buckets, value =
-// last bucket, percent of the total) so the Trends "Trending" deltas agree
+// buckets (server semantics: min/max/avg over represented data cells,
+// including explicit zero-valued cells but excluding zero-fills, value = last
+// bucket, percent of the total) so
+// the Trends "Trending" deltas agree
 // with the re-bucketed chart; summary rows beyond the series grid (groups
 // ranked 6+ under top-5) are moved to the same scale by the grid's
 // aggregate factor inside recomputeFromSeries — without that, their raw
@@ -1539,134 +1647,462 @@ export function resampleResponse(
     starts.push(until);
     buckets.push(liveP.label);
   }
-  const groups = Array.from(new Set(resp.series.map(s => s.group)));
-  // group -> bucket label -> value
+  const cells = collectSeriesCells(resp.series);
+  const includePresence = hasPresenceMetadata(resp.series);
+  // (group, subgroup) -> bucket label -> value
   const acc = new Map<string, Map<string, number>>();
+  const present = new Map<string, Set<string>>();
   const liveCell = hasLiveCell(until, since, cutoff, granularity, liveExtend);
   for (const p of resp.series) {
-    if (p.value === 0) continue;
-    let base = acc.get(p.group);
-    if (!base) { base = new Map(); acc.set(p.group, base); }
+    if (!seriesPointHasData(p)) continue;
+    const key = seriesCellKey(p.group, p.subgroup);
+    let base = acc.get(key);
+    if (!base) { base = new Map(); acc.set(key, base); }
     for (const [i, f] of overlapFractions(p.bucket, since, until, cutoff, starts, stepMin, liveCell)) {
       const b = buckets[i];
-      base.set(b, (base.get(b) ?? 0) + p.value * f);
+      let cellPresent = present.get(key);
+      if (!cellPresent) { cellPresent = new Set(); present.set(key, cellPresent); }
+      cellPresent.add(b);
+      if (resp.metric === 'blended') {
+        // A blended value is a rate, not an hourly amount. The hourly rate is
+        // the value for every overlapping sub-hour cell; multiplying it by a
+        // time fraction and summing would turn a constant rate into a larger
+        // rate as the number of cells grows.
+        base.set(b, base.get(b) ?? p.value);
+      } else {
+        base.set(b, (base.get(b) ?? 0) + p.value * f);
+      }
     }
   }
   const series: ActivitySeriesPoint[] = [];
   for (const b of buckets) {
-    for (const g of groups) {
-      const v = acc.get(g)?.get(b) ?? 0;
-      series.push({ bucket: b, group: g, value: v, is_zero: v === 0 });
+    for (const cell of cells) {
+      const v = acc.get(cell.key)?.get(b) ?? 0;
+      series.push(addPresence({
+        bucket: b,
+        group: cell.group,
+        ...(cell.subgroup ? { subgroup: cell.subgroup } : {}),
+        value: v,
+        is_zero: v === 0,
+      }, includePresence, present.get(cell.key)?.has(b) ?? false));
     }
   }
-  const { summary, totals } = recomputeFromSeries(resp, series, buckets);
+  const { summary, totals } = resp.metric === 'blended'
+    ? recomputeBlendedFromSeries(resp, series, buckets)
+    : recomputeFromSeries(resp, series, buckets);
   return { ...resp, rollup: granularity, buckets, series, summary, totals };
 }
 
-// boundaryShare mirrors bucketWindowShare for a whole bucket whose START is
-// known as an instant: the same coverage (rowCoverageEnd — the live bucket's
-// recorded extent caps the denominator, cutoff floored to whole minutes)
-// and the same clamped window overlap. The windows that reach this path are
-// custom picks and past periods, which never live-extend (see
-// liveExtensionEligible), so the live-cell branch of bucketWindowShare is
-// excluded by construction. bucketWindowShare itself only accepts
-// hour_bucket STRINGS (the database serialization), and the string
-// round-trip re-anchors a fall-back's SECOND-occurrence start through the
-// ambiguous wall-clock (dayjs's setter resolves it to the FIRST occurrence —
-// the exact trap floorWindowUntil's rebuild exists to dodge, see its
-// comment), so for known instants the share is computed directly on the
-// epoch instead.
-function boundaryShare(
-  start: dayjs.Dayjs,
+export type ActivityRollup = 'hour' | 'day' | 'week' | 'month' | 'total';
+export type ActivityOutputRollup = ActivityRollup | 'minute' | 'min15';
+
+function rollupBucketLabel(bucket: string, rollup: ActivityRollup): string {
+  if (rollup === 'total') return 'Total';
+  if (rollup === 'hour') return hourSortFromBucket(bucket) ?? dayjs(bucket).format('YYYY-MM-DD HH:00');
+  const t = dayjs(bucket);
+  if (rollup === 'week') return mondayOf(t).format('YYYY-MM-DD');
+  return rollup === 'day' ? t.format('YYYY-MM-DD') : t.format('YYYY-MM');
+}
+
+// A long-range chart should not force the client to materialize every stored
+// hourly cell. Coarse output is bounded by the requested rollup; only the
+// target buckets whose edges cut the requested window need hourly rows for
+// exact boundary correction.
+const MAX_FULL_HOURLY_SOURCE_HOURS = 7 * 24;
+
+function rollupForGranularity(granularity: Granularity): ActivityRollup {
+  if (granularity === 'month') return 'month';
+  return 'day';
+}
+
+function rollupBucketStart(time: dayjs.Dayjs, rollup: ActivityRollup): dayjs.Dayjs {
+  if (rollup === 'hour') return floorWindowUntil(time, 'hour');
+  if (rollup === 'day') return time.startOf('day');
+  if (rollup === 'week') return mondayOf(time);
+  return time.startOf('month');
+}
+
+function rollupBucketEnd(start: dayjs.Dayjs, rollup: ActivityRollup): dayjs.Dayjs {
+  if (rollup === 'hour') return start.add(1, 'hour');
+  if (rollup === 'day') return start.add(1, 'day');
+  if (rollup === 'week') return start.add(7, 'day');
+  return start.add(1, 'month');
+}
+
+export interface ActivitySourcePlan {
+  sourceRollup: ActivityRollup;
+  // When set, this small hourly query covers only the source buckets whose
+  // coarse values may include data outside the requested window.
+  boundary?: Array<{ bucket: string; since: dayjs.Dayjs; until: dayjs.Dayjs }>;
+}
+
+// activitySourcePlan chooses a bounded source response for an activity view.
+// Hourly data remains the source for short/fine views, where the output itself
+// is small. For long day/week/month/total views, the selected coarse rollup is
+// fetched across the range and an optional hourly boundary query corrects the
+// first/last coarse buckets before the caller renders or collapses Total.
+export function activitySourcePlan(
+  range: Pick<DateRange, 'since' | 'until' | 'granularity'>,
+  outputRollup: ActivityOutputRollup,
+  liveExtend: boolean,
+): ActivitySourcePlan {
+  const hours = range.until.diff(range.since, 'hour', true);
+  const fullHourly = hours <= MAX_FULL_HOURLY_SOURCE_HOURS;
+  if (fullHourly || outputRollup === 'hour' || outputRollup === 'minute' || outputRollup === 'min15') {
+    return { sourceRollup: 'hour' };
+  }
+
+  // Total needs a rollup that still has multiple buckets so interior values
+  // are preserved; aggregateTotalResponse collapses the corrected result only
+  // after the boundary merge.
+  const sourceRollup = outputRollup === 'total'
+    ? rollupForGranularity(range.granularity)
+    : outputRollup;
+  const boundaryStarts: dayjs.Dayjs[] = [];
+  const addBoundary = (start: dayjs.Dayjs) => {
+    if (!boundaryStarts.some(existing => existing.valueOf() === start.valueOf())) {
+      boundaryStarts.push(start);
+    }
+  };
+  const sinceStart = rollupBucketStart(range.since, sourceRollup);
+  if (!range.since.isSame(sinceStart)) addBoundary(sinceStart);
+
+  const untilStart = rollupBucketStart(range.until, sourceRollup);
+  // An aligned live boundary is intentional: the coarse query contains the
+  // current live unit only up to the fetch cutoff, so there is no outside
+  // value to remove. An unaligned end always needs the containing bucket.
+  if (!range.until.isSame(untilStart)) addBoundary(untilStart);
+
+  if (boundaryStarts.length === 0) return { sourceRollup };
+  boundaryStarts.sort((a, b) => a.valueOf() - b.valueOf());
+  // Keep the first and last coarse buckets as separate requests. Combining
+  // them into one hourly range would turn a one-year custom month query back
+  // into roughly 8,760 hourly cells and recreate the regression this plan is
+  // meant to avoid.
+  return {
+    sourceRollup,
+    boundary: boundaryStarts.map(start => ({
+      bucket: rollupBucketLabel(start.format('YYYY-MM-DD HH:mm:ss'), sourceRollup),
+      since: start,
+      // The activity endpoint widens its upper bound to the containing hour.
+      // Stop one second before the coarse boundary so the hourly query
+      // contains the final needed hour without adding the next one.
+      until: rollupBucketEnd(start, sourceRollup).subtract(1, 'second'),
+    })),
+  };
+}
+
+// activitySourceQueryUntil keeps a current-period source query inside the
+// live range unit. This matters when a request crosses a clock rollover after
+// the range was rendered: a stale range must not fetch the newly-started day,
+// month, or other source bucket just because the request resolves later.
+export function activitySourceQueryUntil(
+  range: Pick<DateRange, 'key' | 'since' | 'until' | 'granularity'>,
+  sourceRollup: ActivityRollup,
+  cutoff: dayjs.Dayjs,
+  liveExtend: boolean,
+): dayjs.Dayjs {
+  if (!liveExtend) return queryWindowUntil(range, sourceRollup);
+  const unitEnd = range.until.add(
+    range.granularity === 'month' ? 1 : range.granularity === 'day' ? 1 : range.granularity === 'hour' ? 1 : range.granularity === 'min15' ? 15 : 1,
+    range.granularity === 'month' ? 'month' : range.granularity === 'day' ? 'day' : range.granularity === 'hour' ? 'hour' : 'minute',
+  ).subtract(1, 'second');
+  const now = floorWindowUntil(cutoff, 'minute');
+  return now.isBefore(unitEnd) ? now : unitEnd;
+}
+
+// aggregateHourlyResponse converts an hourly response into the selected
+// calendar rollup after applying the exact hourly-window share to each row.
+// The server's day/week/month/total aggregates have already lost the hourly
+// distribution, so their single elapsed-time ratio cannot be correct for
+// non-uniform traffic. This helper keeps every hourly cell until after the
+// boundary trim, then recomputes the selected metric's summaries and totals.
+// It is intentionally additive-only; blended responses are built from the
+// separately normalized spend and token responses below.
+export function aggregateHourlyResponse(
+  resp: ActivityResponse,
   since: dayjs.Dayjs,
   until: dayjs.Dayjs,
   cutoff: dayjs.Dayjs,
-  granularity: Granularity,
-  wallField?: number,
-): number {
-  const rowUnit = granularity === 'day' ? 'day' : granularity === 'month' ? 'month' : 'hour';
-  // The server anchors a fall-back's repeated hour on its FIRST occurrence
-  // (billing truncates rows to the local hour; the endpoint's widening also
-  // resolves an ambiguous bound to the first pass — see activityWindow's
-  // time.Date in admin.go), and bucketWindowShare's hour_bucket string
-  // round-trip resolves to that same instant. A start rebuilt onto the
-  // SECOND pass (floorWindowUntil's rebuild for a second-pass bound — now
-  // reachable for the 15-minute-misaligned Chatham shift, whose fixed floor
-  // lands a custom range's last bucket at the transition 14:00Z, wall
-  // 02:45:00 +12:45) would measure only a fraction of the row's coverage
-  // (60 of the merged 120 minutes — 60 of 90 in half-hour shift zones like
-  // Lord Howe, and 60 of 75 on Chatham's field-02 row); rebuild the anchor
-  // from the ambiguous wall-clock instead — minute(0) resolves to the FIRST
-  // pass (06:00Z -> 05:00Z in New York, 15:00Z -> 14:00Z on Lord Howe, and
-  // 14:00Z -> 12:15Z on Chatham, which subtract(1, 'hour') can never reach
-  // — the second pass there starts 105 minutes after the anchor).
-  if (rowUnit === 'hour' && isRepeatHour(start.subtract(1, 'hour'))) {
-    start = start.minute(0).second(0).millisecond(0);
+  rangeGranularity: Granularity,
+  rollup: ActivityRollup,
+  liveExtend = false,
+): ActivityResponse {
+  if (resp.metric === 'blended' || resp.rollup !== 'hour') return resp;
+
+  const sourceBuckets = [...resp.buckets];
+  for (const p of resp.series) {
+    if (!sourceBuckets.includes(p.bucket)) sourceBuckets.push(p.bucket);
   }
-  const row = rowCoverage(start, rowUnit, cutoff, rowUnit === 'hour' ? wallField : undefined);
-  const coverage = row.coverage;
-  if (coverage <= 0) return 0;
-  let overlap = 0;
-  for (const r of row.runs) {
-    overlap += Math.max(0, Math.min(r.to, until.valueOf()) - Math.max(r.from, since.valueOf()));
+  const includedSourceBuckets = sourceBuckets.filter(bucket =>
+    rollup === 'total' || bucketWindowShare(
+      bucket, since, until, cutoff, rangeGranularity, liveExtend,
+    ) > 0,
+  );
+  const buckets = rollup === 'total'
+    ? ['Total']
+    : [...new Set(includedSourceBuckets.map(b => rollupBucketLabel(b, rollup)))];
+  const cells = collectSeriesCells(resp.series);
+  const includePresence = hasPresenceMetadata(resp.series);
+  const acc = new Map<string, Map<string, number>>();
+  const present = new Map<string, Set<string>>();
+  for (const p of resp.series) {
+    if (!seriesPointHasData(p)) continue;
+    const share = bucketWindowShare(p.bucket, since, until, cutoff, rangeGranularity, liveExtend);
+    if (share <= 0) continue;
+    const bucket = rollupBucketLabel(p.bucket, rollup);
+    const key = seriesCellKey(p.group, p.subgroup);
+    let base = acc.get(key);
+    if (!base) { base = new Map(); acc.set(key, base); }
+    base.set(bucket, (base.get(bucket) ?? 0) + p.value * share);
+    let cellPresent = present.get(key);
+    if (!cellPresent) { cellPresent = new Set(); present.set(key, cellPresent); }
+    cellPresent.add(bucket);
   }
-  return overlap > 0 ? (overlap / 60000) / coverage : 0;
+  const series: ActivitySeriesPoint[] = [];
+  for (const bucket of buckets) {
+    for (const cell of cells) {
+      const value = acc.get(cell.key)?.get(bucket) ?? 0;
+      series.push(addPresence({
+        bucket,
+        group: cell.group,
+        ...(cell.subgroup ? { subgroup: cell.subgroup } : {}),
+        value,
+        is_zero: value === 0,
+      }, includePresence, present.get(cell.key)?.has(bucket) ?? false));
+    }
+  }
+  const { summary, totals } = recomputeFromSeries(resp, series, buckets);
+  return { ...resp, rollup, buckets, series, summary, totals };
 }
 
-// prorateBoundaryBuckets fixes the SERVER-bucketed boundary overcount for
-// custom ranges whose picked bounds cut mid-bucket at the range granularity
-// (e.g. a 14:37-18:22 pick -> hour). The activity endpoint widens the query
-// window to the buckets CONTAINING the raw bounds (activityWindow in
-// admin.go) and sums the FULL boundary rows into the response: rows in
-// [14:00, 14:37) inflate the first bar and [18:22, 19:00) the last, plus
-// the summary sums/value/min/max/avg/percent and the metric total. The
-// Overview flow prorates those exact rows with bucketWindowShare (its KPI
-// and charts read the same hour_bucket rows), so the same window is correct
-// there — this mirrors that share for the already-aggregated response: each
-// boundary bucket's value is scaled by the fraction of its recorded extent
-// that lies inside [since, until) (boundaryShare), interior buckets are
-// unchanged, and the summed fields are recomputed from the scaled grid
-// (recomputeFromSeries — summary rows beyond the series grid follow the
-// same scale via the grid's aggregate factor there). The result agrees
-// with the Overview computation
-// for the same window and rows; a boundary bucket whose share is 1 (fully
-// in-window) is left untouched and the response is returned as-is when no
-// bucket is partial.
-//
-// The gate is EXACTLY the query shape that overcounts:
-//   - the response rollup must equal the range granularity — the server
-//     bucketed at the window's own scale. A COARSER rollup (Explore's day
-//     rollup over an hour-granularity range, week/total anywhere) sums
-//     whole boundary days into its boundary bars on purpose (the accepted
-//     residual-4 behavior) and is never prorated; a FINER rollup (Explore's
-//     hour rollup over a day-granularity range) overcounts its own hourly
-//     boundary bars the same way but is out of this fix's scope (the same
-//     residual as the coarser ones — the shares would have to be computed at
-//     the rollup's scale, not the range's); the sub-hour granularities are
-//     returned unchanged by the first gate below — Trends' sub-hour ranges
-//     never even reach this function (resampleResponse handles them),
-//     while Explore's pass through and are skipped there.
-//   - a bound must be MID-bucket at that granularity: preset ranges arrive
-//     snapped to their own grid (Activity.tsx), and the query either
-//     aligned to the boundary (exclusiveUntil — the previous-period queries
-//     whose since lies on the grid) or intentionally kept the live bucket,
-//     so their responses are already exact and returned unchanged.
-//   - the BLENDED metric is excluded entirely: its cells are RATES. A rate
-//     is invariant under the window overlap (the in-window slice carries the
-//     same rate as the whole bucket under the uniform-within-bucket
-//     assumption — the Overview rate series prorates numerator and
-//     denominator alike), so scaling a rate bar by a time share would
-//     invent an error where the server's rate is already right, and the
-//     summary can't be re-derived from rates alone (it needs the cell's
-//     spend/tokens, which the response does not carry).
-//
-// `untilSent` is the `until` the QUERY actually carried (the
-// queryWindowUntil result), which locates the response's last bucket (the
-// bucket containing it); it differs from the user's `until` exactly when
-// the query floored to the boundary. `cutoff` is the fetch time (like the
-// Overview's cutNow): the live bucket's recorded extent caps the boundary
-// denominator, so a custom range ending in the live hour keeps its full
-// accumulated value, exactly like the Overview proration.
+// normalizeHourlyResponse is the single client-side boundary-normalization
+// entry point. The activity endpoint widens every query to complete buckets,
+// so callers must retain hourly cells until after the requested window has
+// been applied. Sub-hour charts request an explicit minute/min15 output
+// rollup; all other rollups aggregate corrected hourly cells directly. The
+// range granularity alone must not override an Explore rollup selection.
+export function normalizeHourlyResponse(
+  resp: ActivityResponse,
+  since: dayjs.Dayjs,
+  until: dayjs.Dayjs,
+  cutoff: dayjs.Dayjs,
+  rangeGranularity: Granularity,
+  rollup: ActivityOutputRollup,
+  liveExtend = false,
+): ActivityResponse {
+  if (rollup === 'minute' || rollup === 'min15') {
+    return resampleResponse(resp, since, until, cutoff, rollup, liveExtend);
+  }
+  return aggregateHourlyResponse(resp, since, until, cutoff, rangeGranularity, rollup, liveExtend);
+}
+
+function seriesPointMap(resp: ActivityResponse): Map<string, ActivitySeriesPoint> {
+  const points = new Map<string, ActivitySeriesPoint>();
+  for (const point of resp.series) {
+    points.set(`${point.bucket}\u0001${seriesCellKey(point.group, point.subgroup)}`, point);
+  }
+  return points;
+}
+
+// combineBlendedResponses derives rates from normalized spend and token cells.
+// Keeping the two additive metrics until after hourly boundary correction is
+// the only way to make blended rates correct for partial hours and calendar
+// buckets with non-uniform usage. Subgroups remain independent series cells,
+// while the summary rate is derived from the primary group's combined totals.
+export function combineBlendedResponses(
+  spend: ActivityResponse,
+  tokens: ActivityResponse,
+): ActivityResponse {
+  const buckets = [...spend.buckets];
+  for (const bucket of tokens.buckets) {
+    if (!buckets.includes(bucket)) buckets.push(bucket);
+  }
+  const cells = collectSeriesCells([...spend.series, ...tokens.series]);
+  const includePresence = hasPresenceMetadata(spend.series) || hasPresenceMetadata(tokens.series);
+  const spendPoints = seriesPointMap(spend);
+  const tokenPoints = seriesPointMap(tokens);
+  const series: ActivitySeriesPoint[] = [];
+  for (const bucket of buckets) {
+    for (const cell of cells) {
+      const key = `${bucket}\u0001${cell.key}`;
+      const spendPoint = spendPoints.get(key);
+      const tokenPoint = tokenPoints.get(key);
+      const spendValue = seriesPointHasData(spendPoint) ? spendPoint!.value : 0;
+      const tokenValue = seriesPointHasData(tokenPoint) ? tokenPoint!.value : 0;
+      const value = tokenValue > 0 ? (spendValue / tokenValue) * 1e6 : 0;
+      series.push(addPresence({
+        bucket,
+        group: cell.group,
+        ...(cell.subgroup ? { subgroup: cell.subgroup } : {}),
+        value,
+        is_zero: value === 0,
+      }, includePresence, seriesPointHasData(spendPoint) || seriesPointHasData(tokenPoint)));
+    }
+  }
+
+  const groups = Array.from(new Set(cells.map(c => c.group)));
+  const groupSpend = new Map<string, number>();
+  const groupTokens = new Map<string, number>();
+  const groupPresent = new Map<string, Set<string>>();
+  const bucketRates = new Map<string, Map<string, number>>();
+  for (const group of groups) {
+    const rates = new Map<string, number>();
+    for (const bucket of buckets) {
+      let spendValue = 0;
+      let tokenValue = 0;
+      let hasData = false;
+      for (const cell of cells) {
+        if (cell.group !== group) continue;
+        const key = `${bucket}\u0001${cell.key}`;
+        const spendPoint = spendPoints.get(key);
+        const tokenPoint = tokenPoints.get(key);
+        if (seriesPointHasData(spendPoint)) spendValue += spendPoint!.value;
+        if (seriesPointHasData(tokenPoint)) tokenValue += tokenPoint!.value;
+        hasData = hasData || seriesPointHasData(spendPoint) || seriesPointHasData(tokenPoint);
+      }
+      groupSpend.set(group, (groupSpend.get(group) ?? 0) + spendValue);
+      groupTokens.set(group, (groupTokens.get(group) ?? 0) + tokenValue);
+      if (hasData) {
+        let groupBuckets = groupPresent.get(group);
+        if (!groupBuckets) { groupBuckets = new Set(); groupPresent.set(group, groupBuckets); }
+        groupBuckets.add(bucket);
+        rates.set(bucket, tokenValue > 0 ? (spendValue / tokenValue) * 1e6 : 0);
+      }
+    }
+    bucketRates.set(group, rates);
+  }
+  const totalSpend = [...groupSpend.values()].reduce((a, v) => a + v, 0);
+  const summary: ActivityGroupSummary[] = groups.map(group => {
+    const ratesByBucket = bucketRates.get(group) ?? new Map<string, number>();
+    const rates = buckets
+      .filter(bucket => groupPresent.get(group)?.has(bucket))
+      .map(bucket => ratesByBucket.get(bucket) ?? 0);
+    const sum = blendedRate(groupSpend.get(group) ?? 0, groupTokens.get(group) ?? 0);
+    return {
+      group,
+      min: rates.length ? Math.min(...rates) : 0,
+      max: rates.length ? Math.max(...rates) : 0,
+      avg: rates.length ? rates.reduce((a, v) => a + v, 0) / rates.length : 0,
+      sum,
+      value: buckets.length ? ratesByBucket.get(buckets[buckets.length - 1]) ?? 0 : 0,
+      percent: totalSpend > 0 ? ((groupSpend.get(group) ?? 0) / totalSpend) * 100 : 0,
+    };
+  });
+  const totals = {
+    ...spend.totals,
+    spend: spend.totals.spend,
+    tokens: tokens.totals.tokens,
+  };
+  return {
+    ...spend,
+    metric: 'blended',
+    rollup: spend.rollup,
+    buckets,
+    series,
+    summary,
+    totals,
+  };
+}
+
+// limitActivityResponse applies Explore/Trends' Top-N fold after the hourly
+// response has been normalized. The server cannot choose this set correctly
+// from widened boundary rows: a group that is large just outside the window
+// can otherwise displace a genuinely top in-window group. `rankResponse`
+// carries the normalized values for the requested rank metric; when omitted,
+// the chart metric's normalized summary is used. The folded series is kept
+// small for the chart, but normalized summaries for the tail are retained so
+// Trends can still calculate deltas for groups represented by Other. Both
+// the retained series cells and the summary rows are emitted in this
+// normalized rank order, even when every group fits within Top-N.
+export function limitActivityResponse(
+  resp: ActivityResponse,
+  topN: number,
+  rankResponse: ActivityResponse = resp,
+  blendedSources?: { spend: ActivityResponse; tokens: ActivityResponse },
+): ActivityResponse {
+  if (topN <= 0) return resp;
+
+  if (resp.metric === 'blended' && blendedSources) {
+    // Rates cannot be folded by adding rate cells. Fold the normalized spend
+    // and token matrices first, then derive the top groups' and Other's rates
+    // from their combined values.
+    const spend = limitActivityResponse(blendedSources.spend, topN, rankResponse);
+    const tokens = limitActivityResponse(blendedSources.tokens, topN, rankResponse);
+    return combineBlendedResponses(spend, tokens);
+  }
+
+  const groups = Array.from(new Set([
+    ...resp.summary.map(s => s.group),
+    ...resp.series.map(s => s.group),
+  ])).filter(g => g !== 'Other');
+
+  const rankTotals = new Map(rankResponse.summary.map(s => [s.group, s.sum]));
+  const ordered = [...groups].sort((a, b) => {
+    const av = rankTotals.get(a) ?? 0;
+    const bv = rankTotals.get(b) ?? 0;
+    if (av !== bv) return bv - av;
+    return a.localeCompare(b);
+  });
+  const topGroups = ordered.slice(0, topN);
+  const topSet = new Set(topGroups);
+  const tailSet = new Set(ordered.slice(topN));
+  const rankIndex = new Map(topGroups.map((group, i) => [group, i]));
+  const cells = collectSeriesCells(resp.series)
+    .filter(c => topSet.has(c.group))
+    .sort((a, b) => (rankIndex.get(a.group)! - rankIndex.get(b.group)!));
+  const includePresence = hasPresenceMetadata(resp.series);
+  const points = seriesPointMap(resp);
+  const buckets = [...resp.buckets];
+  const series: ActivitySeriesPoint[] = [];
+  for (const bucket of buckets) {
+    for (const cell of cells) {
+      const point = points.get(`${bucket}\u0001${cell.key}`);
+      const value = seriesPointHasData(point) ? point!.value : 0;
+      series.push(addPresence({
+        bucket,
+        group: cell.group,
+        ...(cell.subgroup ? { subgroup: cell.subgroup } : {}),
+        value,
+        is_zero: value === 0,
+      }, includePresence, seriesPointHasData(point)));
+    }
+    if (tailSet.size > 0) {
+      let value = 0;
+      let hasData = false;
+      for (const p of resp.series) {
+        if (p.bucket === bucket && tailSet.has(p.group) && seriesPointHasData(p)) {
+          value += p.value;
+          hasData = true;
+        }
+      }
+      series.push(addPresence(
+        { bucket, group: 'Other', value, is_zero: value === 0 },
+        includePresence,
+        hasData,
+      ));
+    }
+  }
+  const folded: ActivityResponse = { ...resp, series };
+  const { summary, totals } = resp.metric === 'blended'
+    ? recomputeBlendedFromSeries(resp, series, buckets)
+    : recomputeFromSeries(resp, series, buckets);
+  const summaryByGroup = new Map(summary.map(s => [s.group, s]));
+  const tailSummaryByGroup = new Map(resp.summary
+    .filter(s => !topSet.has(s.group) && s.group !== 'Other')
+    .map(s => [s.group, s]));
+  const summaryOrder = [...topGroups, ...(tailSet.size > 0 ? ['Other'] : []), ...ordered.slice(topN)];
+  const orderedSummary = summaryOrder
+    .map(group => summaryByGroup.get(group) ?? tailSummaryByGroup.get(group))
+    .filter((s): s is ActivityGroupSummary => s !== undefined);
+  return { ...folded, summary: orderedSummary, totals };
+}
+
+// prorateBoundaryBuckets is retained for old callers that already request
+// hourly data. It deliberately does not touch day/week/month/total responses:
+// those payloads have discarded the hourly distribution, so a single
+// aggregate share cannot be correct for non-uniform usage. New callers should
+// use normalizeHourlyResponse and choose the final rollup after correction.
 export function prorateBoundaryBuckets(
   resp: ActivityResponse,
   since: dayjs.Dayjs,
@@ -1675,62 +2111,172 @@ export function prorateBoundaryBuckets(
   cutoff: dayjs.Dayjs,
   granularity: Granularity,
   rollup: string,
+  liveExtend = false,
 ): ActivityResponse {
+  // Coarser responses have already discarded the hourly distribution. A
+  // single elapsed-time share cannot correct them for non-uniform usage, so
+  // callers must fetch hourly cells and use normalizeHourlyResponse instead.
+  // Keep this legacy helper hourly-only for callers that still import it.
   if (granularity === 'minute' || granularity === 'min15') return resp;
-  if (rollup !== granularity) return resp;
   if (resp.metric === 'blended') return resp;
   if (resp.buckets.length === 0) return resp;
-  const shares = new Map<string, number>();
-  const firstStart = floorWindowUntil(since, granularity);
-  if (!firstStart.isSame(since)) {
-    shares.set(resp.buckets[0], boundaryShare(
-      firstStart,
-      since,
-      until,
-      cutoff,
-      granularity,
-      granularity === 'hour' ? hourFieldFromBucket(resp.buckets[0]) : undefined,
-    ));
-  }
-  const lastStart = floorWindowUntil(untilSent, granularity);
-  if (!lastStart.isSame(until)) {
-    // The last bucket of the widened window starts at floor(untilSent) — the
-    // bucket containing the SENT until. It is partial exactly when the user's
-    // until cuts inside it (share < 1): when the query floored to the
-    // boundary (exclusiveUntil), the last bucket lies entirely inside the
-    // window and its share is exactly 1 — skipped below, so a grid-aligned
-    // prev/since response only prorates its first bucket — while a prev query
-    // that sent the RAW mid-bucket since (prevWindowUntil) reaches this
-    // branch with the shared bucket's prev-period slice, exactly like the
-    // first-bucket machinery.
-    const lastBucket = resp.buckets[resp.buckets.length - 1];
-    shares.set(lastBucket, boundaryShare(
-      lastStart,
-      since,
-      until,
-      cutoff,
-      granularity,
-      granularity === 'hour' ? hourFieldFromBucket(lastBucket) : undefined,
-    ));
-  }
-  const toApply = new Map<string, number>();
-  for (const [b, share] of shares) {
-    // A share of exactly 1 means the bucket lies entirely inside the window
-    // (the previous-period last bucket, and grid-aligned ends the query
-    // already cut) — skip it so the response stays untouched when nothing
-    // is partial.
-    if (share < 1) toApply.set(b, share);
-  }
-  if (toApply.size === 0) return resp;
-  const series = resp.series.map(p => {
-    const share = toApply.get(p.bucket);
-    // is_zero is rebuilt from the scaled value, so a boundary bucket scaled
-    // to 0 (a share of 0 only arises for a no-data future window) never
-    // claims a value it no longer carries.
-    return share === undefined ? p : { ...p, value: p.value * share, is_zero: p.value * share === 0 };
+  if (resp.rollup !== 'hour' || rollup !== 'hour') return resp;
+
+  const series = resp.series.map(point => {
+    const share = bucketWindowShare(
+      point.bucket, since, until, cutoff, granularity, liveExtend,
+    );
+    const value = point.value * share;
+    return share === 1 ? point : { ...point, value, is_zero: value === 0 };
   });
   const { summary, totals } = recomputeFromSeries(resp, series, resp.buckets);
-  return { ...resp, series, summary, totals };
+  const unchanged = series.every((point, i) => {
+    const original = resp.series[i];
+    return original
+      && point.bucket === original.bucket
+      && point.group === original.group
+      && point.subgroup === original.subgroup
+      && point.value === original.value
+      && point.is_zero === original.is_zero;
+  });
+  return unchanged ? resp : { ...resp, series, summary, totals };
+}
+
+// aggregateTotalResponse collapses a corrected hourly response into the
+// single bucket used by Explore's Total rollup. Additive metrics must take
+// this path: the server's total response has already discarded the hourly
+// cells, so scaling that one aggregate would also scale interior hours. The
+// caller corrects the hourly boundary cells first, then this helper sums the
+// remaining values and recomputes the one-bucket summary and metric total.
+// Subgroup points are kept as separate series cells; summaries remain at the
+// primary-group level, matching the activity endpoint's response shape.
+export function aggregateTotalResponse(resp: ActivityResponse): ActivityResponse {
+  if (resp.metric === 'blended' || resp.rollup === 'total') return resp;
+
+  const includePresence = hasPresenceMetadata(resp.series);
+  const byCell = new Map<string, ActivitySeriesPoint>();
+  for (const p of resp.series) {
+    const key = `${p.group}\u0000${p.subgroup ?? ''}`;
+    const current = byCell.get(key);
+    if (current) {
+      if (seriesPointHasData(p)) current.value += p.value;
+      current.is_zero = current.value === 0;
+      if (includePresence) current.has_data = seriesPointHasData(current) || seriesPointHasData(p);
+    } else {
+      byCell.set(key, addPresence({
+        ...p,
+        bucket: 'Total',
+        value: seriesPointHasData(p) ? p.value : 0,
+        is_zero: p.value === 0,
+      }, includePresence, seriesPointHasData(p)));
+    }
+  }
+  const series = [...byCell.values()];
+  const totalResp: ActivityResponse = {
+    ...resp,
+    rollup: 'total',
+    buckets: ['Total'],
+    series,
+  };
+  const { summary, totals } = recomputeFromSeries(totalResp, series, totalResp.buckets);
+  return { ...totalResp, summary, totals };
+}
+
+// mergeActivityBoundaryResponses overlays corrected hourly boundary buckets
+// onto a coarse response. The coarse response supplies all interior buckets;
+// the hourly responses supply only the first/last buckets whose aggregate
+// values include rows outside the requested range. Rebuilding a dense grid
+// here keeps explicit zero cells and has_data presence intact for summaries.
+export function mergeActivityBoundaryResponses(
+  coarse: ActivityResponse,
+  boundaryResponses: ActivityResponse[],
+  since: dayjs.Dayjs,
+  until: dayjs.Dayjs,
+  cutoff: dayjs.Dayjs,
+  rangeGranularity: Granularity,
+  sourceRollup: ActivityRollup,
+  liveExtend = false,
+): ActivityResponse {
+  if (coarse.metric === 'blended' || boundaryResponses.length === 0) return coarse;
+
+  const corrected = boundaryResponses.map(resp => aggregateHourlyResponse(
+    resp, since, until, cutoff, rangeGranularity, sourceRollup, liveExtend,
+  ));
+  const boundaryBuckets = new Set(corrected.flatMap(resp => resp.buckets));
+  if (boundaryBuckets.size === 0) return coarse;
+
+  const buckets = [...coarse.buckets];
+  for (const bucket of boundaryBuckets) {
+    if (buckets.includes(bucket)) continue;
+    const index = buckets.findIndex(existing => existing.localeCompare(bucket) > 0);
+    if (index < 0) buckets.push(bucket);
+    else buckets.splice(index, 0, bucket);
+  }
+
+  const cells = collectSeriesCells([
+    ...coarse.series,
+    ...corrected.flatMap(resp => resp.series),
+  ]);
+  const coarsePoints = seriesPointMap(coarse);
+  const boundaryPoints = new Map<string, ActivitySeriesPoint>();
+  for (const resp of corrected) {
+    for (const point of resp.series) {
+      boundaryPoints.set(`${point.bucket}\u0001${seriesCellKey(point.group, point.subgroup)}`, point);
+    }
+  }
+  const includePresence = hasPresenceMetadata(coarse.series)
+    || corrected.some(resp => hasPresenceMetadata(resp.series));
+  const series: ActivitySeriesPoint[] = [];
+  for (const bucket of buckets) {
+    const points = boundaryBuckets.has(bucket) ? boundaryPoints : coarsePoints;
+    for (const cell of cells) {
+      const point = points.get(`${bucket}\u0001${cell.key}`);
+      const hasData = seriesPointHasData(point);
+      const value = hasData ? point!.value : 0;
+      series.push(addPresence({
+        bucket,
+        group: cell.group,
+        ...(cell.subgroup ? { subgroup: cell.subgroup } : {}),
+        value,
+        is_zero: value === 0,
+      }, includePresence, hasData));
+    }
+  }
+  const merged: ActivityResponse = {
+    ...coarse,
+    rollup: sourceRollup,
+    buckets,
+    series,
+  };
+  const { summary, totals } = recomputeFromSeries(merged, series, buckets);
+  return { ...merged, summary, totals };
+}
+
+// normalizeActivitySourceResponse handles both bounded coarse sources and
+// the existing short-range hourly source. Long ranges keep their selected
+// source rollup for interior buckets, overlay corrected boundary responses,
+// and collapse to Total only after that merge.
+export function normalizeActivitySourceResponse(
+  resp: ActivityResponse,
+  boundaryResponses: ActivityResponse[],
+  since: dayjs.Dayjs,
+  until: dayjs.Dayjs,
+  cutoff: dayjs.Dayjs,
+  rangeGranularity: Granularity,
+  sourceRollup: ActivityRollup,
+  outputRollup: ActivityOutputRollup,
+  liveExtend = false,
+): ActivityResponse {
+  if (resp.rollup === 'hour') {
+    return normalizeHourlyResponse(
+      resp, since, until, cutoff, rangeGranularity, outputRollup, liveExtend,
+    );
+  }
+  const merged = mergeActivityBoundaryResponses(
+    resp, boundaryResponses, since, until, cutoff,
+    rangeGranularity, sourceRollup, liveExtend,
+  );
+  return outputRollup === 'total' ? aggregateTotalResponse(merged) : merged;
 }
 
 // groupTotals sums a metric per group, sorted descending. An optional
