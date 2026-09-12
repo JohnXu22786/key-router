@@ -4,11 +4,10 @@ import type { ReactNode } from 'react';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import Stats from './Stats';
 import { getConsumptions, getKeys, getOverview, getProviders } from '../api/client';
-import type { Consumption, Key, OverviewStats, Provider } from '../api/client';
+import type { Consumption, Key, Provider } from '../api/client';
 
 type ConsumptionResponse = Awaited<ReturnType<typeof getConsumptions>>;
 type KeysResponse = Awaited<ReturnType<typeof getKeys>>;
-type OverviewResponse = Awaited<ReturnType<typeof getOverview>>;
 type ProvidersResponse = Awaited<ReturnType<typeof getProviders>>;
 
 vi.mock('../api/client', async (importOriginal) => {
@@ -101,14 +100,13 @@ const makeProvider = (id: number, name: string) => ({ id, name } as Provider);
 type Requests = {
   consumptions: Array<Deferred<ConsumptionResponse>>;
   keys: Array<Deferred<KeysResponse>>;
-  overview: Array<Deferred<OverviewResponse>>;
   providers: Array<Deferred<ProvidersResponse>>;
 };
 
 let requests: Requests;
 
 beforeEach(() => {
-  requests = { consumptions: [], keys: [], overview: [], providers: [] };
+  requests = { consumptions: [], keys: [], providers: [] };
   vi.mocked(getConsumptions).mockReset().mockImplementation(() => {
     const request = deferred<ConsumptionResponse>();
     requests.consumptions.push(request);
@@ -119,11 +117,7 @@ beforeEach(() => {
     requests.keys.push(request);
     return request.promise;
   });
-  vi.mocked(getOverview).mockReset().mockImplementation(() => {
-    const request = deferred<OverviewResponse>();
-    requests.overview.push(request);
-    return request.promise;
-  });
+  vi.mocked(getOverview).mockReset();
   vi.mocked(getProviders).mockReset().mockImplementation(() => {
     const request = deferred<ProvidersResponse>();
     requests.providers.push(request);
@@ -138,6 +132,31 @@ afterEach(() => {
 });
 
 describe('Stats range request races', () => {
+  it('keeps successful stats when the unused overview endpoint fails', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-08-13T12:00:00Z'));
+    vi.mocked(getOverview).mockRejectedValue(new Error('overview unavailable'));
+
+    render(<Stats />);
+    await waitFor(() => {
+      expect(requests.consumptions).toHaveLength(2);
+      expect(requests.keys).toHaveLength(1);
+      expect(requests.providers).toHaveLength(1);
+    });
+
+    await act(async () => {
+      requests.consumptions[0].resolve(response([makeConsumption(1, 1)]) as ConsumptionResponse);
+      requests.consumptions[1].resolve(response([] as Consumption[]) as ConsumptionResponse);
+      requests.keys[0].resolve(response([makeKey(1, 'stats-key', 1)]) as KeysResponse);
+      requests.providers[0].resolve(response([makeProvider(1, 'stats-provider')]) as ProvidersResponse);
+    });
+
+    expect(await screen.findByText('stats-key')).not.toBeNull();
+    expect(screen.getByText('stats-provider')).not.toBeNull();
+    expect(screen.queryByText('Failed to load stats — check the log file.')).toBeNull();
+    expect(getOverview).not.toHaveBeenCalled();
+  });
+
   it('keeps an older refresh from overwriting the newly selected range', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(new Date('2026-08-13T12:00:00Z'));
@@ -145,7 +164,6 @@ describe('Stats range request races', () => {
     await waitFor(() => {
       expect(requests.consumptions).toHaveLength(2);
       expect(requests.keys).toHaveLength(1);
-      expect(requests.overview).toHaveLength(1);
       expect(requests.providers).toHaveLength(1);
     });
 
@@ -153,7 +171,6 @@ describe('Stats range request races', () => {
       requests.consumptions[0].resolve(response([makeConsumption(1, 1)]) as ConsumptionResponse);
       requests.consumptions[1].resolve(response([] as Consumption[]) as ConsumptionResponse);
       requests.keys[0].resolve(response([makeKey(1, 'initial-key', 1)]) as KeysResponse);
-      requests.overview[0].resolve(response({} as OverviewStats) as OverviewResponse);
       requests.providers[0].resolve(response([makeProvider(1, 'initial-provider')]) as ProvidersResponse);
     });
     expect(await screen.findByText('initial-key')).not.toBeNull();
@@ -164,7 +181,6 @@ describe('Stats range request races', () => {
     await waitFor(() => {
       expect(requests.consumptions).toHaveLength(4);
       expect(requests.keys).toHaveLength(2);
-      expect(requests.overview).toHaveLength(2);
       expect(requests.providers).toHaveLength(2);
     });
 
@@ -174,7 +190,6 @@ describe('Stats range request races', () => {
     await waitFor(() => {
       expect(requests.consumptions).toHaveLength(6);
       expect(requests.keys).toHaveLength(3);
-      expect(requests.overview).toHaveLength(3);
       expect(requests.providers).toHaveLength(3);
     });
 
@@ -183,7 +198,6 @@ describe('Stats range request races', () => {
       requests.consumptions[2].resolve(response([makeConsumption(2, 99)]) as ConsumptionResponse);
       requests.consumptions[3].resolve(response([] as Consumption[]) as ConsumptionResponse);
       requests.keys[1].resolve(response([makeKey(99, 'stale-key', 99)]) as KeysResponse);
-      requests.overview[1].resolve(response({} as OverviewStats) as OverviewResponse);
       requests.providers[1].resolve(response([makeProvider(99, 'stale-provider')]) as ProvidersResponse);
     });
 
@@ -195,7 +209,6 @@ describe('Stats range request races', () => {
       requests.consumptions[4].resolve(response([makeConsumption(3, 3)]) as ConsumptionResponse);
       requests.consumptions[5].resolve(response([] as Consumption[]) as ConsumptionResponse);
       requests.keys[2].resolve(response([makeKey(3, 'new-key', 3)]) as KeysResponse);
-      requests.overview[2].resolve(response({} as OverviewStats) as OverviewResponse);
       requests.providers[2].resolve(response([makeProvider(3, 'new-provider')]) as ProvidersResponse);
     });
 
@@ -214,7 +227,6 @@ describe('Stats range request races', () => {
     await waitFor(() => {
       expect(requests.consumptions).toHaveLength(2);
       expect(requests.keys).toHaveLength(1);
-      expect(requests.overview).toHaveLength(1);
       expect(requests.providers).toHaveLength(1);
     });
 
@@ -222,7 +234,6 @@ describe('Stats range request races', () => {
       requests.consumptions[0].resolve(response([makeConsumption(1, 1)]) as ConsumptionResponse);
       requests.consumptions[1].resolve(response([makeConsumption(1, 2, '2026-08-05T10:00:00Z')]) as ConsumptionResponse);
       requests.keys[0].resolve(response([makeKey(1, 'initial-key', 1)]) as KeysResponse);
-      requests.overview[0].resolve(response({} as OverviewStats) as OverviewResponse);
       requests.providers[0].resolve(response([makeProvider(1, 'initial-provider')]) as ProvidersResponse);
     });
     expect(await screen.findByText('initial-key')).not.toBeNull();
@@ -233,7 +244,6 @@ describe('Stats range request races', () => {
     await waitFor(() => {
       expect(requests.consumptions).toHaveLength(4);
       expect(requests.keys).toHaveLength(2);
-      expect(requests.overview).toHaveLength(2);
       expect(requests.providers).toHaveLength(2);
     });
 
@@ -241,7 +251,6 @@ describe('Stats range request races', () => {
       requests.consumptions[2].reject(new Error('latest range failed'));
       requests.consumptions[3].resolve(response([] as Consumption[]) as ConsumptionResponse);
       requests.keys[1].resolve(response([makeKey(1, 'new-range-key', 1)]) as KeysResponse);
-      requests.overview[1].resolve(response({} as OverviewStats) as OverviewResponse);
       requests.providers[1].resolve(response([makeProvider(1, 'new-range-provider')]) as ProvidersResponse);
     });
 
@@ -264,7 +273,6 @@ describe('Stats Chatham spring-forward aggregation', () => {
     await waitFor(() => {
       expect(requests.consumptions).toHaveLength(2);
       expect(requests.keys).toHaveLength(1);
-      expect(requests.overview).toHaveLength(1);
       expect(requests.providers).toHaveLength(1);
     });
 
@@ -272,7 +280,6 @@ describe('Stats Chatham spring-forward aggregation', () => {
       requests.consumptions[0].resolve(response([] as Consumption[]) as ConsumptionResponse);
       requests.consumptions[1].resolve(response([] as Consumption[]) as ConsumptionResponse);
       requests.keys[0].resolve(response([makeKey(1, 'chatham-key', 1)]) as KeysResponse);
-      requests.overview[0].resolve(response({} as OverviewStats) as OverviewResponse);
       requests.providers[0].resolve(response([makeProvider(1, 'chatham-provider')]) as ProvidersResponse);
     });
 
@@ -282,7 +289,6 @@ describe('Stats Chatham spring-forward aggregation', () => {
     await waitFor(() => {
       expect(requests.consumptions).toHaveLength(4);
       expect(requests.keys).toHaveLength(2);
-      expect(requests.overview).toHaveLength(2);
       expect(requests.providers).toHaveLength(2);
     });
 
@@ -290,7 +296,6 @@ describe('Stats Chatham spring-forward aggregation', () => {
       requests.consumptions[2].resolve(response([makeConsumption(1, 60, '2026-09-27T04:00:00+13:45')]) as ConsumptionResponse);
       requests.consumptions[3].resolve(response([] as Consumption[]) as ConsumptionResponse);
       requests.keys[1].resolve(response([makeKey(1, 'chatham-key', 1)]) as KeysResponse);
-      requests.overview[1].resolve(response({} as OverviewStats) as OverviewResponse);
       requests.providers[1].resolve(response([makeProvider(1, 'chatham-provider')]) as ProvidersResponse);
     });
 

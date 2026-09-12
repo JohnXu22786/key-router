@@ -8,7 +8,7 @@ import {
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   BarChart, Bar,
 } from 'recharts';
-import { getConsumptions, getOverview, getKeys, getProviders, Consumption, OverviewStats, Key, Provider } from '../api/client';
+import { getConsumptions, getKeys, getProviders, Consumption, Key, Provider } from '../api/client';
 import { cacheHitRate, hourSortForWindow } from './activityShared';
 import { prorateStatsConsumptions } from './statsAggregation';
 import dayjs from 'dayjs';
@@ -65,7 +65,6 @@ interface KeyRow { key_id: number; name: string; max: number; avg: number; min: 
 const Stats: React.FC = () => {
   const [consumptions, setConsumptions] = useState<Consumption[]>([]);
   const [prevConsumptions, setPrevConsumptions] = useState<Consumption[]>([]);
-  const [overview, setOverview] = useState<OverviewStats | null>(null);
   const [keys, setKeys] = useState<Key[]>([]);
   const [providers, setProviders] = useState<Provider[]>([]);
   const [rangeIdx, setRangeIdx] = useState(3); // default 7 days
@@ -98,10 +97,9 @@ const Stats: React.FC = () => {
       const prevSince = prevSinceValue.toISOString();
       const currentResponse = getConsumptions({ since, until: now })
         .then(curRes => ({ curRes, cutoff: dayjs() }));
-      const [current, prevRes, ovRes, keyRes, provRes] = await Promise.all([
+      const [current, prevRes, keyRes, provRes] = await Promise.all([
         currentResponse,
         getConsumptions({ since: prevSince, until: since }),
-        getOverview(),
         getKeys(),
         getProviders(),
       ]);
@@ -110,7 +108,6 @@ const Stats: React.FC = () => {
       setConsumptions(prorateStatsConsumptions(curRes.data, sinceValue, untilValue, cutoff, r.granularity));
       setPrevConsumptions(prorateStatsConsumptions(prevRes.data, prevSinceValue, sinceValue, cutoff, r.granularity));
       setStatsWindow({ since: sinceValue, until: untilValue });
-      setOverview(ovRes.data);
       setKeys(keyRes.data);
       setProviders(provRes.data);
       setSelectedKey(null);
