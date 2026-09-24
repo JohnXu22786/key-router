@@ -74,14 +74,15 @@ func setAutostartEnabled(enabled bool) error {
 	defer regCloseKey.Call(hkey)
 
 	if enabled {
-		pathPtr, _ := syscall.UTF16PtrFromString(appPath)
+		runCommand := autostartRunValue(appPath)
+		pathPtr, _ := syscall.UTF16PtrFromString(runCommand)
 		ret, _, _ = regSetValue.Call(
 			hkey,
 			uintptr(unsafePtr(runValue)),
 			0,
 			uintptr(regSZ),
 			uintptr(unsafe.Pointer(pathPtr)),
-			uintptr(len(appPath)*2+2), // bytes incl. null terminator
+			uintptr(len(runCommand)*2+2), // bytes incl. null terminator
 		)
 		if ret != 0 {
 			return syscall.Errno(ret)
@@ -164,7 +165,7 @@ func autostartEnabled() bool {
 		return false
 	}
 	existing := syscall.UTF16ToString(buf)
-	return existing != "" && filepath.Clean(existing) == appPath
+	return existing == autostartRunValue(appPath) || (existing != "" && filepath.Clean(existing) == appPath)
 }
 
 // unsafePtr converts a Go string to a uintptr for the syscall shims above.

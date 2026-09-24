@@ -12,6 +12,37 @@ import (
 // disabling leaves an empty value in place).
 var regDeleteValue = advapi32.NewProc("RegDeleteValueW")
 
+var (
+	testCommandLineToArgvW = syscall.NewLazyDLL("shell32.dll").NewProc("CommandLineToArgvW")
+	testLocalFree          = syscall.NewLazyDLL("kernel32.dll").NewProc("LocalFree")
+)
+
+func TestAutostartRunValueParsesAsSingleExecutable(t *testing.T) {
+	path := `C:\Program Files\Key Router\KeyRouter.exe`
+	want, err := syscall.UTF16FromString(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command, err := syscall.UTF16PtrFromString(autostartRunValue(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var argc int32
+	argv, _, _ := testCommandLineToArgvW.Call(uintptr(unsafe.Pointer(command)), uintptr(unsafe.Pointer(&argc)))
+	if argv == 0 {
+		t.Fatal("CommandLineToArgvW failed to parse the Run value")
+	}
+	defer testLocalFree.Call(argv)
+	if argc != 1 {
+		t.Fatalf("parsed %d arguments, want one executable argument", argc)
+	}
+	args := unsafe.Slice((**uint16)(unsafe.Pointer(argv)), int(argc))
+	if got := syscall.UTF16ToString(unsafe.Slice(args[0], len(want))); got != path {
+		t.Fatalf("parsed executable = %q, want %q", got, path)
+	}
+}
+
 // TestAutostartRoundTrip exercises the full enable → read-back → disable cycle
 // against the real HKCU Run key, preserving whatever entry existed before.
 // Regression: the Settings "Launch at Login" toggle flipped back to off after
