@@ -165,7 +165,7 @@ func restoreAutostartRaw(saved string, existed bool) error {
 			0,
 			uintptr(regSZ),
 			uintptr(unsafe.Pointer(p)),
-			uintptr(len(saved)*2+2), // bytes incl. null terminator
+			autostartRegistryStringSize(saved), // bytes incl. null terminator
 		)
 	} else {
 		ret, _, _ = regDeleteValue.Call(hkey, uintptr(unsafePtr(runValue)))

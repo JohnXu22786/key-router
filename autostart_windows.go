@@ -82,7 +82,7 @@ func setAutostartEnabled(enabled bool) error {
 			0,
 			uintptr(regSZ),
 			uintptr(unsafe.Pointer(pathPtr)),
-			uintptr(len(runCommand)*2+2), // bytes incl. null terminator
+			autostartRegistryStringSize(runCommand), // bytes incl. null terminator
 		)
 		if ret != 0 {
 			return syscall.Errno(ret)
