@@ -104,8 +104,8 @@ func TestLegacyDataDirs(t *testing.T) {
 		dirs := legacyDataDirs("linux", env(nil), home)
 		exe, _ := os.Executable()
 		want := filepath.Join(filepath.Dir(exe), "data")
-		if len(dirs) == 0 || dirs[0] != want {
-			t.Errorf("first legacy dir = %v, want %q", dirs, want)
+		if !contains(dirs, want) {
+			t.Errorf("legacy dirs %v missing %q", dirs, want)
 		}
 	})
 
@@ -231,6 +231,38 @@ func TestMigrateLegacyData(t *testing.T) {
 		}
 		if _, err := os.Stat(filepath.Join(newDir, "key-router.log")); !os.IsNotExist(err) {
 			t.Errorf("log file was copied (should not be): %v", err)
+		}
+	})
+
+	t.Run("prefers newer app-data when both legacy databases exist", func(t *testing.T) {
+		root := t.TempDir()
+		xdgDataHome := filepath.Join(root, "xdg")
+		execPath := filepath.Join(root, "bin", "key-router")
+		env := func(key string) string {
+			if key == "XDG_DATA_HOME" {
+				return xdgDataHome
+			}
+			return ""
+		}
+		home := func() (string, error) { return "", os.ErrNotExist }
+		legacyDirs := legacyDataDirsForExecutable("linux", env, home, execPath)
+		appDataDir := filepath.Join(xdgDataHome, "localrouter")
+		exeDataDir := filepath.Join(filepath.Dir(execPath), "data")
+		if len(legacyDirs) != 2 || legacyDirs[0] != appDataDir || legacyDirs[1] != exeDataDir {
+			t.Fatalf("legacy dirs = %v, want app-data %q before exe-adjacent %q", legacyDirs, appDataDir, exeDataDir)
+		}
+		write(filepath.Join(appDataDir, "local-router.db"), "newer app-data database")
+		write(filepath.Join(exeDataDir, "local-router.db"), "older exe-adjacent database")
+		newDir := filepath.Join(root, "keyrouter")
+
+		migrateLegacyData(newDir, legacyDirs)
+
+		got, err := os.ReadFile(filepath.Join(newDir, "key-router.db"))
+		if err != nil {
+			t.Fatalf("read migrated database: %v", err)
+		}
+		if string(got) != "newer app-data database" {
+			t.Errorf("migrated database = %q, want newer app-data contents", got)
 		}
 	})
 }

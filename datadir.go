@@ -47,19 +47,21 @@ func resolveDefaultDataDir(goos string, getenv func(string) string, home func() 
 }
 
 // legacyDataDirs returns the directories that earlier versions may have used
-// for user data, oldest first:
+// for user data, newest first:
 //
-//  1. The executable-adjacent ./data directory (pre-0.2.0 builds).
-//  2. The previous application-data directory, named after the old
+//  1. The previous application-data directory, named after the old
 //     "LocalRouter" product name (v0.1.x builds after the app-data move).
+//  2. The executable-adjacent ./data directory (earlier builds).
 //
 // These are checked at startup so an upgrade never loses the user's keys,
 // routes, or billing history.
 func legacyDataDirs(goos string, getenv func(string) string, home func() (string, error)) []string {
+	execPath, _ := os.Executable()
+	return legacyDataDirsForExecutable(goos, getenv, home, execPath)
+}
+
+func legacyDataDirsForExecutable(goos string, getenv func(string) string, home func() (string, error), execPath string) []string {
 	var dirs []string
-	if execPath, err := os.Executable(); err == nil {
-		dirs = append(dirs, filepath.Join(filepath.Dir(execPath), "data"))
-	}
 	switch goos {
 	case "windows":
 		if d := getenv("LOCALAPPDATA"); d != "" {
@@ -76,6 +78,9 @@ func legacyDataDirs(goos string, getenv func(string) string, home func() (string
 		if h, err := home(); err == nil && h != "" {
 			dirs = append(dirs, filepath.Join(h, ".local", "share", "localrouter"))
 		}
+	}
+	if execPath != "" {
+		dirs = append(dirs, filepath.Join(filepath.Dir(execPath), "data"))
 	}
 	return dirs
 }
