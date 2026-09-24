@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 )
 
@@ -134,10 +135,9 @@ func migrateLegacyData(newDir string, legacyDirs []string) {
 }
 
 // copyLegacyFiles copies flat files from legacyDir into newDir, renaming
-// local-router.* files to key-router.*. Writes go through a temp file plus
-// rename so a crash mid-copy can never leave a truncated key-router.db
-// behind: the idempotency check keys on that file's existence, and a partial
-// DB would block retries.
+// local-router.* files to key-router.*. It copies the database last because
+// its presence marks migration complete. Writes go through a temp file plus
+// rename so a crash mid-copy can never leave a truncated key-router.db behind.
 func copyLegacyFiles(legacyDir, newDir string) error {
 	if err := os.MkdirAll(newDir, 0700); err != nil {
 		return err
@@ -146,6 +146,13 @@ func copyLegacyFiles(legacyDir, newDir string) error {
 	if err != nil {
 		return err
 	}
+	// The destination database is the completion marker checked at startup.
+	// Keep it last so failures copying state files leave migration retryable.
+	sort.SliceStable(entries, func(i, j int) bool {
+		iIsDB := entries[i].Name() == "local-router.db"
+		jIsDB := entries[j].Name() == "local-router.db"
+		return !iIsDB && jIsDB
+	})
 	for _, e := range entries {
 		if e.IsDir() {
 			continue // flat files only (db, windows.json, logs)
