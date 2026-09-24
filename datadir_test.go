@@ -167,6 +167,36 @@ func TestMigrateLegacyData(t *testing.T) {
 		}
 	})
 
+	t.Run("retries when a later file copy fails", func(t *testing.T) {
+		legacy := t.TempDir()
+		newDir := filepath.Join(t.TempDir(), "keyrouter")
+		write(filepath.Join(legacy, "local-router.db"), "db")
+		write(filepath.Join(legacy, "windows.json"), "{}")
+
+		// A directory at the destination makes the windows.json rename fail.
+		windowsPath := filepath.Join(newDir, "windows.json")
+		if err := os.MkdirAll(windowsPath, 0700); err != nil {
+			t.Fatal(err)
+		}
+		migrateLegacyData(newDir, []string{legacy})
+
+		if _, err := os.Stat(filepath.Join(newDir, "key-router.db")); !os.IsNotExist(err) {
+			t.Fatalf("database copied despite a later-file failure: %v", err)
+		}
+		if err := os.Remove(windowsPath); err != nil {
+			t.Fatal(err)
+		}
+
+		migrateLegacyData(newDir, []string{legacy})
+
+		if got, err := os.ReadFile(filepath.Join(newDir, "key-router.db")); err != nil || string(got) != "db" {
+			t.Errorf("db not migrated after retry: %v %q", err, got)
+		}
+		if got, err := os.ReadFile(windowsPath); err != nil || string(got) != "{}" {
+			t.Errorf("windows.json not migrated after retry: %v %q", err, got)
+		}
+	})
+
 	t.Run("is a no-op when the new dir already has a database", func(t *testing.T) {
 		legacy := t.TempDir()
 		newDir := t.TempDir()
