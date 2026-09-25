@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildKeyPayload, changedFields, windowTypes } from './keyPayload';
+import { buildKeyPayload, changedFields, KeyPayloadValidationError, windowTypes } from './keyPayload';
 
 // Helpers mirror the form contract: `values` is the full form store at save
 // time (validateFields returns untouched fields too) and `baseline` is the
@@ -107,17 +107,34 @@ describe('buildKeyPayload — edit path force-sends a window limit with its metr
       .toEqual({ rpd_metric: 'requests', rpd_limit: 5000 });
   });
 
-  it('does not ship a fractional limit into a non-cost metric (would 400 the int64 bind)', () => {
-    // A stored cost limit opens as stored/1e6, so a sub-dollar cost window
-    // ("$0.005" — exact shape of the mangled keys the old bug produced, or a
-    // legit "$12.50") shows a fraction. Flipping only its metric to requests
-    // must leave the fractional limit un-sent: the backend int64 bind rejects
-    // non-integers, and the stored integer stays valid in the new unit.
-    const values = { rpd_metric: 'requests', rpd_limit: 0.005 };
-    const baseline = { rpd_metric: 'cost', rpd_limit: 0.005 };
-    const payload = buildKeyPayload(values, edit(values, baseline));
-    expect(payload).toEqual({ rpd_metric: 'requests' });
-    expect(payload.rpd_limit).toBeUndefined();
+  it('rejects switching a fractional cost limit to a count metric without replacing or clearing it', () => {
+    const values = { rpd_metric: 'requests', rpd_limit: 12.5 };
+    const baseline = { rpd_metric: 'cost', rpd_limit: 12.5 };
+    expect(() => buildKeyPayload(values, edit(values, baseline)))
+      .toThrow(KeyPayloadValidationError);
+    expect(() => buildKeyPayload(values, edit(values, baseline)))
+      .toThrow('Enter an integer count or clear the limit before saving.');
+  });
+
+  it('switches a fractional cost limit to a count metric when replaced with an integer', () => {
+    const values = { rpd_metric: 'requests', rpd_limit: 2500 };
+    const baseline = { rpd_metric: 'cost', rpd_limit: 12.5 };
+    expect(buildKeyPayload(values, edit(values, baseline)))
+      .toEqual({ rpd_metric: 'requests', rpd_limit: 2500 });
+  });
+
+  it('switches a fractional cost limit to a count metric when explicitly cleared', () => {
+    const values = { rpd_metric: 'requests', rpd_limit: null };
+    const baseline = { rpd_metric: 'cost', rpd_limit: 12.5 };
+    expect(buildKeyPayload(values, edit(values, baseline)))
+      .toEqual({ rpd_metric: 'requests', rpd_limit: null });
+  });
+
+  it('sends an explicit clear when the form represents an emptied fractional limit as undefined', () => {
+    const values = { rpd_metric: 'tokens', rpd_limit: undefined };
+    const baseline = { rpd_metric: 'cost', rpd_limit: 12.5 };
+    expect(buildKeyPayload(values, edit(values, baseline)))
+      .toEqual({ rpd_metric: 'tokens', rpd_limit: null });
   });
 
   it('metric-only edit force-sends only the changing window\u2019s limit, not untouched windows\u2019', () => {

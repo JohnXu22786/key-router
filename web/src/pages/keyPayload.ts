@@ -24,6 +24,13 @@ export interface KeyBuildContext {
   baseline: Record<string, any> | null;
 }
 
+export class KeyPayloadValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'KeyPayloadValidationError';
+  }
+}
+
 // The fields whose value differs between `current` (the form store at save
 // time) and `baseline` (the form store when the edit dialog opened). This — a
 // real value comparison — decides what an edit sends. antd's isFieldTouched
@@ -73,6 +80,27 @@ export function buildKeyPayload(values: Record<string, any>, ctx: KeyBuildContex
   for (const key of Object.keys(out)) {
     if (!changed.has(key)) delete payload[key];
   }
+  // A fractional USD display value is not a valid request/token count. If an
+  // existing cost window is switched to a count metric, require an integer
+  // replacement or an explicit clear rather than leaving the stored
+  // micro-USD integer behind under the new unit.
+  for (const wt of windowTypes) {
+    if (!wt.metricField || !changed.has(wt.metricField)) continue;
+    const baseline = ctx.baseline;
+    if (!baseline || baseline[wt.metricField] !== 'cost') continue;
+    const metric = values[wt.metricField];
+    if (metric !== 'requests' && metric !== 'tokens') continue;
+    const limit = values[wt.limitField];
+    if (limit == null) {
+      if (baseline[wt.limitField] != null) payload[wt.limitField] = null;
+      continue;
+    }
+    if (!Number.isInteger(limit)) {
+      throw new KeyPayloadValidationError(
+        `${wt.label} limit must be a whole-number count for ${metric}. Enter an integer count or clear the limit before saving.`,
+      );
+    }
+  }
   // Metric-only edits: a window's metric and limit must travel together.
   // The change-filter above drops a limit the user did not retype, but
   // if the metric column IS being sent its unit drives how the stored limit
@@ -83,13 +111,9 @@ export function buildKeyPayload(values: Record<string, any>, ctx: KeyBuildContex
   // the submitted metric's unit. Name-only edits are unaffected: no metric is
   // in the payload, so no limit is force-sent.
   //
-  // Cost limits are always whole micro-USD (usdToMicroUsd rounds), and any
-  // stored limit is a whole integer, so the only fractional raw value here is
-  // a cost window's /1e6 USD display flipped to a non-cost metric without a
-  // retype (e.g. "$12.50" -> requests). A non-integer has no lossless form in
-  // the new unit and the backend int64 bind rejects it (400ing the whole
-  // save), so rather than guess or fail we DELETE it and let the server keep
-  // the stored integer, which is now a valid count in the new unit.
+  // A fractional cost display switched to a count metric is rejected above;
+  // once the user enters an integer or clears the field, the paired payload
+  // below keeps the stored unit consistent with the selected metric.
   for (const wt of windowTypes) {
     if (!wt.metricField || payload[wt.metricField] == null) continue;
     const limit = out[wt.limitField];
