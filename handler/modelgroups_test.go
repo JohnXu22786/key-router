@@ -7,6 +7,9 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"key-router/db"
+	"key-router/model"
 )
 
 // TestCreateModelGroupDuplicateGroupIDRejected: creating a group whose
@@ -122,5 +125,93 @@ func TestUpdateModelGroupKeepsOwnGroupID(t *testing.T) {
 	e.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("PUT /api/model-groups/%d keeping its own group_id status = %d, want 200 (body: %s)", g.ID, rec.Code, rec.Body.String())
+	}
+}
+
+func TestUpdateModelGroupRejectsEmptyGroupIDWithoutChangingRoutes(t *testing.T) {
+	e := bootstrapKeys(t)
+	closeTestDB(t)
+
+	create := httptest.NewRequest("POST", "/api/model-groups",
+		strings.NewReader(`{"group_id":"gpt-4o","name":"Original","enabled":true}`))
+	create.Header.Set("Content-Type", "application/json")
+	create.Host = "localhost:9999"
+	created := httptest.NewRecorder()
+	e.ServeHTTP(created, create)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("POST /api/model-groups status = %d: %s", created.Code, created.Body.String())
+	}
+	var group struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &group); err != nil {
+		t.Fatalf("unmarshal created model group: %v", err)
+	}
+
+	provider := model.Provider{Name: "Test", Type: "openai", BaseURL: "http://test"}
+	if err := db.GetDB().Create(&provider).Error; err != nil {
+		t.Fatal(err)
+	}
+	route := model.Route{ModelGroupID: group.ID, ProviderID: provider.ID, TargetModel: "gpt-4o"}
+	if err := db.GetDB().Create(&route).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	update := httptest.NewRequest("PUT", "/api/model-groups/"+strconv.FormatInt(group.ID, 10),
+		strings.NewReader(`{"group_id":"","name":"Changed","enabled":false}`))
+	update.Header.Set("Content-Type", "application/json")
+	update.Host = "localhost:9999"
+	updated := httptest.NewRecorder()
+	e.ServeHTTP(updated, update)
+	if updated.Code != http.StatusBadRequest {
+		t.Fatalf("PUT /api/model-groups/%d with empty group_id status = %d, want 400 (body: %s)", group.ID, updated.Code, updated.Body.String())
+	}
+
+	getGroups := httptest.NewRequest("GET", "/api/model-groups", nil)
+	getGroups.Host = "localhost:9999"
+	groupsRec := httptest.NewRecorder()
+	e.ServeHTTP(groupsRec, getGroups)
+	if groupsRec.Code != http.StatusOK {
+		t.Fatalf("GET /api/model-groups status = %d: %s", groupsRec.Code, groupsRec.Body.String())
+	}
+	var groups []struct {
+		ID      int64  `json:"id"`
+		GroupID string `json:"group_id"`
+		Name    string `json:"name"`
+		Enabled bool   `json:"enabled"`
+	}
+	if err := json.Unmarshal(groupsRec.Body.Bytes(), &groups); err != nil {
+		t.Fatalf("unmarshal model groups: %v", err)
+	}
+	var found bool
+	for _, got := range groups {
+		if got.ID == group.ID {
+			found = true
+			if got.GroupID != "gpt-4o" || got.Name != "Original" || !got.Enabled {
+				t.Errorf("model group after rejected update = %+v, want original group_id, name, and enabled state", got)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("model group %d missing after rejected update", group.ID)
+	}
+
+	getRoutes := httptest.NewRequest("GET", "/api/routes?model_group_id="+strconv.FormatInt(group.ID, 10), nil)
+	getRoutes.Host = "localhost:9999"
+	routesRec := httptest.NewRecorder()
+	e.ServeHTTP(routesRec, getRoutes)
+	if routesRec.Code != http.StatusOK {
+		t.Fatalf("GET /api/routes status = %d: %s", routesRec.Code, routesRec.Body.String())
+	}
+	var routes []struct {
+		ID           int64  `json:"id"`
+		ModelGroupID int64  `json:"model_group_id"`
+		TargetModel  string `json:"target_model"`
+	}
+	if err := json.Unmarshal(routesRec.Body.Bytes(), &routes); err != nil {
+		t.Fatalf("unmarshal routes: %v", err)
+	}
+	if len(routes) != 1 || routes[0].ID != route.ID || routes[0].ModelGroupID != group.ID || routes[0].TargetModel != "gpt-4o" {
+		t.Errorf("routes after rejected update = %+v, want the original route attached to model group %d", routes, group.ID)
 	}
 }

@@ -720,6 +720,10 @@ func (h *AdminHandler) UpdateModelGroup(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if mg.GroupID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "group_id is required"})
+		return
+	}
 	mg.ID = id
 	// Renaming group_id to an existing value must be a 400, not a raw
 	// SQLite constraint 500 (same as CreateModelGroup/UpdatePricing). The
