@@ -241,6 +241,9 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 				log.Printf("[relay] unsupported route %d for key %d: %v", route.Route.ID, key.ID, err)
 				continue
 			}
+			// This attempt had no upstream response, so an earlier HTTP status
+			// must not determine the terminal response.
+			lastUpstreamStatus = 0
 			log.Printf("[relay] forward error for key %d: %v", key.ID, err)
 			// Client disconnected (context canceled): abort WITHOUT cooling
 			// the key — cooling every key of the group on one disconnect
