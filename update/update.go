@@ -498,12 +498,12 @@ func launchPosixRelaunch(exe string) error {
 // posixRelaunchScript returns the shell script that waits for the given
 // process (by PID) to exit, then execs the exe. The wait gives up after
 // ~5 minutes (PID reuse — a recycled PID could otherwise stall the
-// relaunch forever) and proceeds anyway; by then the old process is gone
-// either way. The exe path is single-quoted and any embedded quote is
-// escaped, so $, backtick, and double quotes in paths stay literal.
+// relaunch forever), then re-checks that the original process is gone before
+// execing. The exe path is single-quoted and any embedded quote is escaped,
+// so $, backtick, and double quotes in paths stay literal.
 func posixRelaunchScript(pid int, exe string) string {
-	return fmt.Sprintf("n=0; while kill -0 %d 2>/dev/null && [ $n -lt 300 ]; do n=$((n+1)); sleep 1; done; exec '%s'",
-		pid, strings.ReplaceAll(exe, "'", `'\''`))
+	return fmt.Sprintf("n=0; while kill -0 %d 2>/dev/null && [ $n -lt 300 ]; do n=$((n+1)); sleep 1; done; if kill -0 %d 2>/dev/null; then exit 1; fi; exec '%s'",
+		pid, pid, strings.ReplaceAll(exe, "'", `'\''`))
 }
 
 // launchWindowsSwap writes a small batch script that waits for this process
