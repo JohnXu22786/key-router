@@ -136,3 +136,26 @@ describe('useDragSort pointer cancellation', () => {
     expect(screen.getAllByRole('row').map(row => row.textContent)).toEqual(['b', 'c', 'a']);
   });
 });
+
+describe('useDragSort pointer ownership', () => {
+  it('ignores moves from a secondary pointer during an active drag', () => {
+    vi.useFakeTimers();
+    const onCommit = vi.fn();
+    render(<Harness onCommit={onCommit} />);
+    setDragGeometry();
+
+    fireEvent(screen.getByRole('button', { name: 'a' }), pointerEvent('pointerdown', 1, 110));
+    fireEvent(screen.getByTestId('row-a'), pointerEvent('pointermove', 1, 150));
+    expect(screen.getByTestId('over-index').textContent).toBe('1');
+
+    fireEvent(screen.getByTestId('row-a'), pointerEvent('pointermove', 2, 190));
+    expect(screen.getByTestId('over-index').textContent).toBe('1');
+
+    fireEvent(screen.getByTestId('row-a'), pointerEvent('pointerup', 1, 150));
+    act(() => { vi.advanceTimersByTime(150); });
+
+    expect(onCommit).toHaveBeenCalledOnce();
+    expect(onCommit).toHaveBeenCalledWith(['b', 'a', 'c']);
+    expect(screen.getAllByRole('row').map(row => row.textContent)).toEqual(['b', 'a', 'c']);
+  });
+});

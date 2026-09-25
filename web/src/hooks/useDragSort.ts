@@ -146,7 +146,7 @@ export function useDragSort<T>(
   }, []);
 
   const onPointerMove = useCallback((e: React.PointerEvent) => {
-    if (dragIndex.current === null || committedRef.current) return;
+    if (e.pointerId !== activePointer.current || dragIndex.current === null || committedRef.current) return;
     e.preventDefault();
     const from = dragIndex.current;
     // The dragged row tracks the pointer 1:1 (clamped to its table body).
