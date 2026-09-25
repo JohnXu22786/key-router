@@ -17,6 +17,8 @@ import (
 // Engine handles routing selection and retry logic
 type Engine struct {
 	mu            sync.RWMutex
+	statusLocksMu sync.Mutex
+	statusLocks   map[int64]*sync.Mutex
 	WindowManager *window.WindowManager
 	Calculator    *billing.Calculator
 
@@ -96,6 +98,7 @@ func NewEngine() *Engine {
 		routes:        make(map[string][]*RouteEntry),
 		providers:     make(map[int64]*model.Provider),
 		keys:          make(map[int64][]*model.Key),
+		statusLocks:   make(map[int64]*sync.Mutex),
 		outcomes:      make(map[int64]*KeyOutcome),
 	}
 	e.Refresh()
@@ -322,10 +325,27 @@ func (e *Engine) RecordSuccess(keyID int64, tokens int64, costMicroUSD int64) {
 	e.WindowManager.IncrementAllWithCost(keyID, tokens, costMicroUSD)
 }
 
+// lockKeyStatus serializes each key's DB status write and cache update.
+func (e *Engine) lockKeyStatus(keyID int64) func() {
+	e.statusLocksMu.Lock()
+	lock := e.statusLocks[keyID]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		e.statusLocks[keyID] = lock
+	}
+	e.statusLocksMu.Unlock()
+
+	lock.Lock()
+	return lock.Unlock
+}
+
 // MarkKeyDisabled marks a key as disabled due to auth error.
 // The status guard keeps a deliberately-disabled key from being re-marked
 // by a stale in-flight relay response.
 func (e *Engine) MarkKeyDisabled(keyID int64, reason string) {
+	unlock := e.lockKeyStatus(keyID)
+	defer unlock()
+
 	res := db.GetDB().Model(&model.Key{}).
 		Where("id = ? AND status <> ?", keyID, model.KeyStatusDisabled).
 		Updates(map[string]interface{}{
@@ -371,6 +391,9 @@ func (e *Engine) MarkKeyDisabled(keyID int64, reason string) {
 // health checker and would be safe to keep serving without recovery
 // ever needing to run.
 func (e *Engine) MarkKeyActive(keyID int64) {
+	unlock := e.lockKeyStatus(keyID)
+	defer unlock()
+
 	res := db.GetDB().Model(&model.Key{}).
 		Where("id = ? AND (status <> ? OR (disabled_reason IS NOT NULL AND disabled_reason <> '') OR rate_limited_until IS NOT NULL) AND (status <> ? OR disabled_reason IN (?, ?, ?, ?)) AND (total_spend_limit IS NULL OR total_spend_limit = 0 OR total_spent < total_spend_limit) AND (rate_limited_until IS NULL OR rate_limited_until <= ?)",
 			keyID, model.KeyStatusActive, model.KeyStatusDisabled,
@@ -542,6 +565,9 @@ func (e *Engine) RecordEmptyResponse(keyID, providerID int64) {
 //     the newest reason is still synced so the UI keeps showing WHY the
 //     key is down.
 func (e *Engine) failKey(keyID int64, reason string, cooldown time.Duration) {
+	unlock := e.lockKeyStatus(keyID)
+	defer unlock()
+
 	until := time.Now().Add(cooldown)
 	res := db.GetDB().Model(&model.Key{}).
 		Where("id = ? AND status <> ? AND (rate_limited_until IS NULL OR rate_limited_until <= ?) AND (total_spend_limit IS NULL OR total_spend_limit = 0 OR total_spent < total_spend_limit)",
