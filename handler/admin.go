@@ -517,7 +517,7 @@ func (h *AdminHandler) UpdateKey(c *gin.Context) {
 		return
 	}
 	// Display-name uniqueness per provider (excluding the key being edited).
-	if k.Name != "" && k.Name != orig.Name {
+	if k.Name != "" && (k.Name != orig.Name || k.ProviderID != orig.ProviderID) {
 		var dup int64
 		if err := db.GetDB().Model(&model.Key{}).
 			Where("provider_id = ? AND name = ? AND id <> ?", k.ProviderID, k.Name, id).
