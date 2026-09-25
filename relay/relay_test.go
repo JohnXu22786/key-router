@@ -178,6 +178,125 @@ func TestStreamResponsePreservesIncompleteOutcome(t *testing.T) {
 	}
 }
 
+func TestResponsesMessageContentDetection(t *testing.T) {
+	cases := []struct {
+		name string
+		item string
+		want bool
+	}{
+		{
+			name: "empty message wrapper",
+			item: `{"type":"message","content":[]}`,
+		},
+		{
+			name: "message with text",
+			item: `{"type":"message","content":[{"type":"output_text","text":"hello"}]}`,
+			want: true,
+		},
+		{
+			name: "message with refusal",
+			item: `{"type":"message","content":[{"type":"refusal","refusal":"cannot help"}]}`,
+			want: true,
+		},
+		{
+			name: "function call",
+			item: `{"type":"function_call","id":"fc_1"}`,
+			want: true,
+		},
+		{
+			name: "reasoning item",
+			item: `{"type":"reasoning","summary":[]}`,
+			want: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(`{"output":[` + tc.item + `]}`)
+			if got := bodyHasContent(body, "responses"); got != tc.want {
+				t.Errorf("bodyHasContent() = %t, want %t", got, tc.want)
+			}
+
+			chunk := `{"type":"response.output_item.added","item":` + tc.item + `}`
+			if got := streamChunkHasContent(chunk, "responses"); got != tc.want {
+				t.Errorf("streamChunkHasContent() = %t, want %t", got, tc.want)
+			}
+		})
+	}
+
+	streamCases := []struct {
+		name  string
+		chunk string
+		want  bool
+	}{
+		{
+			name:  "text delta",
+			chunk: `{"type":"response.output_text.delta","delta":"hello"}`,
+			want:  true,
+		},
+		{
+			name:  "empty text delta",
+			chunk: `{"type":"response.output_text.delta","delta":""}`,
+		},
+		{
+			name:  "refusal delta",
+			chunk: `{"type":"response.refusal.delta","delta":"cannot help"}`,
+			want:  true,
+		},
+	}
+	for _, tc := range streamCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := streamChunkHasContent(tc.chunk, "responses"); got != tc.want {
+				t.Errorf("streamChunkHasContent() = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestResponsesStreamMessageContentAtRelayBoundary(t *testing.T) {
+	cases := []struct {
+		name        string
+		contentType string
+		body        string
+		wantContent bool
+	}{
+		{
+			name:        "native SSE empty message wrapper",
+			contentType: "text/event-stream",
+			body:        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"content\":[]}}\n\n",
+		},
+		{
+			name:        "full JSON fallback empty message wrapper",
+			contentType: "application/json",
+			body:        `{"id":"resp_1","object":"response","status":"completed","output":[{"type":"message","content":[]}],"usage":{"input_tokens":1,"output_tokens":0,"total_tokens":1}}`,
+		},
+		{
+			name:        "native SSE message with text",
+			contentType: "text/event-stream",
+			body:        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}}\n\n",
+			wantContent: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := &http.Response{
+				Header: http.Header{"Content-Type": []string{tc.contentType}},
+				Body:   io.NopCloser(strings.NewReader(tc.body)),
+			}
+			w := httptest.NewRecorder()
+
+			_, sawContent, err := StreamResponse(w, resp, "responses", "responses", "mock-model")
+			if err != nil {
+				t.Fatalf("StreamResponse error = %v, want nil", err)
+			}
+			if sawContent != tc.wantContent {
+				t.Errorf("sawContent = %t, want %t", sawContent, tc.wantContent)
+			}
+		})
+	}
+}
+
 // TestConvertOpenAIResponseToAnthropicReasoning guards the non-stream
 // OpenAI→Anthropic response path: the model's reasoning_content must
 // survive as a thinking block (regression: it was silently dropped).

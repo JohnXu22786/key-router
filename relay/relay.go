@@ -311,6 +311,32 @@ func stripStreamOptions(body []byte) []byte {
 	return clean
 }
 
+// responsesMessageHasContent reports whether a Responses message has any
+// non-empty text or refusal content.
+func responsesMessageHasContent(item map[string]interface{}) bool {
+	content, ok := item["content"].([]interface{})
+	if !ok {
+		return false
+	}
+	for _, rawPart := range content {
+		part, ok := rawPart.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		switch part["type"] {
+		case "output_text":
+			if text, ok := part["text"].(string); ok && text != "" {
+				return true
+			}
+		case "refusal":
+			if refusal, ok := part["refusal"].(string); ok && refusal != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // bodyHasContent reports whether an upstream's full non-SSE response
 // body (returned when the upstream ignored stream:true) carried any
 // user-visible content. Mirrors streamChunkHasContent for the body
@@ -320,8 +346,8 @@ func stripStreamOptions(body []byte) []byte {
 //     .reasoning_content
 //   - anthropic: a content array with at least one text, tool_use or
 //     thinking block
-//   - responses: an output array with at least one message / function_call /
-//     reasoning item, or a top-level "output_text" field
+//   - responses: an output array with a message containing text/refusal or
+//     a function_call / reasoning item, or a top-level "output_text" field
 //
 // Unparseable / unrecognized shapes return false (the streamChunkHasContent
 // default branch would also miss them — the empty-response rule degrades
@@ -369,7 +395,11 @@ func bodyHasContent(body []byte, upstreamFormat string) bool {
 					continue
 				}
 				switch item["type"] {
-				case "message", "function_call", "reasoning":
+				case "message":
+					if responsesMessageHasContent(item) {
+						return true
+					}
+				case "function_call", "reasoning":
 					return true
 				}
 			}
@@ -433,14 +463,17 @@ func streamChunkHasContent(jsonStr, upstreamFormat string) bool {
 		// and the next chunk tries again.
 		t, _ := v["type"].(string)
 		switch {
-		case t == "response.output_text.delta":
-			return true
+		case t == "response.output_text.delta", t == "response.refusal.delta":
+			delta, _ := v["delta"].(string)
+			return delta != ""
 		case t == "response.function_call_arguments.delta":
 			return true
 		case t == "response.output_item.added":
 			if item, ok := v["item"].(map[string]interface{}); ok {
 				switch item["type"] {
-				case "function_call", "message", "reasoning":
+				case "message":
+					return responsesMessageHasContent(item)
+				case "function_call", "reasoning":
 					return true
 				}
 			}
