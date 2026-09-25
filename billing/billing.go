@@ -60,6 +60,12 @@ func (c *Calculator) GetPricing(modelName string) *model.Pricing {
 	return nil
 }
 
+func (c *Calculator) getExactPricing(modelName string) *model.Pricing {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.pricing[modelName]
+}
+
 // RefreshPricing reloads pricing from database
 func (c *Calculator) RefreshPricing() {
 	c.loadPricing()
@@ -124,28 +130,30 @@ func lookupPricing(modelName string) (*model.Pricing, error) {
 // resolvePricing returns the effective pricing rule for priceModel: its exact
 // Pricing-table rule, else the "*" wildcard rule, else nil.
 //
-// A genuine query error is NOT treated as an absence of pricing. The exact
-// lookup and the wildcard lookup both used to discard their error, so when
-// both failed — e.g. a brief SQLite locked/busy read during a relay response
-// — the code fell through to zeroed rates and RecordConsumption wrote the row
-// at $0, silently under-billing an otherwise-priced request. When the answer
-// is unknown (a lookup errored instead of returning a definitive result), the
-// error is logged and the cached Calculator price is used as the best
-// available estimate. Only a definitive no-rule (no exact rule and no
-// wildcard) yields nil, which makes the caller charge zero — the intended
-// price for an unpriced model.
+// A genuine query error is not a definitive absence. If the exact lookup
+// errors, only a cached exact rule can safely price the model: querying or
+// using a wildcard could override an exact rule whose status is unknown. Once
+// exact absence is definitive, the wildcard is queried. If that lookup errors,
+// the cached Calculator price remains the best available estimate.
 func resolvePricing(calc *Calculator, priceModel string) *model.Pricing {
 	exact, exactErr := lookupPricing(priceModel)
 	if exact != nil {
 		return exact
 	}
+	if exactErr != nil {
+		if calc != nil {
+			if p := calc.getExactPricing(priceModel); p != nil {
+				log.Printf("[billing] exact pricing lookup failed for %q: %v; using cached exact price", priceModel, exactErr)
+				return p
+			}
+		}
+		log.Printf("[billing] exact pricing lookup failed for %q: %v; no cached exact price, skipping wildcard fallback", priceModel, exactErr)
+		return nil
+	}
 
-	// No exact rule (or its lookup failed): fall back to the "*" wildcard.
+	// Exact absence is definitive, so it is safe to use the "*" wildcard.
 	wildcard, wildcardErr := lookupPricing("*")
 	if wildcard != nil {
-		if exactErr != nil {
-			log.Printf("[billing] exact pricing lookup failed for %q: %v; using wildcard price", priceModel, exactErr)
-		}
 		return wildcard
 	}
 
