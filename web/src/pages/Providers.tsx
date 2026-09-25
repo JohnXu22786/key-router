@@ -14,7 +14,7 @@ import {
 import { subscribeEvents, jsonEqual } from '../api/events';
 import { useDragSort } from '../hooks/useDragSort';
 import { microUsdToUsd } from './keyLimits';
-import { windowTypes, buildKeyPayload } from './keyPayload';
+import { windowTypes, buildKeyPayload, KeyPayloadValidationError } from './keyPayload';
 
 const { Title, Text } = Typography;
 
@@ -253,7 +253,9 @@ const Providers: React.FC = () => {
       else { await createKey(payload); message.success('Key created'); }
       keyFormBaselineRef.current = null;
       setKeyModal(false); setEditingKey(null); keyForm.resetFields(); fetch();
-    } catch { message.error('Failed to save key'); }
+    } catch (err) {
+      message.error(err instanceof KeyPayloadValidationError ? err.message : 'Failed to save key');
+    }
   };
 
   // Renamed from `deleteKey` to avoid shadowing the imported `deleteKey`

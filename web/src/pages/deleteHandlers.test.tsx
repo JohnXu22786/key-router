@@ -14,7 +14,8 @@
 // imported mock exactly once with the right id.
 import React from 'react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, cleanup, fireEvent, act, waitFor } from '@testing-library/react';
+import { render, cleanup, fireEvent, act, waitFor, screen } from '@testing-library/react';
+import { message } from 'antd';
 import Providers from './Providers';
 import Models from './Models';
 import {
@@ -103,6 +104,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
   vi.clearAllMocks();
 });
 
@@ -167,6 +169,37 @@ describe('Providers — delete handlers must call the imported api functions', (
     });
     expect(vi.mocked(deleteKey)).toHaveBeenCalledWith(10);
   });
+});
+
+describe('Providers — fractional cost metric change validation', () => {
+  it('shows an actionable error and does not update when the old fractional cost limit is unchanged', async () => {
+    const costKey = { ...key1, rpd_metric: 'cost', rpd_limit: 12_500_000 } as Key;
+    vi.mocked(getProviders).mockResolvedValue({ data: [prov1] } as any);
+    vi.mocked(getKeys).mockResolvedValue({ data: [costKey] } as any);
+    vi.mocked(getRoutes).mockResolvedValue({ data: [] } as any);
+    const error = vi.spyOn(message, 'error').mockImplementation(() => '' as any);
+
+    const { container, findByText } = render(<Providers />);
+    await findByText('P1');
+    const header = container.querySelector('.ant-collapse-header') as HTMLElement | null;
+    if (!header) throw new Error('provider collapse header not found');
+    await act(async () => { fireEvent.click(header); });
+    await findByText('K1');
+
+    const editButton = container.querySelector('button[title="Edit"]') as HTMLButtonElement | null;
+    if (!editButton) throw new Error('key edit button not found');
+    await act(async () => { fireEvent.click(editButton); });
+    await findByText('Edit Key');
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: 'Daily Metric' }));
+    fireEvent.click(await screen.findByText('Requests', { selector: '.ant-select-item-option-content' }));
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'OK' })); });
+
+    await waitFor(() => {
+      expect(error).toHaveBeenCalledWith(expect.stringContaining('Enter an integer count or clear the limit'));
+    });
+    expect(updateKey).not.toHaveBeenCalled();
+  }, 15000);
 });
 
 describe('Models — delete handler must call the imported api function', () => {
