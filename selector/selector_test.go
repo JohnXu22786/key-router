@@ -3,10 +3,14 @@ package selector
 import (
 	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
+	"time"
 
 	"key-router/db"
 	"key-router/model"
+
+	"gorm.io/gorm"
 )
 
 func newTestEngine(t *testing.T) *Engine {
@@ -118,5 +122,112 @@ func TestStatusChangedCallback(t *testing.T) {
 	want := []string{model.KeyStatusRateLimited, model.KeyStatusDisabled, model.KeyStatusActive}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("status changes = %v, want %v", got, want)
+	}
+}
+
+func TestFailKeyAndMarkKeyDisabledSerializeCacheUpdate(t *testing.T) {
+	e := newTestEngine(t)
+	key := model.Key{ProviderID: 1, Status: model.KeyStatusActive}
+	if err := db.GetDB().Create(&key).Error; err != nil {
+		t.Fatal(err)
+	}
+	e.Refresh()
+	cachedKey := e.GetKeyStatus(key.ID)
+	if cachedKey == nil {
+		t.Fatal("key missing from selector cache")
+	}
+
+	const callbackName = "selector:test_pause_cooldown_cache_update"
+	cooldownCommitted := make(chan struct{})
+	releaseCooldown := make(chan struct{})
+	disabledCommitted := make(chan struct{})
+	var cooldownOnce sync.Once
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseCooldown) }) }
+	callback := db.GetDB().Callback().Update().After("gorm:commit_or_rollback_transaction")
+	if err := callback.Register(callbackName, func(tx *gorm.DB) {
+		updates, ok := tx.Statement.Dest.(map[string]interface{})
+		if !ok {
+			return
+		}
+		status, _ := updates["status"].(string)
+		switch status {
+		case model.KeyStatusRateLimited:
+			cooldownOnce.Do(func() {
+				close(cooldownCommitted)
+				<-releaseCooldown
+			})
+		case model.KeyStatusDisabled:
+			close(disabledCommitted)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		release()
+		if err := callback.Remove(callbackName); err != nil {
+			t.Errorf("remove test update callback: %v", err)
+		}
+	})
+
+	failDone := make(chan struct{})
+	go func() {
+		e.failKey(key.ID, "http_429", -time.Second)
+		close(failDone)
+	}()
+	select {
+	case <-cooldownCommitted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the cooldown DB write")
+	}
+
+	disableDone := make(chan struct{})
+	disableStarted := make(chan struct{})
+	go func() {
+		close(disableStarted)
+		e.MarkKeyDisabled(key.ID, model.ReasonAuthFailed)
+		close(disableDone)
+	}()
+	<-disableStarted
+
+	// The cooldown has committed but its cache update is paused. A serialized
+	// disable must wait before writing the DB, or the stale cooldown can later
+	// overwrite the disabled cache state.
+	select {
+	case <-disabledCommitted:
+		t.Error("disable DB write passed the paused cooldown cache update")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	release()
+	select {
+	case <-failDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the cooldown transition")
+	}
+	select {
+	case <-disableDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the disable transition")
+	}
+
+	var persisted model.Key
+	if err := db.GetDB().First(&persisted, key.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Status != model.KeyStatusDisabled {
+		t.Errorf("DB status = %q, want %q", persisted.Status, model.KeyStatusDisabled)
+	}
+	if persisted.DisabledReason != model.ReasonAuthFailed {
+		t.Errorf("DB disabled reason = %q, want %q", persisted.DisabledReason, model.ReasonAuthFailed)
+	}
+	if cachedKey.Status != model.KeyStatusDisabled {
+		t.Errorf("cached status = %q, want %q", cachedKey.Status, model.KeyStatusDisabled)
+	}
+	if cachedKey.DisabledReason != model.ReasonAuthFailed {
+		t.Errorf("cached disabled reason = %q, want %q", cachedKey.DisabledReason, model.ReasonAuthFailed)
+	}
+	if got := e.SelectKey(&RouteEntry{Keys: []*model.Key{cachedKey}}); got != nil {
+		t.Errorf("SelectKey admitted disabled key %d", got.ID)
 	}
 }
