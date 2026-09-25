@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"key-router/db"
+	"key-router/middleware"
 	"key-router/model"
 
 	"github.com/gin-gonic/gin"
@@ -41,6 +42,7 @@ func (a *App) BeginShutdown() {
 	a.mu.Lock()
 	a.stop = true
 	a.mu.Unlock()
+	middleware.BeginShutdown()
 }
 
 // New creates a new server instance
