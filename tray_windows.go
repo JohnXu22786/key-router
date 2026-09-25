@@ -29,7 +29,7 @@ type trayState struct {
 	started  bool
 	quitChan chan struct{} // closed when the user picks "Exit"
 
-	exitRequested  bool            // Exit confirmed once; guards quitChan close
+	startup        trayStartupGuard
 	win            uintptr         // hidden tray notification window
 	nid            *notifyIconData // Shell_NotifyIcon registration (re-added on Explorer restart)
 	taskbarCreated uintptr         // WM_TASKBARCREATED, registered at startup
@@ -123,8 +123,8 @@ type notifyIconData struct {
 }
 
 // StartTray registers the tray icon and, when that succeeds, installs the
-// close-to-tray window handler. hwnd is the webview window handle. Returns a
-// channel that closes when the user chooses Exit.
+// close-to-tray window handler unless an exit was already requested. hwnd is
+// the webview window handle. Returns a channel that closes when the app exits.
 func StartTray(hwnd uintptr) <-chan struct{} {
 	tray.mu.Lock()
 	if tray.started {
@@ -142,11 +142,18 @@ func StartTray(hwnd uintptr) <-chan struct{} {
 		return tray.quitChan
 	}
 
-	// Install the close handler BEFORE the webview message loop runs so the
-	// first WM_CLOSE is intercepted. The webview window exists by now.
-	tray.ctx = installTrayCloseHandler(hwnd, func() {
-		log.Println("[tray] app hidden to tray")
-	})
+	// Hold the startup gate through installation so an exit request cannot
+	// queue WM_CLOSE between the exit check and the subclass being installed.
+	if !tray.startup.installCloseHandler(func() {
+		ctx := installTrayCloseHandler(hwnd, func() {
+			log.Println("[tray] app hidden to tray")
+		})
+		tray.mu.Lock()
+		tray.ctx = ctx
+		tray.mu.Unlock()
+	}) {
+		removeTrayIcon()
+	}
 	return tray.quitChan
 }
 
@@ -230,7 +237,9 @@ func registerTrayIcon() error {
 	if res == 0 {
 		return fmt.Errorf("Shell_NotifyIconW failed: %v", err)
 	}
+	tray.mu.Lock()
 	tray.nid = nid
+	tray.mu.Unlock()
 	log.Println("[tray] tray icon registered")
 	return nil
 }
@@ -359,12 +368,11 @@ func requestExit() {
 // and closing the quit channel. Used by the tray Exit flow after the
 // confirmation and by the post-update exit (no confirmation there).
 func requestExitNow() {
-	tray.mu.Lock()
-	if tray.exitRequested {
-		tray.mu.Unlock()
+	if !tray.startup.requestExit() {
 		return
 	}
-	tray.exitRequested = true
+
+	tray.mu.Lock()
 	ctx := tray.ctx
 	nid := tray.nid
 	tray.nid = nil // icon is being removed; don't re-add it on Explorer restarts
@@ -393,6 +401,16 @@ func requestExitNow() {
 		os.Exit(0)
 	}
 	close(tray.quitChan)
+}
+
+func removeTrayIcon() {
+	tray.mu.Lock()
+	nid := tray.nid
+	tray.nid = nil
+	tray.mu.Unlock()
+	if nid != nil {
+		pShellNotifyIcon.Call(nimDelete, uintptr(unsafe.Pointer(nid)))
+	}
 }
 
 // webviewWindowHwnd is the main window handle, recorded so the post-update
