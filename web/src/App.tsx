@@ -199,13 +199,13 @@ const LayoutWithRouter: React.FC = () => {
             />
           )}
           <Routes>
-            <Route path="/" element={<ErrorBoundary><Activity /></ErrorBoundary>} />
+            <Route path="/" element={<ErrorBoundary key={location.pathname}><Activity /></ErrorBoundary>} />
             {/* /stats was the Activity page's URL before it became the home page */}
             <Route path="/stats" element={<Navigate to="/" replace />} />
-            <Route path="/providers" element={<ErrorBoundary><Providers /></ErrorBoundary>} />
-            <Route path="/models" element={<ErrorBoundary><Models /></ErrorBoundary>} />
-            <Route path="/settings" element={<ErrorBoundary><Settings /></ErrorBoundary>} />
-            <Route path="/help" element={<ErrorBoundary><Help /></ErrorBoundary>} />
+            <Route path="/providers" element={<ErrorBoundary key={location.pathname}><Providers /></ErrorBoundary>} />
+            <Route path="/models" element={<ErrorBoundary key={location.pathname}><Models /></ErrorBoundary>} />
+            <Route path="/settings" element={<ErrorBoundary key={location.pathname}><Settings /></ErrorBoundary>} />
+            <Route path="/help" element={<ErrorBoundary key={location.pathname}><Help /></ErrorBoundary>} />
           </Routes>
         </Content>
       </Layout>
