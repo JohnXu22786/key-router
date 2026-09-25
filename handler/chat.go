@@ -1099,8 +1099,8 @@ func truncateAppName(s string) string {
 
 // responseIsEmpty reports whether a successful 2xx body (upstream
 // "completed successfully" but produced no user-visible content) is
-// empty for the empty-response failover. Empty means: no text content
-// AND no tool_calls / tool_use AND no reasoning_content. Usage /
+// empty for the empty-response failover. Empty means: no text content,
+// refusal, tool_calls / tool_use, or reasoning_content. Usage /
 // stop_reason alone do not make a body non-empty — a model that
 // consumed prompt tokens but produced nothing is still an empty
 // completion from the user's perspective.
@@ -1158,7 +1158,7 @@ func responseIsEmpty(body []byte, upstreamFormat string) bool {
 	default:
 		// OpenAI / chat-completions body: choices[0].message.content
 		// (string OR a parts array of {"type":"text","text":...}),
-		// .tool_calls (array), .reasoning_content (string). A choice
+		// .tool_calls (array), .reasoning_content or .refusal (strings). A choice
 		// with ANY of those non-empty is non-empty. (Some OpenAI-
 		// compatible gateways mirror Anthropic's multi-block shape and
 		// return content as a parts array — same convention
@@ -1188,6 +1188,9 @@ func responseIsEmpty(body []byte, upstreamFormat string) bool {
 				return false
 			}
 			if s, ok := msg["reasoning_content"].(string); ok && s != "" {
+				return false
+			}
+			if s, ok := msg["refusal"].(string); ok && s != "" {
 				return false
 			}
 		}
