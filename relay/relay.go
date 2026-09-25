@@ -755,7 +755,7 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 	sawDone := false
 	sawStop := false
 	sawDelta := false
-	sawCompleted := false
+	sawResponseTerminal := false
 	// A same-format stream may end with an error frame and no terminator —
 	// don't append [DONE] after it (SDKs treat [DONE] as success)
 	sawErrorFrame := false
@@ -824,11 +824,11 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 					sawDelta = true
 				}
 			}
-			// A native Responses stream ends with response.completed /
-			// response.failed — nothing may be synthesized after them. The
-			// streaming error event ({"type":"error",...}) is also terminal.
-			if inputFormat == "responses" && ev.Type == "response.completed" {
-				sawCompleted = true
+			// Native Responses terminal outcomes must not be upgraded by
+			// synthesized completion at clean EOF. The streaming error event
+			// ({"type":"error",...}) is also terminal.
+			if inputFormat == "responses" && (ev.Type == "response.completed" || ev.Type == "response.incomplete") {
+				sawResponseTerminal = true
 			}
 			if isErrorPayload(ev.Error) || (inputFormat == "responses" &&
 				(ev.Type == "response.failed" || ev.Type == "error")) {
@@ -987,7 +987,7 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 			}
 		}
 		flusher.Flush()
-	} else if inputFormat == "responses" && !sawCompleted && !sawErrorFrame && rsc == nil {
+	} else if inputFormat == "responses" && !sawResponseTerminal && !sawErrorFrame && rsc == nil {
 		// A native Responses stream ends with response.completed; an
 		// upstream that drops the connection instead leaves the SDK waiting
 		// forever. Synthesize a minimal completion so clients can finish.
@@ -1223,10 +1223,9 @@ func extractStreamUsage(data []byte, inputFormat, upstreamFormat string, usage *
 			usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens + usage.CacheHitTokens + usage.CacheWriteTokens
 		}
 	case "responses":
-		// A native Responses stream carries usage only in response.completed
-		// (nested under "response"). The Responses API's input_tokens INCLUDE
-		// cached tokens — same semantics as OpenAI, so billing subtracts
-		// cached tokens at the cache-read rate.
+		// response.completed and response.incomplete may carry usage nested
+		// under "response". Responses input_tokens INCLUDE cached tokens, with
+		// the same billing semantics as OpenAI.
 		var event struct {
 			Type     string `json:"type"`
 			Response *struct {
@@ -1240,7 +1239,7 @@ func extractStreamUsage(data []byte, inputFormat, upstreamFormat string, usage *
 				} `json:"usage"`
 			} `json:"response"`
 		}
-		if err := json.Unmarshal(data, &event); err == nil && event.Type == "response.completed" &&
+		if err := json.Unmarshal(data, &event); err == nil && (event.Type == "response.completed" || event.Type == "response.incomplete") &&
 			event.Response != nil && event.Response.Usage != nil {
 			u := event.Response.Usage
 			usage.PromptTokens = u.InputTokens
