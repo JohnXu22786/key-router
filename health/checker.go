@@ -29,13 +29,16 @@ type OnKeyResult func(keyID int64, ok bool, reason string)
 // is still detected and auto-disabled instead of sitting in rotation
 // forever.
 type Checker struct {
-	mu       sync.Mutex
-	interval time.Duration
-	stopChan chan struct{}
-	done     chan struct{} // closed when the loop goroutine exits
-	running  bool
-	disabled bool // set by Disable(): the checker must never restart
-	onResult OnKeyResult
+	mu           sync.Mutex
+	interval     time.Duration
+	stopChan     chan struct{}
+	done         chan struct{} // closed when the loop goroutine exits
+	stoppingDone chan struct{} // generation being drained after running becomes false
+	stopWaiters  int           // callers waiting for the stopping generation to exit
+	activeLoops  int           // loop generations launched but not yet exited
+	running      bool
+	disabled     bool // set by Disable(): the checker must never restart
+	onResult     OnKeyResult
 	// failCount tracks consecutive probe failures per key so a persistently
 	// failing key (e.g. a billable Anthropic inference probe) is not probed
 	// every interval forever.
@@ -67,55 +70,87 @@ func (c *Checker) SetOnKeyResult(cb OnKeyResult) {
 	c.onResult = cb
 }
 
-// Start begins the periodic health check loop
+// Start begins the periodic health check loop.
 func (c *Checker) Start() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.running || c.disabled {
-		return
-	}
-
-	// Read interval from settings
-	intervalStr := db.GetSetting(model.SettingHealthCheck)
-	if intervalStr != "" {
-		var sec int
-		if _, err := fmt.Sscanf(intervalStr, "%d", &sec); err == nil && sec > 0 {
-			c.interval = time.Duration(sec) * time.Second
+	for {
+		c.mu.Lock()
+		if c.running || c.disabled {
+			c.mu.Unlock()
+			return
 		}
-	}
+		if stoppingDone := c.stoppingDone; stoppingDone != nil {
+			c.mu.Unlock()
+			<-stoppingDone
 
-	c.stopChan = make(chan struct{})
-	c.done = make(chan struct{})
-	c.running = true
-	// Capture the generation's channels AND interval in the closure so a
-	// concurrent Stop/Start pair can never make the loop observe another
-	// generation's (open) channels or a racing interval write.
-	stop, done := c.stopChan, c.done
-	interval := c.interval
-	go func() {
-		defer close(done)
-		c.loop(stop, interval)
-	}()
-	log.Printf("[health] checker started (interval: %v)", c.interval)
-}
+			c.mu.Lock()
+			if c.stoppingDone == stoppingDone {
+				c.stoppingDone = nil
+			}
+			c.mu.Unlock()
+			continue
+		}
+		if c.activeLoops != 0 {
+			done := c.done
+			c.mu.Unlock()
+			<-done
+			continue
+		}
 
-// Stop stops the health check loop and waits for it to exit.
-// Uses a per-generation done channel (not a WaitGroup) so that concurrent
-// Stop/Start pairs — e.g. the async Restart from UpdateSettings — can never
-// trigger "WaitGroup misuse: Add called concurrently with Wait".
-func (c *Checker) Stop() {
-	c.mu.Lock()
-	if !c.running {
+		// Read interval from settings
+		intervalStr := db.GetSetting(model.SettingHealthCheck)
+		if intervalStr != "" {
+			var sec int
+			if _, err := fmt.Sscanf(intervalStr, "%d", &sec); err == nil && sec > 0 {
+				c.interval = time.Duration(sec) * time.Second
+			}
+		}
+
+		c.stopChan = make(chan struct{})
+		c.done = make(chan struct{})
+		c.running = true
+		c.activeLoops++
+		// Capture the generation's channels AND interval in the closure so a
+		// concurrent Stop/Start pair can never make the loop observe another
+		// generation's (open) channels or a racing interval write.
+		stop, done := c.stopChan, c.done
+		interval := c.interval
+		go func() {
+			defer func() {
+				c.mu.Lock()
+				c.activeLoops--
+				c.mu.Unlock()
+				close(done)
+			}()
+			c.loop(stop, interval)
+		}()
+		log.Printf("[health] checker started (interval: %v)", c.interval)
 		c.mu.Unlock()
 		return
 	}
-	close(c.stopChan)
-	c.running = false
-	done := c.done
+}
+
+// Stop stops the health check loop and waits for its generation to exit.
+// Concurrent callers share the same done channel while that generation drains,
+// so a Restart cannot start a replacement loop before its probes have ended.
+func (c *Checker) Stop() {
+	c.mu.Lock()
+	if c.running {
+		close(c.stopChan)
+		c.running = false
+		c.stoppingDone = c.done
+	}
+	done := c.stoppingDone
+	if done != nil {
+		c.stopWaiters++
+	}
 	c.mu.Unlock()
 
-	<-done
+	if done != nil {
+		<-done
+		c.mu.Lock()
+		c.stopWaiters--
+		c.mu.Unlock()
+	}
 }
 
 // Disable permanently prevents the checker from (re)starting — used at

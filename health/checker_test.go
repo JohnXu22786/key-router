@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -961,3 +962,230 @@ func loadTestKey(t *testing.T, id int64) model.Key {
 // recordFailure semantics (mark once + failover, never disable on one
 // failure); mixed-streak and streak-breaking rules are engine-level and
 // pinned in selector/outcome_test.go (RecordResult).
+
+func TestConcurrentRestartsWaitForStoppingGeneration(t *testing.T) {
+	const interval = 10 * time.Millisecond
+
+	firstProbeStarted := make(chan struct{})
+	secondProbeStarted := make(chan struct{})
+	firstResultStarted := make(chan struct{})
+	resumedProbeStarted := make(chan int32, 16)
+	releaseFirst := make(chan struct{})
+	releaseSecond := make(chan struct{})
+	releaseFirstResult := make(chan struct{})
+	releaseResumed := make(chan struct{}, 100)
+	var releaseFirstOnce, releaseSecondOnce, releaseFirstResultOnce sync.Once
+	unblockFirst := func() { releaseFirstOnce.Do(func() { close(releaseFirst) }) }
+	unblockSecond := func() { releaseSecondOnce.Do(func() { close(releaseSecond) }) }
+	unblockFirstResult := func() { releaseFirstResultOnce.Do(func() { close(releaseFirstResult) }) }
+	var requests, inFlight, maxInFlight, results atomic.Int32
+	var holdResumed atomic.Bool
+
+	c, k, _ := newTestEnv(t, func(w http.ResponseWriter, _ *http.Request) {
+		request := requests.Add(1)
+		active := inFlight.Add(1)
+		for {
+			previous := maxInFlight.Load()
+			if active <= previous || maxInFlight.CompareAndSwap(previous, active) {
+				break
+			}
+		}
+		defer inFlight.Add(-1)
+
+		switch request {
+		case 1:
+			close(firstProbeStarted)
+			<-releaseFirst
+		case 2:
+			close(secondProbeStarted)
+			<-releaseSecond
+		default:
+			if holdResumed.Load() {
+				resumedProbeStarted <- request
+				<-releaseResumed
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{}`)
+	})
+	t.Cleanup(func() {
+		unblockFirst()
+		unblockSecond()
+		unblockFirstResult()
+		for i := 0; i < cap(releaseResumed); i++ {
+			select {
+			case releaseResumed <- struct{}{}:
+			default:
+			}
+		}
+		c.Disable()
+	})
+
+	if err := db.SetSetting(model.SettingHealthCheck, "0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.GetDB().Model(&model.Key{}).Where("id = ?", k.ID).Updates(map[string]interface{}{
+		"status":             model.KeyStatusRateLimited,
+		"rate_limited_until": nil,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	// Keep the key probe-eligible after each successful probe so a second
+	// active loop would make an observable concurrent request.
+	c.SetOnKeyResult(func(int64, bool, string) {
+		if results.Add(1) == 1 {
+			close(firstResultStarted)
+			<-releaseFirstResult
+		}
+	})
+	c.mu.Lock()
+	c.interval = interval
+	c.mu.Unlock()
+	c.Start()
+
+	c.mu.Lock()
+	firstDone := c.done
+	c.mu.Unlock()
+	waitSignal := func(name string, signal <-chan struct{}) {
+		t.Helper()
+		select {
+		case <-signal:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for %s", name)
+		}
+	}
+	waitSignal("first probe", firstProbeStarted)
+
+	firstRestartDone := make(chan struct{})
+	go func() {
+		c.Restart()
+		close(firstRestartDone)
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		c.mu.Lock()
+		stopping := !c.running && c.stoppingDone == firstDone
+		c.mu.Unlock()
+		if stopping {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("first Restart did not begin draining the blocked generation")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	secondRestartDone := make(chan struct{})
+	go func() {
+		c.Restart()
+		close(secondRestartDone)
+	}()
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		c.mu.Lock()
+		waitingForGeneration := !c.running && c.stoppingDone == firstDone && c.stopWaiters >= 2
+		c.mu.Unlock()
+		if waitingForGeneration {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("second Restart did not join the stopping generation")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-secondProbeStarted:
+		t.Fatal("a replacement generation probed before the stopping generation exited")
+	case <-secondRestartDone:
+		t.Fatal("overlapping Restart returned before the in-flight probe was released")
+	case <-time.After(6 * interval):
+	}
+	c.mu.Lock()
+	unchangedGeneration := !c.running && c.done == firstDone && c.stoppingDone == firstDone && c.activeLoops == 1
+	c.mu.Unlock()
+	if !unchangedGeneration {
+		t.Fatal("checker replaced the generation before its done channel closed")
+	}
+
+	unblockFirst()
+	waitSignal("first probe result", firstResultStarted)
+	select {
+	case <-firstDone:
+		t.Fatal("generation exited while its result callback was blocked")
+	case <-secondProbeStarted:
+		t.Fatal("another generation probed before the prior pass completed")
+	case <-firstRestartDone:
+		t.Fatal("first Restart returned while the prior result callback was blocked")
+	case <-secondRestartDone:
+		t.Fatal("second Restart returned while the prior result callback was blocked")
+	case <-time.After(6 * interval):
+	}
+	c.mu.Lock()
+	callbackStillDraining := c.done == firstDone && c.stoppingDone == firstDone && c.activeLoops == 1
+	c.mu.Unlock()
+	if !callbackStillDraining {
+		t.Fatal("replacement generation started before the prior done channel closed")
+	}
+	unblockFirstResult()
+	waitSignal("next probe after the first generation was released", secondProbeStarted)
+	unblockSecond()
+	waitSignal("first Restart completion", firstRestartDone)
+	waitSignal("second Restart completion", secondRestartDone)
+	select {
+	case <-firstDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stopping generation did not close its done channel")
+	}
+
+	c.mu.Lock()
+	resumedDone := c.done
+	resumed := c.running && resumedDone != firstDone && c.stoppingDone == nil && c.activeLoops == 1
+	c.mu.Unlock()
+	if !resumed {
+		t.Fatal("expected exactly one running generation after both Restarts")
+	}
+	assertCurrentGeneration := func() {
+		t.Helper()
+		c.mu.Lock()
+		current := c.running && c.done == resumedDone && c.stoppingDone == nil && c.activeLoops == 1
+		c.mu.Unlock()
+		if !current {
+			t.Fatal("checker started another generation while the resumed loop was active")
+		}
+	}
+
+	holdResumed.Store(true)
+	waitResumedProbe := func() int32 {
+		t.Helper()
+		select {
+		case request := <-resumedProbeStarted:
+			return request
+		case <-time.After(2 * time.Second):
+			t.Fatal("the resumed checker loop did not probe")
+			return 0
+		}
+	}
+	assertNoConcurrentResumedProbe := func() {
+		t.Helper()
+		select {
+		case request := <-resumedProbeStarted:
+			t.Fatalf("another loop probed while request %d was blocked (request %d)", requests.Load(), request)
+		case <-time.After(6 * interval):
+		}
+	}
+
+	firstResumedProbe := waitResumedProbe()
+	assertNoConcurrentResumedProbe()
+	assertCurrentGeneration()
+	releaseResumed <- struct{}{}
+	secondResumedProbe := waitResumedProbe()
+	if secondResumedProbe <= firstResumedProbe {
+		t.Fatalf("resumed probe sequence = %d then %d", firstResumedProbe, secondResumedProbe)
+	}
+	assertNoConcurrentResumedProbe()
+	assertCurrentGeneration()
+	if got := maxInFlight.Load(); got > 1 {
+		t.Fatalf("maximum concurrent probes = %d, want 1", got)
+	}
+	releaseResumed <- struct{}{}
+}
