@@ -1,6 +1,11 @@
 package update
 
 import (
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -56,14 +61,79 @@ func TestPosixRelaunchScript(t *testing.T) {
 	for _, want := range []string{
 		`kill -0 4242`,
 		`$n -lt 300`,
+		`if kill -0 4242 2>/dev/null; then exit 1; fi`,
 		`exec '/opt/KeyRouter/app'`,
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("posix relaunch script missing %q\n---\n%s", want, s)
 		}
 	}
+	loopEnd := strings.Index(s, "done;")
+	finalCheck := strings.Index(s, `if kill -0 4242 2>/dev/null; then exit 1; fi`)
+	execAt := strings.Index(s, `exec '/opt/KeyRouter/app'`)
+	if loopEnd < 0 || finalCheck <= loopEnd || execAt <= finalCheck {
+		t.Errorf("final PID check must follow the wait loop and precede exec: loop=%d check=%d exec=%d\n---\n%s", loopEnd, finalCheck, execAt, s)
+	}
+
 	s2 := posixRelaunchScript(1, `/a'b`)
 	if !strings.Contains(s2, `exec '/a'\''b'`) {
 		t.Errorf("posix relaunch script does not escape single quotes\n---\n%s", s2)
 	}
+}
+
+func TestPosixRelaunchScriptAbortsWhenPIDRemainsAlive(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell behavior")
+	}
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skipf("POSIX shell unavailable: %v", err)
+	}
+
+	marker := filepath.Join(t.TempDir(), "launched")
+	next := writeRelaunchMarkerExecutable(t)
+	prefix := "kill() { return 0; }; sleep() { :; }; "
+	cmd := exec.Command(sh, "-c", prefix+posixRelaunchScript(4242, next))
+	cmd.Env = append(os.Environ(), "MARKER="+marker)
+	err = cmd.Run()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+		t.Fatalf("alive process should abort with status 1, got err %v", err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("relaunch target ran despite the original PID remaining alive (stat err %v)", err)
+	}
+}
+
+func TestPosixRelaunchScriptExecutesAfterPIDExits(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell behavior")
+	}
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skipf("POSIX shell unavailable: %v", err)
+	}
+
+	marker := filepath.Join(t.TempDir(), "launched")
+	next := writeRelaunchMarkerExecutable(t)
+	// The first liveness check succeeds; the second and final checks report
+	// that the old process exited. The relaunch target must then run.
+	prefix := `calls=0; kill() { calls=$((calls+1)); [ "$calls" -eq 1 ]; }; sleep() { :; }; `
+	cmd := exec.Command(sh, "-c", prefix+posixRelaunchScript(4242, next))
+	cmd.Env = append(os.Environ(), "MARKER="+marker)
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("relaunch script failed after PID exit: %v", err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("relaunch target was not executed after PID exit: %v", err)
+	}
+}
+
+func writeRelaunchMarkerExecutable(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "next")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n: > \"$MARKER\"\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
