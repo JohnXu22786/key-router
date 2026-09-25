@@ -271,9 +271,12 @@ func TestWindowsSwapScript(t *testing.T) {
 		`if errorlevel 1 goto proceed`,
 		// Still alive after the final check → abort, never swap/relaunch.
 		`del "%~f0" & exit /b 1`,
-		// Only relaunch after the move succeeded: a failed move (exe locked)
-		// would otherwise silently launch the old binary.
-		`if errorlevel 1 del "%~f0" & exit /b 1`,
+		// A failed move jumps to cleanup; a successful move falls through to
+		// start and exits before the failure label. Keep each self-delete and
+		// following command on one batch line so CMD can execute both.
+		`if errorlevel 1 goto movefailed`,
+		`del "%~f0" & goto :eof`,
+		":movefailed\ndel \"%~f0\" & exit /b 1",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("swap script missing %q\n---\n%s", want, s)
@@ -283,6 +286,15 @@ func TestWindowsSwapScript(t *testing.T) {
 	// final-check rework (%%n%% in the Go template → %n% in the .bat).
 	if strings.Contains(s, "%%n%%") {
 		t.Errorf("swap script still contains double-escaped %%n%% (must be %%%%n%%%% in Go source, %%n%% in the .bat)\n---\n%s", s)
+	}
+	moveAt := strings.Index(s, `move /Y "D:\apps\KeyRouter\KeyRouter.exe.new" "D:\apps\KeyRouter\KeyRouter.exe"`)
+	moveGuardAt := strings.Index(s, "if errorlevel 1 goto movefailed")
+	startAt := strings.Index(s, `start "" "D:\apps\KeyRouter\KeyRouter.exe"`)
+	successExitAt := strings.Index(s, `del "%~f0" & goto :eof`)
+	moveFailedAt := strings.Index(s, ":movefailed")
+	moveFailureBlockAt := strings.Index(s, ":movefailed\ndel \"%~f0\" & exit /b 1")
+	if moveAt < 0 || moveGuardAt < moveAt || startAt < moveGuardAt || successExitAt < startAt || moveFailedAt < successExitAt || moveFailureBlockAt < moveFailedAt {
+		t.Errorf("move success/failure ordering wrong: move=%d guard=%d start=%d success-exit=%d failure-label=%d\n---\n%s", moveAt, moveGuardAt, startAt, successExitAt, moveFailedAt, s)
 	}
 	// Ordering: the final PID re-check MUST precede the swap — a `:finalcheck`
 	// emitted after `:proceed` would be dead code and silently re-open the
