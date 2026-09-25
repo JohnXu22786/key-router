@@ -211,10 +211,14 @@ func assetPattern(goos, goarch, installMode string) string {
 		}
 		return "-darwin-" + arch
 	case "linux":
-		if installMode == "installed" {
-			return "-linux-amd64.deb"
+		if goarch == "" {
+			return ""
 		}
-		return "-linux-amd64"
+		suffix := "-linux-" + goarch
+		if installMode == "installed" {
+			return suffix + ".deb"
+		}
+		return suffix
 	default:
 		return ""
 	}
