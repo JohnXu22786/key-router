@@ -66,6 +66,66 @@ describe('JsonEditor - Enter with empty pairs', () => {
   });
 });
 
+describe('JsonEditor - quote pair interactions', () => {
+  const quotes = [
+    { quote: '"', value: '""', shiftKey: true },
+    { quote: "'", value: "''", shiftKey: false },
+  ] as const;
+
+  it.each(quotes)('jumps over an existing $quote', ({ quote, value, shiftKey }) => {
+    const { getByRole } = render(<ControlledEditor initialValue={value} />);
+    const textarea = getByRole('textbox') as HTMLTextAreaElement;
+    textarea.setSelectionRange(1, 1);
+
+    fireEvent.keyDown(textarea, { key: quote, code: 'Quote', shiftKey });
+
+    expect(textarea.value).toBe(value);
+    expect(textarea.selectionStart).toBe(2);
+    expect(textarea.selectionEnd).toBe(2);
+  });
+
+  it.each(quotes)('auto-pairs $quote when no closer exists', ({ quote, value, shiftKey }) => {
+    let frame: FrameRequestCallback | undefined;
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      frame = callback;
+      return 1;
+    });
+
+    const { getByRole } = render(<ControlledEditor initialValue="" />);
+    const textarea = getByRole('textbox') as HTMLTextAreaElement;
+    textarea.setSelectionRange(0, 0);
+
+    fireEvent.keyDown(textarea, { key: quote, code: 'Quote', shiftKey });
+
+    expect(textarea.value).toBe(value);
+    act(() => frame?.(0));
+    expect(textarea.selectionStart).toBe(1);
+    expect(textarea.selectionEnd).toBe(1);
+  });
+
+  it('keeps bracket pairing and closer skipping unchanged', () => {
+    let frame: FrameRequestCallback | undefined;
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      frame = callback;
+      return 1;
+    });
+
+    const { getByRole } = render(<ControlledEditor initialValue="" />);
+    const textarea = getByRole('textbox') as HTMLTextAreaElement;
+    textarea.setSelectionRange(0, 0);
+    fireEvent.keyDown(textarea, { key: '[', code: 'BracketLeft' });
+
+    expect(textarea.value).toBe('[]');
+    act(() => frame?.(0));
+    expect(textarea.selectionStart).toBe(1);
+
+    fireEvent.keyDown(textarea, { key: ']', code: 'BracketRight' });
+    expect(textarea.value).toBe('[]');
+    expect(textarea.selectionStart).toBe(2);
+    expect(textarea.selectionEnd).toBe(2);
+  });
+});
+
 describe('JsonEditor — validity notification', () => {
   it('updates the guard after commit and never performs a render-phase setState on the parent', () => {
     const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
