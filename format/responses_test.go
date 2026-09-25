@@ -982,6 +982,112 @@ func TestResponsesStreamConverterFromChatError(t *testing.T) {
 	}
 }
 
+func TestResponsesStreamConverterTerminalEventTypeMatchesStatus(t *testing.T) {
+	tests := []struct {
+		name              string
+		upstream          string
+		chunks            []string
+		wantEventType     string
+		wantStatus        string
+		wantIncompleteWhy string
+		wantErrorCode     string
+		wantErrorMessage  string
+	}{
+		{
+			name:          "completed",
+			upstream:      "openai",
+			chunks:        []string{`{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`},
+			wantEventType: "response.completed",
+			wantStatus:    "completed",
+		},
+		{
+			name:              "incomplete length",
+			upstream:          "openai",
+			chunks:            []string{`{"choices":[{"delta":{},"finish_reason":"length"}]}`},
+			wantEventType:     "response.incomplete",
+			wantStatus:        "incomplete",
+			wantIncompleteWhy: "max_output_tokens",
+		},
+		{
+			name:     "incomplete max_tokens",
+			upstream: "anthropic",
+			chunks: []string{
+				`{"type":"message_delta","delta":{"stop_reason":"max_tokens"}}`,
+				`{"type":"message_stop"}`,
+			},
+			wantEventType:     "response.incomplete",
+			wantStatus:        "incomplete",
+			wantIncompleteWhy: "max_output_tokens",
+		},
+		{
+			name:             "failed content_filter",
+			upstream:         "openai",
+			chunks:           []string{`{"choices":[{"delta":{},"finish_reason":"content_filter"}]}`},
+			wantEventType:    "response.failed",
+			wantStatus:       "failed",
+			wantErrorCode:    "content_filter",
+			wantErrorMessage: "The model produced content that was filtered",
+		},
+		{
+			name:     "failed refusal",
+			upstream: "anthropic",
+			chunks: []string{
+				`{"type":"message_delta","delta":{"stop_reason":"refusal"}}`,
+				`{"type":"message_stop"}`,
+			},
+			wantEventType:    "response.failed",
+			wantStatus:       "failed",
+			wantErrorCode:    "refusal",
+			wantErrorMessage: "The model refused to respond",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			conv := NewResponsesStreamConverter(tc.upstream)
+			conv.SetModel("m")
+			var events [][]byte
+			for _, chunk := range tc.chunks {
+				converted, err := conv.Convert([]byte(chunk))
+				if err != nil && err != ErrSkipChunk {
+					t.Fatal(err)
+				}
+				events = append(events, converted...)
+			}
+			events = append(events, conv.CloseStream()...)
+			if len(events) == 0 {
+				t.Fatal("converter emitted no events")
+			}
+
+			terminal := decodeEvents(t, events)[len(events)-1]
+			if terminal["type"] != tc.wantEventType {
+				t.Errorf("terminal event type = %v, want %s", terminal["type"], tc.wantEventType)
+			}
+			response, ok := terminal["response"].(map[string]interface{})
+			if !ok {
+				t.Fatalf("terminal response = %T, want object", terminal["response"])
+			}
+			if response["status"] != tc.wantStatus {
+				t.Errorf("response status = %v, want %s", response["status"], tc.wantStatus)
+			}
+			if tc.wantIncompleteWhy != "" {
+				details, ok := response["incomplete_details"].(map[string]interface{})
+				if !ok || details["reason"] != tc.wantIncompleteWhy {
+					t.Errorf("incomplete_details = %v, want reason %s", response["incomplete_details"], tc.wantIncompleteWhy)
+				}
+			}
+			if tc.wantErrorCode != "" {
+				errBlock, ok := response["error"].(map[string]interface{})
+				if !ok || errBlock["code"] != tc.wantErrorCode || errBlock["message"] != tc.wantErrorMessage || errBlock["type"] != "server_error" {
+					t.Errorf("response error = %v, want code %s, message %q, type server_error", response["error"], tc.wantErrorCode, tc.wantErrorMessage)
+				}
+			} else if response["error"] != nil {
+				t.Errorf("response error = %v, want nil", response["error"])
+			}
+		})
+	}
+}
+
 func TestResponsesStreamConverterContentFilterFails(t *testing.T) {
 	// chat finish_reason "content_filter" must produce a FAILED response,
 	// not a successful completed one
