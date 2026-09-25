@@ -104,6 +104,33 @@ func TestResponsesNativePassthrough(t *testing.T) {
 	}
 }
 
+func TestRelayDropsClearSiteDataResponseHeader(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Clear-Site-Data", `"cache", "cookies"`)
+		w.Header().Set("X-Upstream-Safe", "passed-through")
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"chatcmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	}))
+	defer upstream.Close()
+
+	e := bootstrapResponses(t, "openai", "mock-model", upstream.URL)
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"mock-model","messages":[{"role":"user","content":"hi"}]}`))
+	req.Host = "localhost:9999"
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Clear-Site-Data"); got != "" {
+		t.Errorf("Clear-Site-Data = %q, want it omitted", got)
+	}
+	if got := rec.Header().Get("X-Upstream-Safe"); got != "passed-through" {
+		t.Errorf("X-Upstream-Safe = %q, want passed-through", got)
+	}
+}
+
 // TestResponsesFallbackToChatCompletions: an OpenAI-compatible gateway
 // without /v1/responses (404) must be retried as chat completions and the
 // response converted back to the Responses API shape.

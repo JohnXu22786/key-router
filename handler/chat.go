@@ -451,7 +451,7 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 		// hostile upstream must not set cookies/CSP on the local UI origin).
 		for k, v := range resp.Header {
 			if k != "Content-Length" && k != "Content-Encoding" && k != "Transfer-Encoding" && k != "Connection" && k != "Location" &&
-				k != "Set-Cookie" && k != "Content-Security-Policy" && k != "Access-Control-Allow-Origin" {
+				k != "Set-Cookie" && k != "Content-Security-Policy" && k != "Access-Control-Allow-Origin" && k != "Clear-Site-Data" {
 				for _, hv := range v {
 					c.Writer.Header().Add(k, hv)
 				}
