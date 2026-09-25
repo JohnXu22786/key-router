@@ -305,8 +305,14 @@ func TestRecordConsumptionExactPricingLookupErrorPrefersCachedExactPrice(t *test
 	db.GetDB().Create(&model.Pricing{ModelName: "upstream-real", PromptPer1M: 2.0})
 	db.GetDB().Create(&model.Pricing{ModelName: "*", PromptPer1M: 4.0})
 	calc := NewCalculator()
+	if result := db.GetDB().Model(&model.Pricing{}).Where("model_name = ?", "upstream-real").Update("PromptPer1M", 3.0); result.Error != nil {
+		t.Fatal(result.Error)
+	} else if result.RowsAffected != 1 {
+		t.Fatalf("updated exact pricing rows = %d, want 1", result.RowsAffected)
+	}
 
 	const callbackName = "billing_test:fail_exact_pricing_lookup"
+	injectedExactError := false
 	queryCallbacks := db.GetDB().Callback().Query()
 	if err := queryCallbacks.After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
 		if tx.Statement.Table != "pricings" || len(tx.Statement.Vars) == 0 {
@@ -318,6 +324,7 @@ func TestRecordConsumptionExactPricingLookupErrorPrefersCachedExactPrice(t *test
 		}
 		switch modelName {
 		case "upstream-real":
+			injectedExactError = true
 			tx.AddError(errors.New("simulated exact pricing lookup failure"))
 		}
 	}); err != nil {
@@ -334,12 +341,59 @@ func TestRecordConsumptionExactPricingLookupErrorPrefersCachedExactPrice(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !injectedExactError {
+		t.Fatal("exact pricing lookup error injection did not fire")
+	}
 	wildcard, err := lookupPricing("*")
 	if err != nil || wildcard == nil {
 		t.Fatalf("wildcard pricing lookup after exact lookup error = (%v, %v), want a successful rule", wildcard, err)
 	}
 	if consumption.CostUSD != 2.0 {
 		t.Fatalf("CostUSD = %v, want 2 (cached exact price, not wildcard price)", consumption.CostUSD)
+	}
+}
+
+func TestRecordConsumptionExactPricingLookupErrorSkipsWildcardWithoutCachedExact(t *testing.T) {
+	key := setupBillingDB(t)
+	db.GetDB().Create(&model.Pricing{ModelName: "upstream-real", PromptPer1M: 2.0})
+	db.GetDB().Create(&model.Pricing{ModelName: "*", PromptPer1M: 4.0})
+
+	const callbackName = "billing_test:fail_exact_pricing_lookup_without_cache"
+	injectedExactError := false
+	queryCallbacks := db.GetDB().Callback().Query()
+	if err := queryCallbacks.After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Table != "pricings" || len(tx.Statement.Vars) == 0 {
+			return
+		}
+		modelName, ok := tx.Statement.Vars[0].(string)
+		if !ok || modelName != "upstream-real" {
+			return
+		}
+		injectedExactError = true
+		tx.AddError(errors.New("simulated exact pricing lookup failure"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := queryCallbacks.Remove(callbackName); err != nil {
+			t.Errorf("remove pricing lookup test callback: %v", err)
+		}
+	})
+
+	usage := &model.TokenUsage{PromptTokens: 1_000_000, CompletionTokens: 0, TotalTokens: 1_000_000, Format: "openai"}
+	consumption, err := RecordConsumption(key.ID, "client-model", "upstream-real", "app", usage, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !injectedExactError {
+		t.Fatal("exact pricing lookup error injection did not fire")
+	}
+	wildcard, err := lookupPricing("*")
+	if err != nil || wildcard == nil {
+		t.Fatalf("wildcard pricing lookup after exact lookup error = (%v, %v), want a successful rule", wildcard, err)
+	}
+	if consumption.CostUSD != 0 {
+		t.Fatalf("CostUSD = %v, want 0 when exact lookup errors and no exact price is cached", consumption.CostUSD)
 	}
 }
 
