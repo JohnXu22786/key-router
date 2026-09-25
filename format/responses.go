@@ -967,7 +967,7 @@ type ResponsesStreamConverter struct {
 
 	started  bool
 	closed   bool // output items closed; stream waits for the usage chunk
-	finished bool // response.completed emitted
+	finished bool // terminal response event emitted
 	errored  bool
 
 	items       []*responsesItem
@@ -1048,7 +1048,7 @@ func NewResponsesStreamConverter(upstream string) *ResponsesStreamConverter {
 // SetModel sets the model name stamped on the synthesized response objects.
 func (c *ResponsesStreamConverter) SetModel(name string) { c.modelName = name }
 
-// Finished reports whether response.completed has been emitted.
+// Finished reports whether a terminal response event has been emitted.
 func (c *ResponsesStreamConverter) Finished() bool { return c.finished }
 
 // Errored reports whether a mid-stream upstream error was surfaced.
@@ -1444,7 +1444,7 @@ func (c *ResponsesStreamConverter) anthropicFullMessage(ev map[string]interface{
 // CloseStream emits the events that terminate a stream which ended without a
 // natural finish (EOF before the usage chunk or before message_stop): opens
 // the lifecycle events if nothing was ever converted, closes any open output
-// items and always emits response.completed.
+// items and always emits a terminal response event.
 func (c *ResponsesStreamConverter) CloseStream() [][]byte {
 	if c.finished {
 		return nil
@@ -1459,7 +1459,7 @@ func (c *ResponsesStreamConverter) CloseStream() [][]byte {
 	return events
 }
 
-// completedEvents emits response.completed with the final output items and
+// completedEvents emits the terminal response event with final output items and
 // usage (Responses semantics: input_tokens includes cached tokens).
 func (c *ResponsesStreamConverter) completedEvents() [][]byte {
 	c.finished = true
@@ -1507,7 +1507,7 @@ func (c *ResponsesStreamConverter) completedEvents() [][]byte {
 	resp := c.responseObject(status, incomplete, output, usage)
 	resp["error"] = failedError
 	ev, _ := json.Marshal(map[string]interface{}{
-		"type":     "response.completed",
+		"type":     "response." + status,
 		"response": resp,
 	})
 	return [][]byte{ev}
