@@ -558,9 +558,11 @@ if errorlevel 1 goto proceed
 del "%%~f0" & exit /b 1
 :proceed
 move /Y "%[2]s" "%[3]s" >nul
-if errorlevel 1 del "%%~f0" & exit /b 1
+if errorlevel 1 goto movefailed
 start "" "%[3]s"
-del "%%~f0"
+del "%%~f0" & goto :eof
+:movefailed
+del "%%~f0" & exit /b 1
 `, pid, newPath, exePath)
 }
 
