@@ -65,7 +65,7 @@ func ResponsesRequestToChatCompletion(body []byte, modelOverride string) ([]byte
 		})
 	}
 
-	// input: a plain string, or a list of message / function_call_output items
+	// input: a plain string, or a list of message / function_call / output items
 	switch in := rReq["input"].(type) {
 	case string:
 		if in != "" {
@@ -187,10 +187,10 @@ func ResponsesRequestToChatCompletion(body []byte, modelOverride string) ([]byte
 }
 
 // responsesInputItemToChat converts one Responses API input item into the
-// chat messages it corresponds to (function_call_output items become tool
-// messages; a message item stays a single message). system/developer items
-// are hoisted into the leading system message via systemParts (chat only
-// accepts leading system content).
+// chat messages it corresponds to (function_call items become assistant tool
+// calls; function_call_output items become tool messages; a message item stays
+// a single message). system/developer items are hoisted into the leading
+// system message via systemParts (chat only accepts leading system content).
 func responsesInputItemToChat(item interface{}, systemParts *[]string) []interface{} {
 	m, ok := safeMap(item)
 	if !ok {
@@ -247,15 +247,7 @@ func responsesInputItemToChat(item interface{}, systemParts *[]string) []interfa
 					// be the CALL id — the client echoes it back in
 					// function_call_output.call_id, which becomes the chat
 					// tool message's tool_call_id.
-					args, _ := p["arguments"].(string)
-					toolCalls = append(toolCalls, map[string]interface{}{
-						"id":   firstNonEmpty(p["call_id"], p["id"]),
-						"type": "function",
-						"function": map[string]interface{}{
-							"name":      safeStringOrDefault(p, "name", ""),
-							"arguments": args,
-						},
-					})
+					toolCalls = append(toolCalls, responsesFunctionCallToChat(p))
 				}
 			}
 			if len(textParts) > 0 {
@@ -268,6 +260,12 @@ func responsesInputItemToChat(item interface{}, systemParts *[]string) []interfa
 			msg["tool_calls"] = toolCalls
 		}
 		return []interface{}{msg}
+	case "function_call":
+		return []interface{}{map[string]interface{}{
+			"role":       "assistant",
+			"content":    "",
+			"tool_calls": []interface{}{responsesFunctionCallToChat(m)},
+		}}
 	case "function_call_output":
 		// The output may be a plain string or an array of Responses-shaped
 		// parts (text/image/file/audio) — convert them to chat tool content
@@ -280,6 +278,18 @@ func responsesInputItemToChat(item interface{}, systemParts *[]string) []interfa
 		}}
 	}
 	return nil
+}
+
+func responsesFunctionCallToChat(p map[string]interface{}) map[string]interface{} {
+	args, _ := p["arguments"].(string)
+	return map[string]interface{}{
+		"id":   firstNonEmpty(p["call_id"], p["id"]),
+		"type": "function",
+		"function": map[string]interface{}{
+			"name":      safeStringOrDefault(p, "name", ""),
+			"arguments": args,
+		},
+	}
 }
 
 // EasyInputMessage defaults its type to message when it has a role.
@@ -642,6 +652,11 @@ func ResponsesRequestToAnthropic(body []byte, modelOverride string) ([]byte, err
 						"content": responsesAssistantContent(m["content"]),
 					})
 				}
+			case "function_call":
+				anthMessages = append(anthMessages, map[string]interface{}{
+					"role":    "assistant",
+					"content": responsesAssistantContent([]interface{}{m}),
+				})
 			case "function_call_output":
 				// tool output → user message with a tool_result part.
 				// Anthropic tool_result.content must be a string or an

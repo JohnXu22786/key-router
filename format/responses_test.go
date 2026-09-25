@@ -446,6 +446,92 @@ func TestResponsesRequestToAnthropic(t *testing.T) {
 	}
 }
 
+func TestResponsesRequestToChatCompletionStandaloneFunctionCall(t *testing.T) {
+	body := `{"model":"m","input":[
+		{"type":"function_call","id":"fc_1","call_id":"call_7","name":"lookup","arguments":"{\"key\":\"value\"}"},
+		{"type":"function_call_output","call_id":"call_7","output":"result"}
+	]}`
+	out, err := ResponsesRequestToChatCompletion([]byte(body), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req map[string]interface{}
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := req["messages"].([]interface{})
+	if len(msgs) < 2 {
+		t.Fatalf("messages = %v, want assistant tool call and tool output", msgs)
+	}
+	asst := msgs[0].(map[string]interface{})
+	if asst["role"] != "assistant" {
+		t.Fatalf("assistant message = %v", asst)
+	}
+	toolCalls, _ := asst["tool_calls"].([]interface{})
+	if len(toolCalls) != 1 {
+		t.Fatalf("tool_calls = %v, want one call", toolCalls)
+	}
+	tc := toolCalls[0].(map[string]interface{})
+	if tc["id"] != "call_7" {
+		t.Errorf("tool call id = %v, want call_7", tc["id"])
+	}
+	fn := tc["function"].(map[string]interface{})
+	if fn["name"] != "lookup" || fn["arguments"] != `{"key":"value"}` {
+		t.Errorf("tool call function = %v", fn)
+	}
+	tool := msgs[1].(map[string]interface{})
+	if tool["role"] != "tool" || tool["tool_call_id"] != "call_7" || tool["content"] != "result" {
+		t.Errorf("tool output = %v", tool)
+	}
+}
+
+func TestResponsesRequestToAnthropicStandaloneFunctionCall(t *testing.T) {
+	body := `{"model":"m","input":[
+		{"type":"function_call","id":"fc_1","call_id":"call_7","name":"lookup","arguments":"{\"key\":\"value\"}"},
+		{"type":"function_call_output","call_id":"call_7","output":"result"}
+	]}`
+	out, err := ResponsesRequestToAnthropic([]byte(body), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req map[string]interface{}
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := req["messages"].([]interface{})
+	if len(msgs) != 2 {
+		t.Fatalf("messages = %v, want assistant tool call and user tool result", msgs)
+	}
+	asst := msgs[0].(map[string]interface{})
+	if asst["role"] != "assistant" {
+		t.Fatalf("assistant message = %v", asst)
+	}
+	blocks, _ := asst["content"].([]interface{})
+	if len(blocks) != 1 {
+		t.Fatalf("assistant content = %v, want one tool_use block", blocks)
+	}
+	toolUse := blocks[0].(map[string]interface{})
+	if toolUse["type"] != "tool_use" || toolUse["id"] != "call_7" || toolUse["name"] != "lookup" {
+		t.Errorf("tool_use block = %v", toolUse)
+	}
+	input, _ := toolUse["input"].(map[string]interface{})
+	if input["key"] != "value" {
+		t.Errorf("tool_use input = %v, want parsed object", toolUse["input"])
+	}
+	result := msgs[1].(map[string]interface{})
+	if result["role"] != "user" {
+		t.Fatalf("tool result message = %v", result)
+	}
+	resultBlocks, _ := result["content"].([]interface{})
+	if len(resultBlocks) != 1 {
+		t.Fatalf("tool result content = %v, want one tool_result block", result["content"])
+	}
+	toolResult := resultBlocks[0].(map[string]interface{})
+	if toolResult["type"] != "tool_result" || toolResult["tool_use_id"] != "call_7" || toolResult["content"] != "result" {
+		t.Errorf("tool_result block = %v", toolResult)
+	}
+}
+
 func TestResponsesRequestToAnthropicDefaultMessageType(t *testing.T) {
 	body := `{"model":"m","input":[
 		{"role":"user","content":"message without type"},
