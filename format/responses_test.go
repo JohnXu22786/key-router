@@ -111,6 +111,31 @@ func TestResponsesRequestToChatCompletion(t *testing.T) {
 	}
 }
 
+func TestResponsesRequestToChatCompletionDefaultMessageType(t *testing.T) {
+	body := `{"model":"m","input":[
+		{"role":"user","content":"message without type"},
+		{"call_id":"call_1","output":"tool output"},
+		{"name":"lookup","arguments":"{}"}
+	]}`
+
+	out, err := ResponsesRequestToChatCompletion([]byte(body), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req map[string]interface{}
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := req["messages"].([]interface{})
+	if len(msgs) != 1 {
+		t.Fatalf("messages = %d, want only the typeless message: %v", len(msgs), msgs)
+	}
+	msg := msgs[0].(map[string]interface{})
+	if msg["role"] != "user" || msg["content"] != "message without type" {
+		t.Errorf("message = %v, want user message with original content", msg)
+	}
+}
+
 func TestResponsesRequestToChatCompletionStringInput(t *testing.T) {
 	out, err := ResponsesRequestToChatCompletion([]byte(`{"model":"m","input":"just a string"}`), "")
 	if err != nil {
@@ -418,6 +443,39 @@ func TestResponsesRequestToAnthropic(t *testing.T) {
 	tr := lastContent[0].(map[string]interface{})
 	if tr["type"] != "tool_result" || tr["tool_use_id"] != "call_7" {
 		t.Errorf("tool_result = %v", tr)
+	}
+}
+
+func TestResponsesRequestToAnthropicDefaultMessageType(t *testing.T) {
+	body := `{"model":"m","input":[
+		{"role":"user","content":"message without type"},
+		{"call_id":"call_1","output":"tool output"},
+		{"name":"lookup","arguments":"{}"}
+	]}`
+
+	out, err := ResponsesRequestToAnthropic([]byte(body), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req map[string]interface{}
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := req["messages"].([]interface{})
+	if len(msgs) != 1 {
+		t.Fatalf("messages = %d, want only the typeless message: %v", len(msgs), msgs)
+	}
+	msg := msgs[0].(map[string]interface{})
+	if msg["role"] != "user" {
+		t.Fatalf("message = %v, want user role", msg)
+	}
+	content, _ := msg["content"].([]interface{})
+	if len(content) != 1 {
+		t.Fatalf("content = %v, want one text block", msg["content"])
+	}
+	text := content[0].(map[string]interface{})
+	if text["type"] != "text" || text["text"] != "message without type" {
+		t.Errorf("content block = %v, want original message text", text)
 	}
 }
 

@@ -196,7 +196,7 @@ func responsesInputItemToChat(item interface{}, systemParts *[]string) []interfa
 	if !ok {
 		return nil
 	}
-	switch safeStringOrDefault(m, "type", "") {
+	switch responsesInputItemType(m) {
 	case "message":
 		role := safeStringOrDefault(m, "role", "user")
 		switch role {
@@ -280,6 +280,20 @@ func responsesInputItemToChat(item interface{}, systemParts *[]string) []interfa
 		}}
 	}
 	return nil
+}
+
+// EasyInputMessage defaults its type to message when it has a role.
+func responsesInputItemType(m map[string]interface{}) string {
+	if itemType, ok := safeString(m, "type"); ok {
+		return itemType
+	}
+	if _, hasType := m["type"]; hasType {
+		return ""
+	}
+	if role, ok := safeString(m, "role"); ok && role != "" {
+		return "message"
+	}
+	return ""
 }
 
 // responsesToolsToChat maps Responses API tools onto chat completions. The
@@ -610,7 +624,7 @@ func ResponsesRequestToAnthropic(body []byte, modelOverride string) ([]byte, err
 			if !ok {
 				continue
 			}
-			switch safeStringOrDefault(m, "type", "") {
+			switch responsesInputItemType(m) {
 			case "message":
 				switch safeStringOrDefault(m, "role", "user") {
 				case "system", "developer":
