@@ -235,6 +235,23 @@ func TestClassifyQuotaCodes(t *testing.T) {
 	}
 }
 
+func TestClassifyQuotaRateLimitOverrideAcrossBody(t *testing.T) {
+	bodies := []string{
+		`{"error":{"code":"insufficient_quota","message":"too many requests, please slow down"}}`,
+		`{"error":{"message":"too many requests, please slow down","code":"insufficient_quota"}}`,
+		`{"error":{"billing":{"reason":"You exceeded your current quota, please check your plan and billing details."},"message":"too many requests, please slow down"}}`,
+		`{"error":{"message":"too many requests, please slow down","billing":{"reason":"You exceeded your current quota, please check your plan and billing details."}}}`,
+	}
+	for _, body := range bodies {
+		for i := 0; i < 50; i++ {
+			sig := ClassifyErrorBody([]byte(body))
+			if sig.QuotaExhausted {
+				t.Fatalf("iteration %d: body %q classified as quota exhausted despite a body-wide rate-limit signal", i, body)
+			}
+		}
+	}
+}
+
 // TestClassifyEmptyAndNoise: bodies with no signal must classify as nothing
 // — an empty body, an unparseable gateway page, an HTML error page.
 func TestClassifyEmptyAndNoise(t *testing.T) {
