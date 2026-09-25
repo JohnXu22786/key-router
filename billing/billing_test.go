@@ -355,8 +355,9 @@ func TestRecordConsumptionExactPricingLookupErrorPrefersCachedExactPrice(t *test
 
 func TestRecordConsumptionExactPricingLookupErrorSkipsWildcardWithoutCachedExact(t *testing.T) {
 	key := setupBillingDB(t)
-	db.GetDB().Create(&model.Pricing{ModelName: "upstream-real", PromptPer1M: 2.0})
 	db.GetDB().Create(&model.Pricing{ModelName: "*", PromptPer1M: 4.0})
+	calc := NewCalculator()
+	db.GetDB().Create(&model.Pricing{ModelName: "upstream-real", PromptPer1M: 2.0})
 
 	const callbackName = "billing_test:fail_exact_pricing_lookup_without_cache"
 	injectedExactError := false
@@ -381,7 +382,7 @@ func TestRecordConsumptionExactPricingLookupErrorSkipsWildcardWithoutCachedExact
 	})
 
 	usage := &model.TokenUsage{PromptTokens: 1_000_000, CompletionTokens: 0, TotalTokens: 1_000_000, Format: "openai"}
-	consumption, err := RecordConsumption(key.ID, "client-model", "upstream-real", "app", usage, nil, nil)
+	consumption, err := RecordConsumption(key.ID, "client-model", "upstream-real", "app", usage, nil, calc)
 	if err != nil {
 		t.Fatal(err)
 	}
