@@ -151,6 +151,33 @@ func TestExtractStreamUsageDerivesTotalTokens(t *testing.T) {
 	}
 }
 
+func TestStreamResponsePreservesIncompleteOutcome(t *testing.T) {
+	incomplete := `{"type":"response.incomplete","response":{"id":"resp_1","object":"response","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"input_tokens":11,"input_tokens_details":{"cached_tokens":3},"output_tokens":7,"total_tokens":18}}}`
+	upstream := "event: response.incomplete\ndata: " + incomplete + "\n\n"
+	resp := &http.Response{
+		Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:   io.NopCloser(strings.NewReader(upstream)),
+	}
+	w := httptest.NewRecorder()
+
+	usage, sawContent, err := StreamResponse(w, resp, "responses", "responses", "mock-model")
+	if err != nil {
+		t.Fatalf("StreamResponse error = %v, want nil", err)
+	}
+	if sawContent {
+		t.Error("sawContent = true, want false for an incomplete event with no output")
+	}
+	if got, want := strings.TrimRight(w.Body.String(), "\n"), strings.TrimRight(upstream, "\n"); got != want {
+		t.Errorf("stream output = %q, want original incomplete event unchanged: %q", got, want)
+	}
+	if usage == nil {
+		t.Fatal("usage = nil, want usage from the incomplete response")
+	}
+	if usage.PromptTokens != 11 || usage.CompletionTokens != 7 || usage.TotalTokens != 18 || usage.CacheHitTokens != 3 || usage.Format != "openai" {
+		t.Errorf("usage = %+v, want prompt=11 completion=7 total=18 cache-hit=3 format=openai", usage)
+	}
+}
+
 // TestConvertOpenAIResponseToAnthropicReasoning guards the non-stream
 // OpenAI→Anthropic response path: the model's reasoning_content must
 // survive as a thinking block (regression: it was silently dropped).
