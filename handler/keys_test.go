@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -174,6 +175,53 @@ func TestCreateKeyAppendsAtEndOfProvider(t *testing.T) {
 func jsonInt(v int64) string {
 	b, _ := json.Marshal(v)
 	return string(b)
+}
+
+func TestUpdateKeyRejectsProviderMoveToDuplicateName(t *testing.T) {
+	e := bootstrapKeys(t)
+	closeTestDB(t)
+
+	source := model.Provider{Name: "source", Type: "openai", BaseURL: "http://source"}
+	destination := model.Provider{Name: "destination", Type: "openai", BaseURL: "http://destination"}
+	for _, provider := range []*model.Provider{&source, &destination} {
+		if err := db.GetDB().Create(provider).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	moving := model.Key{ProviderID: source.ID, Name: "shared", KeyValue: "moving-key"}
+	existing := model.Key{ProviderID: destination.ID, Name: "shared", KeyValue: "destination-key"}
+	for _, key := range []*model.Key{&moving, &existing} {
+		if err := db.GetDB().Create(key).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var before []model.Key
+	if err := db.GetDB().Order("id").Find(&before).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	payload := `{"provider_id":` + jsonInt(destination.ID) + `}`
+	req := httptest.NewRequest("PUT", "/api/keys/"+strconv.FormatInt(moving.ID, 10), strings.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Host = "localhost:9999"
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("PUT /api/keys/%d status = %d, want 400: %s", moving.ID, rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "a key with this name already exists for the provider") {
+		t.Fatalf("PUT /api/keys/%d error = %s, want duplicate-name rejection", moving.ID, rec.Body.String())
+	}
+
+	var after []model.Key
+	if err := db.GetDB().Order("id").Find(&after).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Errorf("key rows changed after rejected move:\nbefore: %+v\nafter:  %+v", before, after)
+	}
 }
 
 // TestUpdateKeyPreservesExplicitDisabledReason: an admin who disables a key
