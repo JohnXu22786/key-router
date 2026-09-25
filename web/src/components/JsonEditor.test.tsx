@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import React, { StrictMode, useState } from 'react';
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, fireEvent } from '@testing-library/react';
+import { act, cleanup, render, fireEvent } from '@testing-library/react';
 import JsonEditor from './JsonEditor';
 
 // Mirrors how Models.tsx / RoutesPage.tsx wire JsonEditor: onValid calls
@@ -25,11 +25,45 @@ function Shell() {
   );
 }
 
+function ControlledEditor({ initialValue }: { initialValue: string }) {
+  const [value, setValue] = useState(initialValue);
+  return <JsonEditor value={value} onChange={setValue} />;
+}
+
 const spies: ReturnType<typeof vi.spyOn>[] = [];
 
 afterEach(() => {
+  cleanup();
   for (const s of spies) s.mockRestore();
   spies.length = 0;
+  vi.unstubAllGlobals();
+});
+
+describe('JsonEditor - Enter with empty pairs', () => {
+  it.each([
+    { value: '{}', closer: '}' },
+    { value: '[]', closer: ']' },
+  ])('expands $value with one closer and a valid JSON value', ({ value, closer }) => {
+    let frame: FrameRequestCallback | undefined;
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      frame = callback;
+      return 1;
+    });
+
+    const { getByRole } = render(<ControlledEditor initialValue={value} />);
+    const textarea = getByRole('textbox') as HTMLTextAreaElement;
+    textarea.setSelectionRange(1, 1);
+
+    fireEvent.keyDown(textarea, { key: 'Enter', code: 'Enter' });
+    const expected = `${value[0]}\n  \n${closer}`;
+    expect(textarea.value).toBe(expected);
+
+    act(() => frame?.(0));
+    expect(textarea.selectionStart).toBe(expected.indexOf(`\n${closer}`));
+    expect(textarea.selectionEnd).toBe(textarea.selectionStart);
+    expect(textarea.value.split(closer).length - 1).toBe(1);
+    expect(() => JSON.parse(textarea.value)).not.toThrow();
+  });
 });
 
 describe('JsonEditor — validity notification', () => {

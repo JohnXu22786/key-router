@@ -57,11 +57,11 @@ const JsonEditor: React.FC<JsonEditorProps> = ({
   const { token } = theme.useToken();
 
   // Insert text at the cursor, replacing the selection; returns new caret pos.
-  const insertAtCaret = useCallback((insert: string, caretOffset = insert.length) => {
+  const insertAtCaret = useCallback((insert: string, caretOffset = insert.length, consumeAfter = 0) => {
     const el = ref.current;
     if (!el) return;
     const start = el.selectionStart;
-    const end = el.selectionEnd;
+    const end = el.selectionEnd + consumeAfter;
     const next = value.slice(0, start) + insert + value.slice(end);
     onChange?.(next);
     // Set the caret after the DOM updates.
@@ -96,14 +96,16 @@ const JsonEditor: React.FC<JsonEditorProps> = ({
       // If the char at the caret closes the current block, add a dedented
       // line below (Sublime behavior for {} / []).
       let suffix = '';
+      let consumeClosing = false;
       if (lastChar === '{' || lastChar === '[') {
         const closing = PAIRS[lastChar];
         if (value.slice(start, start + 1) === closing) {
           suffix = '\n' + indent + closing;
+          consumeClosing = start === end;
         }
       }
       const insert = '\n' + indent + extra + suffix;
-      insertAtCaret(insert, '\n'.length + indent.length + extra.length);
+      insertAtCaret(insert, '\n'.length + indent.length + extra.length, consumeClosing ? 1 : 0);
       return;
     }
 
