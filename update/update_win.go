@@ -22,7 +22,7 @@ var (
 
 // errorCancelled is ERROR_CANCELLED (1223) — the user declined the UAC
 // prompt. syscall does not export it, so it is defined here.
-const errorCancelled = syscall.Errno(1223)
+const errorCancelled = syscall.Errno(shellExecuteErrorCancelledCode)
 
 // shellExecuteInfo mirrors SHELLEXECUTEINFOW. On x64 the API pads members to
 // pointer alignment, which matches Go's natural struct alignment, so the
@@ -84,14 +84,9 @@ func shellExecute(verb, path, args string) error {
 		lpParameters: p,
 		nShow:        1, // SW_SHOWNORMAL
 	}
-	ret, _, _ := shellExecuteExW.Call(uintptr(unsafe.Pointer(info)))
+	ret, _, lastErr := shellExecuteExW.Call(uintptr(unsafe.Pointer(info)))
 	if ret == 0 {
-		// hInstApp carries the error code when the call fails.
-		errno := syscall.Errno(info.hInstApp)
-		if errno == errorCancelled {
-			return ErrUpdateCancelled
-		}
-		return errno
+		return mapShellExecuteLastError(lastErr)
 	}
 	return nil
 }
