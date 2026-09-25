@@ -253,6 +253,41 @@ func TestResponsesMessageContentDetection(t *testing.T) {
 	}
 }
 
+func TestOpenAIStreamChunkRefusalContentDetection(t *testing.T) {
+	cases := []struct {
+		name  string
+		chunk string
+		want  bool
+	}{
+		{
+			name:  "delta refusal",
+			chunk: `{"choices":[{"delta":{"refusal":"I cannot help with that request."}}]}`,
+			want:  true,
+		},
+		{
+			name:  "message refusal",
+			chunk: `{"choices":[{"message":{"refusal":"I cannot help with that request."}}]}`,
+			want:  true,
+		},
+		{
+			name:  "empty delta refusal",
+			chunk: `{"choices":[{"delta":{"refusal":""}}]}`,
+		},
+		{
+			name:  "empty message refusal",
+			chunk: `{"choices":[{"message":{"refusal":""}}]}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := streamChunkHasContent(tc.chunk, "openai"); got != tc.want {
+				t.Errorf("streamChunkHasContent() = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestResponsesStreamMessageContentAtRelayBoundary(t *testing.T) {
 	cases := []struct {
 		name        string

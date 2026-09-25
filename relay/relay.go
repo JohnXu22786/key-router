@@ -418,7 +418,7 @@ func bodyHasContent(body []byte, upstreamFormat string) bool {
 }
 
 // streamChunkHasContent reports whether a single upstream stream event
-// carried user-visible content — text / tool_call / tool_use /
+// carried user-visible content — text / refusal / tool_call / tool_use /
 // reasoning_content. Used to drive the empty-response failover in
 // StreamResponse. Best-effort across the three upstream formats; missing
 // or unparseable chunks return false (safe — the next chunk gets a
@@ -483,7 +483,7 @@ func streamChunkHasContent(jsonStr, upstreamFormat string) bool {
 		return false
 	default:
 		// OpenAI / chat-completions chunk: a single "choices" array, each
-		// entry may carry a "delta" with content / tool_calls /
+		// entry may carry a "delta" with content / refusal / tool_calls /
 		// reasoning_content, or a "message" with the same (some gateways
 		// emit a complete choice object). Non-empty string content,
 		// non-empty tool_calls array, and non-empty reasoning_content all
@@ -491,7 +491,8 @@ func streamChunkHasContent(jsonStr, upstreamFormat string) bool {
 		// "text":...} items) on gateways that mirror Anthropic's
 		// multi-block shape — join its text parts and treat a non-empty
 		// join as content (same convention completionToStreamChunk uses
-		// when it rebuilds a chunk from a full body).
+		// when it rebuilds a chunk from a full body). Non-empty refusal
+		// strings count as content as well.
 		choices, ok := v["choices"].([]interface{})
 		if !ok {
 			return false
@@ -516,6 +517,9 @@ func streamChunkHasContent(jsonStr, upstreamFormat string) bool {
 					return true
 				}
 				if s, ok := obj["reasoning_content"].(string); ok && s != "" {
+					return true
+				}
+				if s, ok := obj["refusal"].(string); ok && s != "" {
 					return true
 				}
 			}

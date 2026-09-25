@@ -26,3 +26,29 @@ func TestQuotaExhaustedInBodyExcludesRateLimitCodes(t *testing.T) {
 		t.Error("billing_error must be treated as quota exhaustion")
 	}
 }
+
+func TestResponseIsEmptyOpenAIRefusal(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{
+			name: "non-empty refusal is content",
+			body: `{"choices":[{"message":{"refusal":"I cannot help with that request."}}]}`,
+		},
+		{
+			name: "empty refusal is empty",
+			body: `{"choices":[{"message":{"refusal":""}}]}`,
+			want: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := responseIsEmpty([]byte(tc.body), "openai"); got != tc.want {
+				t.Errorf("responseIsEmpty() = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
