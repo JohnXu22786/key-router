@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -93,6 +94,45 @@ func TestCheckKeyDoesNotRecoverDuringCooldown(t *testing.T) {
 	}
 	if len(flips) != 0 {
 		t.Errorf("status events = %v, want none while the cooldown is still running", flips)
+	}
+}
+
+// TestCheckKeySkipsFreshCooldownAfterStaleEligibility uses an active pass
+// snapshot, then applies a cooldown before checkKey refreshes the row. The
+// refresh must prevent a billable probe even though the stale snapshot was
+// eligible when checkAll selected it.
+func TestCheckKeySkipsFreshCooldownAfterStaleEligibility(t *testing.T) {
+	var requests atomic.Int32
+	c, k, _ := newTestEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		okUpstream(w, r)
+	})
+	if k.Status != model.KeyStatusActive {
+		t.Fatalf("stale key status = %q, want active", k.Status)
+	}
+	if !c.shouldProbeKey(k) {
+		t.Fatal("active stale key was not eligible for probing")
+	}
+
+	until := time.Now().Add(10 * time.Minute)
+	if err := db.GetDB().Model(&model.Key{}).Where("id = ?", k.ID).Updates(map[string]interface{}{
+		"status":             model.KeyStatusRateLimited,
+		"rate_limited_until": until,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	c.checkKey(k)
+
+	if got := requests.Load(); got != 0 {
+		t.Errorf("upstream requests = %d, want 0 while the fresh cooldown is running", got)
+	}
+	after := loadTestKey(t, k.ID)
+	if after.Status != model.KeyStatusRateLimited {
+		t.Errorf("status = %q, want rate_limited", after.Status)
+	}
+	if after.RateLimitedUntil == nil || !after.RateLimitedUntil.Equal(until) {
+		t.Errorf("rate_limited_until = %v, want %v", after.RateLimitedUntil, until)
 	}
 }
 
