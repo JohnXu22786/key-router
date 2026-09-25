@@ -25,6 +25,10 @@ import (
 // the engine. It inserts two models over two days so the activity endpoint
 // has something to aggregate.
 func bootstrapActivity(t *testing.T) *gin.Engine {
+	return bootstrapActivityAt(t, time.Now())
+}
+
+func bootstrapActivityAt(t *testing.T, anchor time.Time) *gin.Engine {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	tmp := t.TempDir()
@@ -47,9 +51,8 @@ func bootstrapActivity(t *testing.T) *gin.Engine {
 	db.GetDB().Where("group_id = ?", "g2").First(&g2)
 
 	// Consumption: two days, two models, plus an "Unknown" (empty model_name) row.
-	now := time.Now()
-	day1 := time.Date(now.Year(), now.Month(), now.Day()-1, 12, 0, 0, 0, now.Location())
-	day2 := time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, now.Location())
+	day1 := time.Date(anchor.Year(), anchor.Month(), anchor.Day()-1, 12, 0, 0, 0, anchor.Location())
+	day2 := time.Date(anchor.Year(), anchor.Month(), anchor.Day(), 12, 0, 0, 0, anchor.Location())
 	db.GetDB().Create(&model.Consumption{KeyID: key.ID, HourBucket: day1, ModelName: "g1", RequestCount: 5, InputTokens: 100, OutputTokens: 20, CacheHitTokens: 10, CostUSD: 0.01})
 	db.GetDB().Create(&model.Consumption{KeyID: key.ID, HourBucket: day2, ModelName: "g2", RequestCount: 3, InputTokens: 50, OutputTokens: 10, CacheHitTokens: 5, CostUSD: 0.005})
 	day1late := day1.Add(time.Hour)
@@ -173,17 +176,18 @@ func TestActivityEdgeCases(t *testing.T) {
 // cell from a dense-grid zero-fill. The frontend needs this distinction when
 // it recomputes summary statistics after correcting the widened hourly range.
 func TestActivitySeriesPresence(t *testing.T) {
-	e := bootstrapActivity(t)
+	date := time.Now().AddDate(0, 0, -1)
+	anchor := time.Date(date.Year(), date.Month(), date.Day(), 23, 59, 59, 0, date.Location())
+	e := bootstrapActivityAt(t, anchor)
 	t.Cleanup(func() {
 		if sqlDB, err := db.GetDB().DB(); err == nil {
 			sqlDB.Close()
 		}
 	})
 
-	now := time.Now()
-	day1 := time.Date(now.Year(), now.Month(), now.Day()-1, 0, 0, 0, 0, now.Location()).Format("2006-01-02")
-	day2 := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).Format("2006-01-02")
-	req := httptest.NewRequest("GET", "/api/stats/activity?metric=spend&group_by=model&rollup=day&"+rangeQuery(t), nil)
+	day1 := time.Date(anchor.Year(), anchor.Month(), anchor.Day()-1, 12, 0, 0, 0, anchor.Location()).Format("2006-01-02")
+	day2 := time.Date(anchor.Year(), anchor.Month(), anchor.Day(), 12, 0, 0, 0, anchor.Location()).Format("2006-01-02")
+	req := httptest.NewRequest("GET", "/api/stats/activity?metric=spend&group_by=model&rollup=day&"+rangeQuery(t, anchor), nil)
 	req.Host = "localhost:9999"
 	rec := httptest.NewRecorder()
 	e.ServeHTTP(rec, req)
@@ -240,19 +244,19 @@ func TestActivitySeriesPresence(t *testing.T) {
 // group, and "Other" stays a single aggregated stack. The fixture gives g1
 // spend on day1 from k2 ($0.02) and k1 ($0.01) — a precise ordering check.
 func TestActivitySubgroup(t *testing.T) {
-	e := bootstrapActivity(t)
+	anchor := time.Now()
+	e := bootstrapActivityAt(t, anchor)
 	t.Cleanup(func() {
 		if sqlDB, err := db.GetDB().DB(); err == nil {
 			sqlDB.Close()
 		}
 	})
 
-	now := time.Now()
 	// Bucket labels are year-qualified ("YYYY-MM-DD") since the time-scale
 	// rework, so the subgroup fixture's day label must match that format.
-	day1Label := time.Date(now.Year(), now.Month(), now.Day()-1, 12, 0, 0, 0, now.Location()).Format("2006-01-02")
+	day1Label := time.Date(anchor.Year(), anchor.Month(), anchor.Day()-1, 12, 0, 0, 0, anchor.Location()).Format("2006-01-02")
 
-	req := httptest.NewRequest("GET", "/api/stats/activity?metric=spend&group_by=model&subgroup=key&rollup=day&top=1", nil)
+	req := httptest.NewRequest("GET", "/api/stats/activity?metric=spend&group_by=model&subgroup=key&rollup=day&top=1&"+rangeQuery(t, anchor), nil)
 	req.Host = "localhost:9999"
 	rec := httptest.NewRecorder()
 	e.ServeHTTP(rec, req)
@@ -446,13 +450,14 @@ func TestActivityDuplicateKeyNamesRemainSeparate(t *testing.T) {
 // since/until are pinned so the fixture rows (yesterday + today noon) are
 // always in range regardless of the wall-clock time the test runs at.
 func TestActivityTotalRollup(t *testing.T) {
-	e := bootstrapActivity(t)
+	anchor := time.Now()
+	e := bootstrapActivityAt(t, anchor)
 	t.Cleanup(func() {
 		if sqlDB, err := db.GetDB().DB(); err == nil {
 			sqlDB.Close()
 		}
 	})
-	qs := "metric=spend&group_by=model&rollup=total&" + rangeQuery(t)
+	qs := "metric=spend&group_by=model&rollup=total&" + rangeQuery(t, anchor)
 
 	req := httptest.NewRequest("GET", "/api/stats/activity?"+qs, nil)
 	req.Host = "localhost:9999"
@@ -493,7 +498,7 @@ func TestActivityTotalRollup(t *testing.T) {
 	}
 
 	// With top=1 the runner-up groups fold into Other (single bucket).
-	req2 := httptest.NewRequest("GET", "/api/stats/activity?metric=spend&group_by=model&rollup=total&top=1&"+rangeQuery(t), nil)
+	req2 := httptest.NewRequest("GET", "/api/stats/activity?metric=spend&group_by=model&rollup=total&top=1&"+rangeQuery(t, anchor), nil)
 	req2.Host = "localhost:9999"
 	rec2 := httptest.NewRecorder()
 	e.ServeHTTP(rec2, req2)
@@ -536,16 +541,16 @@ func TestActivityTotalRollup(t *testing.T) {
 // same calendar month but OUTSIDE the range must NOT leak in. Regression
 // for activityWindow treating total as the month rollup, which widened the
 // query to the whole containing month(s) and inflated the Total bucket with
-// out-of-range usage. The window is pinned to 2020-01 so no wall-clock
-// fixture row (yesterday/today noon) can land in it — assertions are exact.
+// out-of-range usage. The bootstrap fixture is anchored in 2019-12, outside
+// this window, so only the explicit test rows contribute.
 func TestActivityTotalRollupExactRange(t *testing.T) {
-	e := bootstrapActivity(t)
+	loc := time.Local
+	e := bootstrapActivityAt(t, time.Date(2019, 12, 1, 0, 0, 0, 0, loc))
 	t.Cleanup(func() {
 		if sqlDB, err := db.GetDB().DB(); err == nil {
 			sqlDB.Close()
 		}
 	})
-	loc := time.Local
 	since := time.Date(2020, 1, 13, 0, 0, 0, 0, loc)
 	until := time.Date(2020, 1, 20, 23, 59, 59, 0, loc)
 	var key model.Key
@@ -615,7 +620,8 @@ func TestActivityTotalRollupExactRange(t *testing.T) {
 // may differ from the charted metric. An extra high-request/low-spend g2 row
 // makes the metric ranks diverge from the spend rank.
 func TestActivityRankBy(t *testing.T) {
-	e := bootstrapActivity(t)
+	anchor := time.Now()
+	e := bootstrapActivityAt(t, anchor)
 	t.Cleanup(func() {
 		if sqlDB, err := db.GetDB().DB(); err == nil {
 			sqlDB.Close()
@@ -628,11 +634,10 @@ func TestActivityRankBy(t *testing.T) {
 	// (g1 0.03 > g2 ~0.0051).
 	var k1 model.Key
 	db.GetDB().Where("name = ?", "k1").First(&k1)
-	now := time.Now()
-	day1 := time.Date(now.Year(), now.Month(), now.Day()-1, 12, 0, 0, 0, now.Location())
+	day1 := time.Date(anchor.Year(), anchor.Month(), anchor.Day()-1, 12, 0, 0, 0, anchor.Location())
 	db.GetDB().Create(&model.Consumption{KeyID: k1.ID, HourBucket: day1.Add(2 * time.Hour), ModelName: "g2", RequestCount: 100, InputTokens: 0, OutputTokens: 0, CostUSD: 0.0001})
 
-	req := httptest.NewRequest("GET", "/api/stats/activity?metric=spend&group_by=model&rollup=day&rank_by=requests&top=1&"+rangeQuery(t), nil)
+	req := httptest.NewRequest("GET", "/api/stats/activity?metric=spend&group_by=model&rollup=day&rank_by=requests&top=1&"+rangeQuery(t, anchor), nil)
 	req.Host = "localhost:9999"
 	rec := httptest.NewRecorder()
 	e.ServeHTTP(rec, req)
@@ -684,7 +689,7 @@ func TestActivityRankBy(t *testing.T) {
 	}
 
 	// Without rank_by the default stays the chart metric's sum (g1 first).
-	req2 := httptest.NewRequest("GET", "/api/stats/activity?metric=spend&group_by=model&rollup=day&"+rangeQuery(t), nil)
+	req2 := httptest.NewRequest("GET", "/api/stats/activity?metric=spend&group_by=model&rollup=day&"+rangeQuery(t, anchor), nil)
 	req2.Host = "localhost:9999"
 	rec2 := httptest.NewRecorder()
 	e.ServeHTTP(rec2, req2)
@@ -702,7 +707,7 @@ func TestActivityRankBy(t *testing.T) {
 	}
 
 	// rank_by=tokens with the same fixture ranks by token totals (g1 first).
-	req3 := httptest.NewRequest("GET", "/api/stats/activity?metric=spend&group_by=model&rollup=day&rank_by=tokens&"+rangeQuery(t), nil)
+	req3 := httptest.NewRequest("GET", "/api/stats/activity?metric=spend&group_by=model&rollup=day&rank_by=tokens&"+rangeQuery(t, anchor), nil)
 	req3.Host = "localhost:9999"
 	rec3 := httptest.NewRecorder()
 	e.ServeHTTP(rec3, req3)
@@ -753,7 +758,8 @@ type summaryRow struct {
 // 252.17), while the correct overall-rate ranking is [g1 g2] (148.98 >
 // 127.78) — so the summary ORDER assertion pins the rank semantics too.
 func TestActivityBlended(t *testing.T) {
-	e := bootstrapActivity(t)
+	anchor := time.Now()
+	e := bootstrapActivityAt(t, anchor)
 	t.Cleanup(func() {
 		if sqlDB, err := db.GetDB().DB(); err == nil {
 			sqlDB.Close()
@@ -763,9 +769,8 @@ func TestActivityBlended(t *testing.T) {
 	var k1, k2 model.Key
 	db.GetDB().Where("name = ?", "k1").First(&k1)
 	db.GetDB().Where("name = ?", "k2").First(&k2)
-	now := time.Now()
-	day1 := time.Date(now.Year(), now.Month(), now.Day()-1, 12, 0, 0, 0, now.Location())
-	day2 := time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, now.Location())
+	day1 := time.Date(anchor.Year(), anchor.Month(), anchor.Day()-1, 12, 0, 0, 0, anchor.Location())
+	day2 := time.Date(anchor.Year(), anchor.Month(), anchor.Day(), 12, 0, 0, 0, anchor.Location())
 	day1Label := day1.Format("2006-01-02")
 	day2Label := day2.Format("2006-01-02")
 	// Distinct hours satisfy the (key_id, hour_bucket, model_name, app_name)
@@ -775,7 +780,7 @@ func TestActivityBlended(t *testing.T) {
 	db.GetDB().Create(&model.Consumption{KeyID: k2.ID, HourBucket: day1.Add(4 * time.Hour), ModelName: "g1", RequestCount: 2, InputTokens: 80, OutputTokens: 20, CacheHitTokens: 0, CostUSD: 0.04})
 	db.GetDB().Create(&model.Consumption{KeyID: k1.ID, HourBucket: day1.Add(2 * time.Hour), ModelName: "g2", RequestCount: 1, InputTokens: 50, OutputTokens: 10, CacheHitTokens: 0, CostUSD: 0.012})
 
-	req := httptest.NewRequest("GET", "/api/stats/activity?metric=blended&group_by=model&rollup=day&"+rangeQuery(t), nil)
+	req := httptest.NewRequest("GET", "/api/stats/activity?metric=blended&group_by=model&rollup=day&"+rangeQuery(t, anchor), nil)
 	req.Host = "localhost:9999"
 	rec := httptest.NewRecorder()
 	e.ServeHTTP(rec, req)
@@ -880,7 +885,7 @@ func TestActivityBlended(t *testing.T) {
 	// never a sum of row rates. day1 folds g2 + Unknown: (0.012+0)/(60+10)
 	// = 171.43 (a naive sum of g2's row rates would read 200); day2 folds g2
 	// alone: 0.011/120 = 91.67 (naive: 83.33 + 100 = 183.33).
-	req2 := httptest.NewRequest("GET", "/api/stats/activity?metric=blended&group_by=model&rollup=day&top=1&"+rangeQuery(t), nil)
+	req2 := httptest.NewRequest("GET", "/api/stats/activity?metric=blended&group_by=model&rollup=day&top=1&"+rangeQuery(t, anchor), nil)
 	req2.Host = "localhost:9999"
 	rec2 := httptest.NewRecorder()
 	e.ServeHTTP(rec2, req2)
@@ -916,7 +921,7 @@ func TestActivityBlended(t *testing.T) {
 	// subgroup=key: each subgroup's rate from ITS spend/tokens only. k2's
 	// combined day1 rate (0.06/340 = 176.47) must not be the sum of its row
 	// rates (83.33 + 400 = 483.33).
-	req3 := httptest.NewRequest("GET", "/api/stats/activity?metric=blended&group_by=model&subgroup=key&rollup=day&"+rangeQuery(t), nil)
+	req3 := httptest.NewRequest("GET", "/api/stats/activity?metric=blended&group_by=model&subgroup=key&rollup=day&"+rangeQuery(t, anchor), nil)
 	req3.Host = "localhost:9999"
 	rec3 := httptest.NewRecorder()
 	e.ServeHTTP(rec3, req3)
@@ -956,11 +961,10 @@ func summaryGroups(s []summaryRow) []string {
 // rangeQuery pins since/until to the last two days (start of day minus one
 // day through end of today), so the fixture's yesterday-noon and today-noon
 // rows are always in range no matter what wall-clock time the suite runs at.
-func rangeQuery(t *testing.T) string {
+func rangeQuery(t *testing.T, anchor time.Time) string {
 	t.Helper()
-	now := time.Now()
-	since := time.Date(now.Year(), now.Month(), now.Day()-1, 0, 0, 0, 0, now.Location())
-	until := time.Date(now.Year(), now.Month(), now.Day(), 23, 59, 59, 0, now.Location())
+	since := time.Date(anchor.Year(), anchor.Month(), anchor.Day()-1, 0, 0, 0, 0, anchor.Location())
+	until := time.Date(anchor.Year(), anchor.Month(), anchor.Day()+1, 0, 0, 0, 0, anchor.Location()).Add(-time.Second)
 	return fmt.Sprintf("since=%s&until=%s",
 		url.QueryEscape(since.Format(time.RFC3339)), url.QueryEscape(until.Format(time.RFC3339)))
 }
@@ -1080,7 +1084,8 @@ func TestActivityWeekRollupMonthBoundary(t *testing.T) {
 // aggregate, a blended rate must use only the in-window spend/tokens mix, and
 // Top-N must rank after the outside-window rows have been removed.
 func TestActivityPreciseWindow(t *testing.T) {
-	e := bootstrapActivity(t)
+	loc := time.Local
+	e := bootstrapActivityAt(t, time.Date(2026, 8, 1, 0, 0, 0, 0, loc))
 	t.Cleanup(func() {
 		if sqlDB, err := db.GetDB().DB(); err == nil {
 			sqlDB.Close()
@@ -1091,7 +1096,6 @@ func TestActivityPreciseWindow(t *testing.T) {
 	if err := db.GetDB().Where("name = ?", "k1").First(&key).Error; err != nil {
 		t.Fatal(err)
 	}
-	loc := time.Local
 	since := time.Date(2026, 8, 13, 12, 0, 0, 0, loc)
 	until := time.Date(2026, 8, 13, 14, 0, 0, 0, loc)
 	insert := func(hour time.Time, group string, cost float64, tokens int64) {
@@ -1327,7 +1331,8 @@ func summarySumOf(rows []struct {
 // Fixture (bootstrapActivity): g1 spend $0.03 via k1 ($0.01) + k2 ($0.02,
 // app "testapp"); g2 spend $0.005 via k1; one empty-model_name row ($0).
 func TestActivityFilter(t *testing.T) {
-	e := bootstrapActivity(t)
+	anchor := time.Now()
+	e := bootstrapActivityAt(t, anchor)
 	t.Cleanup(func() {
 		if sqlDB, err := db.GetDB().DB(); err == nil {
 			sqlDB.Close()
@@ -1342,9 +1347,8 @@ func TestActivityFilter(t *testing.T) {
 	// Explicit range covering the fixture rows (yesterday + today noon): the
 	// default since..until window ("now-7d .. now") would drop today's row
 	// when the suite runs before noon.
-	now := time.Now()
-	since := time.Date(now.Year(), now.Month(), now.Day()-1, 0, 0, 0, 0, now.Location())
-	until := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
+	since := time.Date(anchor.Year(), anchor.Month(), anchor.Day()-1, 0, 0, 0, 0, anchor.Location())
+	until := time.Date(anchor.Year(), anchor.Month(), anchor.Day()+1, 0, 0, 0, 0, anchor.Location())
 	rangeQS := fmt.Sprintf("since=%s&until=%s",
 		url.QueryEscape(since.Format(time.RFC3339)), url.QueryEscape(until.Format(time.RFC3339)))
 
@@ -1417,7 +1421,8 @@ func TestActivityFilter(t *testing.T) {
 // TestConsumptionsFilter pins the same filter on the raw-consumption
 // endpoint (the Overview tab's data source).
 func TestConsumptionsFilter(t *testing.T) {
-	e := bootstrapActivity(t)
+	anchor := time.Now()
+	e := bootstrapActivityAt(t, anchor)
 	t.Cleanup(func() {
 		if sqlDB, err := db.GetDB().DB(); err == nil {
 			sqlDB.Close()
@@ -1442,9 +1447,8 @@ func TestConsumptionsFilter(t *testing.T) {
 
 	// Explicit range covering the fixture rows (see TestActivityFilter): the
 	// default since..until window drops today's noon row before noon.
-	now := time.Now()
-	since := time.Date(now.Year(), now.Month(), now.Day()-1, 0, 0, 0, 0, now.Location())
-	until := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
+	since := time.Date(anchor.Year(), anchor.Month(), anchor.Day()-1, 0, 0, 0, 0, anchor.Location())
+	until := time.Date(anchor.Year(), anchor.Month(), anchor.Day()+1, 0, 0, 0, 0, anchor.Location())
 	rangeQS := fmt.Sprintf("since=%s&until=%s",
 		url.QueryEscape(since.Format(time.RFC3339)), url.QueryEscape(until.Format(time.RFC3339)))
 
@@ -1470,7 +1474,8 @@ func TestConsumptionsFilter(t *testing.T) {
 // one model row named "Unknown" (11 requests) and one app row attributed
 // "Unknown" (13 requests), both distinct from the fixture's empty-name rows.
 func TestActivityUnknownFilterCollision(t *testing.T) {
-	e := bootstrapActivity(t)
+	anchor := time.Now()
+	e := bootstrapActivityAt(t, anchor)
 	t.Cleanup(func() {
 		if sqlDB, err := db.GetDB().DB(); err == nil {
 			sqlDB.Close()
@@ -1487,13 +1492,12 @@ func TestActivityUnknownFilterCollision(t *testing.T) {
 
 	// Rows with names LITERALLY "Unknown", on (key, hour, model, app) tuples
 	// distinct from the fixture's rows (that tuple carries a unique index).
-	now := time.Now()
-	hour := time.Date(now.Year(), now.Month(), now.Day()-1, 12, 0, 0, 0, now.Location())
+	hour := time.Date(anchor.Year(), anchor.Month(), anchor.Day()-1, 12, 0, 0, 0, anchor.Location())
 	db.GetDB().Create(&model.Consumption{KeyID: key1.ID, HourBucket: hour.Add(time.Hour), ModelName: "Unknown", RequestCount: 11})
 	db.GetDB().Create(&model.Consumption{KeyID: key2.ID, HourBucket: hour.Add(2 * time.Hour), ModelName: "g1", AppName: "Unknown", RequestCount: 13})
 
-	since := time.Date(now.Year(), now.Month(), now.Day()-1, 0, 0, 0, 0, now.Location())
-	until := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
+	since := time.Date(anchor.Year(), anchor.Month(), anchor.Day()-1, 0, 0, 0, 0, anchor.Location())
+	until := time.Date(anchor.Year(), anchor.Month(), anchor.Day()+1, 0, 0, 0, 0, anchor.Location())
 	rangeQS := fmt.Sprintf("since=%s&until=%s",
 		url.QueryEscape(since.Format(time.RFC3339)), url.QueryEscape(until.Format(time.RFC3339)))
 

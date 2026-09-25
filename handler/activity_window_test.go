@@ -19,17 +19,17 @@ import (
 // most of the hour. Querying a mid-hour window must yield the current-hour
 // bucket with its data.
 func TestActivityShortRangeMidHour(t *testing.T) {
-	e := bootstrapActivity(t)
+	anchor := time.Now()
+	e := bootstrapActivityAt(t, anchor)
 	t.Cleanup(func() {
 		if sqlDB, err := db.GetDB().DB(); err == nil {
 			sqlDB.Close()
 		}
 	})
 
-	now := time.Now()
 	// bootstrapActivity's g1 spend rows live at yesterday 12:00 (k1 $0.01,
 	// k2 $0.02). A 15m-style window at 12:10..12:30 must still return them.
-	hour := time.Date(now.Year(), now.Month(), now.Day()-1, 12, 0, 0, 0, now.Location())
+	hour := time.Date(anchor.Year(), anchor.Month(), anchor.Day()-1, 12, 0, 0, 0, anchor.Location())
 	qs := fmt.Sprintf("metric=spend&group_by=model&rollup=hour&since=%s&until=%s",
 		url.QueryEscape(hour.Add(10*time.Minute).Format(time.RFC3339)),
 		url.QueryEscape(hour.Add(30*time.Minute).Format(time.RFC3339)))
@@ -75,15 +75,15 @@ func TestActivityShortRangeMidHour(t *testing.T) {
 // rows inside [since, until]. A 20-minute window on day1 must aggregate the
 // full day1 bucket.
 func TestActivityDayRollupBoundaryBuckets(t *testing.T) {
-	e := bootstrapActivity(t)
+	anchor := time.Now()
+	e := bootstrapActivityAt(t, anchor)
 	t.Cleanup(func() {
 		if sqlDB, err := db.GetDB().DB(); err == nil {
 			sqlDB.Close()
 		}
 	})
 
-	now := time.Now()
-	day1 := time.Date(now.Year(), now.Month(), now.Day()-1, 12, 0, 0, 0, now.Location())
+	day1 := time.Date(anchor.Year(), anchor.Month(), anchor.Day()-1, 12, 0, 0, 0, anchor.Location())
 	// Requests metric: day1 has g1 5+7 and an Unknown 1 (at 13:00, AFTER the
 	// window's until — the day bucket must still include it).
 	qs := fmt.Sprintf("metric=requests&group_by=model&rollup=day&since=%s&until=%s",
@@ -127,15 +127,15 @@ func TestActivityDayRollupBoundaryBuckets(t *testing.T) {
 // hour_bucket >= since, so a since in the middle of the hour must still
 // match the truncated current-hour bucket.
 func TestStatsConsumptionsMidHourSince(t *testing.T) {
-	e := bootstrapActivity(t)
+	anchor := time.Now()
+	e := bootstrapActivityAt(t, anchor)
 	t.Cleanup(func() {
 		if sqlDB, err := db.GetDB().DB(); err == nil {
 			sqlDB.Close()
 		}
 	})
 
-	now := time.Now()
-	hour := time.Date(now.Year(), now.Month(), now.Day()-1, 12, 0, 0, 0, now.Location())
+	hour := time.Date(anchor.Year(), anchor.Month(), anchor.Day()-1, 12, 0, 0, 0, anchor.Location())
 	qs := fmt.Sprintf("since=%s&until=%s",
 		url.QueryEscape(hour.Add(10*time.Minute).Format(time.RFC3339)),
 		url.QueryEscape(hour.Add(30*time.Minute).Format(time.RFC3339)))
