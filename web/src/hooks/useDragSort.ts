@@ -76,7 +76,7 @@ export function useDragSort<T>(
   const maxDy = useRef(Infinity);
   const startClientY = useRef(0);
   const settleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Guards against a second commit from pointerup + pointercancel racing.
+  // Guards against duplicate pointerup events while a drop is settling.
   const committedRef = useRef(false);
   // The pointer that owns the active drag: other pointers (multi-touch) must
   // not end it.
@@ -190,7 +190,10 @@ export function useDragSort<T>(
       // to its slot instead of snapping it.
       setSettling(true);
       setDy(0);
-      settleTimer.current = setTimeout(() => { reset(); }, SLIDE_MS);
+      settleTimer.current = setTimeout(() => {
+        settleTimer.current = null;
+        reset();
+      }, SLIDE_MS);
       return;
     }
     // Rows between from..to already slid out of the way, so the target slot
@@ -202,6 +205,7 @@ export function useDragSort<T>(
     setSettling(true);
     setDy(glideTo);
     settleTimer.current = setTimeout(() => {
+      settleTimer.current = null;
       const next = [...itemsRef.current];
       const [moved] = next.splice(from, 1);
       next.splice(to, 0, moved);
@@ -210,22 +214,36 @@ export function useDragSort<T>(
     }, SLIDE_MS);
   }, [reset]);
 
-  const endDrag = useCallback((e: React.PointerEvent) => {
+  const cancel = useCallback((pointerId: number) => {
+    if (pointerId !== activePointer.current || dragIndex.current === null || committedRef.current) return;
+    if (settleTimer.current) {
+      clearTimeout(settleTimer.current);
+      settleTimer.current = null;
+    }
+    reset();
+  }, [reset]);
+
+  const onPointerUp = useCallback((e: React.PointerEvent) => {
     if (e.pointerId !== activePointer.current) return;
     commit();
   }, [commit]);
-  const onPointerUp = endDrag;
-  const onPointerCancel = endDrag;
 
-  // Fallback so a pointerup/pointercancel that never reaches the row (e.g.
+  const onPointerCancel = useCallback((e: React.PointerEvent) => {
+    cancel(e.pointerId);
+  }, [cancel]);
+
+  // Fallback so pointerup/pointercancel events that never reach the row (e.g.
   // capture failed and the pointer is released elsewhere) cannot leave the
-  // table stuck in drag state. No-op after the row's own handler already
-  // committed (committedRef / pointer id).
+  // table stuck in drag state. The shared guards make row and window delivery
+  // idempotent, and a cancellation after pointerup cannot undo its drop.
   useEffect(() => {
     if (!dragging) return;
     const finish = (ev: PointerEvent) => {
-      if (ev.pointerId !== activePointer.current) return;
-      commit();
+      if (ev.type === 'pointercancel') {
+        cancel(ev.pointerId);
+      } else if (ev.pointerId === activePointer.current) {
+        commit();
+      }
     };
     window.addEventListener('pointerup', finish);
     window.addEventListener('pointercancel', finish);
@@ -233,7 +251,7 @@ export function useDragSort<T>(
       window.removeEventListener('pointerup', finish);
       window.removeEventListener('pointercancel', finish);
     };
-  }, [dragging, commit]);
+  }, [dragging, commit, cancel]);
 
   const rowStyle = useCallback((index: number): React.CSSProperties => {
     if (!dragging || dragIndex.current === null || overIndex === null) {
