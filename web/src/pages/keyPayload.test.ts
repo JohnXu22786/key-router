@@ -127,14 +127,14 @@ describe('buildKeyPayload — edit path force-sends a window limit with its metr
     const values = { rpd_metric: 'requests', rpd_limit: null };
     const baseline = { rpd_metric: 'cost', rpd_limit: 12.5 };
     expect(buildKeyPayload(values, edit(values, baseline)))
-      .toEqual({ rpd_metric: 'requests', rpd_limit: null });
+      .toEqual({ rpd_metric: 'requests', rpd_limit: 0 });
   });
 
   it('sends an explicit clear when the form represents an emptied fractional limit as undefined', () => {
     const values = { rpd_metric: 'tokens', rpd_limit: undefined };
     const baseline = { rpd_metric: 'cost', rpd_limit: 12.5 };
     expect(buildKeyPayload(values, edit(values, baseline)))
-      .toEqual({ rpd_metric: 'tokens', rpd_limit: null });
+      .toEqual({ rpd_metric: 'tokens', rpd_limit: 0 });
   });
 
   it('metric-only edit force-sends only the changing window\u2019s limit, not untouched windows\u2019', () => {

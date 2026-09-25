@@ -92,7 +92,9 @@ export function buildKeyPayload(values: Record<string, any>, ctx: KeyBuildContex
     if (metric !== 'requests' && metric !== 'tokens') continue;
     const limit = values[wt.limitField];
     if (limit == null) {
-      if (baseline[wt.limitField] != null) payload[wt.limitField] = null;
+      // The API intentionally ignores JSON null for editable fields; zero is
+      // its persisted representation for an unlimited window.
+      if (baseline[wt.limitField] != null) payload[wt.limitField] = 0;
       continue;
     }
     if (!Number.isInteger(limit)) {
