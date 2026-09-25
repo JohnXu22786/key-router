@@ -100,17 +100,17 @@ func Init(dataDir string) error {
 // old column. Runs inside one transaction; idempotent (old columns gone
 // => no-op on subsequent launches).
 func migratePricingPer1KToPer1M(db *gorm.DB) error {
-	hasColumn := func(col string) bool {
+	hasColumn := func(queryDB *gorm.DB, col string) bool {
 		var n int
-		db.Raw("SELECT COUNT(*) FROM pragma_table_info('pricings') WHERE name = ?", col).Scan(&n)
+		queryDB.Raw("SELECT COUNT(*) FROM pragma_table_info('pricings') WHERE name = ?", col).Scan(&n)
 		return n > 0
 	}
 
 	// Newer schema already in place (or table brand new): nothing to do.
-	if !hasColumn("prompt_per_1k") {
+	if !hasColumn(db, "prompt_per_1k") {
 		return nil
 	}
-	if !hasColumn("prompt_per_1m") {
+	if !hasColumn(db, "prompt_per_1m") {
 		// Shouldn't happen after AutoMigrate, but be safe.
 		return db.Exec("ALTER TABLE pricings ADD COLUMN prompt_per_1m REAL DEFAULT 0").Error
 	}
@@ -135,7 +135,9 @@ func migratePricingPer1KToPer1M(db *gorm.DB) error {
 		{"cache_write_per_1k", "cache_write_per_1m"},
 	} {
 		oldCol, newCol := pair[0], pair[1]
-		if !hasColumn(newCol) {
+		// The transaction owns SQLite's only configured connection, so schema
+		// checks during the migration must use it instead of the outer DB handle.
+		if !hasColumn(tx, newCol) {
 			if err := tx.Exec("ALTER TABLE pricings ADD COLUMN " + newCol + " REAL DEFAULT 0").Error; err != nil {
 				tx.Rollback()
 				return err

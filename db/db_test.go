@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -500,6 +501,71 @@ func TestInitRebuildsLegacyConsumptionIndex(t *testing.T) {
 	// Exact duplicates remain impossible.
 	if err := GetDB().Create(&model.Consumption{KeyID: 1, HourBucket: hour, ModelName: "gpt-4o", AppName: "app-a", RequestCount: 1}).Error; err == nil {
 		t.Error("exact (key, hour, model, app) duplicate accepted after Init")
+	}
+}
+
+// TestMigratePricingPer1KToPer1MWithSingleConnection exercises the legacy
+// pricing upgrade with the same one-connection limit used by Init. The
+// context bounds the regression: an outer-DB schema query while the migration
+// transaction holds the only connection fails instead of hanging the test.
+func TestMigratePricingPer1KToPer1MWithSingleConnection(t *testing.T) {
+	dbc, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "pricing.db")), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if sqlDB, err := dbc.DB(); err == nil {
+			sqlDB.Close()
+		}
+	})
+	if err := dbc.Exec(`CREATE TABLE pricings (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		model_name TEXT NOT NULL,
+		prompt_per_1k REAL DEFAULT 0,
+		completion_per_1k REAL DEFAULT 0,
+		cache_read_per_1k REAL DEFAULT 0,
+		cache_write_per_1k REAL DEFAULT 0,
+		prompt_per_1m REAL DEFAULT 0,
+		completion_per_1m REAL DEFAULT 0,
+		cache_read_per_1m REAL DEFAULT 0,
+		cache_write_per_1m REAL DEFAULT 0
+	)`).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := dbc.Exec(`INSERT INTO pricings
+		(model_name, prompt_per_1k, completion_per_1k, cache_read_per_1k, cache_write_per_1k)
+		VALUES (?, ?, ?, ?, ?)`, "legacy-model", 0.2, 0.3, 0.4, 0.5).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	sqlDB, err := dbc.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlDB.SetMaxOpenConns(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := migratePricingPer1KToPer1M(dbc.WithContext(ctx)); err != nil {
+		t.Fatalf("pricing migration with one open connection failed: %v", err)
+	}
+
+	var got struct {
+		PromptPer1M     float64 `gorm:"column:prompt_per_1m"`
+		CompletionPer1M float64 `gorm:"column:completion_per_1m"`
+		CacheReadPer1M  float64 `gorm:"column:cache_read_per_1m"`
+		CacheWritePer1M float64 `gorm:"column:cache_write_per_1m"`
+	}
+	if err := dbc.Raw(`SELECT prompt_per_1m, completion_per_1m, cache_read_per_1m, cache_write_per_1m
+		FROM pricings WHERE model_name = ?`, "legacy-model").Scan(&got).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.PromptPer1M != 200 || got.CompletionPer1M != 300 || got.CacheReadPer1M != 400 || got.CacheWritePer1M != 500 {
+		t.Errorf("migrated pricing = %+v, want rates 200/300/400/500 per 1M", got)
+	}
+	for _, oldColumn := range []string{"prompt_per_1k", "completion_per_1k", "cache_read_per_1k", "cache_write_per_1k"} {
+		if dbc.Migrator().HasColumn("pricings", oldColumn) {
+			t.Errorf("legacy column %q still exists after migration", oldColumn)
+		}
 	}
 }
 
