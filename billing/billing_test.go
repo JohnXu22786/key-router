@@ -1,12 +1,15 @@
 package billing
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"key-router/db"
 	"key-router/model"
+
+	"gorm.io/gorm"
 )
 
 // TestGetConsumptionSummaryMidHourSince pins the hour-bucket boundary: the
@@ -294,6 +297,49 @@ func TestRecordConsumptionPricingLookupErrorFallsBackToCache(t *testing.T) {
 	// silently billed at $0.
 	if consumption.CostUSD != 2.0 {
 		t.Fatalf("CostUSD = %v, want 2 (cached-price fallback, not 0)", consumption.CostUSD)
+	}
+}
+
+func TestRecordConsumptionExactPricingLookupErrorPrefersCachedExactPrice(t *testing.T) {
+	key := setupBillingDB(t)
+	db.GetDB().Create(&model.Pricing{ModelName: "upstream-real", PromptPer1M: 2.0})
+	db.GetDB().Create(&model.Pricing{ModelName: "*", PromptPer1M: 4.0})
+	calc := NewCalculator()
+
+	const callbackName = "billing_test:fail_exact_pricing_lookup"
+	queryCallbacks := db.GetDB().Callback().Query()
+	if err := queryCallbacks.After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Table != "pricings" || len(tx.Statement.Vars) == 0 {
+			return
+		}
+		modelName, ok := tx.Statement.Vars[0].(string)
+		if !ok {
+			return
+		}
+		switch modelName {
+		case "upstream-real":
+			tx.AddError(errors.New("simulated exact pricing lookup failure"))
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := queryCallbacks.Remove(callbackName); err != nil {
+			t.Errorf("remove pricing lookup test callback: %v", err)
+		}
+	})
+
+	usage := &model.TokenUsage{PromptTokens: 1_000_000, CompletionTokens: 0, TotalTokens: 1_000_000, Format: "openai"}
+	consumption, err := RecordConsumption(key.ID, "client-model", "upstream-real", "app", usage, nil, calc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wildcard, err := lookupPricing("*")
+	if err != nil || wildcard == nil {
+		t.Fatalf("wildcard pricing lookup after exact lookup error = (%v, %v), want a successful rule", wildcard, err)
+	}
+	if consumption.CostUSD != 2.0 {
+		t.Fatalf("CostUSD = %v, want 2 (cached exact price, not wildcard price)", consumption.CostUSD)
 	}
 }
 
