@@ -43,7 +43,12 @@ func main() {
 	// application-data directory — never next to the executable — so it
 	// survives updates across every build type and platform. KEYROUTER_DATA
 	// overrides it (used for testing / isolated instances).
-	dataDir := resolveDataDir(os.Getenv, defaultDataDir)
+	dataDir, err := resolveDataDir(os.Getenv, defaultDataDir)
+	if err != nil {
+		log.Printf("[main] cannot create data directory: %v", err)
+		showFatalError(fmt.Sprintf("KeyRouter failed to start:\n\nCannot create data directory:\n%v", err))
+		os.Exit(1)
+	}
 	if err := os.MkdirAll(dataDir, 0700); err != nil {
 		log.Printf("[main] cannot create data directory: %v", err)
 		showFatalError(fmt.Sprintf("KeyRouter failed to start:\n\nCannot create data directory:\n%v", err))

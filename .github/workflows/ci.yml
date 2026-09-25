@@ -52,6 +52,28 @@ jobs:
           gofmt -l . | tee /dev/stderr
           test -z "$(gofmt -l .)"
 
+  platform-fallback:
+    name: Fallback security (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Windows fallback ACL tests
+        if: runner.os == 'Windows'
+        run: go test -run 'TestResolveDataDir|TestFallbackUserComponent|TestTempFallback|TestWindowsFallback' datadir.go datadir_windows.go datadir_test.go datadir_windows_test.go
+
+      - name: macOS fallback ACL tests
+        if: runner.os == 'macOS'
+        run: go test -run 'TestResolveDataDir|TestFallbackUserComponent|TestTempFallback|TestDarwinFallback' datadir.go datadir_darwin.go datadir_test.go datadir_darwin_test.go
+
 # No separate web job: the go job above already runs `npm run build` (which
 # includes the tsc type-check) before compiling, so a web-only job would
 # duplicate the exact same steps.
