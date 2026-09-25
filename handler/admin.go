@@ -473,29 +473,19 @@ func (h *AdminHandler) UpdateKey(c *gin.Context) {
 	c.Request.Body = io.NopCloser(bytes.NewReader(body))
 	var raw map[string]json.RawMessage
 	json.Unmarshal(body, &raw)
-	_, statusInPayload := raw["status"]
-	_, cooldownInPayload := raw["rate_limited_until"]
-	_, reasonInPayload := raw["disabled_reason"]
-	_, strategyInPayload := raw["recovery_strategy"]
+	hasNonNullField := func(name string) bool {
+		value, ok := raw[name]
+		return ok && !bytes.Equal(bytes.TrimSpace(value), []byte("null"))
+	}
+	statusInPayload := hasNonNullField("status")
+	cooldownInPayload := hasNonNullField("rate_limited_until")
+	reasonInPayload := hasNonNullField("disabled_reason")
+	strategyInPayload := hasNonNullField("recovery_strategy")
 	// Explicit null on any relay-owned field is treated as absent: a null
 	// status would persist an empty string (key unusable), null cooldown
 	// would instantly re-admit a hot key, null reason would strip
 	// "auth_failed" so the health checker never recovers the key, and null
 	// recovery_strategy would silently flip a lazy key to immediate.
-	for _, f := range []string{"status", "rate_limited_until", "disabled_reason", "recovery_strategy"} {
-		if rv, ok := raw[f]; ok && string(rv) == "null" {
-			switch f {
-			case "status":
-				statusInPayload = false
-			case "rate_limited_until":
-				cooldownInPayload = false
-			case "disabled_reason":
-				reasonInPayload = false
-			case "recovery_strategy":
-				strategyInPayload = false
-			}
-		}
-	}
 
 	var k model.Key
 	if err := db.GetDB().First(&k, id).Error; err != nil {
@@ -574,12 +564,64 @@ func (h *AdminHandler) UpdateKey(c *gin.Context) {
 	// only when the caller did NOT supply a reason of their own — an
 	// explicit non-null disabled_reason in the same payload must survive
 	// (it is the admin's recorded justification).
-	if statusInPayload && k.Status == model.KeyStatusDisabled && !reasonInPayload {
+	clearDisabledReason := statusInPayload && k.Status == model.KeyStatusDisabled && !reasonInPayload
+	if clearDisabledReason {
 		k.DisabledReason = ""
 	}
-	if err := db.GetDB().Save(&k).Error; err != nil {
-		log.Printf("[admin] UpdateKey save error: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+
+	// Only persist explicitly submitted, admin-editable fields. In particular,
+	// TotalSpent and relay-owned state must never be copied from the read snapshot
+	// by a name-only edit.
+	updates := make(map[string]any)
+	for _, field := range []struct {
+		jsonName  string
+		modelName string
+		value     any
+	}{
+		{"provider_id", "ProviderID", k.ProviderID},
+		{"name", "Name", k.Name},
+		{"key_value", "KeyValue", k.KeyValue},
+		{"rpm_limit", "RPMLimit", k.RPMLimit},
+		{"tpm_limit", "TPMLimit", k.TPMLimit},
+		{"rp5h_limit", "RP5hLimit", k.RP5hLimit},
+		{"rp5h_metric", "RP5hMetric", k.RP5hMetric},
+		{"rpd_limit", "RPDLimit", k.RPDLimit},
+		{"rpd_metric", "RPDMetric", k.RPDMetric},
+		{"rpw_limit", "RPWLimit", k.RPWLimit},
+		{"rpw_metric", "RPWMetric", k.RPWMetric},
+		{"rpm_month_limit", "RPMLimitMonth", k.RPMLimitMonth},
+		{"rpm_metric", "RPMMetric", k.RPMMetric},
+		{"total_spend_limit", "TotalSpendLimit", k.TotalSpendLimit},
+		{"sort_order", "SortOrder", k.SortOrder},
+	} {
+		if hasNonNullField(field.jsonName) {
+			updates[field.modelName] = field.value
+		}
+	}
+	if statusInPayload {
+		updates["Status"] = k.Status
+	}
+	if cooldownInPayload {
+		updates["RateLimitedUntil"] = k.RateLimitedUntil
+	}
+	if reasonInPayload {
+		updates["DisabledReason"] = k.DisabledReason
+	}
+	if strategyInPayload {
+		updates["RecoveryStrategy"] = k.RecoveryStrategy
+	}
+	if clearDisabledReason {
+		updates["DisabledReason"] = ""
+	}
+	if len(updates) > 0 {
+		if err := db.GetDB().Model(&model.Key{}).Where("id = ?", id).Updates(updates).Error; err != nil {
+			log.Printf("[admin] UpdateKey update error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	if err := db.GetDB().First(&k, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "key not found"})
 		return
 	}
 	// A key edit (e.g. fixing the key_value of an auth_failed key) must
