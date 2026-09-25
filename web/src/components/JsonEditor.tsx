@@ -124,16 +124,6 @@ const JsonEditor: React.FC<JsonEditorProps> = ({
       }
     }
 
-    // --- Auto-close pairs on typing openers ---
-    if (e.key.length === 1 && PAIRS[e.key] && !e.ctrlKey && !e.metaKey && !e.altKey) {
-      // Skip when there's a selection (replace it) — still wrap.
-      e.preventDefault();
-      const closing = PAIRS[e.key];
-      const wrapped = sel.length > 0 ? e.key + sel + closing : e.key + closing;
-      insertAtCaret(wrapped, e.key.length);
-      return;
-    }
-
     // --- Typing a closer that already exists: jump over it ---
     if (e.key.length === 1 && start === end) {
       const next = value[start];
@@ -142,6 +132,16 @@ const JsonEditor: React.FC<JsonEditorProps> = ({
         el.setSelectionRange(start + 1, start + 1);
         return;
       }
+    }
+
+    // --- Auto-close pairs on typing openers ---
+    if (e.key.length === 1 && PAIRS[e.key] && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      // Skip when there's a selection (replace it) — still wrap.
+      e.preventDefault();
+      const closing = PAIRS[e.key];
+      const wrapped = sel.length > 0 ? e.key + sel + closing : e.key + closing;
+      insertAtCaret(wrapped, e.key.length);
+      return;
     }
   };
 
