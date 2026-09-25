@@ -269,6 +269,13 @@ func (c *Checker) checkKey(key *model.Key) {
 	}
 	key = &fresh
 
+	// A key may enter cooldown after checkAll's eligibility snapshot. Honor
+	// the refreshed state before spending a probe request.
+	if key.Status == model.KeyStatusRateLimited &&
+		key.RateLimitedUntil != nil && time.Now().Before(*key.RateLimitedUntil) {
+		return
+	}
+
 	// Disabled keys are only ever auto-recovered by the engine's state
 	// machine when the disabled_reason was set by the system
 	// (auth_failed / insufficient_quota / spend_limit_exhausted). A key
