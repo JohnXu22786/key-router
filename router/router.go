@@ -2,7 +2,6 @@ package router
 
 import (
 	"bytes"
-	"embed"
 	"io"
 	"io/fs"
 	"log"
@@ -75,7 +74,7 @@ var sharedAdminHandler = struct {
 
 // Setup configures all routes and returns the gin engine
 func Setup(
-	staticFS embed.FS,
+	staticFS fs.FS,
 	engine *selector.Engine,
 	checker *health.Checker,
 	hub *events.Hub,
@@ -180,6 +179,10 @@ func Setup(
 		log.Printf("[router] no embedded web UI found: %v", err)
 		// Fallback: serve a simple index.html
 		r.NoRoute(func(c *gin.Context) {
+			if isAPIFallbackPath(c.Request.URL.Path) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+				return
+			}
 			c.String(http.StatusOK, "<html><body><h1>KeyRouter</h1><p>Web UI not built. Run: cd web && npm install && npm run build</p></body></html>")
 		})
 	} else {
@@ -198,8 +201,7 @@ func serveStaticFallback(prefix string, fsys fs.FS) gin.HandlerFunc {
 		// index.html and mislead API clients). The prefix check without the
 		// trailing slash also covers typos like /v1foo or /apix; paths are
 		// compared case-insensitively.
-		p := strings.ToLower(c.Request.URL.Path)
-		if strings.HasPrefix(p, "/api") || strings.HasPrefix(p, "/v1") {
+		if isAPIFallbackPath(c.Request.URL.Path) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 			return
 		}
@@ -235,4 +237,9 @@ func serveStaticFallback(prefix string, fsys fs.FS) gin.HandlerFunc {
 		stat, _ := f.Stat()
 		http.ServeContent(c.Writer, c.Request, path, stat.ModTime(), bytes.NewReader(data))
 	}
+}
+
+func isAPIFallbackPath(path string) bool {
+	p := strings.ToLower(path)
+	return strings.HasPrefix(p, "/api") || strings.HasPrefix(p, "/v1")
 }
