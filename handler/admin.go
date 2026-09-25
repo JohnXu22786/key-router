@@ -1805,15 +1805,35 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 		return
 	}
 
-	// Load key names (for group_by/subgroup = key display).
+	// Load key display labels. Preserve unique names, but include the stable
+	// key ID when names collide so separate keys remain separate groups.
 	keyNames := make(map[int64]string)
 	var keys []model.Key
 	if groupBy == "key" || groupBy == "app" || subgroup == "key" {
 		if err := db.GetDB().Find(&keys).Error; err == nil {
+			nameCounts := make(map[string]int)
 			for i := range keys {
-				keyNames[keys[i].ID] = keys[i].Name
+				if keys[i].Name != "" {
+					nameCounts[keys[i].Name]++
+				}
+			}
+			for i := range keys {
+				name := keys[i].Name
+				if name == "" {
+					continue
+				}
+				if nameCounts[name] > 1 {
+					name = fmt.Sprintf("%s (Key #%d)", name, keys[i].ID)
+				}
+				keyNames[keys[i].ID] = name
 			}
 		}
+	}
+	keyLabel := func(keyID int64) string {
+		if name := keyNames[keyID]; name != "" {
+			return name
+		}
+		return fmt.Sprintf("Key #%d", keyID)
 	}
 
 	// groupOf maps a consumption row to its display group.
@@ -1825,10 +1845,7 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 			}
 			return r.ModelName
 		case "key":
-			if n, ok := keyNames[r.KeyID]; ok && n != "" {
-				return n
-			}
-			return fmt.Sprintf("Key #%d", r.KeyID)
+			return keyLabel(r.KeyID)
 		default: // app = the attribution-detected client app ("" = "Unknown")
 			if r.AppName != "" {
 				return r.AppName
@@ -1865,10 +1882,7 @@ func (h *AdminHandler) GetActivity(c *gin.Context) {
 			}
 			return r.ModelName
 		case "key":
-			if n, ok := keyNames[r.KeyID]; ok && n != "" {
-				return n
-			}
-			return fmt.Sprintf("Key #%d", r.KeyID)
+			return keyLabel(r.KeyID)
 		default: // app
 			if r.AppName != "" {
 				return r.AppName

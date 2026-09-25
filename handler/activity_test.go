@@ -311,6 +311,135 @@ func TestActivitySubgroup(t *testing.T) {
 	}
 }
 
+func TestActivityDuplicateKeyNamesRemainSeparate(t *testing.T) {
+	e := bootstrapActivity(t)
+	t.Cleanup(func() {
+		if sqlDB, err := db.GetDB().DB(); err == nil {
+			sqlDB.Close()
+		}
+	})
+
+	var firstProvider model.Provider
+	if err := db.GetDB().Where("name = ?", "mock").First(&firstProvider).Error; err != nil {
+		t.Fatal(err)
+	}
+	secondProvider := model.Provider{Name: "duplicate-key-provider", Type: "openai", BaseURL: "http://localhost:2"}
+	if err := db.GetDB().Create(&secondProvider).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	keys := []model.Key{
+		{ProviderID: firstProvider.ID, KeyValue: "duplicate-key-one", Name: "shared-key"},
+		{ProviderID: secondProvider.ID, KeyValue: "duplicate-key-two", Name: "shared-key"},
+	}
+	for i := range keys {
+		if err := db.GetDB().Create(&keys[i]).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	now := time.Now()
+	day := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	bucket := day.Add(12 * time.Hour)
+	for i, cost := range []float64{0.13, 0.29} {
+		if err := db.GetDB().Create(&model.Consumption{
+			KeyID: keys[i].ID, HourBucket: bucket, ModelName: "duplicate-key-model", CostUSD: cost,
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	rangeQS := fmt.Sprintf("since=%s&until=%s",
+		url.QueryEscape(day.Format(time.RFC3339)),
+		url.QueryEscape(day.AddDate(0, 0, 1).Format(time.RFC3339)))
+	dayLabel := day.Format("2006-01-02")
+
+	type activityResult struct {
+		Series []struct {
+			Bucket   string  `json:"bucket"`
+			Group    string  `json:"group"`
+			Subgroup string  `json:"subgroup"`
+			Value    float64 `json:"value"`
+			HasData  bool    `json:"has_data"`
+		} `json:"series"`
+		Summary []struct {
+			Group string  `json:"group"`
+			Sum   float64 `json:"sum"`
+		} `json:"summary"`
+	}
+	request := func(qs string) activityResult {
+		t.Helper()
+		req := httptest.NewRequest("GET", "/api/stats/activity?"+qs, nil)
+		req.Host = "localhost:9999"
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+		}
+		var out activityResult
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("bad json: %v\n%s", err, rec.Body.String())
+		}
+		return out
+	}
+
+	want := map[string]float64{
+		fmt.Sprintf("shared-key (Key #%d)", keys[0].ID): 0.13,
+		fmt.Sprintf("shared-key (Key #%d)", keys[1].ID): 0.29,
+	}
+	byKey := request("metric=spend&group_by=key&rollup=day&filter_type=model&filter_value=duplicate-key-model&" + rangeQS)
+	if len(byKey.Summary) != len(want) {
+		t.Fatalf("group_by=key summary = %+v, want two separate key groups", byKey.Summary)
+	}
+	summaryValues := make(map[string]float64, len(byKey.Summary))
+	for _, summary := range byKey.Summary {
+		summaryValues[summary.Group] = summary.Sum
+	}
+	for label, value := range want {
+		if got := summaryValues[label]; got != value {
+			t.Errorf("group_by=key summary[%q] = %v, want %v; summary=%+v", label, got, value, byKey.Summary)
+		}
+	}
+	seriesValues := make(map[string]float64, len(want))
+	for _, point := range byKey.Series {
+		if point.HasData {
+			if point.Bucket != dayLabel {
+				t.Errorf("group_by=key populated bucket = %q, want %q", point.Bucket, dayLabel)
+			}
+			seriesValues[point.Group] = point.Value
+		}
+	}
+	if len(seriesValues) != len(want) {
+		t.Fatalf("group_by=key populated series = %+v, want two separate key groups", seriesValues)
+	}
+	for label, value := range want {
+		if got := seriesValues[label]; got != value {
+			t.Errorf("group_by=key series[%q] = %v, want %v", label, got, value)
+		}
+	}
+
+	bySubgroup := request("metric=spend&group_by=model&subgroup=key&rollup=day&filter_type=model&filter_value=duplicate-key-model&" + rangeQS)
+	if len(bySubgroup.Summary) != 1 || bySubgroup.Summary[0].Group != "duplicate-key-model" || bySubgroup.Summary[0].Sum != 0.42 {
+		t.Fatalf("subgroup=key summary = %+v, want duplicate-key-model sum 0.42", bySubgroup.Summary)
+	}
+	subgroupValues := make(map[string]float64, len(want))
+	for _, point := range bySubgroup.Series {
+		if point.HasData {
+			if point.Group != "duplicate-key-model" || point.Bucket != dayLabel {
+				t.Errorf("subgroup=key populated series point = %+v, want duplicate-key-model on %s", point, dayLabel)
+			}
+			subgroupValues[point.Subgroup] = point.Value
+		}
+	}
+	if len(subgroupValues) != len(want) {
+		t.Fatalf("subgroup=key populated series = %+v, want two distinct key subgroups", subgroupValues)
+	}
+	for label, value := range want {
+		if got := subgroupValues[label]; got != value {
+			t.Errorf("subgroup=key series[%q] = %v, want %v", label, got, value)
+		}
+	}
+}
+
 // TestActivityTotalRollup pins the rollup=total behavior: the whole range
 // collapses into a single "Total" bucket, every group's series value equals
 // its range total, and the summary's Value (last bucket) equals its Sum.
