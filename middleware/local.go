@@ -25,15 +25,20 @@ func LocalOnlyMiddleware() gin.HandlerFunc {
 		}
 
 		// Origin check: browser requests must come from THIS server's origin.
-		// The hostname must be local AND the effective origin port must match
-		// the request's port — a portless Origin means the page came from the
-		// default port (80/443), which never equals the management port, so
-		// it is rejected (a dev server or local process must not CSRF the
-		// unauthenticated management API).
+		// The hostname must be local and match the request target. The
+		// effective origin port must also match the request's port. A portless
+		// Origin means the page came from the default port (80/443), which
+		// never equals the management port, so it is rejected (a dev server or
+		// local process must not CSRF the unauthenticated management API).
 		origin := c.GetHeader("Origin")
 		if origin != "" {
 			u, err := url.Parse(origin)
-			if err != nil || !isLocalHost(u.Hostname()) {
+			if err != nil {
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "forbidden: cross-origin request"})
+				return
+			}
+			originHost := u.Hostname()
+			if !isLocalHost(originHost) || !strings.EqualFold(strings.TrimSpace(originHost), strings.TrimSpace(host)) {
 				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "forbidden: cross-origin request"})
 				return
 			}
