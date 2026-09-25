@@ -1102,6 +1102,10 @@ func (h *AdminHandler) UpdatePricing(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if p.ModelName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "model_name is required"})
+		return
+	}
 	p.ID = id
 	// Changing model_name to an existing value must be a 400, not a raw
 	// SQLite constraint 500 (same as CreatePricing)
