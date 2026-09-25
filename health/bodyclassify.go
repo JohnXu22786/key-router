@@ -50,13 +50,16 @@ func ClassifyErrorBody(body []byte) ErrorBodySignals {
 		values = []string{string(body)} // plain-text / non-JSON body
 	}
 
-	// Signals are matched WITHIN one sentence of one value — never stitched
-	// across field boundaries or across sentences ("The model ... is fine.
-	// The endpoint was not found" must not chain). Accumulating every
-	// signal before deciding also makes the result independent of JSON map
-	// iteration order.
+	// Token signals are matched WITHIN one sentence of one value — never
+	// stitched across field boundaries or sentences. Quota exhaustion has one
+	// body-wide rule: any rate-limit signal overrides billing evidence, even
+	// when gateways put those signals in separate JSON fields. Accumulating
+	// both flags before deciding also makes classification independent of JSON
+	// map iteration order.
 	signals := ErrorBodySignals{}
 	keyAny := false
+	quotaAny := false
+	rateLimitAny := false
 	for _, v := range values {
 		for _, sentence := range splitSentences(v) {
 			tokens := normalizeTokens(sentence)
@@ -77,16 +80,18 @@ func ClassifyErrorBody(body []byte) ErrorBodySignals {
 				signals.ModelProblem = true
 			}
 
-			// Quota exhaustion: explicit billing codes/phrases only, and
-			// never when the same sentence also carries a rate-limit signal
-			// (quota_exceeded, too many requests, throttling, per-minute
-			// windows, 请求过于频繁...).
-			if (matchAny(tokens, quotaExhaustedSignals) || matchAnyString(compact, quotaChineseSignals)) &&
-				!matchAny(tokens, rateLimitSignals) && !matchAnyString(compact, rateLimitChineseSignals) {
-				signals.QuotaExhausted = true
+			// Quota and rate-limit evidence can arrive in separate upstream
+			// fields. Preserve local matching, then apply the override once the
+			// full body has been inspected.
+			if matchAny(tokens, quotaExhaustedSignals) || matchAnyString(compact, quotaChineseSignals) {
+				quotaAny = true
+			}
+			if matchAny(tokens, rateLimitSignals) || matchAnyString(compact, rateLimitChineseSignals) {
+				rateLimitAny = true
 			}
 		}
 	}
+	signals.QuotaExhausted = quotaAny && !rateLimitAny
 	if keyAny {
 		signals.KeyInvalid = true
 		signals.ModelProblem = false
