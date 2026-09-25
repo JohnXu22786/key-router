@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -49,31 +50,159 @@ func TestResolveDataDir(t *testing.T) {
 	}
 
 	t.Run("KEYROUTER_DATA override wins", func(t *testing.T) {
-		got := resolveDataDir(env(map[string]string{"KEYROUTER_DATA": "/custom"}), func() string { return "/default" })
+		got, err := resolveDataDir(env(map[string]string{"KEYROUTER_DATA": "/custom"}), func() string { return "/default" })
+		if err != nil {
+			t.Fatal(err)
+		}
 		if got != "/custom" {
 			t.Errorf("got %q, want /custom", got)
 		}
 	})
 
 	t.Run("platform default used when override unset", func(t *testing.T) {
-		got := resolveDataDir(env(nil), func() string { return "/default" })
+		got, err := resolveDataDir(env(nil), func() string { return "/default" })
+		if err != nil {
+			t.Fatal(err)
+		}
 		if got != "/default" {
 			t.Errorf("got %q, want /default", got)
 		}
 	})
 
-	t.Run("temp dir fallback when nothing resolves", func(t *testing.T) {
-		got := resolveDataDir(env(nil), func() string { return "" })
-		if got == "" || got == "/" {
-			t.Errorf("got %q, want a temp-dir path", got)
+	t.Run("private temp dir fallback when nothing resolves", func(t *testing.T) {
+		user := "resolve-test-" + filepath.Base(t.TempDir())
+		getenv := env(map[string]string{"USER": user})
+		got, err := resolveDataDir(getenv, func() string { return "" })
+		if err != nil {
+			t.Fatal(err)
 		}
-		if filepath.Dir(got) != os.TempDir() {
-			t.Errorf("fallback %q not inside %q", got, os.TempDir())
+		t.Cleanup(func() { _ = os.RemoveAll(got) })
+		tempDir, err := filepath.EvalSymlinks(os.TempDir())
+		if err != nil {
+			t.Fatal(err)
 		}
-		if !strings.Contains(filepath.Base(got), "keyrouter-") {
-			t.Errorf("fallback %q should be user-scoped", got)
+		if filepath.Dir(got) != tempDir {
+			t.Errorf("fallback %q not inside %q", got, tempDir)
+		}
+		if filepath.Base(got) != "keyrouter-"+user {
+			t.Errorf("fallback %q should retain the stable per-user name", got)
+		}
+		info, err := os.Stat(got)
+		if err != nil {
+			t.Fatalf("stat fallback directory: %v", err)
+		}
+		if !info.IsDir() {
+			t.Fatalf("fallback %q is not a directory", got)
+		}
+		if runtime.GOOS != "windows" && (info.Mode().Perm()&0077 != 0 || info.Mode().Perm()&0700 != 0700) {
+			t.Errorf("fallback permissions = %04o, want owner access only", info.Mode().Perm())
+		}
+		again, err := resolveDataDir(getenv, func() string { return "" })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if again != got {
+			t.Errorf("fallback changed across starts: first %q, then %q", got, again)
+		}
+		if err := os.WriteFile(filepath.Join(got, "persisted.db"), []byte("data"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if data, err := os.ReadFile(filepath.Join(again, "persisted.db")); err != nil || string(data) != "data" {
+			t.Errorf("fallback data did not persist across resolution: data=%q err=%v", data, err)
 		}
 	})
+}
+
+func TestFallbackUserComponentCannotContainPathSeparators(t *testing.T) {
+	got := fallbackUserComponent(`name/../../other\user`)
+	if strings.ContainsAny(got, `/\`) {
+		t.Fatalf("fallback user component %q contains a path separator", got)
+	}
+}
+
+func TestTempFallbackRejectsPreexistingDirectoryWithLogSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("cannot simulate a directory owned by a different Windows account")
+	}
+	user := "fallback-test-" + filepath.Base(t.TempDir())
+	attackerDir := filepath.Join(os.TempDir(), "keyrouter-"+user)
+	if err := os.Mkdir(attackerDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(attackerDir) })
+
+	victimPath := filepath.Join(t.TempDir(), "victim.txt")
+	if err := os.WriteFile(victimPath, []byte("victim data"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victimPath, filepath.Join(attackerDir, "key-router.log")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	getenv := func(key string) string {
+		if key == "USER" {
+			return user
+		}
+		return ""
+	}
+	if dataDir, err := resolveDataDir(getenv, func() string { return "" }); err == nil {
+		t.Fatalf("fallback accepted attacker-controlled directory %q", dataDir)
+	}
+	if got, err := os.ReadFile(victimPath); err != nil || string(got) != "victim data" {
+		t.Errorf("victim file changed through log symlink: data=%q err=%v", got, err)
+	}
+}
+
+func TestTempFallbackRejectsSymlinkedDirectory(t *testing.T) {
+	user := "fallback-link-test-" + filepath.Base(t.TempDir())
+	attackerDir := filepath.Join(os.TempDir(), "keyrouter-"+user)
+	victimDir := t.TempDir()
+	victimPath := filepath.Join(victimDir, "key-router.log")
+	if err := os.WriteFile(victimPath, []byte("victim data"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victimDir, attackerDir); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(attackerDir) })
+
+	getenv := func(key string) string {
+		if key == "USER" {
+			return user
+		}
+		return ""
+	}
+	if dataDir, err := resolveDataDir(getenv, func() string { return "" }); err == nil {
+		t.Fatalf("fallback accepted symlinked directory %q", dataDir)
+	}
+	if got, err := os.ReadFile(victimPath); err != nil || string(got) != "victim data" {
+		t.Errorf("victim file changed through directory symlink: data=%q err=%v", got, err)
+	}
+}
+
+func TestTempFallbackRejectsWritableNonStickyTempParent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows temporary-parent ACLs are covered by platform tests")
+	}
+	user := "unsafe-parent-test-" + filepath.Base(t.TempDir())
+	shared := filepath.Join(t.TempDir(), "shared")
+	if err := os.Mkdir(shared, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(shared, 0777); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", shared)
+	getenv := func(key string) string {
+		if key == "USER" {
+			return user
+		}
+		return ""
+	}
+	if dataDir, err := resolveDataDir(getenv, func() string { return "" }); err == nil {
+		_ = os.RemoveAll(dataDir)
+		t.Fatalf("fallback accepted replaceable temporary parent %q", shared)
+	}
 }
 
 // The core requirement: the data directory must never be inside the

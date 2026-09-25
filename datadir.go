@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -87,14 +88,15 @@ func legacyDataDirsForExecutable(goos string, getenv func(string) string, home f
 }
 
 // resolveDataDir picks the data directory: the KEYROUTER_DATA override wins,
-// then the platform app-data directory, then a user-scoped last-resort temp
-// dir (so the SQLite DB, which holds API keys, is never world-readable).
-func resolveDataDir(getenv func(string) string, defaultDir func() string) string {
+// then the platform app-data directory, then a private per-user temp dir.
+// The fallback is created atomically only below a non-replaceable temp parent;
+// existing directories are accepted only when their contents are also private.
+func resolveDataDir(getenv func(string) string, defaultDir func() string) (string, error) {
 	if d := getenv("KEYROUTER_DATA"); d != "" {
-		return d
+		return d, nil
 	}
 	if d := defaultDir(); d != "" {
-		return d
+		return d, nil
 	}
 	user := getenv("USER")
 	if user == "" {
@@ -103,7 +105,67 @@ func resolveDataDir(getenv func(string) string, defaultDir func() string) string
 	if user == "" {
 		user = "user"
 	}
-	return filepath.Join(os.TempDir(), "keyrouter-"+user)
+	user = fallbackUserComponent(user)
+	tempDir, err := filepath.Abs(os.TempDir())
+	if err != nil {
+		return "", fmt.Errorf("resolve temporary directory: %w", err)
+	}
+	tempDir, err = filepath.EvalSymlinks(tempDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve temporary directory: %w", err)
+	}
+	if err := validateFallbackTempParent(tempDir); err != nil {
+		return "", fmt.Errorf("unsafe temporary directory: %w", err)
+	}
+	d := filepath.Join(tempDir, "keyrouter-"+user)
+	if err := ensurePrivateFallbackDataDir(d); err != nil {
+		return "", fmt.Errorf("secure temporary fallback data directory: %w", err)
+	}
+	return d, nil
+}
+
+func fallbackUserComponent(user string) string {
+	return strings.NewReplacer("/", "_", `\`, "_").Replace(user)
+}
+
+func fallbackTempParentDirs(dir string) ([]string, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, err
+	}
+	var dirs []string
+	for current := filepath.Clean(abs); ; current = filepath.Dir(current) {
+		dirs = append(dirs, current)
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+	}
+	return dirs, nil
+}
+
+func ensurePrivateFallbackDataDir(dir string) error {
+	if err := createPrivateFallbackDataDir(dir); err == nil {
+		info, err := os.Lstat(dir)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || !privateFallbackDataDir(dir, info) {
+			return fmt.Errorf("refusing newly created insecure directory %q", dir)
+		}
+		return nil
+	} else if !os.IsExist(err) {
+		return err
+	}
+
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || !privateFallbackDataDir(dir, info) {
+		return fmt.Errorf("refusing insecure pre-existing directory %q", dir)
+	}
+	return nil
 }
 
 // migrateLegacyData copies user data from the legacy data directories (see
