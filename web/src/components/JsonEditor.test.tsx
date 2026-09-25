@@ -186,4 +186,17 @@ describe('JsonEditor — validity notification', () => {
     expect(onValid).toHaveBeenCalledTimes(1);
     expect(onValid).toHaveBeenLastCalledWith(false);
   });
+
+  it('maps a trimmed JSON parser position to the textarea line after leading blank lines', () => {
+    const value = '\n\nnot-json';
+    const parse = vi.spyOn(JSON, 'parse').mockImplementationOnce(() => {
+      throw new SyntaxError('Unexpected token at position 0');
+    });
+    spies.push(parse);
+
+    const { getByText } = render(<JsonEditor value={value} />);
+
+    expect(parse).toHaveBeenCalledWith(value.trim());
+    expect(getByText(/line 3/).textContent).toContain('(line 3)');
+  });
 });

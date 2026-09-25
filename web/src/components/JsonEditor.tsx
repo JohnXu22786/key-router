@@ -32,6 +32,8 @@ function lineOf(text: string, pos: number): number {
 function parseJSON(text: string): { ok: boolean; error?: string; line?: number } {
   const trimmed = text.trim();
   if (trimmed === '') return { ok: true };
+  // JSON.parse positions and JavaScript string lengths both use UTF-16 code units.
+  const leadingOffset = text.length - text.trimStart().length;
   try {
     JSON.parse(trimmed);
     return { ok: true };
@@ -42,7 +44,7 @@ function parseJSON(text: string): { ok: boolean; error?: string; line?: number }
     return {
       ok: false,
       error: String(e?.message ?? 'Invalid JSON'),
-      line: pos != null ? lineOf(text, Math.min(pos, text.length)) : undefined,
+      line: pos != null ? lineOf(text, Math.min(leadingOffset + pos, text.length)) : undefined,
     };
   }
 }
