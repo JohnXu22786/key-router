@@ -178,6 +178,46 @@ func TestFindAssetPortableVsInstalled(t *testing.T) {
 			want: "KeyRouter-v0.3.2-linux-amd64.deb",
 		},
 		{
+			name: "linux arm64 portable does not select amd64 assets",
+			goos: "linux", goarch: "arm64", mode: "portable",
+			assets: []Asset{
+				{Name: "KeyRouter-v0.3.2-linux-amd64"},
+				{Name: "KeyRouter-v0.3.2-linux-amd64.tar.gz"},
+				{Name: "KeyRouter-v0.3.2-linux-amd64.deb"},
+			},
+			want: "",
+		},
+		{
+			name: "linux arm64 portable selects an exact arm64 asset",
+			goos: "linux", goarch: "arm64", mode: "portable",
+			assets: []Asset{
+				{Name: "KeyRouter-v0.3.2-linux-amd64"},
+				{Name: "KeyRouter-v0.3.2-linux-arm64"},
+			},
+			want: "KeyRouter-v0.3.2-linux-arm64",
+		},
+		{
+			name: "linux arm64 installed does not select amd64 deb",
+			goos: "linux", goarch: "arm64", mode: "installed",
+			assets: []Asset{{Name: "KeyRouter-v0.3.2-linux-amd64.deb"}},
+			want:   "",
+		},
+		{
+			name: "linux arm64 installed selects an exact arm64 deb",
+			goos: "linux", goarch: "arm64", mode: "installed",
+			assets: []Asset{
+				{Name: "KeyRouter-v0.3.2-linux-amd64.deb"},
+				{Name: "KeyRouter-v0.3.2-linux-arm64.deb"},
+			},
+			want: "KeyRouter-v0.3.2-linux-arm64.deb",
+		},
+		{
+			name: "unsupported linux architecture does not fall back to amd64",
+			goos: "linux", goarch: "ppc64le", mode: "portable",
+			assets: []Asset{{Name: "KeyRouter-v0.3.2-linux-amd64"}},
+			want:   "",
+		},
+		{
 			name: "darwin arm64 portable skips the .dmg that precedes the raw binary",
 			goos: "darwin", goarch: "arm64", mode: "portable",
 			assets: []Asset{
