@@ -163,9 +163,15 @@ const Models: React.FC = () => {
     {
       title: 'Pricing ($/1M)', key: 'pricing',
       render: (_: unknown, r: Route) => {
-        const hasPrice = r.prompt_per_1m || r.completion_per_1m;
-        return hasPrice
-          ? <Tag color="blue">${r.prompt_per_1m.toFixed(4)} / ${r.completion_per_1m.toFixed(4)}</Tag>
+        const rates = [
+          ['Prompt', r.prompt_per_1m],
+          ['Completion', r.completion_per_1m],
+          ['Cache read', r.cache_read_per_1m],
+          ['Cache write', r.cache_write_per_1m],
+        ] as const;
+        const overrides = rates.filter(([, rate]) => rate !== 0);
+        return overrides.length > 0
+          ? <Tag color="blue">{overrides.map(([label, rate]) => `${label} $${rate.toFixed(4)}`).join(' · ')}</Tag>
           : <Tag>inherit</Tag>;
       },
     },
