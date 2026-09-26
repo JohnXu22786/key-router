@@ -14,7 +14,7 @@ import { getActivity, ActivityResponse, ActivityGroupSummary } from '../api/clie
 import {
   DateRange, ActivityFilter, CUSTOM_KEY, filterKey, fmtUSDInt, fmtTokens, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS,
   fmtPercent, fmt3sig, fmtTick, fmtBucket, modelFavicon, Granularity,
-  ActivityOutputRollup, activitySourcePlan, liveExtensionEligible,
+  ActivityOutputRollup, activitySourcePlan, liveExtensionEligible, stackedGroupKey,
   normalizeActivitySourceResponse, combineBlendedResponses,
   limitActivityResponse,
 } from './activityShared';
@@ -79,10 +79,9 @@ const CHART_TYPES = [
   { key: 'line', label: 'Line chart' },
 ] as const;
 
-// Separator between a group and its subgroup in chart row keys. Names can
-// contain most printable chars, so a control char is safe.
-const SEP = '\u0001';
-const keyFor = (g: string, sg: string) => (sg ? g + SEP + sg : g);
+// Encode the pair so arbitrary group names cannot collide with bucket metadata
+// or ordinary object properties; JSON preserves the group/subgroup boundary.
+const keyFor = (g: string, sg: string) => stackedGroupKey(JSON.stringify([g, sg]));
 const displayFor = (g: string, sg: string) => (sg ? `${g} · ${sg}` : g);
 
 // rollupGran maps the API rollup value to a chart-label granularity. The

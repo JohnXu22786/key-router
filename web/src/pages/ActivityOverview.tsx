@@ -6,7 +6,7 @@ import {
   BarChart, Bar, LineChart, Line,
 } from 'recharts';
 import { getConsumptions, getKeys, Consumption, Key } from '../api/client';
-import { DateRange, ActivityFilter, CUSTOM_KEY, filterKey, ExploreOpts, fmtUSD, fmtTokens, fmtCompact, fmtTokensBare, fmtUSDInt, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtPercent, fmtTick, fmtBucket, series, stackedData, groupTotals, bucketWindowShare, Granularity, maskKey, cacheHitRate } from './activityShared';
+import { DateRange, ActivityFilter, CUSTOM_KEY, filterKey, ExploreOpts, fmtUSD, fmtTokens, fmtCompact, fmtTokensBare, fmtUSDInt, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtPercent, fmtTick, fmtBucket, series, stackedData, stackedGroupKey, groupTotals, bucketWindowShare, Granularity, maskKey, cacheHitRate } from './activityShared';
 import dayjs from 'dayjs';
 
 const { Text } = Typography;
@@ -326,10 +326,12 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
   const otherModelSet = new Set(modelSpend.slice(5).map(([m]) => m));
   usageByModel.forEach(row => {
     let sum = 0;
-    for (const [g, v] of Object.entries(row)) {
-      if (g !== 'label' && g !== 'Other' && otherModelSet.has(g)) { sum += (v as number); delete (row as any)[g]; }
+    for (const g of otherModelSet) {
+      const key = stackedGroupKey(g);
+      sum += row[key] ?? 0;
+      delete row[key];
     }
-    (row as any).Other = sum;
+    row[stackedGroupKey('Other')] = sum;
   });
   const modelGroups: LegendGroup[] = (hasSpend ? [...topModels, 'Other'] : []).map((m, i) => ({
     name: m,
@@ -346,10 +348,12 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
   const otherReqSet = new Set(modelReqs.slice(5).map(([m]) => m));
   reqByModel.forEach(row => {
     let sum = 0;
-    for (const [g, v] of Object.entries(row)) {
-      if (g !== 'label' && g !== 'Other' && otherReqSet.has(g)) { sum += (v as number); delete (row as any)[g]; }
+    for (const g of otherReqSet) {
+      const key = stackedGroupKey(g);
+      sum += row[key] ?? 0;
+      delete row[key];
     }
-    (row as any).Other = sum;
+    row[stackedGroupKey('Other')] = sum;
   });
   const reqGroups: LegendGroup[] = (hasRequests ? [...topReqModels, 'Other'] : []).map((m, i) => ({
     name: m,
@@ -508,7 +512,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
                 <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => fmtUSDInt(Number(v))} />
                 <Tooltip formatter={(v: any, name: any) => [fmtUSD(Number(v)), String(name)]} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
                 {vis.map((m, i) => (
-                  <Bar key={m} dataKey={m} stackId="a" fill={modelColor.get(m)} maxBarSize={22} radius={i === vis.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]} />
+                  <Bar key={m} dataKey={(row: Record<string, any>) => row[stackedGroupKey(m)]} name={m} stackId="a" fill={modelColor.get(m)} maxBarSize={22} radius={i === vis.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]} />
                 ))}
               </BarChart>
             </ResponsiveContainer>
@@ -526,7 +530,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
                 <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={50} tickFormatter={(v) => fmtCompact(Number(v))} />
                 <Tooltip formatter={(v: any, name: any) => [fmtCompact(Number(v)), String(name)]} contentStyle={{ borderRadius: 8, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
                 {vis.map((m, i) => (
-                  <Bar key={m} dataKey={m} stackId="a" fill={reqColor.get(m)} maxBarSize={14} radius={i === vis.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]} />
+                  <Bar key={m} dataKey={(row: Record<string, any>) => row[stackedGroupKey(m)]} name={m} stackId="a" fill={reqColor.get(m)} maxBarSize={14} radius={i === vis.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]} />
                 ))}
               </BarChart>
             </ResponsiveContainer>

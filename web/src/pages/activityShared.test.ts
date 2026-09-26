@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import dayjs from 'dayjs';
 import {
-  makeRanges, customRange, granularityFor, series, stackedData, bucketAxis,
+  makeRanges, customRange, granularityFor, series, stackedData, stackedGroupKey, bucketAxis,
   bucketWindowShare, groupTotals, floorWindowUntil, exclusiveUntil, queryWindowUntil,
   prevWindowUntil,
   fmtTick, fmtBucket, fmtDayLabel, CUSTOM_KEY,
@@ -714,7 +714,7 @@ describe('series — rolling windows never accumulate phantom data', () => {
       { hour_bucket: '2026-08-13T16:00:00', m: 'a', n: 5 },
     ];
     const stacked = stackedData(rows, ['a', 'b'], r => r.m, r => r.n, since, until, until, 'hour');
-    expect(stacked.map(r => [r.label, r.a, r.b])).toEqual([
+    expect(stacked.map(r => [r.label, r[stackedGroupKey('a')], r[stackedGroupKey('b')]])).toEqual([
       ['08-13 13:00', 55, 0],
       ['08-13 14:00', 60, 0],
       ['08-13 15:00', 0, 60],
@@ -1042,8 +1042,8 @@ describe('stackedData', () => {
     ];
     const out = stackedData(rows, ['a', 'b'], r => r.m, r => r.n, since, until, until, 'hour');
     expect(out).toEqual([
-      { label: '08-13 09:00', sort: '2026-08-13 09:00', a: 2, b: 0 },
-      { label: '08-13 10:00', sort: '2026-08-13 10:00', a: 0, b: 4 },
+      { label: '08-13 09:00', sort: '2026-08-13 09:00', [stackedGroupKey('a')]: 2, [stackedGroupKey('b')]: 0 },
+      { label: '08-13 10:00', sort: '2026-08-13 10:00', [stackedGroupKey('a')]: 0, [stackedGroupKey('b')]: 4 },
     ]);
   });
 
@@ -1057,13 +1057,30 @@ describe('stackedData', () => {
     ];
     const out = stackedData(rows, ['top1', 'Other'], r => r.m, r => r.n, since, until, until, 'hour');
     // The caller folds 'tail' into Other: total must stay 6, never NaN.
-    let other = 0;
-    for (const [g, v] of Object.entries(out[0])) {
-      if (g !== 'label' && g !== 'sort' && g !== 'top1') other += v as number;
+    expect(out[0][stackedGroupKey('top1')]).toBe(1);
+    expect(out[0][stackedGroupKey('tail')]).toBe(5);
+    expect(Number.isNaN(out[0][stackedGroupKey('tail')])).toBe(false);
+  });
+
+  it('keeps metadata and values intact for reserved and prototype group names', () => {
+    const since = dayjs('2026-08-13T09:00:00');
+    const until = dayjs('2026-08-13T10:00:00');
+    const groups = ['label', 'sort', '__proto__', 'constructor', 'ordinary'];
+    const rows = groups.map((m, i) => ({
+      hour_bucket: '2026-08-13T09:00:00', m, n: i + 1,
+    }));
+    const out = stackedData(rows, groups, r => r.m, r => r.n, since, until, until, 'hour');
+
+    expect(out).toHaveLength(1);
+    expect(out[0].label).toBe('08-13 09:00');
+    expect(out[0].sort).toBe('2026-08-13 09:00');
+    for (const [i, group] of groups.entries()) {
+      expect(out[0][stackedGroupKey(group)]).toBe(i + 1);
+      if (group !== 'label' && group !== 'sort') {
+        expect(Object.prototype.hasOwnProperty.call(out[0], group)).toBe(false);
+      }
     }
-    expect(out[0].top1).toBe(1);
-    expect(other).toBe(5);
-    expect(Number.isNaN(out[0].tail)).toBe(false);
+    expect(Object.getPrototypeOf(out[0])).toBe(Object.prototype);
   });
 });
 
@@ -1300,11 +1317,11 @@ describe('stackedData — sub-hour distribution per group', () => {
     ];
     const out = stackedData(rows, ['a', 'b'], r => r.m, r => r.n, since, until, until, 'minute');
     // 15:50-15:59: a=2, b=1 each; the 16:00 bucket starts AT until — excluded.
-    expect(out.map(r => ({ a: r.a, b: r.b }))).toEqual([
+    expect(out.map(r => ({ a: r[stackedGroupKey('a')], b: r[stackedGroupKey('b')] }))).toEqual([
       { a: 2, b: 1 }, { a: 2, b: 1 }, { a: 2, b: 1 }, { a: 2, b: 1 }, { a: 2, b: 1 },
       { a: 2, b: 1 }, { a: 2, b: 1 }, { a: 2, b: 1 }, { a: 2, b: 1 }, { a: 2, b: 1 },
     ]);
-    expect(Number.isNaN(out[0].a)).toBe(false);
+    expect(Number.isNaN(out[0][stackedGroupKey('a')])).toBe(false);
   });
 });
 
@@ -2399,8 +2416,8 @@ describe('toChartData', () => {
       ],
       ['01-01', '01-02']);
     expect(toChartData(r)).toEqual([
-      { label: '01-01', a: 1, b: 2 },
-      { label: '01-02', a: 0, b: 0 },
+      { label: '01-01', [stackedGroupKey('a')]: 1, [stackedGroupKey('b')]: 2 },
+      { label: '01-02', [stackedGroupKey('a')]: 0, [stackedGroupKey('b')]: 0 },
     ]);
   });
 
@@ -2417,8 +2434,25 @@ describe('toChartData', () => {
     );
 
     expect(toChartData(r)).toEqual([
-      { label: '01-01', a: 5, b: 4 },
-      { label: '01-02', a: 1, b: 0 },
+      { label: '01-01', [stackedGroupKey('a')]: 5, [stackedGroupKey('b')]: 4 },
+      { label: '01-02', [stackedGroupKey('a')]: 1, [stackedGroupKey('b')]: 0 },
     ]);
+  });
+
+  it('preserves bucket labels and values for reserved, prototype, and path-like group names', () => {
+    const groups = ['label', 'sort', '__proto__', 'constructor', 'a.b', 'ordinary'];
+    const r = resp(
+      groups.map((group, i) => ({ group, sum: i + 1 })),
+      groups.map((group, i) => ({ bucket: '01-01', group, value: i + 1 })),
+      ['01-01'],
+    );
+
+    const [row] = toChartData(r);
+    expect(row.label).toBe('01-01');
+    for (const [i, group] of groups.entries()) {
+      expect(row[stackedGroupKey(group)]).toBe(i + 1);
+      if (group !== 'label') expect(Object.prototype.hasOwnProperty.call(row, group)).toBe(false);
+    }
+    expect(Object.getPrototypeOf(row)).toBe(Object.prototype);
   });
 });

@@ -6,7 +6,7 @@ import {
   Tooltip as RTooltip, ResponsiveContainer,
 } from 'recharts';
 import { getActivity, getKeys, ActivityResponse } from '../api/client';
-import { DateRange, ActivityFilter, filterKey, fmtUSD, fmtUSDInt, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtTick, fmtBucket, ExploreOpts, maskKey, toChartData, computeTrending, modelFavicon, ActivityOutputRollup, Granularity, activitySourcePlan, normalizeActivitySourceResponse, limitActivityResponse, liveExtensionEligible } from './activityShared';
+import { DateRange, ActivityFilter, filterKey, fmtUSD, fmtUSDInt, fmtCompact, CHART_COLORS, OTHER_COLOR, GRID, AXIS, fmtTick, fmtBucket, ExploreOpts, maskKey, toChartData, stackedGroupKey, computeTrending, modelFavicon, ActivityOutputRollup, Granularity, activitySourcePlan, normalizeActivitySourceResponse, limitActivityResponse, liveExtensionEligible } from './activityShared';
 import dayjs from 'dayjs';
 const { Text } = Typography;
 
@@ -284,7 +284,7 @@ const TrendSection: React.FC<SectionProps> = ({ title, groupBy, range, filter, o
           <BarChart data={chartData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
             {axes}
             {visibleGroups.map((g, i) => (
-              <Bar key={g} dataKey={g} stackId="1" fill={colors.get(g)} maxBarSize={12}
+              <Bar key={g} dataKey={(row: Record<string, string | number>) => row[stackedGroupKey(g)]} name={g} stackId="1" fill={colors.get(g)} maxBarSize={12}
                 radius={i === visibleGroups.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]} />
             ))}
           </BarChart>
@@ -292,14 +292,14 @@ const TrendSection: React.FC<SectionProps> = ({ title, groupBy, range, filter, o
           <AreaChart data={chartData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
             {axes}
             {visibleGroups.map(g => (
-              <Area key={g} dataKey={g} stackId="1" stroke={colors.get(g)} fill={colors.get(g)} fillOpacity={0.4} />
+              <Area key={g} dataKey={(row: Record<string, string | number>) => row[stackedGroupKey(g)]} name={g} stackId="1" stroke={colors.get(g)} fill={colors.get(g)} fillOpacity={0.4} />
             ))}
           </AreaChart>
         ) : (
           <LineChart data={chartData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
             {axes}
             {visibleGroups.map(g => (
-              <Line key={g} dataKey={g} type="monotone" stroke={colors.get(g)} strokeWidth={2} dot={false} />
+              <Line key={g} dataKey={(row: Record<string, string | number>) => row[stackedGroupKey(g)]} name={g} type="monotone" stroke={colors.get(g)} strokeWidth={2} dot={false} />
             ))}
           </LineChart>
         )}

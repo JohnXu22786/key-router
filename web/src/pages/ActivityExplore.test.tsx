@@ -6,6 +6,7 @@ import dayjs from 'dayjs';
 import ActivityExplore from './ActivityExplore';
 import { getActivity } from '../api/client';
 import type { ActivityResponse, ActivityGroupSummary } from '../api/client';
+import { stackedGroupKey } from './activityShared';
 import type { DateRange } from './activityShared';
 
 // The page slices the server summary to Top-N client-side, but the endpoint
@@ -19,11 +20,13 @@ vi.mock('../api/client', async (importOriginal) => {
 });
 
 // The chart needs a layout engine jsdom lacks (ResizeObserver-backed
-// ResponsiveContainer); the table/footer are what this test pins, so render
-// the chart as a no-op.
+// ResponsiveContainer). Capture chart rows for data regressions; graphical
+// items remain no-ops.
 vi.mock('recharts', () => {
   const pass = ({ children }: { children?: ReactNode }) => children ?? null;
-  const chart = ({ children }: { children?: ReactNode }) => <div data-testid="explore-chart">{children}</div>;
+  const chart = ({ children, data }: { children?: ReactNode; data?: Record<string, string | number>[] }) => (
+    <div data-testid="explore-chart" data-chart={JSON.stringify(data ?? [])}>{children}</div>
+  );
   const nul = () => null;
   return {
     ResponsiveContainer: pass,
@@ -253,6 +256,22 @@ describe('ActivityExplore summary footer', () => {
     const calls = vi.mocked(getActivity).mock.calls;
     expect(calls.map(([params]) => params.metric).sort()).toEqual(['spend', 'tokens']);
     expect(calls.every(([params]) => params.rank_by === 'blended')).toBe(true);
+  });
+
+  it('keeps the bucket label and value when a model is named label', async () => {
+    const collisionResponse = makeResponse(1);
+    collisionResponse.series = [{ bucket: '2026-08-13', group: 'label', value: 42, is_zero: false }];
+    collisionResponse.summary = [{
+      group: 'label', min: 42, max: 42, avg: 42, sum: 42, value: 42, percent: 100,
+    }];
+    vi.mocked(getActivity).mockResolvedValue({ data: collisionResponse } as any);
+
+    render(<ActivityExplore range={range} />);
+    const chart = await screen.findByTestId('explore-chart');
+    expect(JSON.parse(chart.getAttribute('data-chart')!)).toEqual([{
+      label: '2026-08-13', [stackedGroupKey(JSON.stringify(['label', '']))]: 42,
+    }]);
+    expect(screen.getAllByText('label').length).toBeGreaterThan(0);
   });
 
   it('clears stale data when custom bounds change and the replacement request fails', async () => {

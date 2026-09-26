@@ -15,12 +15,21 @@ vi.mock('../api/client', async (importOriginal) => {
 });
 
 vi.mock('recharts', () => {
+  let currentChartData: Record<string, any>[] = [];
   const pass = ({ children }: { children?: unknown }) => children ?? null;
+  const barChart = ({ children, data }: { children?: unknown; data?: Record<string, any>[] }) => {
+    currentChartData = data ?? [];
+    return children ?? null;
+  };
+  const bar = ({ dataKey, name }: { dataKey: string | ((row: Record<string, any>) => unknown); name: string }) => {
+    const values = currentChartData.map(row => typeof dataKey === 'function' ? dataKey(row) : row[dataKey]);
+    return <span data-testid="activity-overview-series" data-name={name} data-values={JSON.stringify(values)} />;
+  };
   const nul = () => null;
   return {
     ResponsiveContainer: pass,
-    BarChart: pass,
-    Bar: nul,
+    BarChart: barChart,
+    Bar: bar,
     LineChart: pass,
     Line: nul,
     XAxis: nul,
@@ -303,5 +312,28 @@ describe('ActivityOverview empty state', () => {
 
     await waitFor(() => expect(screen.getAllByRole('group', { name: 'in-range-model' })).toHaveLength(2));
     expect(screen.queryAllByRole('group', { name: 'boundary-model' })).toHaveLength(0);
+  });
+
+  it('reads reserved model keys and folds chart tails into Other', async () => {
+    const names = ['label', 'sort', 'top-3', 'top-4', 'top-5', '__proto__', 'constructor', 'dotted.name'];
+    const rows = names.map((model_name, i) => ({
+      ...makeConsumption(100 - i * 10, '2026-08-01T12:00:00'),
+      model_name,
+      request_count: i + 1,
+    }));
+    vi.mocked(getConsumptions)
+      .mockResolvedValueOnce(response(rows))
+      .mockResolvedValueOnce(response([]));
+
+    render(<ActivityOverview range={customRange(dayjs('2026-08-01T00:00:00'), dayjs('2026-08-02T00:00:00'))} />);
+    await waitFor(() => expect(screen.getAllByTestId('activity-overview-series')).toHaveLength(16));
+
+    const valuesFor = (name: string) => screen.getAllByTestId('activity-overview-series')
+      .filter(element => element.getAttribute('data-name') === name)
+      .map(element => (JSON.parse(element.getAttribute('data-values')!) as number[])
+        .reduce((sum, value) => sum + value, 0));
+    expect(valuesFor('label')).toEqual([100]);
+    expect(valuesFor('sort')).toEqual([90]);
+    expect(valuesFor('Other')).toEqual([120, 6]);
   });
 });
