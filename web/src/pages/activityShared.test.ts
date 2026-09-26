@@ -2306,7 +2306,7 @@ describe('label formatters', () => {
 // --- computeTrending (Trends "Trending" card) ------------------------------
 
 // resp builds a minimal ActivityResponse with the given summary/series.
-function resp(summary: Array<{ group: string; sum: number }>, series: Array<{ bucket: string; group: string; value: number }>, buckets: string[]): ActivityResponse {
+function resp(summary: Array<{ group: string; sum: number }>, series: Array<{ bucket: string; group: string; subgroup?: string; value: number }>, buckets: string[]): ActivityResponse {
   return {
     metric: 'spend', group_by: 'model', rollup: 'day',
     series: series.map(p => ({ ...p, is_zero: p.value === 0 })),
@@ -2401,6 +2401,24 @@ describe('toChartData', () => {
     expect(toChartData(r)).toEqual([
       { label: '01-01', a: 1, b: 2 },
       { label: '01-02', a: 0, b: 0 },
+    ]);
+  });
+
+  it('sums subgroup points that share a primary group and bucket', () => {
+    const r = resp(
+      [{ group: 'a', sum: 6 }, { group: 'b', sum: 4 }],
+      [
+        { bucket: '01-01', group: 'a', subgroup: 'key-1', value: 2 },
+        { bucket: '01-01', group: 'a', subgroup: 'key-2', value: 3 },
+        { bucket: '01-01', group: 'b', value: 4 },
+        { bucket: '01-02', group: 'a', subgroup: 'key-1', value: 1 },
+      ],
+      ['01-01', '01-02'],
+    );
+
+    expect(toChartData(r)).toEqual([
+      { label: '01-01', a: 5, b: 4 },
+      { label: '01-02', a: 1, b: 0 },
     ]);
   });
 });
