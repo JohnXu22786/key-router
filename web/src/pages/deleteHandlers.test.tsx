@@ -19,7 +19,7 @@ import { message } from 'antd';
 import Providers from './Providers';
 import Models from './Models';
 import {
-  getProviders, updateProvider, deleteProvider,
+  getProviders, createKey, updateProvider, deleteProvider,
   getKeys, updateKey, deleteKey, getKeyDetail,
   getRoutes, getModelGroups, updateModelGroup, deleteModelGroup,
   updateRoute, deleteRoute, reorderKeys, reorderRoutes,
@@ -32,6 +32,7 @@ vi.mock('../api/client', async (importOriginal) => {
   return {
     ...actual,
     getProviders: vi.fn(),
+    createKey: vi.fn(),
     updateProvider: vi.fn(),
     deleteProvider: vi.fn(),
     getKeys: vi.fn(),
@@ -93,6 +94,7 @@ const route1: Route = {
 
 beforeEach(() => {
   vi.mocked(getProviders).mockResolvedValue({ data: [] } as any);
+  vi.mocked(createKey).mockResolvedValue({ data: key1 } as any);
   vi.mocked(getKeys).mockResolvedValue({ data: [] } as any);
   vi.mocked(getRoutes).mockResolvedValue({ data: [] } as any);
   vi.mocked(getModelGroups).mockResolvedValue({ data: [] } as any);
@@ -200,6 +202,54 @@ describe('Providers — fractional cost metric change validation', () => {
     });
     expect(updateKey).not.toHaveBeenCalled();
   }, 15000);
+});
+
+describe('Providers — whole-number count limit validation', () => {
+  it('rejects a fractional fixed RPM value when creating a key', async () => {
+    vi.mocked(getProviders).mockResolvedValue({ data: [prov1] } as any);
+    vi.mocked(getKeys).mockResolvedValue({ data: [] } as any);
+    vi.mocked(getRoutes).mockResolvedValue({ data: [] } as any);
+    const { findByText } = render(<Providers />);
+    await findByText('P1');
+
+    fireEvent.click(screen.getByRole('button', { name: /Add Key/ }));
+    const keyInput = screen.getByLabelText('API Key');
+    fireEvent.change(keyInput, { target: { value: 'sk-new' } });
+    const rpmInput = screen.getByRole('spinbutton', { name: 'RPM (requests)' });
+    fireEvent.change(rpmInput, { target: { value: '1.5' } });
+    fireEvent.blur(rpmInput);
+
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'OK' })); });
+
+    expect(await screen.findByText('Enter a whole-number limit.')).not.toBeNull();
+    expect(createKey).not.toHaveBeenCalled();
+  });
+
+  it('rejects a fractional request limit when editing a key', async () => {
+    const countKey = { ...key1, rpd_metric: 'requests', rpd_limit: 10 } as Key;
+    vi.mocked(getProviders).mockResolvedValue({ data: [prov1] } as any);
+    vi.mocked(getKeys).mockResolvedValue({ data: [countKey] } as any);
+    vi.mocked(getRoutes).mockResolvedValue({ data: [] } as any);
+    const { container, findByText } = render(<Providers />);
+    await findByText('P1');
+    const header = container.querySelector('.ant-collapse-header') as HTMLElement | null;
+    if (!header) throw new Error('provider collapse header not found');
+    await act(async () => { fireEvent.click(header); });
+    await findByText('K1');
+
+    const editButton = container.querySelector('button[title="Edit"]') as HTMLButtonElement | null;
+    if (!editButton) throw new Error('key edit button not found');
+    await act(async () => { fireEvent.click(editButton); });
+    await findByText('Edit Key');
+
+    const dailyInput = screen.getByRole('spinbutton', { name: 'Daily Limit' });
+    fireEvent.change(dailyInput, { target: { value: '1.5' } });
+    fireEvent.blur(dailyInput);
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'OK' })); });
+
+    expect(await screen.findByText('Request and token limits must be whole numbers.')).not.toBeNull();
+    expect(updateKey).not.toHaveBeenCalled();
+  });
 });
 
 describe('Models — delete handler must call the imported api function', () => {

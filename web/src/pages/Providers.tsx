@@ -90,6 +90,27 @@ const Providers: React.FC = () => {
   // (ant-design/ant-design#53981), so after openEditKey it would report the
   // whole form as edited and re-send the entire key on every save.
   const keyFormBaselineRef = useRef<Record<string, any> | null>(null);
+  const wholeCountRules = [
+    {
+      validator: (_rule: any, value: number | null | undefined) =>
+        value == null || Number.isInteger(value)
+          ? Promise.resolve()
+          : Promise.reject(new Error('Enter a whole-number limit.')),
+    },
+  ];
+  const metricLimitRules = (metricField: string) => [
+    {
+      validator: (_rule: any, value: number | null | undefined) => {
+        const metric = keyForm.getFieldValue(metricField);
+        if (value == null || metric === 'cost' || Number.isInteger(value)) return Promise.resolve();
+        // Let B41's payload guard give its more specific guidance when a
+        // fractional USD value is carried across a cost-to-count switch.
+        const wasCost = keyFormBaselineRef.current?.[metricField] === 'cost';
+        if (wasCost && (metric === 'requests' || metric === 'tokens')) return Promise.resolve();
+        return Promise.reject(new Error('Request and token limits must be whole numbers.'));
+      },
+    },
+  ];
   // Number of drag orders committed but not yet persisted: the background
   // poll must not overwrite the local order with pre-persist server state.
   // Mirror (assigned during render, Models.tsx pattern) so the SSE handler
@@ -602,19 +623,19 @@ const Providers: React.FC = () => {
             </Typography.Paragraph>
             {/* Window limits: fixed 3-column grid, no auto-wrap */}
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '0 16px' }}>
-              <Form.Item name="rpm_limit" label="RPM (requests)"><InputNumber min={0} placeholder="500" style={{ width: '100%' }} /></Form.Item>
-              <Form.Item name="tpm_limit" label="TPM (tokens)"><InputNumber min={0} placeholder="200000" style={{ width: '100%' }} /></Form.Item>
+              <Form.Item name="rpm_limit" label="RPM (requests)" rules={wholeCountRules}><InputNumber min={0} placeholder="500" style={{ width: '100%' }} /></Form.Item>
+              <Form.Item name="tpm_limit" label="TPM (tokens)" rules={wholeCountRules}><InputNumber min={0} placeholder="200000" style={{ width: '100%' }} /></Form.Item>
               <div />{/* spacer for row 1 col 3 */}
-              <Form.Item name="rp5h_limit" label="5-Hour Limit"><InputNumber min={0} placeholder="5000" style={{ width: '100%' }} /></Form.Item>
+              <Form.Item name="rp5h_limit" label="5-Hour Limit" dependencies={['rp5h_metric']} rules={metricLimitRules('rp5h_metric')}><InputNumber min={0} placeholder="5000" style={{ width: '100%' }} /></Form.Item>
               <Form.Item name="rp5h_metric" label="5-Hour Metric"><Select style={{ width: '100%' }} options={metricOptions} /></Form.Item>
               <div />
-              <Form.Item name="rpd_limit" label="Daily Limit"><InputNumber min={0} placeholder="10000" style={{ width: '100%' }} /></Form.Item>
+              <Form.Item name="rpd_limit" label="Daily Limit" dependencies={['rpd_metric']} rules={metricLimitRules('rpd_metric')}><InputNumber min={0} placeholder="10000" style={{ width: '100%' }} /></Form.Item>
               <Form.Item name="rpd_metric" label="Daily Metric"><Select style={{ width: '100%' }} options={metricOptions} /></Form.Item>
               <div />
-              <Form.Item name="rpw_limit" label="Weekly Limit"><InputNumber min={0} placeholder="50000" style={{ width: '100%' }} /></Form.Item>
+              <Form.Item name="rpw_limit" label="Weekly Limit" dependencies={['rpw_metric']} rules={metricLimitRules('rpw_metric')}><InputNumber min={0} placeholder="50000" style={{ width: '100%' }} /></Form.Item>
               <Form.Item name="rpw_metric" label="Weekly Metric"><Select style={{ width: '100%' }} options={metricOptions} /></Form.Item>
               <div />
-              <Form.Item name="rpm_month_limit" label="Monthly Limit"><InputNumber min={0} placeholder="200000" style={{ width: '100%' }} /></Form.Item>
+              <Form.Item name="rpm_month_limit" label="Monthly Limit" dependencies={['rpm_metric']} rules={metricLimitRules('rpm_metric')}><InputNumber min={0} placeholder="200000" style={{ width: '100%' }} /></Form.Item>
               <Form.Item name="rpm_metric" label="Monthly Metric"><Select style={{ width: '100%' }} options={metricOptions} /></Form.Item>
             </div>
 
