@@ -108,6 +108,7 @@ const Providers: React.FC = () => {
   // between just schedule one trailing re-run.
   const keysRefetchingRef = useRef(false);
   const keysRefetchAgainRef = useRef(false);
+  const keysFetchAfterDragRef = useRef(false);
   const detailFetchingRef = useRef(false);
   const detailFetchAgainRef = useRef(false);
   // Drag-reorder with live preview animation (keys within a provider).
@@ -118,7 +119,7 @@ const Providers: React.FC = () => {
     next => persistOrder(next),
   );
 
-  const fetch = async () => {
+  const fetch = useCallback(async () => {
     setLoading(true);
     const wasPersisting = keyOrderPersistence.pending > 0;
     const gen = keyOrderPersistence.generation;
@@ -127,7 +128,9 @@ const Providers: React.FC = () => {
       if (!mountedRef.current) return;
       setProviders(p.data);
       setRoutes(r.data);
-      if (
+      if (drag.draggingRef.current) {
+        keysFetchAfterDragRef.current = true;
+      } else if (
         !wasPersisting &&
         keyOrderPersistence.pending === 0 &&
         gen === keyOrderPersistence.generation
@@ -136,23 +139,36 @@ const Providers: React.FC = () => {
       } else {
         // The key snapshot may predate an in-flight reorder. Wait for the
         // ordered writes, then fetch again so remount/CRUD refreshes converge.
-        await waitForKeyOrderWrites();
-        const settledGen = keyOrderPersistence.generation;
-        const latest = await getKeys();
-        if (!mountedRef.current) return;
-        if (keyOrderPersistence.pending === 0 && settledGen === keyOrderPersistence.generation) {
-          setKeys(prev => (jsonEqual(prev, latest.data) ? prev : latest.data));
+        while (mountedRef.current) {
+          await waitForKeyOrderWrites();
+          const settledGen = keyOrderPersistence.generation;
+          const latest = await getKeys();
+          if (!mountedRef.current) return;
+          if (drag.draggingRef.current) {
+            keysFetchAfterDragRef.current = true;
+            return;
+          }
+          if (keyOrderPersistence.pending === 0 && settledGen === keyOrderPersistence.generation) {
+            setKeys(prev => (jsonEqual(prev, latest.data) ? prev : latest.data));
+            return;
+          }
         }
       }
     } catch { if (mountedRef.current) message.error('Failed to load providers'); }
     finally { if (mountedRef.current) setLoading(false); }
-  };
+  }, [drag.draggingRef]);
 
   useEffect(() => {
     mountedRef.current = true;
     void fetch();
     return () => { mountedRef.current = false; };
-  }, []);
+  }, [fetch]);
+
+  useEffect(() => {
+    if (drag.dragging || !keysFetchAfterDragRef.current) return;
+    keysFetchAfterDragRef.current = false;
+    void fetch();
+  }, [drag.dragging, fetch]);
 
   // Refresh the open key-detail modal. Shared by the SSE push (key status
   // flips) and the 5s poll (window usage) — without the poll the modal's
