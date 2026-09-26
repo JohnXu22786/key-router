@@ -18,6 +18,22 @@ import { windowTypes, buildKeyPayload, KeyPayloadValidationError } from './keyPa
 
 const { Title, Text } = Typography;
 
+// Reorder writes and their poll guards outlive the Providers route component:
+// a request may still be running after the user navigates to another page.
+const keyOrderPersistence = {
+  pending: 0,
+  generation: 0,
+  queue: Promise.resolve() as Promise<void>,
+};
+// Coordinate independent Providers pages on the same browser origin.
+const keyOrderWriteLock = 'key-router:key-order-write';
+
+async function waitForKeyOrderWrites() {
+  while (keyOrderPersistence.pending > 0) {
+    await keyOrderPersistence.queue;
+  }
+}
+
 const statusColors: Record<string, string> = {
   active: 'green', rate_limited: 'orange', disabled: 'red', testing: 'blue',
 };
@@ -58,6 +74,7 @@ const Providers: React.FC = () => {
   const [keys, setKeys] = useState<Key[]>([]);
   const [routes, setRoutes] = useState<Route[]>([]);
   const [loading, setLoading] = useState(false);
+  const mountedRef = useRef(false);
   const [provModal, setProvModal] = useState(false);
   const [editingProv, setEditingProv] = useState<Provider | null>(null);
   const [keyModal, setKeyModal] = useState(false);
@@ -93,29 +110,49 @@ const Providers: React.FC = () => {
   const keysRefetchAgainRef = useRef(false);
   const detailFetchingRef = useRef(false);
   const detailFetchAgainRef = useRef(false);
-  // Captured at fetch START as well (with the persist generation), so a
-  // poll that raced a commit or a persist is discarded even if the persist
-  // settles before the poll response arrives.
-  const pendingPersistsRef = useRef(0);
-  const persistGenRef = useRef(0);
-
   // Drag-reorder with live preview animation (keys within a provider).
   const drag = useDragSort<Key>(
     keys,
     (from, to) => keys[from]?.provider_id === keys[to]?.provider_id,
-    (next) => { setKeys(next); persistOrder(next); },
+    next => setKeys(next),
+    next => persistOrder(next),
   );
 
   const fetch = async () => {
     setLoading(true);
+    const wasPersisting = keyOrderPersistence.pending > 0;
+    const gen = keyOrderPersistence.generation;
     try {
       const [p, k, r] = await Promise.all([getProviders(), getKeys(), getRoutes()]);
-      setProviders(p.data); setKeys(k.data); setRoutes(r.data);
-    } catch { message.error('Failed to load providers'); }
-    finally { setLoading(false); }
+      if (!mountedRef.current) return;
+      setProviders(p.data);
+      setRoutes(r.data);
+      if (
+        !wasPersisting &&
+        keyOrderPersistence.pending === 0 &&
+        gen === keyOrderPersistence.generation
+      ) {
+        setKeys(k.data);
+      } else {
+        // The key snapshot may predate an in-flight reorder. Wait for the
+        // ordered writes, then fetch again so remount/CRUD refreshes converge.
+        await waitForKeyOrderWrites();
+        const settledGen = keyOrderPersistence.generation;
+        const latest = await getKeys();
+        if (!mountedRef.current) return;
+        if (keyOrderPersistence.pending === 0 && settledGen === keyOrderPersistence.generation) {
+          setKeys(prev => (jsonEqual(prev, latest.data) ? prev : latest.data));
+        }
+      }
+    } catch { if (mountedRef.current) message.error('Failed to load providers'); }
+    finally { if (mountedRef.current) setLoading(false); }
   };
 
-  useEffect(() => { fetch(); }, []);
+  useEffect(() => {
+    mountedRef.current = true;
+    void fetch();
+    return () => { mountedRef.current = false; };
+  }, []);
 
   // Refresh the open key-detail modal. Shared by the SSE push (key status
   // flips) and the 5s poll (window usage) — without the poll the modal's
@@ -157,11 +194,10 @@ const Providers: React.FC = () => {
       // fetches whose out-of-order responses could briefly revert the table.
       if (keysRefetchingRef.current) { keysRefetchAgainRef.current = true; return; }
       keysRefetchingRef.current = true;
-      // Same race guards as the poll: a fetch that started while a drag
-      // commit or persist was pending (or raced one) is discarded, or the
-      // push would revert the UI to pre-persist order. The poll catches up.
-      const wasPersisting = pendingPersistsRef.current > 0;
-      const gen = persistGenRef.current;
+      // Ignore a response that started during an in-flight reorder so it
+      // cannot restore the previous server order.
+      const wasPersisting = keyOrderPersistence.pending > 0;
+      const gen = keyOrderPersistence.generation;
       getKeys().then(res => {
         keysRefetchingRef.current = false;
         if (keysRefetchAgainRef.current) {
@@ -170,7 +206,11 @@ const Providers: React.FC = () => {
           return;
         }
         if (drag.draggingRef.current) return;
-        if (!wasPersisting && pendingPersistsRef.current === 0 && gen === persistGenRef.current) {
+        if (
+          !wasPersisting &&
+          keyOrderPersistence.pending === 0 &&
+          gen === keyOrderPersistence.generation
+        ) {
           setKeys(prev => (jsonEqual(prev, res.data) ? prev : res.data));
         }
       }).catch(() => { keysRefetchingRef.current = false; });
@@ -194,8 +234,8 @@ const Providers: React.FC = () => {
       // skip keys unless no persist was pending at fetch start AND none is
       // pending now AND the persist generation is unchanged, or the poll
       // would revert the UI until the next one.
-      const wasPersisting = pendingPersistsRef.current > 0;
-      const gen = persistGenRef.current;
+      const wasPersisting = keyOrderPersistence.pending > 0;
+      const gen = keyOrderPersistence.generation;
       Promise.all([getProviders(), getKeys(), getRoutes()])
         .then(([p, k, r]) => {
           setProviders(prev => (jsonEqual(prev, p.data) ? prev : p.data));
@@ -203,7 +243,12 @@ const Providers: React.FC = () => {
           // Skip keys while a drag is in progress: the drag commit splices
           // the array at pointerdown-era indices, so the array must not
           // change underneath it (the next poll catches up).
-          if (!drag.draggingRef.current && !wasPersisting && pendingPersistsRef.current === 0 && gen === persistGenRef.current) {
+          if (
+            !drag.draggingRef.current &&
+            !wasPersisting &&
+            keyOrderPersistence.pending === 0 &&
+            gen === keyOrderPersistence.generation
+          ) {
             setKeys(prev => (jsonEqual(prev, k.data) ? prev : k.data));
           }
         })
@@ -306,25 +351,31 @@ const Providers: React.FC = () => {
     } catch { message.error('Failed to reset key spend'); }
   };
   const persistOrder = useCallback((ordered: Key[]) => {
-    // Persist IMMEDIATELY on drop — no debounce: an edit must be written
-    // the moment it happens, so a crash or a forced kill right after a drop
-    // cannot lose the new order. Each drop fires one request; the poll guard
-    // below keeps the refresh from overwriting the local order while the
-    // write is in flight.
-    pendingPersistsRef.current++;
-    const providerCounts: Record<number, number> = {};
-    const payload = ordered.map(k => {
-      const idx = providerCounts[k.provider_id] ?? 0;
-      providerCounts[k.provider_id] = idx + 1;
-      return { id: k.id, sort_order: idx };
-    });
-    reorderKeys(payload)
-      .catch(() => message.error('Failed to save order'))
-      .finally(() => {
-        pendingPersistsRef.current--;
-        persistGenRef.current++;
+    const changedIndex = ordered.findIndex((key, index) => keys[index]?.id !== key.id);
+    const providerId = ordered[changedIndex]?.provider_id;
+    if (providerId == null) return;
+
+    // Serialize order writes so an earlier drop cannot finish after a newer
+    // one and restore the old provider order.
+    keyOrderPersistence.pending++;
+    const payload = ordered
+      .filter(key => key.provider_id === providerId)
+      .map((key, sort_order) => ({ id: key.id, sort_order }));
+    const locks = typeof navigator === 'undefined' ? undefined : navigator.locks;
+    // Register the shared lock at drop time so another tab cannot overtake
+    // this write while it waits behind an earlier drop from this page.
+    const request = locks
+      ? locks.request(keyOrderWriteLock, () => reorderKeys(payload))
+      : keyOrderPersistence.queue.then(() => reorderKeys(payload));
+    keyOrderPersistence.queue = request
+      .catch(() => {
+        message.error('Failed to save order');
+      })
+      .then(() => {
+        keyOrderPersistence.pending--;
+        keyOrderPersistence.generation++;
       });
-  }, []);
+  }, [keys]);
 
   const keyColumns = [
     {

@@ -1,6 +1,8 @@
 package handler_test
 
 import (
+	"bytes"
+	"context"
 	"embed"
 	"encoding/json"
 	"net/http"
@@ -10,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -48,6 +51,23 @@ func closeTestDB(t *testing.T) {
 		}
 	})
 }
+
+type delayedBody struct {
+	reader  *bytes.Reader
+	started chan struct{}
+	release <-chan struct{}
+	once    sync.Once
+}
+
+func (r *delayedBody) Read(p []byte) (int, error) {
+	r.once.Do(func() {
+		close(r.started)
+		<-r.release
+	})
+	return r.reader.Read(p)
+}
+
+func (r *delayedBody) Close() error { return nil }
 
 func getNames(t *testing.T, e *gin.Engine) []string {
 	t.Helper()
@@ -118,6 +138,180 @@ func TestGetKeysReturnsDragOrder(t *testing.T) {
 	want := []string{"a2", "a1", "b1"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("GET /api/keys order = %v, want %v (drag order must survive re-fetch)", got, want)
+	}
+}
+
+func TestReorderKeysSerializesOverlappingRequests(t *testing.T) {
+	e := bootstrapKeys(t)
+	closeTestDB(t)
+
+	provider := model.Provider{Name: "A", Type: "openai", BaseURL: "http://a"}
+	if err := db.GetDB().Create(&provider).Error; err != nil {
+		t.Fatal(err)
+	}
+	keys := []*model.Key{
+		{ProviderID: provider.ID, Name: "a", KeyValue: "ka"},
+		{ProviderID: provider.ID, Name: "b", KeyValue: "kb"},
+		{ProviderID: provider.ID, Name: "c", KeyValue: "kc"},
+	}
+	for _, key := range keys {
+		if err := db.GetDB().Create(key).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	makePayload := func(order []*model.Key) []byte {
+		rows := make([]map[string]any, 0, len(order))
+		for sortOrder, key := range order {
+			rows = append(rows, map[string]any{"id": key.ID, "sort_order": sortOrder})
+		}
+		payload, err := json.Marshal(map[string]any{"keys": rows})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return payload
+	}
+
+	olderRelease := make(chan struct{})
+	olderStarted := make(chan struct{})
+	olderBody := &delayedBody{
+		reader:  bytes.NewReader(makePayload([]*model.Key{keys[1], keys[2], keys[0]})),
+		started: olderStarted,
+		release: olderRelease,
+	}
+	olderRequest := httptest.NewRequest("POST", "/api/keys/reorder", olderBody)
+	olderRequest.Header.Set("Content-Type", "application/json")
+	olderRequest.Host = "localhost:9999"
+	olderResponse := httptest.NewRecorder()
+	olderDone := make(chan struct{})
+	go func() {
+		e.ServeHTTP(olderResponse, olderRequest)
+		close(olderDone)
+	}()
+	select {
+	case <-olderStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("older request did not begin reading its body")
+	}
+
+	newerRelease := make(chan struct{})
+	newerStarted := make(chan struct{})
+	newerBody := &delayedBody{
+		reader:  bytes.NewReader(makePayload([]*model.Key{keys[2], keys[0], keys[1]})),
+		started: newerStarted,
+		release: newerRelease,
+	}
+	newerRequest := httptest.NewRequest("POST", "/api/keys/reorder", newerBody)
+	newerRequest.Header.Set("Content-Type", "application/json")
+	newerRequest.Host = "localhost:9999"
+	newerResponse := httptest.NewRecorder()
+	newerDone := make(chan struct{})
+	go func() {
+		e.ServeHTTP(newerResponse, newerRequest)
+		close(newerDone)
+	}()
+
+	select {
+	case <-newerStarted:
+		close(newerRelease)
+		<-newerDone
+		close(olderRelease)
+		<-olderDone
+		t.Fatal("newer request read its body while the older reorder was still in flight")
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	close(olderRelease)
+	<-olderDone
+	select {
+	case <-newerStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("newer request did not resume after the older reorder completed")
+	}
+	close(newerRelease)
+	<-newerDone
+
+	if olderResponse.Code != http.StatusOK || newerResponse.Code != http.StatusOK {
+		t.Fatalf("reorder statuses = %d, %d; want 200, 200", olderResponse.Code, newerResponse.Code)
+	}
+	got := getNames(t, e)
+	want := []string{"c", "a", "b"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("GET /api/keys order = %v, want the later reorder %v", got, want)
+	}
+}
+
+func TestReorderKeysCancelsWhenWaitingForDatabase(t *testing.T) {
+	e := bootstrapKeys(t)
+	closeTestDB(t)
+
+	provider := model.Provider{Name: "A", Type: "openai", BaseURL: "http://a"}
+	if err := db.GetDB().Create(&provider).Error; err != nil {
+		t.Fatal(err)
+	}
+	keys := []*model.Key{
+		{ProviderID: provider.ID, Name: "a", KeyValue: "ka"},
+		{ProviderID: provider.ID, Name: "b", KeyValue: "kb"},
+	}
+	for _, key := range keys {
+		if err := db.GetDB().Create(key).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	blocker := db.GetDB().Begin()
+	if blocker.Error != nil {
+		t.Fatal(blocker.Error)
+	}
+	defer blocker.Rollback()
+	sqlDB, err := db.GetDB().DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitCount := sqlDB.Stats().WaitCount
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	payload, err := json.Marshal(map[string]any{"keys": []map[string]any{
+		{"id": keys[1].ID, "sort_order": 0},
+		{"id": keys[0].ID, "sort_order": 1},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest("POST", "/api/keys/reorder", strings.NewReader(string(payload))).WithContext(ctx)
+	request.Header.Set("Content-Type", "application/json")
+	request.Host = "localhost:9999"
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		e.ServeHTTP(response, request)
+		close(done)
+	}()
+
+	deadline := time.After(5 * time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for sqlDB.Stats().WaitCount == waitCount {
+		select {
+		case <-done:
+			t.Fatal("reorder returned before waiting for the occupied DB connection")
+		case <-deadline:
+			t.Fatal("reorder did not wait for the occupied DB connection")
+		case <-ticker.C:
+		}
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("canceled reorder remained blocked on the DB connection")
+	}
+	blocker.Rollback()
+
+	got := getNames(t, e)
+	want := []string{"a", "b"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("GET /api/keys order = %v, canceled reorder must not commit", got)
 	}
 }
 

@@ -41,10 +41,12 @@ export interface DragHandlers {
 
 const SLIDE_MS = 150;
 
+// Optional onDrop fires on pointerup; onCommit follows the visual settle.
 export function useDragSort<T>(
   items: T[],
   canReorder: (from: number, to: number) => boolean,
   onCommit: (next: T[]) => void,
+  onDrop?: (next: T[]) => void,
 ): DragHandlers {
   const dragIndex = useRef<number | null>(null);
   const overIndexRef = useRef<number | null>(null);
@@ -63,6 +65,8 @@ export function useDragSort<T>(
   canReorderRef.current = canReorder;
   const onCommitRef = useRef(onCommit);
   onCommitRef.current = onCommit;
+  const onDropRef = useRef(onDrop);
+  onDropRef.current = onDrop;
 
   // Drag geometry, cached at pointerdown: original top offset and height of
   // every row in the dragged row's table (rows can wrap to two lines), the
@@ -202,13 +206,23 @@ export function useDragSort<T>(
     const glideTo = tops.length > 0
       ? tops[localFrom.current + (to - from)] - tops[localFrom.current]
       : (to - from) * (rowHeight.current || 0);
+    const onDrop = onDropRef.current;
+    let nextAtDrop: T[] | null = null;
+    if (onDrop) {
+      nextAtDrop = [...itemsRef.current];
+      const [moved] = nextAtDrop.splice(from, 1);
+      nextAtDrop.splice(to, 0, moved);
+      onDrop(nextAtDrop);
+    }
     setSettling(true);
     setDy(glideTo);
     settleTimer.current = setTimeout(() => {
       settleTimer.current = null;
-      const next = [...itemsRef.current];
-      const [moved] = next.splice(from, 1);
-      next.splice(to, 0, moved);
+      const next = nextAtDrop ?? [...itemsRef.current];
+      if (!nextAtDrop) {
+        const [moved] = next.splice(from, 1);
+        next.splice(to, 0, moved);
+      }
       onCommitRef.current(next);
       reset();
     }, SLIDE_MS);
