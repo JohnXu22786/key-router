@@ -101,7 +101,9 @@ const Providers: React.FC = () => {
   // modal so its Window Counters track the live sliding windows as the
   // buckets rotate (see refreshDetail below).
   const detailIdRef = useRef<number | null>(null);
-  detailIdRef.current = detailData?.key?.id ?? null;
+  // Invalidate detail requests when the user switches keys or closes and
+  // reopens the modal, including when the same key is opened again.
+  const detailSessionRef = useRef(0);
   // Coalescing for SSE-triggered refetches: a burst of status flips must
   // not launch N concurrent fetches whose out-of-order responses could
   // briefly revert the table. One fetch runs at a time; events arriving in
@@ -109,8 +111,8 @@ const Providers: React.FC = () => {
   const keysRefetchingRef = useRef(false);
   const keysRefetchAgainRef = useRef(false);
   const keysFetchAfterDragRef = useRef(false);
-  const detailFetchingRef = useRef(false);
-  const detailFetchAgainRef = useRef(false);
+  const detailFetchingSessionRef = useRef<number | null>(null);
+  const detailFetchAgainSessionRef = useRef<number | null>(null);
   // Drag-reorder with live preview animation (keys within a provider).
   const drag = useDragSort<Key>(
     keys,
@@ -178,24 +180,30 @@ const Providers: React.FC = () => {
   // while a fetch is in flight schedule one trailing re-run, so no
   // update is dropped.
   const refreshDetail = useCallback((keyId: number) => {
-    if (!detailOpenRef.current) return;
-    if (detailFetchingRef.current) { detailFetchAgainRef.current = true; return; }
-    detailFetchingRef.current = true;
-    getKeyDetail(keyId).then(res => {
-      detailFetchingRef.current = false;
-      if (detailFetchAgainRef.current) {
-        detailFetchAgainRef.current = false;
-        // Re-run for the modal's CURRENT key: the call that queued this
-        // re-run may have been for a key the user already switched away
-        // from, and its response would be discarded by the id guard
-        // below. No-ops via the detailOpenRef guard when the modal closed.
-        refreshDetail(detailIdRef.current ?? keyId);
-        return;
+    if (!detailOpenRef.current || detailIdRef.current !== keyId) return;
+    const session = detailSessionRef.current;
+    if (detailFetchingSessionRef.current === session) {
+      detailFetchAgainSessionRef.current = session;
+      return;
+    }
+    detailFetchingSessionRef.current = session;
+    const finish = () => {
+      if (detailFetchingSessionRef.current === session) detailFetchingSessionRef.current = null;
+      if (detailFetchAgainSessionRef.current !== session) return;
+      detailFetchAgainSessionRef.current = null;
+      const currentKeyId = detailIdRef.current;
+      if (session === detailSessionRef.current && detailOpenRef.current && currentKeyId != null) {
+        refreshDetail(currentKeyId);
       }
-      if (detailOpenRef.current) {
+    };
+    getKeyDetail(keyId).then(res => {
+      if (session === detailSessionRef.current && detailOpenRef.current && detailIdRef.current === keyId) {
         setDetailData((prev: any) => (prev?.key?.id === keyId && !jsonEqual(prev, res.data) ? res.data : prev));
       }
-    }).catch(() => { detailFetchingRef.current = false; });
+      // Run one trailing refresh after applying this response; refetch only
+      // if this modal session still owns the displayed key.
+      finish();
+    }).catch(finish);
   }, []);
 
   // Live push: the backend publishes key_status_changed over SSE the moment
@@ -328,11 +336,17 @@ const Providers: React.FC = () => {
   };
 
   const showDetail = async (key: Key) => {
+    const session = ++detailSessionRef.current;
+    detailFetchAgainSessionRef.current = null;
+    detailIdRef.current = key.id;
     try {
       const res = await getKeyDetail(key.id);
+      if (session !== detailSessionRef.current) return;
       setDetailData(res.data);
       setDetailOpen(true);
-    } catch { message.error('Failed to load key details'); }
+    } catch {
+      if (session === detailSessionRef.current) message.error('Failed to load key details');
+    }
   };
 
   const openEditKey = (k: Key) => {
@@ -641,7 +655,12 @@ const Providers: React.FC = () => {
       <Modal
         title={`Key Detail: ${detailData?.key?.name || ''}`}
         open={detailOpen}
-        onCancel={() => setDetailOpen(false)}
+        onCancel={() => {
+          detailSessionRef.current++;
+          detailIdRef.current = null;
+          detailFetchAgainSessionRef.current = null;
+          setDetailOpen(false);
+        }}
         footer={null}
         width={700}
         centered
