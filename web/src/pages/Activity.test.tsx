@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor, cleanup } from '@testing-library/react';
+import { message } from 'antd';
 import dayjs from 'dayjs';
 import Activity from './Activity';
 import { getConsumptions, getKeys } from '../api/client';
@@ -140,5 +141,30 @@ describe('Activity filter candidates', () => {
 
     fireEvent.mouseDown(screen.getByRole('combobox'));
     await waitFor(() => expect(screen.queryAllByText('stale-model')).toHaveLength(0));
+  });
+
+  it('keeps model and app candidates when key metadata is unavailable', async () => {
+    vi.mocked(getConsumptions).mockResolvedValueOnce(response([
+      { ...makeConsumption('model-b', '2026-08-13T15:00:00'), app_name: 'app-b' },
+      { ...makeConsumption('model-a', '2026-08-13T15:00:00'), app_name: 'app-a' },
+    ]));
+    vi.mocked(getKeys).mockRejectedValueOnce(new Error('keys unavailable'));
+    const error = vi.spyOn(message, 'error').mockImplementation(() => '' as any);
+
+    render(<Activity />);
+
+    fireEvent.click(screen.getByRole('button', { name: /filter filter/i }));
+    await waitFor(() => expect(getConsumptions).toHaveBeenCalledTimes(1));
+
+    fireEvent.mouseDown(screen.getByRole('combobox'));
+    expect((await screen.findAllByText('model-a')).length).toBeGreaterThan(0);
+    expect((await screen.findAllByText('model-b')).length).toBeGreaterThan(0);
+    expect(error).not.toHaveBeenCalledWith('Failed to load filter options');
+
+    fireEvent.click(screen.getByRole('combobox'));
+    fireEvent.click(screen.getByRole('radio', { name: 'App' }));
+    fireEvent.mouseDown(screen.getByRole('combobox'));
+    expect((await screen.findAllByText('app-a')).length).toBeGreaterThan(0);
+    expect((await screen.findAllByText('app-b')).length).toBeGreaterThan(0);
   });
 });
