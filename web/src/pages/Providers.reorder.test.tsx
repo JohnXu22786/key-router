@@ -3,7 +3,7 @@ import React from 'react';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import Providers from './Providers';
-import { getKeys, getProviders, getRoutes, reorderKeys } from '../api/client';
+import { getKeys, getProviders, getRoutes, reorderKeys, updateProvider } from '../api/client';
 import type { Key, Provider } from '../api/client';
 
 vi.mock('../api/client', async (importOriginal) => {
@@ -14,6 +14,7 @@ vi.mock('../api/client', async (importOriginal) => {
     getKeys: vi.fn(),
     getRoutes: vi.fn(),
     reorderKeys: vi.fn(),
+    updateProvider: vi.fn(),
   };
 });
 
@@ -128,7 +129,7 @@ function rowIds(container: HTMLElement) {
     .map(row => Number(row.getAttribute('data-row-key')));
 }
 
-function dropFirstKeyToLast(container: HTMLElement, firstKeyId?: number) {
+function startFirstKeyDragToLast(container: HTMLElement, firstKeyId?: number) {
   const firstRow = firstKeyId == null
     ? container.querySelector('tr[data-row-key]')
     : container.querySelector(`tr[data-row-key="${firstKeyId}"]`);
@@ -140,6 +141,11 @@ function dropFirstKeyToLast(container: HTMLElement, firstKeyId?: number) {
 
   fireEvent(handle, pointerEvent('pointerdown', 1, 110));
   fireEvent(firstRow, pointerEvent('pointermove', 1, 190));
+  return firstRow;
+}
+
+function dropFirstKeyToLast(container: HTMLElement, firstKeyId?: number) {
+  const firstRow = startFirstKeyDragToLast(container, firstKeyId);
   fireEvent(firstRow, pointerEvent('pointerup', 1, 190));
 }
 
@@ -169,6 +175,7 @@ describe('Providers key reorder persistence', () => {
     vi.mocked(getKeys).mockResolvedValue({ data: keys } as any);
     vi.mocked(getRoutes).mockResolvedValue({ data: [] } as any);
     vi.mocked(reorderKeys).mockReset();
+    vi.mocked(updateProvider).mockReset();
   });
 
   afterEach(() => {
@@ -428,5 +435,174 @@ describe('Providers key reorder persistence', () => {
       { id: 22, sort_order: 1 },
       { id: 20, sort_order: 2 },
     ]);
+  }, 15000);
+
+  it('defers an ordinary fetch that resolves during a drag, then applies the persisted order', async () => {
+    let serverKeys = keys.map(key => ({ ...key }));
+    const staleFetch = deferred<any>();
+    const postDragSnapshot = deferred<any>();
+    const reorderWrite = deferred<any>();
+    const staleOrder = [...keys].reverse();
+    vi.spyOn(globalThis, 'setInterval').mockImplementation(() => 0 as unknown as ReturnType<typeof setInterval>);
+    vi.mocked(getKeys)
+      .mockResolvedValueOnce({ data: keys.map(key => ({ ...key })) } as any)
+      .mockReturnValueOnce(staleFetch.promise)
+      .mockReturnValueOnce(postDragSnapshot.promise)
+      .mockImplementation(async () => ({
+        data: serverKeys.map(key => ({
+          ...key,
+          name: key.id === 11 ? 'Key 11 refreshed' : key.name,
+        })),
+      }) as any);
+    vi.mocked(updateProvider).mockResolvedValue({ data: provider } as any);
+    vi.mocked(reorderKeys).mockImplementation(async payload => {
+      await reorderWrite.promise;
+      serverKeys = orderKeys(payload, serverKeys);
+      return { data: undefined } as any;
+    });
+
+    const { container } = render(<Providers />);
+    await screen.findByText('Provider One');
+    const header = container.querySelector('.ant-collapse-header');
+    if (!header) throw new Error('provider header not found');
+    fireEvent.click(header);
+    await screen.findByText('Key 10');
+
+    const editProvider = container.querySelector('button[title="Edit provider"]');
+    if (!editProvider) throw new Error('edit provider button not found');
+    fireEvent.click(editProvider);
+    await screen.findByText('Edit Provider');
+    fireEvent.click(screen.getByRole('button', { name: 'OK' }));
+    await waitFor(() => expect(getKeys).toHaveBeenCalledTimes(2));
+
+    const draggedRow = startFirstKeyDragToLast(container, 10);
+    await act(async () => { staleFetch.resolve({ data: staleOrder }); });
+    expect(rowIds(container)).toEqual([10, 11, 12]);
+
+    fireEvent(draggedRow, pointerEvent('pointerup', 1, 190));
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 180)); });
+    await waitFor(() => expect(reorderKeys).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(reorderKeys).mock.calls[0][0]).toEqual([
+      { id: 11, sort_order: 0 },
+      { id: 12, sort_order: 1 },
+      { id: 10, sort_order: 2 },
+    ]);
+    expect(rowIds(container)).toEqual([11, 12, 10]);
+
+    await waitFor(() => expect(getKeys).toHaveBeenCalledTimes(3));
+    await act(async () => {
+      postDragSnapshot.resolve({ data: keys.map(key => ({ ...key })) });
+      await postDragSnapshot.promise;
+    });
+    expect(rowIds(container)).toEqual([11, 12, 10]);
+    expect(getKeys).toHaveBeenCalledTimes(3);
+
+    await act(async () => {
+      reorderWrite.resolve(undefined);
+      await reorderWrite.promise;
+    });
+    await waitFor(() => expect(getKeys).toHaveBeenCalledTimes(4));
+    await waitFor(() => expect(rowIds(container)).toEqual([11, 12, 10]));
+    await screen.findByText('Key 11 refreshed');
+  }, 15000);
+
+  it('retries the recovery GET when another Providers instance advances the shared generation', async () => {
+    let serverKeys = keys.map(key => ({ ...key }));
+    let getKeysCall = 0;
+    const ordinaryFetch = deferred<any>();
+    const postDropSnapshot = deferred<any>();
+    const recoverySnapshot = deferred<any>();
+    const latestSnapshot = deferred<any>();
+    const firstWrite = deferred<any>();
+    vi.spyOn(globalThis, 'setInterval').mockImplementation(() => 0 as unknown as ReturnType<typeof setInterval>);
+    vi.mocked(getKeys).mockImplementation(() => {
+      getKeysCall++;
+      if (getKeysCall <= 2) return Promise.resolve({ data: serverKeys.map(key => ({ ...key })) }) as any;
+      if (getKeysCall === 3) return ordinaryFetch.promise;
+      if (getKeysCall === 4) return postDropSnapshot.promise;
+      if (getKeysCall === 5) return recoverySnapshot.promise;
+      return latestSnapshot.promise;
+    });
+    vi.mocked(updateProvider).mockResolvedValue({ data: provider } as any);
+    vi.mocked(reorderKeys)
+      .mockImplementationOnce(async payload => {
+        await firstWrite.promise;
+        serverKeys = orderKeys(payload, serverKeys);
+        return { data: undefined } as any;
+      })
+      .mockImplementation(async payload => {
+        serverKeys = orderKeys(payload, serverKeys);
+        return { data: undefined } as any;
+      });
+
+    const target = render(<Providers />);
+    await waitFor(() => expect(target.container.textContent).toContain('Provider One'));
+    const targetHeader = target.container.querySelector('.ant-collapse-header');
+    if (!targetHeader) throw new Error('target provider header not found');
+    fireEvent.click(targetHeader);
+    await waitFor(() => expect(target.container.textContent).toContain('Key 10'));
+
+    const peer = render(<Providers />);
+    await waitFor(() => expect(peer.container.textContent).toContain('Provider One'));
+    const peerHeader = peer.container.querySelector('.ant-collapse-header');
+    if (!peerHeader) throw new Error('peer provider header not found');
+    fireEvent.click(peerHeader);
+    await waitFor(() => expect(peer.container.textContent).toContain('Key 10'));
+
+    const editProvider = target.container.querySelector('button[title="Edit provider"]');
+    if (!editProvider) throw new Error('edit provider button not found');
+    fireEvent.click(editProvider);
+    await screen.findByText('Edit Provider');
+    fireEvent.click(screen.getByRole('button', { name: 'OK' }));
+    await waitFor(() => expect(getKeys).toHaveBeenCalledTimes(3));
+
+    const targetDraggedRow = startFirstKeyDragToLast(target.container, 10);
+    await act(async () => { ordinaryFetch.resolve({ data: [...keys].reverse() }); });
+    expect(rowIds(target.container)).toEqual([10, 11, 12]);
+    fireEvent(targetDraggedRow, pointerEvent('pointerup', 1, 190));
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 180)); });
+    await waitFor(() => expect(reorderKeys).toHaveBeenCalledTimes(1));
+    expect(rowIds(target.container)).toEqual([11, 12, 10]);
+
+    await waitFor(() => expect(getKeys).toHaveBeenCalledTimes(4));
+    await act(async () => {
+      postDropSnapshot.resolve({ data: keys.map(key => ({ ...key })) });
+      await postDropSnapshot.promise;
+    });
+    await act(async () => {
+      firstWrite.resolve(undefined);
+      await firstWrite.promise;
+    });
+    await waitFor(() => expect(getKeys).toHaveBeenCalledTimes(5));
+    const firstDropSnapshot = serverKeys.map(key => ({ ...key }));
+
+    dropFirstKeyToLast(peer.container, 11);
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 180)); });
+    await waitFor(() => expect(reorderKeys).toHaveBeenCalledTimes(2));
+    expect(serverKeys.map(key => key.id)).toEqual([10, 12, 11]);
+
+    await act(async () => {
+      recoverySnapshot.resolve({
+        data: firstDropSnapshot.map(key => ({
+          ...key,
+          name: key.id === 11 ? 'Key 11 from stale drop' : key.name,
+        })),
+      });
+      await recoverySnapshot.promise;
+    });
+    await waitFor(() => expect(getKeys).toHaveBeenCalledTimes(6));
+    expect(rowIds(target.container)).toEqual([11, 12, 10]);
+    expect(target.container.textContent).not.toContain('Key 11 from stale drop');
+    await act(async () => {
+      latestSnapshot.resolve({
+        data: serverKeys.map(key => ({
+          ...key,
+          name: key.id === 11 ? 'Key 11 refreshed' : key.name,
+        })),
+      });
+      await latestSnapshot.promise;
+    });
+    await waitFor(() => expect(rowIds(target.container)).toEqual([10, 12, 11]));
+    await screen.findByText('Key 11 refreshed');
   }, 15000);
 });
