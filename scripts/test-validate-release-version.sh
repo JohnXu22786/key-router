@@ -31,18 +31,32 @@ assert_patch_increment() {
   }
 }
 
+assert_patch_invalid() {
+  local input=$1
+  if bash "$increment_patch" "$input" >/dev/null 2>&1; then
+    printf 'expected invalid patch component to be rejected: %q\n' "$input" >&2
+    exit 1
+  fi
+}
+
 assert_valid 'v0.1.0' '0.1.0'
 assert_valid 'v1.2.3-rc.1+build.7' '1.2.3-rc.1+build.7'
 assert_valid 'v10.20.30' '10.20.30'
 assert_patch_increment '9' '10'
 assert_patch_increment '99' '100'
 assert_patch_increment '18446744073709551615' '18446744073709551616'
+assert_patch_invalid '01'
+assert_patch_invalid '12abc'
+assert_patch_invalid '12.3'
 
 assert_invalid '1.2.3'
 assert_invalid 'v01.2.3'
 assert_invalid 'v1.2'
 assert_invalid 'v1.2.3-01'
 assert_invalid 'v1.2.3-rc.01'
+assert_invalid 'v1.2.3+build-7'
+assert_invalid 'v1.2.3+foo.lock'
+assert_invalid 'v1.2.9223372036854775808'
 assert_invalid 'v1.2.3/../../tmp'
 assert_invalid 'v1.2.3;echo injected'
 assert_invalid 'v1.2.3";echo injected'

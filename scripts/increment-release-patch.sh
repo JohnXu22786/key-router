@@ -2,13 +2,10 @@
 set -euo pipefail
 
 patch=${1-}
-case "$patch" in
-  0|[1-9]|[1-9][0-9]*) ;;
-  *)
-    printf 'invalid numeric patch component: %q\n' "$patch" >&2
-    exit 1
-    ;;
-esac
+if [[ ! "$patch" =~ ^(0|[1-9][0-9]*)$ ]]; then
+  printf 'invalid numeric patch component: %q\n' "$patch" >&2
+  exit 1
+fi
 
 # Increment one decimal digit at a time so valid SemVer components are not
 # truncated by the runner's bounded integer arithmetic.
