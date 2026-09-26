@@ -8,7 +8,7 @@ import {
 } from '@ant-design/icons';
 import {
   getProviders, createProvider, updateProvider, deleteProvider,
-  getKeys, createKey, updateKey, deleteKey, reorderKeys, nextKeyOrderRevision, getKeyDetail, resetKeySpend,
+  getKeys, createKey, updateKey, deleteKey, reorderKeys, getKeyDetail, resetKeySpend,
   getRoutes, Provider, Key, Route,
 } from '../api/client';
 import { subscribeEvents, jsonEqual } from '../api/events';
@@ -23,12 +23,12 @@ const { Title, Text } = Typography;
 const keyOrderPersistence = {
   pending: 0,
   generation: 0,
-  queues: new Map<number, Promise<void>>(),
+  queue: Promise.resolve() as Promise<void>,
 };
 
 async function waitForKeyOrderWrites() {
-  while (keyOrderPersistence.queues.size > 0) {
-    await Promise.all([...keyOrderPersistence.queues.values()]);
+  while (keyOrderPersistence.pending > 0) {
+    await keyOrderPersistence.queue;
   }
 }
 
@@ -351,32 +351,25 @@ const Providers: React.FC = () => {
     } catch { message.error('Failed to reset key spend'); }
   };
   const persistOrder = useCallback((ordered: Key[]) => {
-    const providerId = ordered.find((key, index) => keys[index]?.id !== key.id)?.provider_id;
-    if (providerId == null) return;
-    const providerKeys = ordered.filter(key => key.provider_id === providerId);
-    // Do not debounce committed drops: each order enters its provider queue
-    // in sequence, while different providers can persist independently.
+    // Serialize every full-order write so an earlier drop cannot finish after
+    // a newer one and restore the old order.
     keyOrderPersistence.pending++;
-    const revision = nextKeyOrderRevision();
-    const payload = providerKeys.map((k, sort_order) => ({ id: k.id, sort_order }));
-    const previous = keyOrderPersistence.queues.get(providerId) ?? Promise.resolve();
-    const request = previous.then(async () => reorderKeys(providerId, payload, await revision));
-    const queue = request
+    const providerCounts: Record<number, number> = {};
+    const payload = ordered.map(k => {
+      const sort_order = providerCounts[k.provider_id] ?? 0;
+      providerCounts[k.provider_id] = sort_order + 1;
+      return { id: k.id, sort_order };
+    });
+    const request = keyOrderPersistence.queue.then(() => reorderKeys(payload));
+    keyOrderPersistence.queue = request
       .catch(() => {
         message.error('Failed to save order');
-        if (mountedRef.current) void fetch();
       })
       .then(() => {
         keyOrderPersistence.pending--;
         keyOrderPersistence.generation++;
       });
-    keyOrderPersistence.queues.set(providerId, queue);
-    queue.then(() => {
-      if (keyOrderPersistence.queues.get(providerId) === queue) {
-        keyOrderPersistence.queues.delete(providerId);
-      }
-    });
-  }, [keys]);
+  }, []);
 
   const keyColumns = [
     {

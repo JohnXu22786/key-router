@@ -3,7 +3,7 @@ import React from 'react';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import Providers from './Providers';
-import { getKeys, getProviders, getRoutes, nextKeyOrderRevision, reorderKeys } from '../api/client';
+import { getKeys, getProviders, getRoutes, reorderKeys } from '../api/client';
 import type { Key, Provider } from '../api/client';
 
 vi.mock('../api/client', async (importOriginal) => {
@@ -41,20 +41,6 @@ if (typeof globalThis.ResizeObserver !== 'function') {
     disconnect() {}
   };
 }
-if (!navigator.locks) {
-  let lockQueue = Promise.resolve();
-  Object.defineProperty(navigator, 'locks', {
-    configurable: true,
-    value: {
-      request: (_name: string, _options: unknown, callback: () => unknown) => {
-        const result = lockQueue.then(callback);
-        lockQueue = result.then(() => undefined, () => undefined);
-        return result;
-      },
-    },
-  });
-}
-
 const provider: Provider = {
   id: 1,
   name: 'Provider One',
@@ -170,7 +156,6 @@ describe('Providers key reorder persistence', () => {
   });
 
   afterEach(() => {
-    vi.useRealTimers();
     cleanup();
     vi.restoreAllMocks();
     vi.clearAllMocks();
@@ -180,12 +165,12 @@ describe('Providers key reorder persistence', () => {
     let serverKeys = keys.map(key => ({ ...key }));
     const firstWrite = deferred<any>();
     vi.mocked(reorderKeys)
-      .mockImplementationOnce(async (_providerId, payload) => {
+      .mockImplementationOnce(async payload => {
         await firstWrite.promise;
         serverKeys = orderKeys(payload, serverKeys);
         return { data: undefined } as any;
       })
-      .mockImplementationOnce(async (_providerId, payload) => {
+      .mockImplementationOnce(async payload => {
         serverKeys = orderKeys(payload, serverKeys);
         return { data: undefined } as any;
       });
@@ -202,8 +187,7 @@ describe('Providers key reorder persistence', () => {
 
     await dragFirstKeyToLast(container);
     await waitFor(() => expect(reorderKeys).toHaveBeenCalledTimes(1));
-    expect(vi.mocked(reorderKeys).mock.calls[0][0]).toBe(1);
-    expect(vi.mocked(reorderKeys).mock.calls[0][1]).toEqual([
+    expect(vi.mocked(reorderKeys).mock.calls[0][0]).toEqual([
       { id: 11, sort_order: 0 },
       { id: 12, sort_order: 1 },
       { id: 10, sort_order: 2 },
@@ -217,24 +201,30 @@ describe('Providers key reorder persistence', () => {
       await firstWrite.promise;
     });
     await waitFor(() => expect(reorderKeys).toHaveBeenCalledTimes(2));
-    expect(vi.mocked(reorderKeys).mock.calls[1][0]).toBe(1);
-    expect(vi.mocked(reorderKeys).mock.calls[1][1]).toEqual([
+    expect(vi.mocked(reorderKeys).mock.calls[1][0]).toEqual([
       { id: 12, sort_order: 0 },
       { id: 10, sort_order: 1 },
       { id: 11, sort_order: 2 },
     ]);
-    expect(vi.mocked(reorderKeys).mock.calls[1][2].sequence)
-      .toBeGreaterThan(vi.mocked(reorderKeys).mock.calls[0][2].sequence);
     await waitFor(async () => {
       const persisted = await getKeys();
       expect(persisted.data.map(key => key.id)).toEqual([12, 10, 11]);
     });
   });
 
-  it('reconciles the table when a reorder request fails', async () => {
-    const serverKeys = keys.map(key => ({ ...key }));
+  it('continues with a queued drop after an earlier reorder request fails', async () => {
+    let serverKeys = keys.map(key => ({ ...key }));
+    const firstWrite = deferred<any>();
+    vi.mocked(reorderKeys)
+      .mockImplementationOnce(async () => {
+        await firstWrite.promise;
+        throw new Error('temporary server failure');
+      })
+      .mockImplementationOnce(async payload => {
+        serverKeys = orderKeys(payload, serverKeys);
+        return { data: undefined } as any;
+      });
     vi.mocked(getKeys).mockImplementation(async () => ({ data: serverKeys.map(key => ({ ...key })) }) as any);
-    vi.mocked(reorderKeys).mockRejectedValue(new Error('temporary server failure'));
 
     const { container } = render(<Providers />);
     await screen.findByText('Provider One');
@@ -244,8 +234,24 @@ describe('Providers key reorder persistence', () => {
     await screen.findByText('Key 10');
 
     await dragFirstKeyToLast(container);
-    await waitFor(() => expect(rowIds(container)).toEqual([10, 11, 12]));
+    await waitFor(() => expect(reorderKeys).toHaveBeenCalledTimes(1));
+    await dragFirstKeyToLast(container);
     expect(reorderKeys).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      firstWrite.resolve({ data: undefined });
+      await firstWrite.promise;
+    });
+    await waitFor(() => expect(reorderKeys).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(reorderKeys).mock.calls[1][0]).toEqual([
+      { id: 12, sort_order: 0 },
+      { id: 10, sort_order: 1 },
+      { id: 11, sort_order: 2 },
+    ]);
+    await waitFor(async () => {
+      const persisted = await getKeys();
+      expect(persisted.data.map(key => key.id)).toEqual([12, 10, 11]);
+    });
   });
 
   it('keeps a pending write ordered and refreshes keys after the Providers route remounts', async () => {
@@ -253,12 +259,12 @@ describe('Providers key reorder persistence', () => {
     const firstWrite = deferred<any>();
     vi.mocked(getKeys).mockImplementation(async () => ({ data: serverKeys.map(key => ({ ...key })) }) as any);
     vi.mocked(reorderKeys)
-      .mockImplementationOnce(async (_providerId, payload) => {
+      .mockImplementationOnce(async payload => {
         await firstWrite.promise;
         serverKeys = orderKeys(payload, serverKeys);
         return { data: undefined } as any;
       })
-      .mockImplementation(async (_providerId, payload) => {
+      .mockImplementation(async payload => {
         serverKeys = orderKeys(payload, serverKeys);
         return { data: undefined } as any;
       });
@@ -291,7 +297,7 @@ describe('Providers key reorder persistence', () => {
 
     await dragFirstKeyToLast(secondMount.container);
     await waitFor(() => expect(reorderKeys).toHaveBeenCalledTimes(2));
-    expect(vi.mocked(reorderKeys).mock.calls[1][1]).toEqual([
+    expect(vi.mocked(reorderKeys).mock.calls[1][0]).toEqual([
       { id: 12, sort_order: 0 },
       { id: 10, sort_order: 1 },
       { id: 11, sort_order: 2 },
@@ -302,32 +308,7 @@ describe('Providers key reorder persistence', () => {
     });
   });
 
-  it('sends only the dragged provider order', async () => {
-    const providerTwo: Provider = { ...provider, id: 2, name: 'Provider Two' };
-    const otherProviderKey = { ...keys[0], id: 20, provider_id: 2, name: 'Key 20' };
-    vi.mocked(getProviders).mockResolvedValue({ data: [provider, providerTwo] } as any);
-    vi.mocked(getKeys).mockResolvedValue({ data: [...keys, otherProviderKey] } as any);
-    vi.mocked(reorderKeys).mockResolvedValue({ data: undefined } as any);
-
-    const { container } = render(<Providers />);
-    await screen.findByText('Provider One');
-    const firstHeader = container.querySelector('.ant-collapse-header');
-    if (!firstHeader) throw new Error('first provider collapse header not found');
-    fireEvent.click(firstHeader);
-    await screen.findByText('Key 10');
-
-    await dragFirstKeyToLast(container);
-    expect(reorderKeys).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(reorderKeys).mock.calls[0][0]).toBe(1);
-    expect(vi.mocked(reorderKeys).mock.calls[0][1]).toEqual([
-      { id: 11, sort_order: 0 },
-      { id: 12, sort_order: 1 },
-      { id: 10, sort_order: 2 },
-    ]);
-    expect(vi.mocked(reorderKeys).mock.calls[0][1]).not.toContainEqual(expect.objectContaining({ id: 20 }));
-  });
-
-  it('sends another provider drop while the first provider write is pending', async () => {
+  it('serializes reorder writes across providers because each request carries all keys', async () => {
     const providerTwo: Provider = { ...provider, id: 2, name: 'Provider Two' };
     const secondProviderKeys = [20, 21, 22].map((id, index) => ({
       ...keys[index],
@@ -339,10 +320,18 @@ describe('Providers key reorder persistence', () => {
     }));
     const firstWrite = deferred<any>();
     vi.mocked(getProviders).mockResolvedValue({ data: [provider, providerTwo] } as any);
-    vi.mocked(getKeys).mockResolvedValue({ data: [...keys, ...secondProviderKeys] } as any);
+    let serverKeys = [...keys, ...secondProviderKeys];
+    vi.mocked(getKeys).mockImplementation(async () => ({ data: serverKeys.map(key => ({ ...key })) }) as any);
     vi.mocked(reorderKeys)
-      .mockImplementationOnce(() => firstWrite.promise as any)
-      .mockResolvedValueOnce({ data: undefined } as any);
+      .mockImplementationOnce(async payload => {
+        await firstWrite.promise;
+        serverKeys = orderKeys(payload, serverKeys);
+        return { data: undefined } as any;
+      })
+      .mockImplementationOnce(async payload => {
+        serverKeys = orderKeys(payload, serverKeys);
+        return { data: undefined } as any;
+      });
 
     const { container } = render(<Providers />);
     await screen.findByText('Provider Two');
@@ -356,23 +345,20 @@ describe('Providers key reorder persistence', () => {
     fireEvent.click(headers[1]);
     await screen.findByText('Key 20');
     await dragFirstKeyToLast(container, 20);
-    await waitFor(() => expect(reorderKeys).toHaveBeenCalledTimes(2));
-    expect(vi.mocked(reorderKeys).mock.calls[1][0]).toBe(2);
-    expect(vi.mocked(reorderKeys).mock.calls[1][1]).toEqual([
-      { id: 21, sort_order: 0 },
-      { id: 22, sort_order: 1 },
-      { id: 20, sort_order: 2 },
-    ]);
+    expect(reorderKeys).toHaveBeenCalledTimes(1);
 
     await act(async () => {
       firstWrite.resolve({ data: undefined });
       await firstWrite.promise;
     });
-  });
-
-  it('allocates strictly increasing order revisions', async () => {
-    const [first, second] = await Promise.all([nextKeyOrderRevision(), nextKeyOrderRevision()]);
-    expect(second.sequence).toBeGreaterThan(first.sequence);
-    expect(second.client_id).toBe(first.client_id);
+    await waitFor(() => expect(reorderKeys).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(reorderKeys).mock.calls[1][0]).toEqual([
+      { id: 11, sort_order: 0 },
+      { id: 12, sort_order: 1 },
+      { id: 10, sort_order: 2 },
+      { id: 21, sort_order: 0 },
+      { id: 22, sort_order: 1 },
+      { id: 20, sort_order: 2 },
+    ]);
   });
 });

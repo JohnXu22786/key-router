@@ -129,48 +129,7 @@ export const getKeys = () => api.get<Key[]>('/keys');
 export const createKey = (data: Partial<Key>) => api.post<Key>('/keys', data);
 export const updateKey = (id: number, data: Partial<Key>) => api.put<Key>(`/keys/${id}`, data);
 export const deleteKey = (id: number) => api.delete(`/keys/${id}`);
-export interface KeyOrderRevision {
-  sequence: number;
-  client_id: string;
-}
-
-const KEY_ORDER_REVISION_KEY = 'key-router:key-order-revision';
-const KEY_ORDER_REVISION_LOCK = 'key-router:key-order-revision';
-const keyOrderClientId = (() => {
-  try { return globalThis.crypto.randomUUID(); }
-  catch { return `${Date.now()}-${Math.random().toString(36).slice(2)}`; }
-})();
-let lastKeyOrderSequence = 0;
-
-function keyOrderClockSequence() {
-  const clock = typeof performance === 'undefined'
-    ? Date.now()
-    : performance.timeOrigin + performance.now();
-  return Math.floor(clock * 1000);
-}
-
-function allocateKeyOrderRevision(): KeyOrderRevision {
-  const stored = Number(window.localStorage.getItem(KEY_ORDER_REVISION_KEY));
-  const storedSequence = Number.isSafeInteger(stored) && stored > 0 ? stored : 0;
-  const sequence = Math.max(keyOrderClockSequence(), storedSequence + 1, lastKeyOrderSequence + 1);
-  lastKeyOrderSequence = sequence;
-  window.localStorage.setItem(KEY_ORDER_REVISION_KEY, String(sequence));
-  return { sequence, client_id: keyOrderClientId };
-}
-
-export function nextKeyOrderRevision(): Promise<KeyOrderRevision> {
-  const locks = typeof navigator === 'undefined' ? undefined : navigator.locks;
-  if (locks) {
-    return locks.request(KEY_ORDER_REVISION_LOCK, { mode: 'exclusive' }, allocateKeyOrderRevision);
-  }
-  return Promise.reject(new Error('Browser locking is required to order key writes safely'));
-}
-
-export const reorderKeys = (
-  provider_id: number,
-  keys: { id: number; sort_order: number }[],
-  revision: KeyOrderRevision,
-) => api.post('/keys/reorder', { provider_id, revision, keys });
+export const reorderKeys = (keys: { id: number; sort_order: number }[]) => api.post('/keys/reorder', { keys });
 export const resetKeySpend = (id: number) => api.post(`/keys/${id}/reset-spend`);
 
 // Model Groups

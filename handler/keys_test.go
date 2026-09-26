@@ -1,7 +1,6 @@
 package handler_test
 
 import (
-	"bytes"
 	"embed"
 	"encoding/json"
 	"net/http"
@@ -11,7 +10,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -50,23 +48,6 @@ func closeTestDB(t *testing.T) {
 		}
 	})
 }
-
-type delayedBody struct {
-	reader  *bytes.Reader
-	started chan struct{}
-	release <-chan struct{}
-	once    sync.Once
-}
-
-func (r *delayedBody) Read(p []byte) (int, error) {
-	r.once.Do(func() {
-		close(r.started)
-		<-r.release
-	})
-	return r.reader.Read(p)
-}
-
-func (r *delayedBody) Close() error { return nil }
 
 func getNames(t *testing.T, e *gin.Engine) []string {
 	t.Helper()
@@ -110,7 +91,7 @@ func TestGetKeysReturnsDragOrder(t *testing.T) {
 	}
 	k1 := model.Key{ProviderID: provA.ID, Name: "a1", KeyValue: "ka1"}
 	k2 := model.Key{ProviderID: provA.ID, Name: "a2", KeyValue: "ka2"}
-	k3 := model.Key{ProviderID: provB.ID, Name: "b1", KeyValue: "kb1", SortOrder: 7}
+	k3 := model.Key{ProviderID: provB.ID, Name: "b1", KeyValue: "kb1"}
 	for _, k := range []*model.Key{&k1, &k2, &k3} {
 		if err := db.GetDB().Create(k).Error; err != nil {
 			t.Fatal(err)
@@ -118,18 +99,11 @@ func TestGetKeysReturnsDragOrder(t *testing.T) {
 	}
 
 	// Simulate the frontend drag commit: a2 moved above a1 within provider A.
-	payload, _ := json.Marshal(map[string]any{
-		"provider_id": provA.ID,
-		"revision": map[string]any{
-			"sequence":  time.Now().UnixMicro(),
-			"client_id": "drag-order-test",
-		},
-		"keys": []map[string]any{
-			{"id": k2.ID, "sort_order": 0},
-			{"id": k1.ID, "sort_order": 1},
-			{"id": k3.ID, "sort_order": 0},
-		},
-	})
+	payload, _ := json.Marshal(map[string]any{"keys": []map[string]any{
+		{"id": k2.ID, "sort_order": 0},
+		{"id": k1.ID, "sort_order": 1},
+		{"id": k3.ID, "sort_order": 0},
+	}})
 	req := httptest.NewRequest("POST", "/api/keys/reorder", strings.NewReader(string(payload)))
 	req.Header.Set("Content-Type", "application/json")
 	req.Host = "localhost:9999"
@@ -138,103 +112,12 @@ func TestGetKeysReturnsDragOrder(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("POST /api/keys/reorder status = %d: %s", rec.Code, rec.Body.String())
 	}
-	var unchanged model.Key
-	if err := db.GetDB().First(&unchanged, k3.ID).Error; err != nil {
-		t.Fatal(err)
-	}
-	if unchanged.SortOrder != 7 {
-		t.Fatalf("other provider sort_order = %d, want unchanged 7", unchanged.SortOrder)
-	}
 
 	// The re-fetch must preserve the dragged order (per provider).
 	got := getNames(t, e)
 	want := []string{"a2", "a1", "b1"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("GET /api/keys order = %v, want %v (drag order must survive re-fetch)", got, want)
-	}
-}
-
-func TestReorderKeysRejectsOlderRevisionAfterNewerRequestCommits(t *testing.T) {
-	e := bootstrapKeys(t)
-	closeTestDB(t)
-
-	provider := model.Provider{Name: "A", Type: "openai", BaseURL: "http://a"}
-	if err := db.GetDB().Create(&provider).Error; err != nil {
-		t.Fatal(err)
-	}
-	keys := []*model.Key{
-		{ProviderID: provider.ID, Name: "a", KeyValue: "ka"},
-		{ProviderID: provider.ID, Name: "b", KeyValue: "kb"},
-		{ProviderID: provider.ID, Name: "c", KeyValue: "kc"},
-	}
-	for _, key := range keys {
-		if err := db.GetDB().Create(key).Error; err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	baseRevision := time.Now().UnixMicro() + 100
-	makePayload := func(revision int64, order []*model.Key) []byte {
-		rows := make([]map[string]any, 0, len(order))
-		for sortOrder, key := range order {
-			rows = append(rows, map[string]any{"id": key.ID, "sort_order": sortOrder})
-		}
-		payload, err := json.Marshal(map[string]any{
-			"provider_id": provider.ID,
-			"revision": map[string]any{
-				"sequence":  revision,
-				"client_id": "delayed-body-test",
-			},
-			"keys": rows,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return payload
-	}
-
-	olderRelease := make(chan struct{})
-	olderStarted := make(chan struct{})
-	olderBody := &delayedBody{
-		reader:  bytes.NewReader(makePayload(baseRevision, []*model.Key{keys[1], keys[2], keys[0]})),
-		started: olderStarted,
-		release: olderRelease,
-	}
-	olderRequest := httptest.NewRequest("POST", "/api/keys/reorder", olderBody)
-	olderRequest.Header.Set("Content-Type", "application/json")
-	olderRequest.Host = "localhost:9999"
-	olderResponse := httptest.NewRecorder()
-	olderDone := make(chan struct{})
-	go func() {
-		e.ServeHTTP(olderResponse, olderRequest)
-		close(olderDone)
-	}()
-	select {
-	case <-olderStarted:
-	case <-time.After(5 * time.Second):
-		t.Fatal("older request did not begin reading its body")
-	}
-
-	newerPayload := makePayload(baseRevision+1, []*model.Key{keys[2], keys[0], keys[1]})
-	newerRequest := httptest.NewRequest("POST", "/api/keys/reorder", strings.NewReader(string(newerPayload)))
-	newerRequest.Header.Set("Content-Type", "application/json")
-	newerRequest.Host = "localhost:9999"
-	newerResponse := httptest.NewRecorder()
-	e.ServeHTTP(newerResponse, newerRequest)
-	if newerResponse.Code != http.StatusOK {
-		t.Fatalf("newer reorder status = %d: %s", newerResponse.Code, newerResponse.Body.String())
-	}
-
-	close(olderRelease)
-	<-olderDone
-	if olderResponse.Code != http.StatusOK {
-		t.Fatalf("late older reorder status = %d: %s", olderResponse.Code, olderResponse.Body.String())
-	}
-
-	got := getNames(t, e)
-	want := []string{"c", "a", "b"}
-	if !slices.Equal(got, want) {
-		t.Fatalf("GET /api/keys order = %v, want newer order %v", got, want)
 	}
 }
 
@@ -258,17 +141,10 @@ func TestCreateKeyAppendsAtEndOfProvider(t *testing.T) {
 	}
 
 	// Drag so the current order is a2 (0), a1 (1).
-	payload, _ := json.Marshal(map[string]any{
-		"provider_id": prov.ID,
-		"revision": map[string]any{
-			"sequence":  time.Now().UnixMicro(),
-			"client_id": "create-key-test",
-		},
-		"keys": []map[string]any{
-			{"id": k2.ID, "sort_order": 0},
-			{"id": k1.ID, "sort_order": 1},
-		},
-	})
+	payload, _ := json.Marshal(map[string]any{"keys": []map[string]any{
+		{"id": k2.ID, "sort_order": 0},
+		{"id": k1.ID, "sort_order": 1},
+	}})
 	req := httptest.NewRequest("POST", "/api/keys/reorder", strings.NewReader(string(payload)))
 	req.Header.Set("Content-Type", "application/json")
 	req.Host = "localhost:9999"
