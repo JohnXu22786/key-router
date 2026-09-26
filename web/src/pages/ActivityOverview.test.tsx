@@ -378,4 +378,64 @@ describe('ActivityOverview empty state', () => {
     expect(valuesFor('sort')).toEqual([90]);
     expect(valuesFor('Other')).toEqual([120, 6]);
   });
+
+  it('keeps a literal Other model without adding a duplicate overflow legend', async () => {
+    const other = { ...makeConsumption(100, '2026-08-01T12:00:00'), model_name: 'Other', request_count: 7 };
+    vi.mocked(getConsumptions)
+      .mockResolvedValueOnce(response([other]))
+      .mockResolvedValueOnce(response([]));
+
+    render(<ActivityOverview range={customRange(dayjs('2026-08-01T00:00:00'), dayjs('2026-08-02T00:00:00'))} />);
+    await waitFor(() => expect(screen.getAllByRole('group', { name: 'Other' })).toHaveLength(2));
+
+    const valuesFor = (name: string) => screen.getAllByTestId('activity-overview-series')
+      .filter(element => element.getAttribute('data-name') === name)
+      .map(element => (JSON.parse(element.getAttribute('data-values')!) as number[])
+        .reduce((sum, value) => sum + value, 0));
+    expect(valuesFor('Other')).toEqual([100, 7]);
+    expect(screen.queryAllByRole('group', { name: 'Other (overflow)' })).toHaveLength(0);
+  });
+
+  it('keeps literal Other values separate from the tail in both charts', async () => {
+    const rows = [
+      { ...makeConsumption(100, '2026-08-01T12:00:00'), model_name: 'Other', request_count: 100 },
+      ...Array.from({ length: 6 }, (_, i) => ({
+        ...makeConsumption(10 - i, '2026-08-01T12:00:00'),
+        model_name: `tail-${i + 1}`,
+        request_count: 10 - i,
+      })),
+    ];
+    vi.mocked(getConsumptions)
+      .mockResolvedValueOnce(response(rows))
+      .mockResolvedValueOnce(response([]));
+
+    render(<ActivityOverview range={customRange(dayjs('2026-08-01T00:00:00'), dayjs('2026-08-02T00:00:00'))} />);
+    await waitFor(() => expect(screen.getAllByRole('group', { name: 'Other (overflow)' })).toHaveLength(2));
+
+    const valuesFor = (name: string) => screen.getAllByTestId('activity-overview-series')
+      .filter(element => element.getAttribute('data-name') === name)
+      .map(element => (JSON.parse(element.getAttribute('data-values')!) as number[])
+        .reduce((sum, value) => sum + value, 0));
+    expect(valuesFor('Other')).toEqual([100, 100]);
+    expect(valuesFor('Other (overflow)')).toEqual([11, 11]);
+  });
+
+  it('suffixes the overflow label when a real model already uses it', async () => {
+    const rows = [
+      { ...makeConsumption(100, '2026-08-01T12:00:00'), model_name: 'Other', request_count: 100 },
+      { ...makeConsumption(90, '2026-08-01T12:00:00'), model_name: 'Other (overflow)', request_count: 90 },
+      ...Array.from({ length: 5 }, (_, i) => ({
+        ...makeConsumption(10 - i, '2026-08-01T12:00:00'),
+        model_name: `tail-${i + 1}`,
+        request_count: 10 - i,
+      })),
+    ];
+    vi.mocked(getConsumptions)
+      .mockResolvedValueOnce(response(rows))
+      .mockResolvedValueOnce(response([]));
+
+    render(<ActivityOverview range={customRange(dayjs('2026-08-01T00:00:00'), dayjs('2026-08-02T00:00:00'))} />);
+    await waitFor(() => expect(screen.getAllByRole('group', { name: 'Other (overflow) #2' })).toHaveLength(2));
+    expect(screen.getAllByRole('group', { name: 'Other (overflow)' })).toHaveLength(2);
+  });
 });
