@@ -2612,7 +2612,7 @@ export function toChartData(resp: ActivityResponse): Array<Record<string, string
   const bucketIdx = new Map(resp.buckets.map((b, i) => [b, i]));
   for (const p of resp.series) {
     const i = bucketIdx.get(p.bucket);
-    if (i !== undefined) data[i][p.group] = p.value;
+    if (i !== undefined) data[i][p.group] = (Number(data[i][p.group]) || 0) + p.value;
   }
   return data;
 }
