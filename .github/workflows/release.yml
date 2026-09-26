@@ -85,38 +85,13 @@ jobs:
       - name: "Create and push tag (idempotent: skip if a pre-signed tag already exists)"
         env:
           RELEASE_TAG: ${{ steps.resolve.outputs.tag }}
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # If the tag already exists on the remote, the release manager has
-          # already pushed a GPG-signed tag — leave it alone and let build/publish
-          # run against the existing tag. Otherwise create + push the tag.
-          if git ls-remote --exit-code --refs origin "refs/tags/$RELEASE_TAG" >/dev/null; then
-            echo "Tag $RELEASE_TAG already exists on remote; using it."
-          else
-            git tag "$RELEASE_TAG"
-            if ! git push origin "$RELEASE_TAG"; then
-              echo "Tag push failed (likely created by a concurrent run); checking the remote tag."
-              if ! git ls-remote --exit-code --refs origin "refs/tags/$RELEASE_TAG" >/dev/null; then
-                echo "::error::Failed to push release tag and no remote tag exists: $RELEASE_TAG" >&2
-                exit 1
-              fi
-            fi
-          fi
-          # Always fetch the tag ref: it may be a signed tag on another commit,
-          # or a concurrently-created tag that won the push race above.
-          git fetch --no-tags --force origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+        run: bash "$GITHUB_WORKSPACE/scripts/ensure-release-tag.sh"
 
       - name: Resolve release tag commit
         id: resolve_commit
         env:
           RELEASE_TAG: ${{ steps.resolve.outputs.tag }}
-        run: |
-          set -euo pipefail
-          commit_sha=$(git rev-parse --verify "${RELEASE_TAG}^{commit}")
-          echo "commit_sha=$commit_sha" >> "$GITHUB_OUTPUT"
-          echo "Resolved $RELEASE_TAG to $commit_sha"
+        run: bash "$GITHUB_WORKSPACE/scripts/resolve-release-tag-commit.sh"
 
   build:
     name: Build ${{ matrix.name }}
