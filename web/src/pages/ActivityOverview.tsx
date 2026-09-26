@@ -70,6 +70,19 @@ const ExploreLink: React.FC<{ onClick: () => void }> = ({ onClick }) => (
 
 interface LegendGroup { name: string; color: string; }
 
+interface ModelChartGroup extends LegendGroup {
+  // Display names drive ChartCard's hide/show state; storageName identifies
+  // the collision-safe column in each stacked chart row.
+  storageName: string;
+}
+
+function uniqueModelLabel(base: string, used: Set<string>): string {
+  let candidate = base;
+  let suffix = 2;
+  while (used.has(candidate)) candidate = `${base} #${suffix++}`;
+  return candidate;
+}
+
 // ChartCard: a chart card with the reference's custom legend — the color
 // swatch toggles a series hidden, clicking the name shows only it, and the
 // move-right button relocates the legend next to the chart. Each card keeps
@@ -277,8 +290,6 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
 
   const cur = sum(curList, axSince, axUntil, cutNow);
   const prev = sum(prevList, prevWinSince, axSince, cutNow);
-  const hasSpend = cur.spend > 0;
-  const hasRequests = cur.requests > 0;
   const hasTokens = cur.tokens > 0;
   const hasPromptTokens = cur.input > 0;
   // Cache hit rate = cached / total input tokens (incl. cached) — one
@@ -337,45 +348,63 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
   // Usage by model (spend, stacked bars, top-5 + Other like OR)
   const modelSpend = groupTotals(curList, c => c.model_name || 'Unknown', c => c.cost_usd, share)
     .filter(([, value]) => value > 0);
-  const topModels = modelSpend.slice(0, 5).map(([m]) => m);
-  const usageByModel = stackedData(curList, [...topModels, 'Other'], c => c.model_name || 'Unknown', c => c.cost_usd, axSince, axUntil, cutNow, gran);
-  // Fold everything below top-5 into "Other" per bucket.
-  const otherModelSet = new Set(modelSpend.slice(5).map(([m]) => m));
-  usageByModel.forEach(row => {
-    let sum = 0;
-    for (const g of otherModelSet) {
-      const key = stackedGroupKey(g);
-      sum += row[key] ?? 0;
-      delete row[key];
+  const buildModelChart = (totals: Array<[string, number]>, valueFn: (c: Consumption) => number) => {
+    const realNames = new Set(totals.map(([name]) => name));
+    const topNames = totals.slice(0, 5).map(([name]) => name);
+    // A real model named Other remains visible even when it falls outside the
+    // normal top five; otherwise its values would be indistinguishable from
+    // the synthetic tail bucket.
+    if (realNames.has('Other') && !topNames.includes('Other')) topNames.push('Other');
+    const tailNames = totals.map(([name]) => name).filter(name => !topNames.includes(name));
+    const hasRealOther = realNames.has('Other');
+    const hasOverflow = totals.length > 0 && (!hasRealOther || tailNames.length > 0);
+    const overflowStorageName = hasRealOther
+      ? uniqueModelLabel('__activity_other_overflow__', realNames)
+      : 'Other';
+    const overflowDisplayName = hasRealOther
+      ? uniqueModelLabel('Other (overflow)', realNames)
+      : 'Other';
+    const groups: ModelChartGroup[] = topNames.map((name, i) => ({
+      name,
+      storageName: name,
+      color: CHART_COLORS[i % CHART_COLORS.length],
+    }));
+    if (hasOverflow) {
+      groups.push({ name: overflowDisplayName, storageName: overflowStorageName, color: OTHER_COLOR });
     }
-    row[stackedGroupKey('Other')] = sum;
-  });
-  const modelGroups: LegendGroup[] = (hasSpend ? [...topModels, 'Other'] : []).map((m, i) => ({
-    name: m,
-    color: m === 'Other' ? OTHER_COLOR : CHART_COLORS[i % CHART_COLORS.length],
-  }));
-  // Colors keyed by name so bars keep their color while other series hide.
+    const storageGroups = [...topNames, ...(hasOverflow ? [overflowStorageName] : [])];
+    const data = stackedData(curList, storageGroups, c => c.model_name || 'Unknown', valueFn, axSince, axUntil, cutNow, gran);
+    const tailSet = new Set(tailNames);
+    data.forEach(row => {
+      if (!hasOverflow) return;
+      let sum = 0;
+      for (const name of tailSet) {
+        const key = stackedGroupKey(name);
+        sum += row[key] ?? 0;
+        delete row[key];
+      }
+      row[stackedGroupKey(overflowStorageName)] = sum;
+    });
+    return {
+      data,
+      groups,
+      storageByDisplay: new Map(groups.map(group => [group.name, group.storageName])),
+    };
+  };
+  const modelChart = buildModelChart(modelSpend, c => c.cost_usd);
+  const usageByModel = modelChart.data;
+  const modelGroups = modelChart.groups;
+  const modelStorageByDisplay = modelChart.storageByDisplay;
+  // Colors keyed by display name so bars keep their color while other series hide.
   const modelColor = new Map(modelGroups.map(g => [g.name, g.color]));
 
   // Request volume by model (stacked bars, top-5 + Other)
   const modelReqs = groupTotals(curList, c => c.model_name || 'Unknown', c => c.request_count, share)
     .filter(([, value]) => value > 0);
-  const topReqModels = modelReqs.slice(0, 5).map(([m]) => m);
-  const reqByModel = stackedData(curList, [...topReqModels, 'Other'], c => c.model_name || 'Unknown', c => c.request_count, axSince, axUntil, cutNow, gran);
-  const otherReqSet = new Set(modelReqs.slice(5).map(([m]) => m));
-  reqByModel.forEach(row => {
-    let sum = 0;
-    for (const g of otherReqSet) {
-      const key = stackedGroupKey(g);
-      sum += row[key] ?? 0;
-      delete row[key];
-    }
-    row[stackedGroupKey('Other')] = sum;
-  });
-  const reqGroups: LegendGroup[] = (hasRequests ? [...topReqModels, 'Other'] : []).map((m, i) => ({
-    name: m,
-    color: m === 'Other' ? OTHER_COLOR : CHART_COLORS[i % CHART_COLORS.length],
-  }));
+  const requestChart = buildModelChart(modelReqs, c => c.request_count);
+  const reqByModel = requestChart.data;
+  const reqGroups = requestChart.groups;
+  const reqStorageByDisplay = requestChart.storageByDisplay;
   const reqColor = new Map(reqGroups.map(g => [g.name, g.color]));
 
   // Token breakdown: Prompt / Completion (no reasoning field in the model;
@@ -536,7 +565,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
                 <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={56} tickFormatter={(v) => fmtUSDInt(Number(v))} />
                 <Tooltip formatter={(v: any, name: any) => [fmtUSD(Number(v)), String(name)]} contentStyle={{ borderRadius: 8, border: '1px solid ' + GRID, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
                 {vis.map((m, i) => (
-                  <Bar key={m} dataKey={(row: Record<string, any>) => row[stackedGroupKey(m)]} name={m} stackId="a" fill={modelColor.get(m)} maxBarSize={22} radius={i === vis.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]} />
+                  <Bar key={m} dataKey={(row: Record<string, any>) => row[stackedGroupKey(modelStorageByDisplay.get(m) ?? m)]} name={m} stackId="a" fill={modelColor.get(m)} maxBarSize={22} radius={i === vis.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]} />
                 ))}
               </BarChart>
             </ResponsiveContainer>
@@ -554,7 +583,7 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
                 <YAxis tick={{ fill: AXIS, fontSize: 11 }} tickLine={false} axisLine={false} width={50} tickFormatter={(v) => fmtCompact(Number(v))} />
                 <Tooltip formatter={(v: any, name: any) => [fmtCompact(Number(v)), String(name)]} contentStyle={{ borderRadius: 8, background: token.colorBgContainer, color: token.colorText }} labelFormatter={(l) => fmtBucket(gran, String(l))} />
                 {vis.map((m, i) => (
-                  <Bar key={m} dataKey={(row: Record<string, any>) => row[stackedGroupKey(m)]} name={m} stackId="a" fill={reqColor.get(m)} maxBarSize={14} radius={i === vis.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]} />
+                  <Bar key={m} dataKey={(row: Record<string, any>) => row[stackedGroupKey(reqStorageByDisplay.get(m) ?? m)]} name={m} stackId="a" fill={reqColor.get(m)} maxBarSize={14} radius={i === vis.length - 1 ? [2, 2, 0, 0] : [0, 0, 0, 0]} />
                 ))}
               </BarChart>
             </ResponsiveContainer>
