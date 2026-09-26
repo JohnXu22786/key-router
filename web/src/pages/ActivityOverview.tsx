@@ -20,11 +20,26 @@ interface OverviewProps {
   onNavigate?: (tab: 'explore', opts?: ExploreOpts) => void;
 }
 
-// keyValueFor is bound inside the component to the loaded keys.
-function keyValueFor(name: string): string {
-  return keysRefForOverview.get(name) || '';
+interface KeyDisplay {
+  label: string;
+  value: string;
 }
-let keysRefForOverview = new Map<string, string>();
+
+function buildKeyDisplayByID(keys: Key[]): Map<number, KeyDisplay> {
+  const idsByName = new Map<string, number[]>();
+  for (const key of keys) {
+    if (!key.name) continue;
+    idsByName.set(key.name, [...(idsByName.get(key.name) ?? []), key.id]);
+  }
+
+  return new Map(keys.map(key => {
+    const duplicate = Boolean(key.name && (idsByName.get(key.name)?.length ?? 0) > 1);
+    return [key.id, {
+      label: duplicate ? `${key.name} (#${key.id})` : (key.name || `Key #${key.id}`),
+      value: key.key_value || '',
+    }];
+  }));
+}
 
 const deltaPct = (cur: number, prev: number) =>
   prev > 0 ? ((cur - prev) / prev) * 100 : (cur > 0 ? 100 : 0);
@@ -217,7 +232,6 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
         setKeys(keyRes.data);
         setTruncated(responseWasTruncated(curRes) || responseWasTruncated(prevRes));
         setWin({ since: range.since, until: range.until, granularity: range.granularity, prevSince, cutoff });
-        keysRefForOverview = new Map(keyRes.data.map(k => [k.name || `Key #${k.id}`, k.key_value || '']));
       } catch { if (!cancelled) { setError(true); message.error('Failed to load activity'); } }
       finally { if (!cancelled) setLoading(false); }
     };
@@ -381,12 +395,19 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
     Uncached: Math.max(0, (inSeries[i]?.value || 0) - d.value),
   }));
 
-  // Top API Keys (tokens) and Top Apps (attribution headers, tokens)
-  const keyTokens = groupTotals(curList, c => {
-    const k = keys.find(x => x.id === c.key_id);
-    return k?.name || `Key #${c.key_id}`;
-  }, c => c.input_tokens + c.output_tokens, share).filter(([, value]) => value > 0);
-  const topKeys = keyTokens.slice(0, 5);
+  // Top API Keys (tokens) and Top Apps (attribution headers, tokens). Keep
+  // aggregation and masking keyed by ID: display names are user-editable and
+  // are not guaranteed to be unique.
+  const keyDisplayByID = buildKeyDisplayByID(keys);
+  const keyTotals = new Map<number, number>();
+  for (const c of curList) {
+    keyTotals.set(c.key_id, (keyTotals.get(c.key_id) || 0) + (c.input_tokens + c.output_tokens) * share(c));
+  }
+  const topKeys = [...keyTotals.entries()]
+    .map(([keyId, value]) => ({ keyId, value, label: keyDisplayByID.get(keyId)?.label || `Key #${keyId}` }))
+    .filter(({ value }) => value > 0)
+    .sort((a, b) => b.value - a.value || a.keyId - b.keyId)
+    .slice(0, 5);
 
   const appTokens = groupTotals(curList, c => c.app_name || 'Unknown', c => c.input_tokens + c.output_tokens, share)
     .filter(([, value]) => value > 0);
@@ -469,15 +490,15 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
         <Col xs={24} lg={12}>
           <Card style={{ borderRadius: 12 }} title="Top API Keys" extra={<ExploreLink onClick={() => goExplore({ metric: 'tokens', groupBy: 'key' })} />}>
             {topKeys.length === 0 && <Text type="secondary">No usage in this period.</Text>}
-            {topKeys.map(([name, val], idx) => (
-              <div key={name} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '6px 0' }}>
+            {topKeys.map(({ keyId, label, value }, idx) => (
+              <div key={keyId} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '6px 0' }}>
                 <Text type="secondary" style={{ width: 20, textAlign: 'right' }}>{idx + 1}</Text>
                 <span style={{ width: 10, height: 10, borderRadius: '50%', background: CHART_COLORS[idx % CHART_COLORS.length], flexShrink: 0 }} />
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <Text strong style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</Text>
-                  <Text type="secondary" style={{ fontSize: 12 }}>{maskKey(keyValueFor(name))}</Text>
+                  <Text strong style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{label}</Text>
+                  <Text type="secondary" style={{ fontSize: 12 }}>{maskKey(keyDisplayByID.get(keyId)?.value || '')}</Text>
                 </div>
-                <Text strong style={{ width: 90, textAlign: 'right' }}>{fmtTokens(val)}</Text>
+                <Text strong style={{ width: 90, textAlign: 'right' }}>{fmtTokens(value)}</Text>
               </div>
             ))}
           </Card>

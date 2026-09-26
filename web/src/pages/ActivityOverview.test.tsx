@@ -180,6 +180,30 @@ describe('ActivityOverview optional key metadata', () => {
     expect(screen.getByText('Key #1')).not.toBeNull();
     expect(screen.queryByText('Failed to load activity — check the log file.')).toBeNull();
   });
+
+  it('keeps duplicate key names separate and masks each key by ID', async () => {
+    const first = { ...makeConsumption(1, '2026-08-01T12:00:00', 100, 100), id: 1, key_id: 1 };
+    const second = { ...makeConsumption(1, '2026-08-01T12:00:00', 300, 400), id: 2, key_id: 2 };
+    vi.mocked(getConsumptions)
+      .mockResolvedValueOnce(response([first, second]))
+      .mockResolvedValueOnce(response([]));
+    vi.mocked(getKeys).mockResolvedValueOnce({ data: [
+      { id: 2, name: 'Production', key_value: 'sk-production-two' },
+      { id: 1, name: 'Production', key_value: 'sk-production-one' },
+    ] } as unknown as Awaited<ReturnType<typeof getKeys>>);
+
+    render(<ActivityOverview range={customRange(
+      dayjs('2026-08-01T00:00:00'),
+      dayjs('2026-08-02T00:00:00'),
+    )} />);
+
+    expect(await screen.findByText('Production (#1)')).not.toBeNull();
+    expect(screen.getByText('Production (#2)')).not.toBeNull();
+    expect(screen.getByText('sk-productio...one')).not.toBeNull();
+    expect(screen.getByText('sk-productio...two')).not.toBeNull();
+    expect(screen.getByText('200 tok')).not.toBeNull();
+    expect(screen.getByText('700 tok')).not.toBeNull();
+  });
 });
 
 describe('ActivityOverview custom range refresh', () => {
