@@ -363,12 +363,12 @@ const Providers: React.FC = () => {
     const payload = ordered
       .filter(key => key.provider_id === providerId)
       .map((key, sort_order) => ({ id: key.id, sort_order }));
-    const request = keyOrderPersistence.queue.then(() => {
-      const locks = typeof navigator === 'undefined' ? undefined : navigator.locks;
-      return locks
-        ? locks.request(keyOrderWriteLock, () => reorderKeys(payload))
-        : reorderKeys(payload);
-    });
+    const locks = typeof navigator === 'undefined' ? undefined : navigator.locks;
+    // Register the shared lock at drop time so another tab cannot overtake
+    // this write while it waits behind an earlier drop from this page.
+    const request = locks
+      ? locks.request(keyOrderWriteLock, () => reorderKeys(payload))
+      : keyOrderPersistence.queue.then(() => reorderKeys(payload));
     keyOrderPersistence.queue = request
       .catch(() => {
         message.error('Failed to save order');

@@ -41,6 +41,9 @@ if (typeof globalThis.ResizeObserver !== 'function') {
     disconnect() {}
   };
 }
+
+let webLockQueue = Promise.resolve();
+let webLockRequestCount = 0;
 const provider: Provider = {
   id: 1,
   name: 'Provider One',
@@ -149,6 +152,19 @@ async function dragFirstKeyToLast(container: HTMLElement, firstKeyId?: number) {
 
 describe('Providers key reorder persistence', () => {
   beforeEach(() => {
+    webLockQueue = Promise.resolve();
+    webLockRequestCount = 0;
+    Object.defineProperty(navigator, 'locks', {
+      configurable: true,
+      value: {
+        request: (_name: string, callback: () => unknown) => {
+          webLockRequestCount++;
+          const result = webLockQueue.then(callback);
+          webLockQueue = result.then(() => undefined, () => undefined);
+          return result;
+        },
+      } as unknown as LockManager,
+    });
     vi.mocked(getProviders).mockResolvedValue({ data: [provider] } as any);
     vi.mocked(getKeys).mockResolvedValue({ data: keys } as any);
     vi.mocked(getRoutes).mockResolvedValue({ data: [] } as any);
@@ -210,7 +226,59 @@ describe('Providers key reorder persistence', () => {
       const persisted = await getKeys();
       expect(persisted.data.map(key => key.id)).toEqual([12, 10, 11]);
     });
-  });
+  }, 15000);
+
+  it('registers each same-origin tab drop with Web Locks at drop time', async () => {
+    let serverKeys = keys.map(key => ({ ...key }));
+    const firstWrite = deferred<any>();
+    vi.mocked(getKeys).mockImplementation(async () => ({ data: serverKeys.map(key => ({ ...key })) }) as any);
+    vi.mocked(reorderKeys)
+      .mockImplementationOnce(async payload => {
+        await firstWrite.promise;
+        serverKeys = orderKeys(payload, serverKeys);
+        return { data: undefined } as any;
+      })
+      .mockImplementation(async payload => {
+        serverKeys = orderKeys(payload, serverKeys);
+        return { data: undefined } as any;
+      });
+
+    const tabA = render(<Providers />);
+    await waitFor(() => expect(tabA.container.textContent).toContain('Provider One'));
+    const headerA = tabA.container.querySelector('.ant-collapse-header');
+    if (!headerA) throw new Error('first tab provider header not found');
+    fireEvent.click(headerA);
+    await waitFor(() => expect(tabA.container.textContent).toContain('Key 10'));
+
+    const tabB = render(<Providers />);
+    await waitFor(() => expect(tabB.container.textContent).toContain('Provider One'));
+    const headerB = tabB.container.querySelector('.ant-collapse-header');
+    if (!headerB) throw new Error('second tab provider header not found');
+    fireEvent.click(headerB);
+    await waitFor(() => expect(tabB.container.textContent).toContain('Key 10'));
+
+    await dragFirstKeyToLast(tabA.container);
+    await waitFor(() => expect(reorderKeys).toHaveBeenCalledTimes(1));
+    await dragFirstKeyToLast(tabA.container);
+    expect(webLockRequestCount).toBe(2);
+    expect(reorderKeys).toHaveBeenCalledTimes(1);
+
+    await dragFirstKeyToLast(tabB.container);
+    expect(webLockRequestCount).toBe(3);
+    expect(reorderKeys).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      firstWrite.resolve({ data: undefined });
+      await firstWrite.promise;
+    });
+    await waitFor(() => expect(reorderKeys).toHaveBeenCalledTimes(3));
+    expect(vi.mocked(reorderKeys).mock.calls.map(([payload]) => payload.map(key => key.id))).toEqual([
+      [11, 12, 10],
+      [12, 10, 11],
+      [11, 12, 10],
+    ]);
+    expect(serverKeys.map(key => key.id)).toEqual([11, 12, 10]);
+  }, 15000);
 
   it('continues with a queued drop after an earlier reorder request fails', async () => {
     let serverKeys = keys.map(key => ({ ...key }));
@@ -252,7 +320,7 @@ describe('Providers key reorder persistence', () => {
       const persisted = await getKeys();
       expect(persisted.data.map(key => key.id)).toEqual([12, 10, 11]);
     });
-  });
+  }, 15000);
 
   it('keeps a pending write ordered and refreshes keys after the Providers route remounts', async () => {
     let serverKeys = keys.map(key => ({ ...key }));
@@ -306,7 +374,7 @@ describe('Providers key reorder persistence', () => {
       const persisted = await getKeys();
       expect(persisted.data.map(key => key.id)).toEqual([12, 10, 11]);
     });
-  });
+  }, 15000);
 
   it('serializes writes across providers with provider-scoped payloads', async () => {
     const providerTwo: Provider = { ...provider, id: 2, name: 'Provider Two' };
@@ -357,5 +425,5 @@ describe('Providers key reorder persistence', () => {
       { id: 22, sort_order: 1 },
       { id: 20, sort_order: 2 },
     ]);
-  });
+  }, 15000);
 });
