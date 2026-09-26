@@ -31,6 +31,7 @@ jobs:
       tag: ${{ steps.resolve.outputs.tag }}
       ver: ${{ steps.resolve.outputs.ver }}
       prerelease: ${{ steps.resolve.outputs.prerelease }}
+      commit_sha: ${{ steps.resolve_commit.outputs.commit_sha }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -96,9 +97,26 @@ jobs:
           else
             git tag "$RELEASE_TAG"
             if ! git push origin "$RELEASE_TAG"; then
-              echo "Tag push failed (likely created by a concurrent run). Continuing — build/publish will run against the existing tag."
+              echo "Tag push failed (likely created by a concurrent run); checking the remote tag."
+              if ! git ls-remote --exit-code --refs origin "refs/tags/$RELEASE_TAG" >/dev/null; then
+                echo "::error::Failed to push release tag and no remote tag exists: $RELEASE_TAG" >&2
+                exit 1
+              fi
             fi
           fi
+          # Always fetch the tag ref: it may be a signed tag on another commit,
+          # or a concurrently-created tag that won the push race above.
+          git fetch --no-tags --force origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+
+      - name: Resolve release tag commit
+        id: resolve_commit
+        env:
+          RELEASE_TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          commit_sha=$(git rev-parse --verify "${RELEASE_TAG}^{commit}")
+          echo "commit_sha=$commit_sha" >> "$GITHUB_OUTPUT"
+          echo "Resolved $RELEASE_TAG to $commit_sha"
 
   build:
     name: Build ${{ matrix.name }}
@@ -124,6 +142,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.version.outputs.commit_sha }}
 
       - name: Set up Go
         uses: actions/setup-go@v7
@@ -234,7 +254,7 @@ jobs:
           body: |
             ## KeyRouter ${{ needs.version.outputs.tag }}
 
-            Automated release — built from `main`.
+            Automated release — built from the resolved release tag commit.
 
             ### Windows
             - **Installer**: `KeyRouter-${{ needs.version.outputs.tag }}-windows-amd64-setup.exe`

@@ -26,6 +26,9 @@ jobs:
       - name: Validate release version workflow
         run: bash scripts/test-validate-release-version.sh
 
+      - name: Verify release builds use the resolved tag commit
+        run: bash scripts/test-release-build-uses-tag-commit.sh
+
       # web/dist is not committed (content-hashed filenames made every
       # frontend change collide in merges) — build it before compiling so
       # //go:embed web/dist/* resolves.
