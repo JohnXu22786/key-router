@@ -165,7 +165,8 @@ const Activity: React.FC = () => {
     setFilterOptsLoading(true);
     Promise.all([
       getConsumptions({ since: optionRange.since.toISOString(), until: optionRange.until.toISOString() }),
-      getKeys(),
+      // Model and app options come from consumption rows; key metadata is optional.
+      getKeys().catch(() => null),
     ])
       .then(([c, k]) => {
         if (cancelled) return;
@@ -186,7 +187,7 @@ const Activity: React.FC = () => {
         ) > 0);
         const models = [...new Set(inWindow.map(x => x.model_name || 'Unknown'))].sort(cmp);
         const apps = [...new Set(inWindow.map(x => x.app_name || 'Unknown'))].sort(cmp);
-        const keys = [...k.data].sort((a, b) =>
+        const keys = [...(k?.data ?? [])].sort((a, b) =>
           (a.name || `Key #${a.id}`).localeCompare(b.name || `Key #${b.id}`));
         setFilterOpts({ models, apps, keys });
         setFilterOptsTruncated(responseWasTruncated(c));
