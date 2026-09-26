@@ -37,19 +37,34 @@ jobs:
 
       - name: Resolve version (explicit or auto-bump)
         id: resolve
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            tag="${{ inputs.version }}"
+          set -euo pipefail
+          if [ -n "$VERSION_INPUT" ]; then
+            if ! bash "$GITHUB_WORKSPACE/scripts/validate-release-version.sh" "$VERSION_INPUT" >/dev/null; then
+              echo "::error::Invalid version input; expected vX.Y.Z with optional safe prerelease/build suffix." >&2
+              exit 1
+            fi
+            tag="$VERSION_INPUT"
           else
             latest=$(git tag --list 'v*' --sort=-v:refname | head -n1 || true)
             if [ -z "$latest" ]; then
               tag="v0.1.0"
             else
+              if ! bash "$GITHUB_WORKSPACE/scripts/validate-release-version.sh" "$latest" >/dev/null; then
+                echo "::error::Latest repository tag is not a supported release version: $latest" >&2
+                exit 1
+              fi
               base=${latest#v}
               IFS='.' read -r maj min pat <<< "$base"
-              pat="${pat%%-*}"   # tolerate prerelease tags like v1.2.3-beta
+              pat="${pat%%[-+]*}"   # ignore prerelease/build suffixes like v1.2.3-beta+build
               tag="v${maj}.${min}.$((pat + 1))"
             fi
+          fi
+          if ! bash "$GITHUB_WORKSPACE/scripts/validate-release-version.sh" "$tag" >/dev/null; then
+            echo "::error::Resolved release tag is not a supported version: $tag" >&2
+            exit 1
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           # Numeric version (no 'v') for -X ldflags, NSIS, Info.plist, deb:
@@ -58,18 +73,21 @@ jobs:
           echo "ver=${tag#v}" >> "$GITHUB_OUTPUT"
           echo "Resolved tag: $tag"
 
-      - name: Create and push tag (idempotent: skip if a pre-signed tag already exists)
+      - name: "Create and push tag (idempotent: skip if a pre-signed tag already exists)"
+        env:
+          RELEASE_TAG: ${{ steps.resolve.outputs.tag }}
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           # If the tag already exists on the remote, the release manager has
           # already pushed a GPG-signed tag — leave it alone and let build/publish
           # run against the existing tag. Otherwise create + push the tag.
-          if git ls-remote --tags origin "${{ steps.resolve.outputs.tag }}" | grep -q "refs/tags/${{ steps.resolve.outputs.tag }}$"; then
-            echo "Tag ${{ steps.resolve.outputs.tag }} already exists on remote; using it."
+          if git ls-remote --tags origin "$RELEASE_TAG" | grep -Fqx -- "refs/tags/$RELEASE_TAG"; then
+            echo "Tag $RELEASE_TAG already exists on remote; using it."
           else
-            git tag "${{ steps.resolve.outputs.tag }}"
-            if ! git push origin "${{ steps.resolve.outputs.tag }}"; then
+            git tag "$RELEASE_TAG"
+            if ! git push origin "$RELEASE_TAG"; then
               echo "Tag push failed (likely created by a concurrent run). Continuing — build/publish will run against the existing tag."
             fi
           fi
