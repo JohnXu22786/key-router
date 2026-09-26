@@ -31,6 +31,7 @@ jobs:
       tag: ${{ steps.resolve.outputs.tag }}
       ver: ${{ steps.resolve.outputs.ver }}
       prerelease: ${{ steps.resolve.outputs.prerelease }}
+      commit_sha: ${{ steps.resolve_commit.outputs.commit_sha }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -84,21 +85,13 @@ jobs:
       - name: "Create and push tag (idempotent: skip if a pre-signed tag already exists)"
         env:
           RELEASE_TAG: ${{ steps.resolve.outputs.tag }}
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # If the tag already exists on the remote, the release manager has
-          # already pushed a GPG-signed tag — leave it alone and let build/publish
-          # run against the existing tag. Otherwise create + push the tag.
-          if git ls-remote --exit-code --refs origin "refs/tags/$RELEASE_TAG" >/dev/null; then
-            echo "Tag $RELEASE_TAG already exists on remote; using it."
-          else
-            git tag "$RELEASE_TAG"
-            if ! git push origin "$RELEASE_TAG"; then
-              echo "Tag push failed (likely created by a concurrent run). Continuing — build/publish will run against the existing tag."
-            fi
-          fi
+        run: bash "$GITHUB_WORKSPACE/scripts/ensure-release-tag.sh"
+
+      - name: Resolve release tag commit
+        id: resolve_commit
+        env:
+          RELEASE_TAG: ${{ steps.resolve.outputs.tag }}
+        run: bash "$GITHUB_WORKSPACE/scripts/resolve-release-tag-commit.sh"
 
   build:
     name: Build ${{ matrix.name }}
@@ -124,6 +117,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.version.outputs.commit_sha }}
 
       - name: Set up Go
         uses: actions/setup-go@v7
@@ -234,7 +229,7 @@ jobs:
           body: |
             ## KeyRouter ${{ needs.version.outputs.tag }}
 
-            Automated release — built from `main`.
+            Automated release — built from the resolved release tag commit.
 
             ### Windows
             - **Installer**: `KeyRouter-${{ needs.version.outputs.tag }}-windows-amd64-setup.exe`
