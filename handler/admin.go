@@ -33,6 +33,84 @@ import (
 // handler package mirrors the value so /api/health reports the release version.
 var version = "0.1.0"
 
+type keyOrderRevision struct {
+	Sequence int64  `json:"sequence"`
+	ClientID string `json:"client_id"`
+}
+
+func (r keyOrderRevision) compare(other keyOrderRevision) int {
+	if r.Sequence < other.Sequence {
+		return -1
+	}
+	if r.Sequence > other.Sequence {
+		return 1
+	}
+	if r.ClientID < other.ClientID {
+		return -1
+	}
+	if r.ClientID > other.ClientID {
+		return 1
+	}
+	return 0
+}
+
+type keyOrderWriteState struct {
+	revision  keyOrderRevision
+	succeeded bool
+}
+
+// keyOrderWriteGate rejects stale revisions independently for each provider.
+type keyOrderWriteGate struct {
+	latest        map[int64]keyOrderWriteState
+	providerLocks map[int64]*sync.Mutex
+	mu            sync.Mutex
+}
+
+func (g *keyOrderWriteGate) lockForProvider(providerID int64) *sync.Mutex {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.providerLocks == nil {
+		g.providerLocks = make(map[int64]*sync.Mutex)
+	}
+	if g.providerLocks[providerID] == nil {
+		g.providerLocks[providerID] = &sync.Mutex{}
+	}
+	return g.providerLocks[providerID]
+}
+
+func (g *keyOrderWriteGate) apply(providerID int64, revision keyOrderRevision, write func() error) (bool, error) {
+	providerLock := g.lockForProvider(providerID)
+	providerLock.Lock()
+	defer providerLock.Unlock()
+
+	g.mu.Lock()
+	state, exists := g.latest[providerID]
+	if exists {
+		comparison := revision.compare(state.revision)
+		if comparison < 0 || (comparison == 0 && state.succeeded) {
+			g.mu.Unlock()
+			return false, nil
+		}
+	}
+	if g.latest == nil {
+		g.latest = make(map[int64]keyOrderWriteState)
+	}
+	// Keep failed revisions as the high-water mark so older in-flight writes
+	// cannot undo the latest drop; an identical retry may still apply it.
+	state = keyOrderWriteState{revision: revision}
+	g.latest[providerID] = state
+	g.mu.Unlock()
+
+	err := write()
+	if err == nil {
+		g.mu.Lock()
+		state.succeeded = true
+		g.latest[providerID] = state
+		g.mu.Unlock()
+	}
+	return true, err
+}
+
 // Updater abstracts the update client for the update endpoints: a real
 // *update.Client in production, fakes in tests.
 type Updater interface {
@@ -79,8 +157,9 @@ type AdminHandler struct {
 	restarting bool
 	// autoCheckInfo holds the most recent auto-check result (set by
 	// AutoCheck's callback; read by GetAutoCheckState).
-	autoCheckMu   sync.Mutex
-	autoCheckInfo *update.UpdateInfo
+	autoCheckMu    sync.Mutex
+	autoCheckInfo  *update.UpdateInfo
+	keyOrderWrites keyOrderWriteGate
 }
 
 // SetAutoCheckInfo stores the latest auto-check result.
@@ -1016,11 +1095,13 @@ func (h *AdminHandler) DeleteRoute(c *gin.Context) {
 
 // ReorderKeys batch-updates key sort_order based on visual ordering (the
 // order the user arranged keys within a provider; sort_order = call order).
-// sort_order is per-provider: the payload carries all keys with their
-// per-provider sort_order indices (0..n-1 within each provider).
+// sort_order is per-provider: the payload carries that provider's keys with
+// indices 0..n-1 and a client revision that orders overlapping requests.
 func (h *AdminHandler) ReorderKeys(c *gin.Context) {
 	var req struct {
-		Keys []struct {
+		ProviderID int64            `json:"provider_id"`
+		Revision   keyOrderRevision `json:"revision"`
+		Keys       []struct {
 			ID        int64 `json:"id"`
 			SortOrder int64 `json:"sort_order"`
 		} `json:"keys"`
@@ -1029,19 +1110,34 @@ func (h *AdminHandler) ReorderKeys(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-
-	tx := db.GetDB().Begin()
-	for _, r := range req.Keys {
-		if err := tx.Model(&model.Key{}).Where("id = ?", r.ID).Update("sort_order", r.SortOrder).Error; err != nil {
-			tx.Rollback()
-			log.Printf("[admin] ReorderKeys error for key %d: %v", r.ID, err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "reorder failed"})
-			return
-		}
+	if req.ProviderID <= 0 || req.Revision.Sequence <= 0 || req.Revision.ClientID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "provider_id and a valid revision are required"})
+		return
 	}
-	if err := tx.Commit().Error; err != nil {
-		log.Printf("[admin] ReorderKeys commit error: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "reorder commit failed"})
+
+	failure := "reorder failed"
+	applied, err := h.keyOrderWrites.apply(req.ProviderID, req.Revision, func() error {
+		tx := db.GetDB().Begin()
+		for _, r := range req.Keys {
+			if err := tx.Model(&model.Key{}).Where("id = ? AND provider_id = ?", r.ID, req.ProviderID).Update("sort_order", r.SortOrder).Error; err != nil {
+				tx.Rollback()
+				log.Printf("[admin] ReorderKeys error for key %d: %v", r.ID, err)
+				return err
+			}
+		}
+		if err := tx.Commit().Error; err != nil {
+			failure = "reorder commit failed"
+			log.Printf("[admin] ReorderKeys commit error: %v", err)
+			return err
+		}
+		return nil
+	})
+	if !applied {
+		c.JSON(http.StatusOK, gin.H{"status": "superseded"})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": failure})
 		return
 	}
 
