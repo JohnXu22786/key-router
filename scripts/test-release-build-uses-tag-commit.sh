@@ -82,6 +82,38 @@ if [[ "$resolve_step_count" -ne 1 || "$tag_binding_count" -ne 1 ||
 fi
 
 read -r build_dependency_count build_checkout_count pinned_checkout_count < <(awk '
+  function yaml_scalar(value, quote) {
+    sub(/^[[:space:]]*/, "", value)
+    quote = substr(value, 1, 1)
+    if (quote == "\"" || quote == sprintf("%c", 39)) {
+      value = substr(value, 2)
+      sub(quote ".*$", "", value)
+    } else {
+      sub(/[[:space:]]+#.*$/, "", value)
+    }
+    sub(/[[:space:]]+$/, "", value)
+    return value
+  }
+
+  function checkout_action(value) {
+    value = yaml_scalar(value)
+    return value ~ /^actions\/checkout@[^[:space:]]+$/
+  }
+
+  function includes_version(value, count, items, i) {
+    value = yaml_scalar(value)
+    sub(/^\[/, "", value)
+    sub(/\]$/, "", value)
+    gsub(/[[:space:]]/, "", value)
+    gsub(/"/, "", value)
+    gsub(sprintf("%c", 39), "", value)
+    count = split(value, items, ",")
+    for (i = 1; i <= count; i++) {
+      if (items[i] == "version") return 1
+    }
+    return 0
+  }
+
   function finish_step() {
     if (in_step && is_checkout) {
       checkouts++
@@ -89,23 +121,71 @@ read -r build_dependency_count build_checkout_count pinned_checkout_count < <(aw
     }
     in_step = 0
     is_checkout = 0
+    in_with = 0
     has_sha_ref = 0
   }
 
   /^  build:$/ { in_build = 1; next }
   in_build && /^  [[:alnum:]_-]+:/ { finish_step(); exit }
-  in_build && /^    needs: version$/ { needs_version++ }
+  in_build && /^    needs:[[:space:]]*/ {
+    value = $0
+    sub(/^    needs:[[:space:]]*/, "", value)
+    if (value == "") {
+      needs_block = 1
+    } else if (includes_version(value)) {
+      needs_version = 1
+    }
+    next
+  }
+  in_build && needs_block && /^      - / {
+    value = $0
+    sub(/^      -[[:space:]]*/, "", value)
+    if (includes_version(value)) needs_version = 1
+    next
+  }
+  in_build && needs_block && /^    - / {
+    value = $0
+    sub(/^    -[[:space:]]*/, "", value)
+    if (includes_version(value)) needs_version = 1
+    next
+  }
+  in_build && needs_block && /^    [[:alnum:]_-]+:/ { needs_block = 0 }
   in_build && /^      - / {
     finish_step()
     in_step = 1
-    if ($0 ~ /^      - uses:[[:space:]]*actions\/checkout@[^[:space:]]+/) is_checkout = 1
+    if ($0 ~ /^      - uses:[[:space:]]*/) {
+      value = $0
+      sub(/^      - uses:[[:space:]]*/, "", value)
+      if (checkout_action(value)) is_checkout = 1
+    }
     next
   }
-  in_build && in_step && /^        uses:[[:space:]]*actions\/checkout@[^[:space:]]+/ {
-    is_checkout = 1
+  in_build && in_step && /^        with:/ {
+    value = $0
+    sub(/^        with:[[:space:]]*/, "", value)
+    if (value ~ /^\{/) {
+      ref_position = index(value, "ref:")
+      if (ref_position > 0 && yaml_scalar(substr(value, ref_position + 4)) == "${{ needs.version.outputs.commit_sha }}") {
+        has_sha_ref = 1
+      }
+      in_with = 0
+    } else {
+      in_with = 1
+    }
+    next
   }
-  in_build && in_step && is_checkout && /^          ref: / {
-    if ($0 == "          ref: ${{ needs.version.outputs.commit_sha }}") has_sha_ref = 1
+  in_build && in_step && /^        [[:alnum:]_-]+:/ {
+    in_with = 0
+    if ($0 ~ /^        uses:[[:space:]]*/) {
+      value = $0
+      sub(/^        uses:[[:space:]]*/, "", value)
+      if (checkout_action(value)) is_checkout = 1
+    }
+  }
+  in_build && in_step && in_with && /^          ref:[[:space:]]*/ {
+    value = $0
+    sub(/^          ref:[[:space:]]*/, "", value)
+    if (yaml_scalar(value) == "${{ needs.version.outputs.commit_sha }}") has_sha_ref = 1
   }
   END {
     finish_step()
