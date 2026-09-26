@@ -25,6 +25,8 @@ const keyOrderPersistence = {
   generation: 0,
   queue: Promise.resolve() as Promise<void>,
 };
+// Coordinate independent Providers pages on the same browser origin.
+const keyOrderWriteLock = 'key-router:key-order-write';
 
 async function waitForKeyOrderWrites() {
   while (keyOrderPersistence.pending > 0) {
@@ -351,16 +353,22 @@ const Providers: React.FC = () => {
     } catch { message.error('Failed to reset key spend'); }
   };
   const persistOrder = useCallback((ordered: Key[]) => {
-    // Serialize every full-order write so an earlier drop cannot finish after
-    // a newer one and restore the old order.
+    const changedIndex = ordered.findIndex((key, index) => keys[index]?.id !== key.id);
+    const providerId = ordered[changedIndex]?.provider_id;
+    if (providerId == null) return;
+
+    // Serialize order writes so an earlier drop cannot finish after a newer
+    // one and restore the old provider order.
     keyOrderPersistence.pending++;
-    const providerCounts: Record<number, number> = {};
-    const payload = ordered.map(k => {
-      const sort_order = providerCounts[k.provider_id] ?? 0;
-      providerCounts[k.provider_id] = sort_order + 1;
-      return { id: k.id, sort_order };
+    const payload = ordered
+      .filter(key => key.provider_id === providerId)
+      .map((key, sort_order) => ({ id: key.id, sort_order }));
+    const request = keyOrderPersistence.queue.then(() => {
+      const locks = typeof navigator === 'undefined' ? undefined : navigator.locks;
+      return locks
+        ? locks.request(keyOrderWriteLock, () => reorderKeys(payload))
+        : reorderKeys(payload);
     });
-    const request = keyOrderPersistence.queue.then(() => reorderKeys(payload));
     keyOrderPersistence.queue = request
       .catch(() => {
         message.error('Failed to save order');
@@ -369,7 +377,7 @@ const Providers: React.FC = () => {
         keyOrderPersistence.pending--;
         keyOrderPersistence.generation++;
       });
-  }, []);
+  }, [keys]);
 
   const keyColumns = [
     {

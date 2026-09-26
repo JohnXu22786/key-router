@@ -77,6 +77,7 @@ type AdminHandler struct {
 	// fight over the server port.
 	restartMu  sync.Mutex
 	restarting bool
+	reorderMu  sync.Mutex // Prevents a timed-out write from finishing after a newer reorder.
 	// autoCheckInfo holds the most recent auto-check result (set by
 	// AutoCheck's callback; read by GetAutoCheckState).
 	autoCheckMu   sync.Mutex
@@ -1019,6 +1020,12 @@ func (h *AdminHandler) DeleteRoute(c *gin.Context) {
 // sort_order is per-provider: the payload carries all keys with their
 // per-provider sort_order indices (0..n-1 within each provider).
 func (h *AdminHandler) ReorderKeys(c *gin.Context) {
+	h.reorderMu.Lock()
+	defer h.reorderMu.Unlock()
+	if c.Request.Context().Err() != nil {
+		return
+	}
+
 	var req struct {
 		Keys []struct {
 			ID        int64 `json:"id"`
@@ -1029,8 +1036,16 @@ func (h *AdminHandler) ReorderKeys(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if c.Request.Context().Err() != nil {
+		return
+	}
 
-	tx := db.GetDB().Begin()
+	tx := db.GetDB().WithContext(c.Request.Context()).Begin()
+	if tx.Error != nil {
+		log.Printf("[admin] ReorderKeys begin error: %v", tx.Error)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "reorder failed"})
+		return
+	}
 	for _, r := range req.Keys {
 		if err := tx.Model(&model.Key{}).Where("id = ?", r.ID).Update("sort_order", r.SortOrder).Error; err != nil {
 			tx.Rollback()
