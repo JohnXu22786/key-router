@@ -198,10 +198,13 @@ const ActivityOverview: React.FC<OverviewProps> = ({ range, filter, onNavigate }
         // discard the boundary bucket and never count outside the range.
         const currentResponse = getConsumptions({ since: range.since.toISOString(), until: range.until.toISOString(), filter_type: filter?.type, filter_value: filter?.value })
           .then(curRes => ({ curRes, cutoff: dayjs() }));
+        // Key metadata is optional enrichment: activity rows remain useful
+        // with the Key #<id> fallback when the keys endpoint is unavailable.
+        const keysResponse = getKeys().catch(() => ({ data: [] as Key[] }));
         const [current, prevRes, keyRes] = await Promise.all([
           currentResponse,
           getConsumptions({ since: prevSince.toISOString(), until: range.since.toISOString(), filter_type: filter?.type, filter_value: filter?.value }),
-          getKeys(),
+          keysResponse,
         ]);
         const { curRes, cutoff } = current;
         if (cancelled) return;

@@ -164,6 +164,24 @@ describe('ActivityOverview response-time cutoff', () => {
   });
 });
 
+describe('ActivityOverview optional key metadata', () => {
+  it('renders activity data with Key #id fallbacks when keys fail', async () => {
+    vi.mocked(getConsumptions)
+      .mockResolvedValueOnce(response([makeConsumption(100, '2026-08-01T12:00:00')]))
+      .mockResolvedValueOnce(response([]));
+    vi.mocked(getKeys).mockRejectedValueOnce(new Error('keys unavailable'));
+
+    render(<ActivityOverview range={customRange(
+      dayjs('2026-08-01T00:00:00'),
+      dayjs('2026-08-02T00:00:00'),
+    )} />);
+
+    expect(await screen.findByText('$100.00')).not.toBeNull();
+    expect(screen.getByText('Key #1')).not.toBeNull();
+    expect(screen.queryByText('Failed to load activity — check the log file.')).toBeNull();
+  });
+});
+
 describe('ActivityOverview custom range refresh', () => {
   it('clears the previous snapshot when a custom range bound changes', async () => {
     const requests: Array<ReturnType<typeof deferred<ConsumptionResponse>>> = [];
