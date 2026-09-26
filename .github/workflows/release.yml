@@ -83,7 +83,7 @@ jobs:
           # If the tag already exists on the remote, the release manager has
           # already pushed a GPG-signed tag — leave it alone and let build/publish
           # run against the existing tag. Otherwise create + push the tag.
-          if git ls-remote --tags origin "$RELEASE_TAG" | grep -Fqx -- "refs/tags/$RELEASE_TAG"; then
+          if git ls-remote --exit-code --refs origin "refs/tags/$RELEASE_TAG" >/dev/null; then
             echo "Tag $RELEASE_TAG already exists on remote; using it."
           else
             git tag "$RELEASE_TAG"
