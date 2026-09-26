@@ -21,14 +21,67 @@ assert_workflow_line() {
 }
 
 assert_workflow_line 'commit_sha: ${{ steps.resolve_commit.outputs.commit_sha }}'
-assert_workflow_line 'commit_sha=$(git rev-parse --verify "${RELEASE_TAG}^{commit}")'
-assert_workflow_line 'echo "commit_sha=$commit_sha" >> "$GITHUB_OUTPUT"'
 assert_workflow_line 'if ! git push origin "$RELEASE_TAG"; then'
 assert_workflow_line 'if ! git ls-remote --exit-code --refs origin "refs/tags/$RELEASE_TAG" >/dev/null; then'
 assert_workflow_line 'git fetch --no-tags --force origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"'
 assert_workflow_line 'Automated release — built from the resolved release tag commit.'
 
-read -r build_checkout_count pinned_checkout_count < <(awk '
+version_output_count=$(awk '
+  /^  version:$/ { in_version = 1; next }
+  in_version && /^  [[:alnum:]_-]+:/ { exit }
+  in_version && /^    outputs:$/ { in_outputs = 1; next }
+  in_version && /^    [[:alnum:]_-]+:/ { in_outputs = 0 }
+  in_version && in_outputs && $0 == "      commit_sha: ${{ steps.resolve_commit.outputs.commit_sha }}" { count++ }
+  END { printf "%d\n", count }
+' "$workflow")
+
+if [[ "$version_output_count" -ne 1 ]]; then
+  printf 'version job must publish the resolve_commit SHA exactly once (found %s)\n' "$version_output_count" >&2
+  exit 1
+fi
+
+read -r resolve_step_count tag_binding_count peel_count output_write_count < <(awk '
+  function finish_step() {
+    if (in_step && is_resolve) {
+      resolve_steps++
+      if (has_tag_binding) tag_bindings++
+      if (has_peel) peels++
+      if (has_output_write) output_writes++
+    }
+    in_step = 0
+    is_resolve = 0
+    has_tag_binding = 0
+    has_peel = 0
+    has_output_write = 0
+  }
+
+  /^  version:$/ { in_version = 1; next }
+  in_version && /^  [[:alnum:]_-]+:/ { finish_step(); exit }
+  in_version && /^      - / { finish_step(); in_step = 1; next }
+  in_version && in_step && /^        id: resolve_commit$/ { is_resolve = 1 }
+  in_version && in_step && is_resolve && /^          RELEASE_TAG: / {
+    if ($0 == "          RELEASE_TAG: ${{ steps.resolve.outputs.tag }}") has_tag_binding = 1
+  }
+  in_version && in_step && is_resolve && /^          commit_sha=/ {
+    if ($0 == "          commit_sha=$(git rev-parse --verify \"${RELEASE_TAG}^{commit}\")") has_peel = 1
+  }
+  in_version && in_step && is_resolve && /^          echo / {
+    if ($0 == "          echo \"commit_sha=$commit_sha\" >> \"$GITHUB_OUTPUT\"") has_output_write = 1
+  }
+  END {
+    finish_step()
+    printf "%d %d %d %d\n", resolve_steps, tag_bindings, peels, output_writes
+  }
+' "$workflow")
+
+if [[ "$resolve_step_count" -ne 1 || "$tag_binding_count" -ne 1 ||
+  "$peel_count" -ne 1 || "$output_write_count" -ne 1 ]]; then
+  printf 'resolve_commit must bind the resolved tag, peel it to a commit, and publish that SHA (steps=%s, tags=%s, peels=%s, outputs=%s)\n' \
+    "$resolve_step_count" "$tag_binding_count" "$peel_count" "$output_write_count" >&2
+  exit 1
+fi
+
+read -r build_dependency_count build_checkout_count pinned_checkout_count < <(awk '
   function finish_step() {
     if (in_step && is_checkout) {
       checkouts++
@@ -41,6 +94,7 @@ read -r build_checkout_count pinned_checkout_count < <(awk '
 
   /^  build:$/ { in_build = 1; next }
   in_build && /^  [[:alnum:]_-]+:/ { finish_step(); exit }
+  in_build && /^    needs: version$/ { needs_version++ }
   in_build && /^      - / {
     finish_step()
     in_step = 1
@@ -55,13 +109,14 @@ read -r build_checkout_count pinned_checkout_count < <(awk '
   }
   END {
     finish_step()
-    printf "%d %d\n", checkouts, pinned
+    printf "%d %d %d\n", needs_version, checkouts, pinned
   }
 ' "$workflow")
 
-if [[ "$build_checkout_count" -eq 0 || "$build_checkout_count" -ne "$pinned_checkout_count" ]]; then
-  printf 'all build checkouts must use the resolved release commit SHA (found %s checkouts, %s pinned)\n' \
-    "$build_checkout_count" "$pinned_checkout_count" >&2
+if [[ "$build_dependency_count" -ne 1 || "$build_checkout_count" -eq 0 ||
+  "$build_checkout_count" -ne "$pinned_checkout_count" ]]; then
+  printf 'build must depend on version and pin every checkout to its SHA output (needs=%s, checkouts=%s, pinned=%s)\n' \
+    "$build_dependency_count" "$build_checkout_count" "$pinned_checkout_count" >&2
   exit 1
 fi
 
