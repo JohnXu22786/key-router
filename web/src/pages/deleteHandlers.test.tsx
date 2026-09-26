@@ -276,3 +276,30 @@ describe('Models — delete handler must call the imported api function', () => 
     expect(vi.mocked(deleteRoute)).toHaveBeenCalledWith(200);
   });
 });
+
+describe('Models — route pricing summary', () => {
+  it('shows cache-only overrides by name and leaves an all-zero route inherited', async () => {
+    vi.mocked(getModelGroups).mockResolvedValue({ data: [group1] } as any);
+    vi.mocked(getRoutes).mockResolvedValue({ data: [
+      { ...route1, id: 201, target_model: 'cache-read-only', cache_read_per_1m: 0.25 },
+      { ...route1, id: 202, target_model: 'cache-write-only', cache_write_per_1m: 0.5 },
+      { ...route1, id: 203, target_model: 'inherits-pricing' },
+      { ...route1, id: 204, target_model: 'negative-prompt-only', prompt_per_1m: -1 },
+      { ...route1, id: 205, target_model: 'mixed-sign-rates', prompt_per_1m: 0.1, completion_per_1m: -0.01 },
+    ] } as any);
+    vi.mocked(getProviders).mockResolvedValue({ data: [prov1] } as any);
+
+    const { container, findByText } = render(<Models />);
+    await findByText('GPT-4o');
+    const header = container.querySelector('.ant-collapse-header') as HTMLElement | null;
+    if (!header) throw new Error('model group collapse header not found');
+    await act(async () => { fireEvent.click(header); });
+
+    expect(await screen.findByText('Cache read $0.2500')).not.toBeNull();
+    expect(screen.getByText('Cache write $0.5000')).not.toBeNull();
+    expect(screen.getByText('Prompt $-1.0000')).not.toBeNull();
+    expect(screen.getByText('Prompt $0.1000 · Completion $-0.0100')).not.toBeNull();
+    expect(screen.getByText('inherit')).not.toBeNull();
+    expect(screen.queryByText('$0.0000 / $0.0000')).toBeNull();
+  });
+});
