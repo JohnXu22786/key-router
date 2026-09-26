@@ -16,7 +16,7 @@
 // Australia/Lord_Howe via activityShared.dst.lordhowe.test.ts).
 import { describe, it, expect, vi, beforeAll } from 'vitest';
 import dayjs from 'dayjs';
-import { bucketWindowShare, floorWindowUntil, rowCoverage, series, stackedData, prorateBoundaryBuckets, normalizeHourlyResponse } from './activityShared';
+import { bucketWindowShare, floorWindowUntil, rowCoverage, series, stackedData, stackedGroupKey, prorateBoundaryBuckets, normalizeHourlyResponse } from './activityShared';
 import type { ActivityResponse } from '../api/client';
 
 beforeAll(() => {
@@ -495,6 +495,6 @@ describe('hourly axes — Chatham spring-forward wall-clock rows', () => {
 
     const stacked = stackedData(ROWS, ['a'], r => r.model, r => r.v, since, until, cutoff, 'hour', false);
     expect(stacked.map(p => p.sort)).toEqual(hourly.map(p => p.sort));
-    expect(stacked.map(p => p.a)).toEqual([0, 600, 900, 60]);
+    expect(stacked.map(p => p[stackedGroupKey('a')])).toEqual([0, 600, 900, 60]);
   });
 });

@@ -1548,6 +1548,19 @@ export function series<T extends BucketedRow>(
   return axis;
 }
 
+// Group names come from provider/model/user input and can collide with the
+// row metadata (`label`, `sort`) or JavaScript object properties such as
+// `__proto__` and `constructor`. Encode UTF-16 code units behind a prefix so
+// every group has a stable, collision-free storage key while consumers keep
+// the original name for legends and tooltips.
+export function stackedGroupKey(group: string): string {
+  let encoded = '';
+  for (let i = 0; i < group.length; i += 1) {
+    encoded += group.charCodeAt(i).toString(16).padStart(4, '0');
+  }
+  return `__activity_group__${encoded}`;
+}
+
 // stackedData buckets rows per group onto a continuous axis; every group
 // gets a column in each bucket row (zero-filled), like OR's stacked charts.
 // Boundary buckets are prorated like series() so the stacks stay consistent
@@ -1570,7 +1583,7 @@ export function stackedData<T extends BucketedRow>(
   if (liveP) axis.push(liveP);
   const rows = axis.map(p => {
     const row: Record<string, any> = { label: p.label, sort: p.sort };
-    groups.forEach(g => { row[g] = 0; });
+    groups.forEach(g => { row[stackedGroupKey(g)] = 0; });
     return row;
   });
   const stepMin = STEP_MIN[granularity];
@@ -1579,9 +1592,10 @@ export function stackedData<T extends BucketedRow>(
     const liveCell = hasLiveCell(until, since, cutoff, granularity, liveExtend);
     for (const r of list) {
       const g = keyFn(r);
+      const key = stackedGroupKey(g);
       const v = valFn(r);
       for (const [i, f] of hourlyAxisFractions(r, since, until, cutoff, axis, starts, liveCell)) {
-        rows[i][g] = (rows[i][g] ?? 0) + v * f;
+        rows[i][key] = (rows[i][key] ?? 0) + v * f;
       }
     }
     return rows;
@@ -1594,9 +1608,10 @@ export function stackedData<T extends BucketedRow>(
     const liveCell = hasLiveCell(until, since, cutoff, granularity, liveExtend);
     for (const r of list) {
       const g = keyFn(r);
+      const key = stackedGroupKey(g);
       const v = valFn(r);
       for (const [i, f] of overlapFractions(r.hour_bucket, since, until, cutoff, starts, stepMin, liveCell)) {
-        rows[i][g] = (rows[i][g] ?? 0) + v * f;
+        rows[i][key] = (rows[i][key] ?? 0) + v * f;
       }
     }
     return rows;
@@ -1610,10 +1625,11 @@ export function stackedData<T extends BucketedRow>(
     const i = idx.get(keyOf(r.hour_bucket));
     if (i !== undefined) {
       const g = keyFn(r);
+      const key = stackedGroupKey(g);
       // Rows whose group is outside `groups` still accumulate under their
       // own key — callers fold those keys into "Other". Guarding against
       // an uninitialized key keeps the fold from summing NaN into Other.
-      rows[i][g] = (rows[i][g] ?? 0) + valFn(r) * bucketWindowShare(r.hour_bucket, since, until, cutoff, granularity, liveExtend);
+      rows[i][key] = (rows[i][key] ?? 0) + valFn(r) * bucketWindowShare(r.hour_bucket, since, until, cutoff, granularity, liveExtend);
     }
   }
   return rows;
@@ -2601,18 +2617,21 @@ export const maskKey = (raw: string): string => {
   return `${raw.slice(0, 12)}...${raw.slice(-3)}`;
 };
 
-// toChartData builds stacked-chart rows: bucket -> { label, [group]: value }.
+// toChartData builds stacked-chart rows: bucket -> { label, [groupKey]: value }.
 export function toChartData(resp: ActivityResponse): Array<Record<string, string | number>> {
   const groups = Array.from(new Set(resp.series.map(s => s.group)));
   const data: Array<Record<string, string | number>> = resp.buckets.map(b => {
     const row: Record<string, string | number> = { label: b };
-    groups.forEach(g => { row[g] = 0; });
+    groups.forEach(g => { row[stackedGroupKey(g)] = 0; });
     return row;
   });
   const bucketIdx = new Map(resp.buckets.map((b, i) => [b, i]));
   for (const p of resp.series) {
     const i = bucketIdx.get(p.bucket);
-    if (i !== undefined) data[i][p.group] = (Number(data[i][p.group]) || 0) + p.value;
+    if (i !== undefined) {
+      const key = stackedGroupKey(p.group);
+      data[i][key] = (Number(data[i][key]) || 0) + p.value;
+    }
   }
   return data;
 }
