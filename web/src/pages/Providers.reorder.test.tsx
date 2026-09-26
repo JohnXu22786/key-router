@@ -259,13 +259,16 @@ describe('Providers key reorder persistence', () => {
 
     await dragFirstKeyToLast(tabA.container);
     await waitFor(() => expect(reorderKeys).toHaveBeenCalledTimes(1));
-    await dragFirstKeyToLast(tabA.container);
+    dropFirstKeyToLast(tabA.container);
     expect(webLockRequestCount).toBe(2);
     expect(reorderKeys).toHaveBeenCalledTimes(1);
 
-    await dragFirstKeyToLast(tabB.container);
+    dropFirstKeyToLast(tabB.container);
     expect(webLockRequestCount).toBe(3);
     expect(reorderKeys).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      await new Promise(resolve => setTimeout(resolve, 180));
+    });
 
     await act(async () => {
       firstWrite.resolve({ data: undefined });

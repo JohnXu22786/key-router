@@ -114,10 +114,8 @@ const Providers: React.FC = () => {
   const drag = useDragSort<Key>(
     keys,
     (from, to) => keys[from]?.provider_id === keys[to]?.provider_id,
-    next => {
-      setKeys(next);
-      persistOrder(next);
-    },
+    next => setKeys(next),
+    next => persistOrder(next),
   );
 
   const fetch = async () => {
