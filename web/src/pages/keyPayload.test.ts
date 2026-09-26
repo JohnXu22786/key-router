@@ -31,6 +31,24 @@ describe('buildKeyPayload — create path (sends everything)', () => {
     expect(payload.rpd_limit).toBe(0);
     expect(payload.total_spend_limit).toBe(0);
   });
+
+  it.each([
+    ['RPM', { rpm_limit: 1.5 }],
+    ['TPM', { tpm_limit: 1.5 }],
+    ['request metric', { rpd_metric: 'requests', rpd_limit: 1.5 }],
+    ['token metric', { rpw_metric: 'tokens', rpw_limit: 1.5 }],
+  ])('rejects fractional %s limits', (_label, limits) => {
+    expect(() => buildKeyPayload(limits, { editing: false, baseline: null }))
+      .toThrow(KeyPayloadValidationError);
+  });
+
+  it('continues to accept fractional cost limits in USD', () => {
+    const payload = buildKeyPayload(
+      { rpd_metric: 'cost', rpd_limit: 12.5 },
+      { editing: false, baseline: null },
+    );
+    expect(payload.rpd_limit).toBe(12_500_000);
+  });
 });
 
 describe('buildKeyPayload — edit path sends only the fields that actually changed', () => {
@@ -82,6 +100,24 @@ describe('buildKeyPayload — edit path sends only the fields that actually chan
     const values = { name: 'renamed' };
     const baseline = { id: 5, total_spent: 12345, disabled_reason: 'x', name: 'old' };
     expect(buildKeyPayload(values, edit(values, baseline))).toEqual({ name: 'renamed' });
+  });
+
+  it('rejects fractional fixed and request/token limits on edit', () => {
+    expect(() => buildKeyPayload(
+      { rpm_limit: 1.5 },
+      edit({ rpm_limit: 1.5 }, { rpm_limit: 10 }),
+    )).toThrow(KeyPayloadValidationError);
+    expect(() => buildKeyPayload(
+      { rpd_metric: 'requests', rpd_limit: 1.5 },
+      edit({ rpd_metric: 'requests', rpd_limit: 1.5 }, { rpd_metric: 'requests', rpd_limit: 10 }),
+    )).toThrow(KeyPayloadValidationError);
+  });
+
+  it('continues to accept fractional cost limits in USD on edit', () => {
+    const values = { rpd_metric: 'cost', rpd_limit: 12.5 };
+    const baseline = { rpd_metric: 'cost', rpd_limit: 10.25 };
+    expect(buildKeyPayload(values, edit(values, baseline)))
+      .toEqual({ rpd_limit: 12_500_000 });
   });
 });
 

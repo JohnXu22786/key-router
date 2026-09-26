@@ -31,6 +31,24 @@ export class KeyPayloadValidationError extends Error {
   }
 }
 
+function validateCountLimits(values: Record<string, any>, ctx: KeyBuildContext) {
+  for (const wt of windowTypes) {
+    const limit = values[wt.limitField];
+    if (limit == null || Number.isInteger(limit)) continue;
+
+    const metric = wt.metricField ? values[wt.metricField] : undefined;
+    if (metric === 'cost') continue;
+
+    // Keep B41's focused validation and explicit-clear handling for cost
+    // windows switched to a count metric.
+    const wasCost = wt.metricField && ctx.baseline?.[wt.metricField] === 'cost';
+    if (ctx.editing && wasCost && (metric === 'requests' || metric === 'tokens')) continue;
+
+    const unit = metric === 'tokens' || wt.key === 'tpm' ? 'tokens' : 'requests';
+    throw new KeyPayloadValidationError(`${wt.label} limit must be a whole number of ${unit}.`);
+  }
+}
+
 // The fields whose value differs between `current` (the form store at save
 // time) and `baseline` (the form store when the edit dialog opened). This — a
 // real value comparison — decides what an edit sends. antd's isFieldTouched
@@ -64,6 +82,7 @@ export function changedFields(
 // reconciled together (see the loop below), because the limit's unit depends
 // on the metric.
 export function buildKeyPayload(values: Record<string, any>, ctx: KeyBuildContext): Record<string, any> {
+  validateCountLimits(values, ctx);
   const out: any = { ...values };
   for (const wt of windowTypes) {
     if (out[wt.limitField] == null || out[wt.limitField] === 0) continue;
