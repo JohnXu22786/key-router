@@ -60,7 +60,8 @@ jobs:
               base=${latest#v}
               IFS='.' read -r maj min pat <<< "$base"
               pat="${pat%%[-+]*}"   # ignore prerelease/build suffixes like v1.2.3-beta+build
-              tag="v${maj}.${min}.$((pat + 1))"
+              pat=$(bash "$GITHUB_WORKSPACE/scripts/increment-release-patch.sh" "$pat")
+              tag="v${maj}.${min}.${pat}"
             fi
           fi
           if ! bash "$GITHUB_WORKSPACE/scripts/validate-release-version.sh" "$tag" >/dev/null; then

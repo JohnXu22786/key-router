@@ -3,6 +3,7 @@ set -euo pipefail
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 validator="$root/scripts/validate-release-version.sh"
+increment_patch="$root/scripts/increment-release-patch.sh"
 
 assert_valid() {
   local input=$1 expected=$2 actual
@@ -21,9 +22,21 @@ assert_invalid() {
   fi
 }
 
+assert_patch_increment() {
+  local input=$1 expected=$2 actual
+  actual=$(bash "$increment_patch" "$input")
+  [[ "$actual" == "$expected" ]] || {
+    printf 'expected patch %q to increment to %q, got %q\n' "$input" "$expected" "$actual" >&2
+    exit 1
+  }
+}
+
 assert_valid 'v0.1.0' '0.1.0'
 assert_valid 'v1.2.3-rc.1+build.7' '1.2.3-rc.1+build.7'
 assert_valid 'v10.20.30' '10.20.30'
+assert_patch_increment '9' '10'
+assert_patch_increment '99' '100'
+assert_patch_increment '18446744073709551615' '18446744073709551616'
 
 assert_invalid '1.2.3'
 assert_invalid 'v01.2.3'
