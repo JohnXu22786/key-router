@@ -30,6 +30,7 @@ jobs:
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       ver: ${{ steps.resolve.outputs.ver }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -71,6 +72,12 @@ jobs:
           # the window title formats it as "KeyRouter v$ver", so passing the
           # tag verbatim would produce "vv0.1.4".
           echo "ver=${tag#v}" >> "$GITHUB_OUTPUT"
+          core_and_prerelease=${tag%%+*}
+          if [[ "$core_and_prerelease" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
           echo "Resolved tag: $tag"
 
       - name: "Create and push tag (idempotent: skip if a pre-signed tag already exists)"
@@ -222,6 +229,7 @@ jobs:
         with:
           tag_name: ${{ needs.version.outputs.tag }}
           name: KeyRouter ${{ needs.version.outputs.tag }}
+          prerelease: ${{ needs.version.outputs.prerelease }}
           body: |
             ## KeyRouter ${{ needs.version.outputs.tag }}
 
