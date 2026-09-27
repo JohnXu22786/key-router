@@ -6,6 +6,9 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"key-router/db"
+	"key-router/model"
 )
 
 func TestResolveDefaultDataDir(t *testing.T) {
@@ -282,7 +285,9 @@ func TestMigrateLegacyData(t *testing.T) {
 		write(filepath.Join(legacy, "local-router.db"), "db")
 		write(filepath.Join(legacy, "windows.json"), "{}")
 
-		migrateLegacyData(newDir, []string{legacy})
+		if err := migrateLegacyData(newDir, []string{legacy}); err != nil {
+			t.Fatalf("migrate legacy data: %v", err)
+		}
 
 		if got, err := os.ReadFile(filepath.Join(newDir, "key-router.db")); err != nil || string(got) != "db" {
 			t.Errorf("db not migrated: %v %q", err, got)
@@ -307,7 +312,9 @@ func TestMigrateLegacyData(t *testing.T) {
 		if err := os.MkdirAll(windowsPath, 0700); err != nil {
 			t.Fatal(err)
 		}
-		migrateLegacyData(newDir, []string{legacy})
+		if err := migrateLegacyData(newDir, []string{legacy}); err == nil {
+			t.Fatal("expected migration to fail when destination windows.json is a directory")
+		}
 
 		if _, err := os.Stat(filepath.Join(newDir, "key-router.db")); !os.IsNotExist(err) {
 			t.Fatalf("database copied despite a later-file failure: %v", err)
@@ -316,7 +323,9 @@ func TestMigrateLegacyData(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		migrateLegacyData(newDir, []string{legacy})
+		if err := migrateLegacyData(newDir, []string{legacy}); err != nil {
+			t.Fatalf("retry migration: %v", err)
+		}
 
 		if got, err := os.ReadFile(filepath.Join(newDir, "key-router.db")); err != nil || string(got) != "db" {
 			t.Errorf("db not migrated after retry: %v %q", err, got)
@@ -332,7 +341,9 @@ func TestMigrateLegacyData(t *testing.T) {
 		write(filepath.Join(legacy, "local-router.db"), "old")
 		write(filepath.Join(newDir, "key-router.db"), "new")
 
-		migrateLegacyData(newDir, []string{legacy})
+		if err := migrateLegacyData(newDir, []string{legacy}); err != nil {
+			t.Fatalf("migrate legacy data: %v", err)
+		}
 
 		if got, _ := os.ReadFile(filepath.Join(newDir, "key-router.db")); string(got) != "new" {
 			t.Errorf("existing new-dir db overwritten: %q", got)
@@ -344,7 +355,9 @@ func TestMigrateLegacyData(t *testing.T) {
 		write(filepath.Join(legacy, "junk.txt"), "x")
 		newDir := filepath.Join(t.TempDir(), "keyrouter")
 
-		migrateLegacyData(newDir, []string{legacy})
+		if err := migrateLegacyData(newDir, []string{legacy}); err != nil {
+			t.Fatalf("migrate without legacy database: %v", err)
+		}
 
 		if _, err := os.Stat(newDir); !os.IsNotExist(err) {
 			t.Errorf("new dir created without a legacy db: %v", err)
@@ -354,7 +367,9 @@ func TestMigrateLegacyData(t *testing.T) {
 	t.Run("same dir is a no-op", func(t *testing.T) {
 		dir := t.TempDir()
 		write(filepath.Join(dir, "key-router.db"), "db")
-		migrateLegacyData(dir, []string{dir})
+		if err := migrateLegacyData(dir, []string{dir}); err != nil {
+			t.Fatalf("migrate same directory: %v", err)
+		}
 		if got, _ := os.ReadFile(filepath.Join(dir, "key-router.db")); string(got) != "db" {
 			t.Errorf("db changed: %q", got)
 		}
@@ -366,7 +381,9 @@ func TestMigrateLegacyData(t *testing.T) {
 		write(filepath.Join(legacy, "local-router.db"), "db")
 		write(filepath.Join(newDir, "key-router.db.tmp"), "truncated garbage")
 
-		migrateLegacyData(newDir, []string{legacy})
+		if err := migrateLegacyData(newDir, []string{legacy}); err != nil {
+			t.Fatalf("retry after leftover temporary file: %v", err)
+		}
 
 		if got, err := os.ReadFile(filepath.Join(newDir, "key-router.db")); err != nil || string(got) != "db" {
 			t.Errorf("db not migrated after crash leftovers: %v %q", err, got)
@@ -383,7 +400,9 @@ func TestMigrateLegacyData(t *testing.T) {
 		write(filepath.Join(legacy, "local-router.db"), "db")
 		write(filepath.Join(legacy, "local-router.log"), "old log content")
 
-		migrateLegacyData(newDir, []string{legacy})
+		if err := migrateLegacyData(newDir, []string{legacy}); err != nil {
+			t.Fatalf("migrate legacy data without logs: %v", err)
+		}
 
 		if got, err := os.ReadFile(filepath.Join(newDir, "key-router.db")); err != nil || string(got) != "db" {
 			t.Errorf("db not migrated: %v %q", err, got)
@@ -414,7 +433,9 @@ func TestMigrateLegacyData(t *testing.T) {
 		write(filepath.Join(exeDataDir, "local-router.db"), "older exe-adjacent database")
 		newDir := filepath.Join(root, "keyrouter")
 
-		migrateLegacyData(newDir, legacyDirs)
+		if err := migrateLegacyData(newDir, legacyDirs); err != nil {
+			t.Fatalf("migrate newer legacy source: %v", err)
+		}
 
 		got, err := os.ReadFile(filepath.Join(newDir, "key-router.db"))
 		if err != nil {
@@ -424,4 +445,84 @@ func TestMigrateLegacyData(t *testing.T) {
 			t.Errorf("migrated database = %q, want newer app-data contents", got)
 		}
 	})
+}
+
+func TestInitializeDatabaseRetriesLegacyMigrationAfterCopyFailure(t *testing.T) {
+	previousDB := db.GetDB()
+	t.Cleanup(func() {
+		if currentDB := db.GetDB(); currentDB != nil && currentDB != previousDB {
+			if sqlDB, err := currentDB.DB(); err == nil {
+				_ = sqlDB.Close()
+			}
+		}
+		db.DB = previousDB
+	})
+
+	legacyDir := t.TempDir()
+	if err := db.Init(legacyDir); err != nil {
+		t.Fatalf("initialize legacy database: %v", err)
+	}
+	const sentinelKey = "migration.test_sentinel"
+	const sentinelValue = "legacy user data"
+	if err := db.GetDB().Create(&model.Setting{Key: sentinelKey, Value: sentinelValue}).Error; err != nil {
+		t.Fatalf("write legacy sentinel: %v", err)
+	}
+	legacySQLDB, err := db.GetDB().DB()
+	if err != nil {
+		t.Fatalf("get legacy SQL database: %v", err)
+	}
+	if err := legacySQLDB.Close(); err != nil {
+		t.Fatalf("close legacy database: %v", err)
+	}
+	db.DB = previousDB
+	if err := os.Rename(filepath.Join(legacyDir, "key-router.db"), filepath.Join(legacyDir, "local-router.db")); err != nil {
+		t.Fatalf("prepare legacy database filename: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyDir, "windows.json"), []byte("{}"), 0600); err != nil {
+		t.Fatalf("write legacy window state: %v", err)
+	}
+
+	newDir := filepath.Join(t.TempDir(), "keyrouter")
+	windowsPath := filepath.Join(newDir, "windows.json")
+	if err := os.MkdirAll(windowsPath, 0700); err != nil {
+		t.Fatalf("create destination obstruction: %v", err)
+	}
+	if err := initializeDatabase(newDir, []string{legacyDir}); err == nil {
+		t.Fatal("expected startup database initialization to stop on migration failure")
+	}
+	if db.GetDB() != previousDB {
+		t.Fatal("database was initialized despite the failed legacy copy")
+	}
+	if _, err := os.Stat(filepath.Join(newDir, "key-router.db")); !os.IsNotExist(err) {
+		t.Fatalf("fresh database exists after failed legacy copy: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(legacyDir, "local-router.db")); err != nil {
+		t.Fatalf("legacy database was not preserved after failed copy: %v", err)
+	}
+
+	if err := os.Remove(windowsPath); err != nil {
+		t.Fatalf("remove destination obstruction: %v", err)
+	}
+	if err := initializeDatabase(newDir, []string{legacyDir}); err != nil {
+		t.Fatalf("retry startup database initialization: %v", err)
+	}
+	migratedDB := db.GetDB()
+	t.Cleanup(func() {
+		if migratedDB != nil {
+			if sqlDB, err := migratedDB.DB(); err == nil {
+				_ = sqlDB.Close()
+			}
+		}
+		db.DB = previousDB
+	})
+	var migrated model.Setting
+	if err := db.GetDB().Where("key = ?", sentinelKey).First(&migrated).Error; err != nil {
+		t.Fatalf("read migrated legacy setting: %v", err)
+	}
+	if migrated.Value != sentinelValue {
+		t.Errorf("migrated legacy setting = %q, want %q", migrated.Value, sentinelValue)
+	}
+	if got, err := os.ReadFile(windowsPath); err != nil || string(got) != "{}" {
+		t.Errorf("legacy windows state not migrated after retry: data=%q err=%v", got, err)
+	}
 }
