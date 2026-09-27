@@ -183,6 +183,7 @@ func Setup(
 				c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 				return
 			}
+			setManagementUIFrameProtection(c)
 			c.String(http.StatusOK, "<html><body><h1>KeyRouter</h1><p>Web UI not built. Run: cd web && npm install && npm run build</p></body></html>")
 		})
 	} else {
@@ -234,9 +235,17 @@ func serveStaticFallback(prefix string, fsys fs.FS) gin.HandlerFunc {
 			c.Status(http.StatusInternalServerError)
 			return
 		}
+		if path == "index.html" {
+			setManagementUIFrameProtection(c)
+		}
 		stat, _ := f.Stat()
 		http.ServeContent(c.Writer, c.Request, path, stat.ModTime(), bytes.NewReader(data))
 	}
+}
+
+func setManagementUIFrameProtection(c *gin.Context) {
+	c.Header("X-Frame-Options", "DENY")
+	c.Header("Content-Security-Policy", "frame-ancestors 'none'")
 }
 
 func isAPIFallbackPath(path string) bool {
