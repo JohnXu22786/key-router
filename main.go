@@ -65,13 +65,9 @@ func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 	log.Printf("[main] KeyRouter starting... dataDir=%s", dataDir)
 
-	// One-time migration from legacy data locations (exe-adjacent ./data and
-	// the v0.1.x LocalRouter app-data dir). Runs after the log is set up so
-	// migration messages are visible.
-	migrateLegacyData(dataDir, legacyDataDirs(runtime.GOOS, os.Getenv, os.UserHomeDir))
-
-	// Initialize database
-	if err := db.Init(dataDir); err != nil {
+	// Migrate legacy user data before opening the database. Do not start with a
+	// fresh database if a legacy copy fails: that would suppress future retries.
+	if err := initializeDatabase(dataDir, legacyDataDirs(runtime.GOOS, os.Getenv, os.UserHomeDir)); err != nil {
 		log.Printf("[main] database initialization failed: %v", err)
 		showFatalError(fmt.Sprintf("KeyRouter failed to start:\n\nDatabase initialization failed:\n%v", err))
 		os.Exit(1)

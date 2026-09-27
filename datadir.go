@@ -8,6 +8,8 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+
+	"key-router/db"
 )
 
 // defaultDataDir returns the platform's per-user application-data directory
@@ -169,17 +171,17 @@ func ensurePrivateFallbackDataDir(dir string) error {
 }
 
 // migrateLegacyData copies user data from the legacy data directories (see
-// legacyDataDirs) into the new system data directory, exactly once. It is
-// idempotent — once the new directory contains a database it does nothing —
-// and copies instead of moving, so a failed migration can never destroy the
-// original files. Files from the old "local-router.*" naming are renamed to
-// the new "key-router.*" naming while copying.
-func migrateLegacyData(newDir string, legacyDirs []string) {
+// legacyDataDirs) into the new system data directory. It is idempotent — once
+// the new directory contains a database it does nothing — and copies instead
+// of moving, so a failed migration can never destroy the original files.
+// Files from the old "local-router.*" naming are renamed to the new
+// "key-router.*" naming while copying.
+func migrateLegacyData(newDir string, legacyDirs []string) error {
 	if newDir == "" {
-		return
+		return nil
 	}
 	if _, err := os.Stat(filepath.Join(newDir, "key-router.db")); err == nil {
-		return // already migrated (or fresh install with data)
+		return nil // already migrated (or fresh install with data)
 	}
 	for _, legacyDir := range legacyDirs {
 		if legacyDir == "" || legacyDir == newDir {
@@ -190,10 +192,21 @@ func migrateLegacyData(newDir string, legacyDirs []string) {
 		}
 		log.Printf("[main] migrating data from %s to %s", legacyDir, newDir)
 		if err := copyLegacyFiles(legacyDir, newDir); err != nil {
-			log.Printf("[main] data migration failed (continuing with fresh data): %v", err)
+			log.Printf("[main] data migration failed: %v", err)
+			return fmt.Errorf("copy legacy data from %s to %s: %w", legacyDir, newDir, err)
 		}
-		return // one source is enough — don't stack partial migrations
+		return nil // one source is enough — don't stack partial migrations
 	}
+	return nil
+}
+
+// initializeDatabase does not open a fresh database unless legacy migration
+// has completed successfully, so a failed copy remains retryable at startup.
+func initializeDatabase(dataDir string, legacyDirs []string) error {
+	if err := migrateLegacyData(dataDir, legacyDirs); err != nil {
+		return fmt.Errorf("legacy data migration failed: %w", err)
+	}
+	return db.Init(dataDir)
 }
 
 // copyLegacyFiles copies flat files from legacyDir into newDir, renaming
