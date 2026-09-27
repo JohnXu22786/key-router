@@ -1,6 +1,7 @@
 package db
 
 import (
+	"os"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -11,6 +12,118 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
+
+func pricingColumnExists(t *testing.T, dbc *gorm.DB, column string) bool {
+	t.Helper()
+	var count int
+	if err := dbc.Raw("SELECT COUNT(*) FROM pragma_table_info('pricings') WHERE name = ?", column).Scan(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	return count > 0
+}
+
+// legacyPricing mirrors the historical model before the per-1M rename. Keep
+// the original tags so the fixture's table and unique index match an actual
+// database created by that version of GORM.
+type legacyPricing struct {
+	ID              int64   `gorm:"primaryKey;autoIncrement"`
+	ModelName       string  `gorm:"type:varchar(255);not null;uniqueIndex"`
+	PromptPer1K     float64 `gorm:"default:0"`
+	CompletionPer1K float64 `gorm:"default:0"`
+	CacheReadPer1K  float64 `gorm:"default:0"`
+	CacheWritePer1K float64 `gorm:"default:0"`
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+}
+
+func (legacyPricing) TableName() string { return "pricings" }
+
+// TestInitMigratesLegacyPricingPer1K exercises the real upgrade path for an
+// existing database. The legacy names below are the names GORM generated from
+// PromptPer1K and its siblings; Init's AutoMigrate adds the current per-1M
+// columns before the pricing migration copies and removes the old values.
+func TestInitMigratesLegacyPricingPer1K(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(dataDir, "key-router.db")
+	legacy, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.AutoMigrate(&legacyPricing{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, pair := range pricingPer1KColumns {
+		if !pricingColumnExists(t, legacy, pair[0]) {
+			t.Fatalf("legacy fixture is missing GORM column %q", pair[0])
+		}
+	}
+	if err := legacy.Create(&legacyPricing{
+		ModelName:       "legacy-model",
+		PromptPer1K:     1.25,
+		CompletionPer1K: 2.5,
+		CacheReadPer1K:  0.75,
+		CacheWritePer1K: 3.5,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	legacySQL, err := legacy.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacySQL.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Init(dataDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if sqlDB, err := GetDB().DB(); err == nil {
+			sqlDB.Close()
+		}
+	})
+
+	var migrated model.Pricing
+	if err := GetDB().Where("model_name = ?", "legacy-model").First(&migrated).Error; err != nil {
+		t.Fatal(err)
+	}
+	want := [4]float64{1250, 2500, 750, 3500}
+	got := [4]float64{migrated.PromptPer1M, migrated.CompletionPer1M, migrated.CacheReadPer1M, migrated.CacheWritePer1M}
+	if got != want {
+		t.Fatalf("migrated rates = %v, want %v", got, want)
+	}
+	for _, pair := range pricingPer1KColumns {
+		if pricingColumnExists(t, GetDB(), pair[0]) {
+			t.Errorf("legacy column %q still exists after migration", pair[0])
+		}
+		if !pricingColumnExists(t, GetDB(), pair[1]) {
+			t.Errorf("current column %q missing after AutoMigrate", pair[1])
+		}
+	}
+
+	// A second normal launch must be a no-op once the legacy columns are gone.
+	if sqlDB, err := GetDB().DB(); err == nil {
+		if err := sqlDB.Close(); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		t.Fatal(err)
+	}
+	if err := Init(dataDir); err != nil {
+		t.Fatal(err)
+	}
+	var rerun model.Pricing
+	if err := GetDB().Where("model_name = ?", "legacy-model").First(&rerun).Error; err != nil {
+		t.Fatal(err)
+	}
+	if rerun.PromptPer1M != migrated.PromptPer1M || rerun.CompletionPer1M != migrated.CompletionPer1M ||
+		rerun.CacheReadPer1M != migrated.CacheReadPer1M || rerun.CacheWritePer1M != migrated.CacheWritePer1M {
+		t.Fatalf("second launch changed rates: got %+v, first launch %+v", rerun, migrated)
+	}
+}
 
 // TestMigrateAnthropicInputTokensOnce verifies the one-time fold of cached
 // tokens into legacy consumption rows: rows under anthropic-type providers
