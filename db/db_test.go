@@ -38,10 +38,8 @@ type legacyPricing struct {
 
 func (legacyPricing) TableName() string { return "pricings" }
 
-// TestInitMigratesLegacyPricingPer1K exercises the real upgrade path for an
-// existing database. The legacy names below are the names GORM generated from
-// PromptPer1K and its siblings; Init's AutoMigrate adds the current per-1M
-// columns before the pricing migration copies and removes the old values.
+// TestInitMigratesLegacyPricingPer1K exercises conversion from a genuinely
+// legacy-only schema, including a row edited before startup.
 func TestInitMigratesLegacyPricingPer1K(t *testing.T) {
 	dataDir := filepath.Join(t.TempDir(), "data")
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
@@ -69,6 +67,19 @@ func TestInitMigratesLegacyPricingPer1K(t *testing.T) {
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
+	if err := legacy.Create(&legacyPricing{ModelName: "edited-legacy-model", PromptPer1K: 1, CompletionPer1K: 2}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Model(&legacyPricing{}).Where("model_name = ?", "edited-legacy-model").Update("PromptPer1K", 1.75).Error; err != nil {
+		t.Fatal(err)
+	}
+	var editedLegacy legacyPricing
+	if err := legacy.Where("model_name = ?", "edited-legacy-model").First(&editedLegacy).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !editedLegacy.UpdatedAt.After(editedLegacy.CreatedAt) {
+		t.Fatalf("legacy edit did not advance updated_at: created %v, updated %v", editedLegacy.CreatedAt, editedLegacy.UpdatedAt)
+	}
 	legacySQL, err := legacy.DB()
 	if err != nil {
 		t.Fatal(err)
@@ -94,6 +105,15 @@ func TestInitMigratesLegacyPricingPer1K(t *testing.T) {
 	got := [4]float64{migrated.PromptPer1M, migrated.CompletionPer1M, migrated.CacheReadPer1M, migrated.CacheWritePer1M}
 	if got != want {
 		t.Fatalf("migrated rates = %v, want %v", got, want)
+	}
+	var editedLegacyMigrated model.Pricing
+	if err := GetDB().Where("model_name = ?", "edited-legacy-model").First(&editedLegacyMigrated).Error; err != nil {
+		t.Fatal(err)
+	}
+	editedLegacyWant := [4]float64{1750, 2000, 0, 0}
+	editedLegacyGot := [4]float64{editedLegacyMigrated.PromptPer1M, editedLegacyMigrated.CompletionPer1M, editedLegacyMigrated.CacheReadPer1M, editedLegacyMigrated.CacheWritePer1M}
+	if editedLegacyGot != editedLegacyWant {
+		t.Fatalf("edited legacy rates = %v, want %v", editedLegacyGot, editedLegacyWant)
 	}
 	for _, pair := range pricingPer1KColumns {
 		if pricingColumnExists(t, GetDB(), pair[0]) {
@@ -122,6 +142,149 @@ func TestInitMigratesLegacyPricingPer1K(t *testing.T) {
 	if rerun.PromptPer1M != migrated.PromptPer1M || rerun.CompletionPer1M != migrated.CompletionPer1M ||
 		rerun.CacheReadPer1M != migrated.CacheReadPer1M || rerun.CacheWritePer1M != migrated.CacheWritePer1M {
 		t.Fatalf("second launch changed rates: got %+v, first launch %+v", rerun, migrated)
+	}
+}
+
+func TestInitPreservesPricingInMixedPer1KPer1MSchema(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(dataDir, "key-router.db")
+	legacy, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.AutoMigrate(&legacyPricing{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Create(&legacyPricing{ModelName: "edited-before-broken-startup", PromptPer1K: 1, CompletionPer1K: 2}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Model(&legacyPricing{}).Where("model_name = ?", "edited-before-broken-startup").Update("PromptPer1K", 1.75).Error; err != nil {
+		t.Fatal(err)
+	}
+	var editedLegacy legacyPricing
+	if err := legacy.Where("model_name = ?", "edited-before-broken-startup").First(&editedLegacy).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !editedLegacy.UpdatedAt.After(editedLegacy.CreatedAt) {
+		t.Fatalf("legacy edit did not advance updated_at: created %v, updated %v", editedLegacy.CreatedAt, editedLegacy.UpdatedAt)
+	}
+
+	// Model the earlier broken startup: it adds per-1M columns while leaving
+	// the legacy source columns and values in place.
+	if err := legacy.AutoMigrate(&model.Pricing{}); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name                    string
+		per1M                   [4]float64
+		per1K                   [4]float64
+		legacyBeforeAutoMigrate bool
+	}{
+		{
+			name:                    "edited-before-broken-startup",
+			per1M:                   [4]float64{},
+			per1K:                   [4]float64{1.75, 2, 0, 0},
+			legacyBeforeAutoMigrate: true,
+		},
+		{
+			name:  "mixed-nonzero-per1m",
+			per1M: [4]float64{10.25, 20.5, 30.75, 40.125},
+			per1K: [4]float64{99, 88, 77, 66},
+		},
+		{
+			name:  "mixed-zero-components",
+			per1M: [4]float64{0, 2.5, 0, 4.5},
+			per1K: [4]float64{11, 22, 33, 44},
+		},
+		{
+			name:  "mixed-all-zero-per1m",
+			per1M: [4]float64{},
+			per1K: [4]float64{9, 8, 7, 6},
+		},
+	}
+	for _, tc := range cases {
+		if tc.legacyBeforeAutoMigrate {
+			continue
+		}
+		if err := legacy.Create(&model.Pricing{
+			ModelName:       tc.name,
+			PromptPer1M:     tc.per1M[0],
+			CompletionPer1M: tc.per1M[1],
+			CacheReadPer1M:  tc.per1M[2],
+			CacheWritePer1M: tc.per1M[3],
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := legacy.Exec("UPDATE pricings SET prompt_per1_k = ?, completion_per1_k = ?, cache_read_per1_k = ?, cache_write_per1_k = ? WHERE model_name = ?",
+			tc.per1K[0], tc.per1K[1], tc.per1K[2], tc.per1K[3], tc.name).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	legacySQL, err := legacy.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacySQL.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Init(dataDir); err != nil {
+		t.Fatal(err)
+	}
+	closeDB := func() {
+		if sqlDB, err := GetDB().DB(); err == nil {
+			if err := sqlDB.Close(); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	t.Cleanup(closeDB)
+
+	for _, tc := range cases {
+		var got model.Pricing
+		if err := GetDB().Where("model_name = ?", tc.name).First(&got).Error; err != nil {
+			t.Fatal(err)
+		}
+		per1MGot := [4]float64{got.PromptPer1M, got.CompletionPer1M, got.CacheReadPer1M, got.CacheWritePer1M}
+		if per1MGot != tc.per1M {
+			t.Errorf("%s per-1M rates = %v, want preserved values %v", tc.name, per1MGot, tc.per1M)
+		}
+		for i, pair := range pricingPer1KColumns {
+			if !pricingColumnExists(t, GetDB(), pair[0]) {
+				t.Errorf("legacy source column %q was discarded", pair[0])
+				continue
+			}
+			var legacyValue float64
+			if err := GetDB().Raw("SELECT "+pair[0]+" FROM pricings WHERE model_name = ?", tc.name).Scan(&legacyValue).Error; err != nil {
+				t.Fatal(err)
+			}
+			if legacyValue != tc.per1K[i] {
+				t.Errorf("%s legacy value for %s = %v, want preserved source %v", tc.name, pair[0], legacyValue, tc.per1K[i])
+			}
+		}
+	}
+	for _, pair := range pricingPer1KColumns {
+		if !pricingColumnExists(t, GetDB(), pair[0]) {
+			t.Errorf("legacy source column %q was discarded", pair[0])
+		}
+	}
+
+	closeDB()
+	if err := Init(dataDir); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range cases {
+		var got model.Pricing
+		if err := GetDB().Where("model_name = ?", tc.name).First(&got).Error; err != nil {
+			t.Fatal(err)
+		}
+		per1MGot := [4]float64{got.PromptPer1M, got.CompletionPer1M, got.CacheReadPer1M, got.CacheWritePer1M}
+		if per1MGot != tc.per1M {
+			t.Errorf("second startup changed %s per-1M values: got %v, want %v", tc.name, per1MGot, tc.per1M)
+		}
 	}
 }
 
