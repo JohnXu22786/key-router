@@ -259,6 +259,82 @@ func TestLegacyDataDirs(t *testing.T) {
 	})
 }
 
+func TestLegacyWindowsDataDirs(t *testing.T) {
+	const (
+		localAppData = `D:\Users\user\AppData\Local`
+		homeDir      = `C:\Users\user`
+		execPath     = `C:\Program Files\KeyRouter\key-router.exe`
+	)
+	env := func(values map[string]string) func(string) string {
+		return func(k string) string { return values[k] }
+	}
+	profileHome := func() (string, error) { return homeDir, nil }
+	execDataDir := filepath.Join(filepath.Dir(execPath), "data")
+
+	tests := []struct {
+		name     string
+		local    string
+		home     func() (string, error)
+		execPath string
+		want     []string
+	}{
+		{
+			name:     "LOCALAPPDATA takes precedence",
+			local:    localAppData,
+			home:     profileHome,
+			execPath: execPath,
+			want:     []string{filepath.Join(localAppData, "LocalRouter"), execDataDir},
+		},
+		{
+			name:     "unset LOCALAPPDATA falls back to the user profile",
+			home:     profileHome,
+			execPath: execPath,
+			want:     []string{filepath.Join(homeDir, "AppData", "Local", "LocalRouter"), execDataDir},
+		},
+		{
+			name: "valid home works without an executable",
+			home: profileHome,
+			want: []string{filepath.Join(homeDir, "AppData", "Local", "LocalRouter")},
+		},
+		{
+			name:     "unavailable home skips profile path",
+			home:     func() (string, error) { return homeDir, os.ErrNotExist },
+			execPath: execPath,
+			want:     []string{execDataDir},
+		},
+		{
+			name:     "empty home retains executable fallback",
+			home:     func() (string, error) { return "", nil },
+			execPath: execPath,
+			want:     []string{execDataDir},
+		},
+		{
+			name: "empty home and executable return no paths",
+			home: func() (string, error) { return "", nil },
+		},
+		{
+			name:  "LOCALAPPDATA works without a home or executable",
+			local: localAppData,
+			home:  func() (string, error) { return "", os.ErrNotExist },
+			want:  []string{filepath.Join(localAppData, "LocalRouter")},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := legacyDataDirsForExecutable("windows", env(map[string]string{"LOCALAPPDATA": tt.local}), tt.home, tt.execPath)
+			if len(got) != len(tt.want) {
+				t.Fatalf("legacyDataDirsForExecutable() = %q, want %q", got, tt.want)
+			}
+			for i := range tt.want {
+				if got[i] != tt.want[i] {
+					t.Errorf("legacyDataDirsForExecutable()[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
 func contains(list []string, s string) bool {
 	for _, v := range list {
 		if v == s {
