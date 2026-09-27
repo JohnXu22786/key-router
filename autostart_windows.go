@@ -13,11 +13,12 @@ import (
 // autostart registry key: HKCU\Software\Microsoft\Windows\CurrentVersion\Run
 // (per-user, no admin needed).
 var (
-	advapi32    = syscall.NewLazyDLL("advapi32.dll")
-	regOpenKey  = advapi32.NewProc("RegOpenKeyExW")
-	regSetValue = advapi32.NewProc("RegSetValueExW")
-	regGetValue = advapi32.NewProc("RegGetValueW")
-	regCloseKey = advapi32.NewProc("RegCloseKey")
+	advapi32     = syscall.NewLazyDLL("advapi32.dll")
+	regOpenKey   = advapi32.NewProc("RegOpenKeyExW")
+	regCreateKey = advapi32.NewProc("RegCreateKeyExW")
+	regSetValue  = advapi32.NewProc("RegSetValueExW")
+	regGetValue  = advapi32.NewProc("RegGetValueW")
+	regCloseKey  = advapi32.NewProc("RegCloseKey")
 )
 
 const (
@@ -53,21 +54,39 @@ func autostartAppPath() string {
 // setAutostartEnabled enables (true) or disables (false) launching KeyRouter
 // at user login via the HKCU Run key.
 func setAutostartEnabled(enabled bool) error {
+	return setAutostartEnabledAt(enabled, runKeyPath)
+}
+
+func setAutostartEnabledAt(enabled bool, keyPath string) error {
 	appPath := autostartAppPath()
 	if enabled && appPath == "" {
 		return os.ErrNotExist
 	}
 
 	var hkey uintptr
-	// Open (create) the Run key for writing.
-	// KEY_SET_VALUE | KEY_QUERY_VALUE | KEY_CREATE_SUB_KEY
-	ret, _, _ := regOpenKey.Call(
-		uintptr(0x80000001), // HKEY_CURRENT_USER
-		uintptr(unsafePtr(runKeyPath)),
-		0,
-		uintptr(0x20006), // KEY_SET_VALUE | KEY_QUERY_VALUE
-		uintptr(unsafe.Pointer(&hkey)),
-	)
+	var ret uintptr
+	if enabled {
+		// Create the per-user Run key if needed, or open it if it already exists.
+		ret, _, _ = regCreateKey.Call(
+			uintptr(0x80000001), // HKEY_CURRENT_USER
+			uintptr(unsafePtr(keyPath)),
+			0,
+			0,
+			0, // REG_OPTION_NON_VOLATILE
+			uintptr(keySetValue),
+			0,
+			uintptr(unsafe.Pointer(&hkey)),
+			0,
+		)
+	} else {
+		ret, _, _ = regOpenKey.Call(
+			uintptr(0x80000001), // HKEY_CURRENT_USER
+			uintptr(unsafePtr(keyPath)),
+			0,
+			uintptr(keySetValue),
+			uintptr(unsafe.Pointer(&hkey)),
+		)
+	}
 	if ret != 0 {
 		return syscall.Errno(ret)
 	}
