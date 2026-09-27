@@ -65,8 +65,8 @@ func Init(dataDir string) error {
 	}
 
 	// Migrate pricing from per-1K to per-1M rates. Older builds stored
-	// prompt_per_1k etc. (USD per 1,000 tokens); the new schema uses
-	// prompt_per_1m (USD per 1,000,000 tokens). AutoMigrate adds the new
+	// prompt_per1_k etc. (USD per 1,000 tokens); the new schema uses
+	// prompt_per1_m (USD per 1,000,000 tokens). AutoMigrate adds the new
 	// columns but leaves the old ones in place, so copy the values ×1000 and
 	// drop the old columns. Idempotent: once the old columns are gone this
 	// does nothing.
@@ -100,19 +100,19 @@ func Init(dataDir string) error {
 // old column. Runs inside one transaction; idempotent (old columns gone
 // => no-op on subsequent launches).
 func migratePricingPer1KToPer1M(db *gorm.DB) error {
-	hasColumn := func(col string) bool {
+	hasColumn := func(conn *gorm.DB, col string) bool {
 		var n int
-		db.Raw("SELECT COUNT(*) FROM pragma_table_info('pricings') WHERE name = ?", col).Scan(&n)
+		conn.Raw("SELECT COUNT(*) FROM pragma_table_info('pricings') WHERE name = ?", col).Scan(&n)
 		return n > 0
 	}
 
 	// Newer schema already in place (or table brand new): nothing to do.
-	if !hasColumn("prompt_per_1k") {
+	if !hasColumn(db, pricingPer1KColumns[0][0]) {
 		return nil
 	}
-	if !hasColumn("prompt_per_1m") {
+	if !hasColumn(db, pricingPer1KColumns[0][1]) {
 		// Shouldn't happen after AutoMigrate, but be safe.
-		return db.Exec("ALTER TABLE pricings ADD COLUMN prompt_per_1m REAL DEFAULT 0").Error
+		return db.Exec("ALTER TABLE pricings ADD COLUMN " + pricingPer1KColumns[0][1] + " REAL DEFAULT 0").Error
 	}
 
 	log.Println("[db] migrating pricing rates from per-1K to per-1M tokens")
@@ -128,14 +128,9 @@ func migratePricingPer1KToPer1M(db *gorm.DB) error {
 	}()
 
 	// Copy ×1000 into the new columns (per 1K → per 1M is ×1000).
-	for _, pair := range [][2]string{
-		{"prompt_per_1k", "prompt_per_1m"},
-		{"completion_per_1k", "completion_per_1m"},
-		{"cache_read_per_1k", "cache_read_per_1m"},
-		{"cache_write_per_1k", "cache_write_per_1m"},
-	} {
+	for _, pair := range pricingPer1KColumns {
 		oldCol, newCol := pair[0], pair[1]
-		if !hasColumn(newCol) {
+		if !hasColumn(tx, newCol) {
 			if err := tx.Exec("ALTER TABLE pricings ADD COLUMN " + newCol + " REAL DEFAULT 0").Error; err != nil {
 				tx.Rollback()
 				return err
@@ -148,7 +143,8 @@ func migratePricingPer1KToPer1M(db *gorm.DB) error {
 	}
 
 	// Drop the old columns (SQLite supports DROP COLUMN since 3.35).
-	for _, oldCol := range []string{"prompt_per_1k", "completion_per_1k", "cache_read_per_1k", "cache_write_per_1k"} {
+	for _, pair := range pricingPer1KColumns {
+		oldCol := pair[0]
 		if err := tx.Exec("ALTER TABLE pricings DROP COLUMN " + oldCol).Error; err != nil {
 			tx.Rollback()
 			return err
@@ -160,6 +156,17 @@ func migratePricingPer1KToPer1M(db *gorm.DB) error {
 	}
 	log.Println("[db] pricing migration complete (per-1K → per-1M)")
 	return nil
+}
+
+// These names are the columns GORM generated from the historical Pricing
+// fields (PromptPer1K, etc.) and the current fields (PromptPer1M, etc.).
+// Keep the migration tied to the schema GORM actually creates: inserting an
+// underscore before the numeric suffix makes the legacy columns invisible.
+var pricingPer1KColumns = [][2]string{
+	{"prompt_per1_k", "prompt_per1_m"},
+	{"completion_per1_k", "completion_per1_m"},
+	{"cache_read_per1_k", "cache_read_per1_m"},
+	{"cache_write_per1_k", "cache_write_per1_m"},
 }
 
 // GetDB returns the database instance
