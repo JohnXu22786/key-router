@@ -70,6 +70,8 @@ func legacyDataDirsForExecutable(goos string, getenv func(string) string, home f
 	case "windows":
 		if d := getenv("LOCALAPPDATA"); d != "" {
 			dirs = append(dirs, filepath.Join(d, "LocalRouter"))
+		} else if h, err := home(); err == nil && h != "" {
+			dirs = append(dirs, filepath.Join(h, "AppData", "Local", "LocalRouter"))
 		}
 	case "darwin":
 		if h, err := home(); err == nil && h != "" {
