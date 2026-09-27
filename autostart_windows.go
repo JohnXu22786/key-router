@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"unsafe"
 )
@@ -184,7 +185,17 @@ func autostartEnabled() bool {
 		return false
 	}
 	existing := syscall.UTF16ToString(buf)
-	return existing == autostartRunValue(appPath) || (existing != "" && filepath.Clean(existing) == appPath)
+	return autostartRunValueMatchesExecutable(existing, appPath)
+}
+
+func autostartRunValueMatchesExecutable(runValue, appPath string) bool {
+	if runValue == "" || appPath == "" {
+		return false
+	}
+	if len(runValue) >= 2 && runValue[0] == '"' && runValue[len(runValue)-1] == '"' {
+		runValue = runValue[1 : len(runValue)-1]
+	}
+	return strings.EqualFold(filepath.Clean(runValue), filepath.Clean(appPath))
 }
 
 // unsafePtr converts a Go string to a uintptr for the syscall shims above.

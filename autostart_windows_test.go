@@ -46,6 +46,30 @@ func TestAutostartRunValueParsesAsSingleExecutable(t *testing.T) {
 	}
 }
 
+func TestAutostartRunValueMatchesExecutable(t *testing.T) {
+	appPath := `C:\Program Files\Key Router\KeyRouter.exe`
+	tests := []struct {
+		name     string
+		runValue string
+		want     bool
+	}{
+		{name: "quoted exact path", runValue: `"C:\Program Files\Key Router\KeyRouter.exe"`, want: true},
+		{name: "quoted path with different casing", runValue: `"c:\PROGRAM FILES\key router\KEYROUTER.EXE"`, want: true},
+		{name: "unquoted legacy path", runValue: appPath, want: true},
+		{name: "unquoted legacy path with different casing", runValue: `c:\PROGRAM FILES\key router\KEYROUTER.EXE`, want: true},
+		{name: "different executable", runValue: `"C:\Program Files\Key Router\Other.exe"`, want: false},
+		{name: "empty Run value", runValue: "", want: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := autostartRunValueMatchesExecutable(test.runValue, appPath); got != test.want {
+				t.Errorf("autostartRunValueMatchesExecutable(%q, %q) = %t, want %t", test.runValue, appPath, got, test.want)
+			}
+		})
+	}
+}
+
 func TestAutostartCreatesMissingRunKey(t *testing.T) {
 	parentPath := `Software\Microsoft\Windows\CurrentVersion`
 	var parentKey uintptr
