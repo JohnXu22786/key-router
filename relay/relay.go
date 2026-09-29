@@ -550,6 +550,8 @@ func openAIPartsHaveText(parts []interface{}) bool {
 // "anthropic" or "responses") — for /v1/responses requests it can differ
 // from the provider type (chat-completions fallback).
 //
+// includeUsage is the downstream OpenAI stream_options.include_usage opt-in;
+// omitted callers default to false for synthesized full-JSON usage chunks.
 // Returns the captured token usage (from stream end events), a "sawContent"
 // boolean that reports whether ANY text / tool_call / tool_use /
 // reasoning_content was emitted in the stream (used by the handler's
@@ -558,8 +560,9 @@ func openAIPartsHaveText(parts []interface{}) bool {
 // stream that only carried role-only deltas, usage-only events, finish
 // markers or empty keepalive frames — the same definition the non-stream
 // responseIsEmpty helper uses for the body.
-func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, upstreamFormat, modelName string) (*model.TokenUsage, bool, error) {
+func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, upstreamFormat, modelName string, includeUsage ...bool) (*model.TokenUsage, bool, error) {
 	usage := &model.TokenUsage{}
+	usageRequested := len(includeUsage) > 0 && includeUsage[0]
 	// sawContent is sticky: set true the first time we see text, a tool
 	// call, or reasoning content in the stream, and never cleared. The
 	// handler uses it to decide whether a stream was "empty" (no real
@@ -725,6 +728,34 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 			out = append(out, '\n', '\n')
 			if _, err := w.Write(out); err != nil {
 				return usage, sawContent, err
+			}
+			// Match OpenAI's include_usage stream contract: send usage in a
+			// separate, choices-empty chunk after the finish chunk and before
+			// [DONE]. Limit this to full OpenAI completions; other conversion
+			// paths retain their existing usage framing.
+			if upstreamFormat == "openai" && usageRequested {
+				var completion struct {
+					Choices []json.RawMessage `json:"choices"`
+					Usage   json.RawMessage   `json:"usage"`
+				}
+				var usageObject map[string]json.RawMessage
+				if json.Unmarshal(frame, &completion) == nil && len(completion.Choices) > 0 &&
+					json.Unmarshal(completion.Usage, &usageObject) == nil && usageObject != nil {
+					usageChunk, err := json.Marshal(map[string]interface{}{
+						"id":      "chatcmpl-local",
+						"object":  "chat.completion.chunk",
+						"created": 0,
+						"model":   modelName,
+						"choices": []interface{}{},
+						"usage":   completion.Usage,
+					})
+					if err != nil {
+						return usage, sawContent, err
+					}
+					if _, err := fmt.Fprintf(w, "data: %s\n\n", usageChunk); err != nil {
+						return usage, sawContent, err
+					}
+				}
 			}
 			if _, err := fmt.Fprintf(w, "data: [DONE]\n\n"); err != nil {
 				return usage, sawContent, err

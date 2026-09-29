@@ -116,8 +116,11 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 
 	// Extract model from body
 	var reqMeta struct {
-		Model  string `json:"model"`
-		Stream bool   `json:"stream"`
+		Model         string `json:"model"`
+		Stream        bool   `json:"stream"`
+		StreamOptions struct {
+			IncludeUsage bool `json:"include_usage"`
+		} `json:"stream_options"`
 	}
 	if err := json.Unmarshal(body, &reqMeta); err != nil || reqMeta.Model == "" {
 		writeRelayError(c, inputFormat, http.StatusBadRequest, "invalid_request", "invalid_request_error",
@@ -473,7 +476,7 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			// sawContent reports whether the stream carried any text,
 			// tool_call or reasoning_content; the empty-response failover
 			// uses it (see Engine.RecordEmptyResponse).
-			usage, sawContent, streamErr := relay.StreamResponse(c.Writer, resp, inputFormat, rr.UpstreamFormat, targetModel)
+			usage, sawContent, streamErr := relay.StreamResponse(c.Writer, resp, inputFormat, rr.UpstreamFormat, targetModel, reqMeta.StreamOptions.IncludeUsage)
 			resp.Body.Close()
 
 			if streamErr != nil {

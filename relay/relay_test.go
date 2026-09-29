@@ -86,6 +86,121 @@ func TestCompletionToStreamChunkDeltaForm(t *testing.T) {
 	}
 }
 
+func TestStreamResponseSynthesizesOpenAIUsageChunkFromFullJSON(t *testing.T) {
+	body := `{"id":"chatcmpl-1","object":"chat.completion","model":"mock-model","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"hello"}}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10,"prompt_tokens_details":{"cached_tokens":2}}}`
+	resp := &http.Response{
+		Header: http.Header{"Content-Type": []string{"application/json"}},
+		Body:   io.NopCloser(strings.NewReader(body)),
+	}
+	w := httptest.NewRecorder()
+
+	usage, sawContent, err := StreamResponse(w, resp, "openai", "openai", "mock-model", true)
+	if err != nil {
+		t.Fatalf("StreamResponse error = %v, want nil", err)
+	}
+	if !sawContent {
+		t.Fatal("sawContent = false, want true for full completion content")
+	}
+	if usage == nil || usage.PromptTokens != 7 || usage.CompletionTokens != 3 || usage.TotalTokens != 10 {
+		t.Fatalf("usage = %+v, want prompt=7 completion=3 total=10", usage)
+	}
+
+	frames := strings.Split(strings.TrimSpace(w.Body.String()), "\n\n")
+	if len(frames) != 3 {
+		t.Fatalf("stream has %d frames, want completion, usage, and [DONE]: %q", len(frames), w.Body.String())
+	}
+	if frames[2] != "data: [DONE]" {
+		t.Fatalf("final frame = %q, want data: [DONE]", frames[2])
+	}
+
+	var completionChunk struct {
+		Choices []struct {
+			Delta struct {
+				Content string `json:"content"`
+			} `json:"delta"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(frames[0], "data: ")), &completionChunk); err != nil {
+		t.Fatalf("invalid completion chunk: %v", err)
+	}
+	if len(completionChunk.Choices) != 1 || completionChunk.Choices[0].Delta.Content != "hello" || completionChunk.Choices[0].FinishReason != "stop" {
+		t.Errorf("completion chunk = %+v, want content hello and finish_reason stop", completionChunk.Choices)
+	}
+
+	var usageChunk struct {
+		Object  string            `json:"object"`
+		Choices []json.RawMessage `json:"choices"`
+		Usage   struct {
+			PromptTokens     int64 `json:"prompt_tokens"`
+			CompletionTokens int64 `json:"completion_tokens"`
+			TotalTokens      int64 `json:"total_tokens"`
+			PromptDetails    struct {
+				CachedTokens int64 `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(frames[1], "data: ")), &usageChunk); err != nil {
+		t.Fatalf("invalid usage chunk: %v", err)
+	}
+	if len(usageChunk.Choices) != 0 {
+		t.Errorf("usage chunk choices = %v, want empty choices", usageChunk.Choices)
+	}
+	if usageChunk.Object != "chat.completion.chunk" {
+		t.Errorf("usage chunk object = %q, want chat.completion.chunk", usageChunk.Object)
+	}
+	if usageChunk.Usage.PromptTokens != 7 || usageChunk.Usage.CompletionTokens != 3 || usageChunk.Usage.TotalTokens != 10 || usageChunk.Usage.PromptDetails.CachedTokens != 2 {
+		t.Errorf("usage chunk = %+v, want prompt=7 completion=3 total=10 cached=2", usageChunk.Usage)
+	}
+}
+
+func TestStreamResponseOmitsOpenAIUsageChunkWithoutOptIn(t *testing.T) {
+	body := `{"id":"chatcmpl-1","object":"chat.completion","model":"mock-model","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"hello"}}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}`
+	resp := &http.Response{
+		Header: http.Header{"Content-Type": []string{"application/json"}},
+		Body:   io.NopCloser(strings.NewReader(body)),
+	}
+	w := httptest.NewRecorder()
+
+	usage, sawContent, err := StreamResponse(w, resp, "openai", "openai", "mock-model", false)
+	if err != nil {
+		t.Fatalf("StreamResponse error = %v, want nil", err)
+	}
+	if !sawContent {
+		t.Fatal("sawContent = false, want true for full completion content")
+	}
+	if usage == nil || usage.PromptTokens != 7 || usage.CompletionTokens != 3 || usage.TotalTokens != 10 {
+		t.Fatalf("usage = %+v, want prompt=7 completion=3 total=10 for metering", usage)
+	}
+	frames := strings.Split(strings.TrimSpace(w.Body.String()), "\n\n")
+	if len(frames) != 2 || frames[1] != "data: [DONE]" {
+		t.Fatalf("stream frames = %q, want completion followed directly by [DONE]", w.Body.String())
+	}
+}
+
+func TestStreamResponseForwardsOpenAIUsageChunkFromSSE(t *testing.T) {
+	upstream := "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10}}\n\n" +
+		"data: [DONE]\n\n"
+	resp := &http.Response{
+		Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:   io.NopCloser(strings.NewReader(upstream)),
+	}
+	w := httptest.NewRecorder()
+
+	_, _, err := StreamResponse(w, resp, "openai", "openai", "mock-model", true)
+	if err != nil {
+		t.Fatalf("StreamResponse error = %v, want nil", err)
+	}
+	frames := strings.Split(strings.TrimSpace(w.Body.String()), "\n\n")
+	if len(frames) != 3 || frames[2] != "data: [DONE]" {
+		t.Fatalf("stream frames = %q, want upstream content, usage, and [DONE] only", w.Body.String())
+	}
+	if !strings.Contains(frames[1], `"choices":[]`) || !strings.Contains(frames[1], `"total_tokens":10`) {
+		t.Errorf("upstream usage frame = %q, want its choices-empty usage chunk forwarded", frames[1])
+	}
+}
+
 func TestStreamResponseSynthesizesResponsesRefusalFromFullChat(t *testing.T) {
 	body := `{"id":"chatcmpl-refusal","object":"chat.completion","model":"m","choices":[{"finish_reason":"stop","message":{"role":"assistant","content":null,"refusal":"I cannot help with that request."}}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`
 	resp := &http.Response{
