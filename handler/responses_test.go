@@ -420,6 +420,34 @@ func TestResponsesNativeFailedIsTerminal(t *testing.T) {
 	}
 }
 
+func TestResponsesNativeFailedJSONIsNotBilled(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"resp_failed","object":"response","status":"failed","error":{"code":"server_error","message":"overloaded"},"output":[],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}`)
+	}))
+	defer upstream.Close()
+
+	e := bootstrapResponses(t, "openai", "mock-model", upstream.URL)
+	rec := postResponses(t, e, `{"model":"mock-model","input":"hi","stream":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"type":"response.failed"`) || !strings.Contains(rec.Body.String(), `"message":"overloaded"`) {
+		t.Fatalf("failed response event or original error was not forwarded: %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), `"type":"response.completed"`) {
+		t.Fatalf("failed response was followed by response.completed: %s", rec.Body.String())
+	}
+
+	var count int64
+	if err := db.GetDB().Model(&model.Consumption{}).Count(&count).Error; err != nil {
+		t.Fatalf("count consumption records: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("consumption records = %d, want 0 for failed response", count)
+	}
+}
+
 // TestResponsesNativeStreamPassthrough: a native /v1/responses SSE stream is
 // relayed verbatim (event: lines and data frames), with no synthesized
 // tail after response.completed.

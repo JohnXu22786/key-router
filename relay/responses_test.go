@@ -2,6 +2,7 @@ package relay
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -324,5 +325,85 @@ func TestChatCompletionResponseToResponsesMissingTotalTokens(t *testing.T) {
 	}
 	if u["input_tokens"] != float64(10) || u["output_tokens"] != float64(5) {
 		t.Errorf("usage = %v", u)
+	}
+}
+
+func TestResponsesBodyToEventsMatchesTerminalStatus(t *testing.T) {
+	tests := []struct {
+		name             string
+		body             string
+		wantTerminalType string
+	}{
+		{
+			name:             "completed",
+			body:             `{"id":"resp_done","object":"response","status":"completed","output":[]}`,
+			wantTerminalType: "response.completed",
+		},
+		{
+			name:             "incomplete",
+			body:             `{"id":"resp_cut","object":"response","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}`,
+			wantTerminalType: "response.incomplete",
+		},
+		{
+			name:             "failed",
+			body:             `{"id":"resp_failed","object":"response","status":"failed","error":{"code":"content_filter","type":"server_error"},"output":[]}`,
+			wantTerminalType: "response.failed",
+		},
+	}
+	wantEventTypes := []string{"response.created", "response.in_progress"}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			events, err := responsesBodyToEvents([]byte(tt.body))
+			if err != nil {
+				t.Fatalf("responsesBodyToEvents error = %v", err)
+			}
+			if len(events) != 3 {
+				t.Fatalf("got %d events, want 3", len(events))
+			}
+
+			var wantResponse map[string]interface{}
+			if err := json.Unmarshal([]byte(tt.body), &wantResponse); err != nil {
+				t.Fatal(err)
+			}
+			wantTypes := append(append([]string(nil), wantEventTypes...), tt.wantTerminalType)
+			for i, raw := range events {
+				var event struct {
+					Type     string                 `json:"type"`
+					Response map[string]interface{} `json:"response"`
+				}
+				if err := json.Unmarshal(raw, &event); err != nil {
+					t.Fatalf("event %d is invalid JSON: %v", i, err)
+				}
+				if event.Type != wantTypes[i] {
+					t.Errorf("event %d type = %q, want %q", i, event.Type, wantTypes[i])
+				}
+				if !reflect.DeepEqual(event.Response, wantResponse) {
+					t.Errorf("event %d response = %v, want unchanged response %v", i, event.Response, wantResponse)
+				}
+			}
+		})
+	}
+}
+
+func TestResponsesBodyToEventsEmptyBodyStillCompletes(t *testing.T) {
+	events, err := responsesBodyToEvents(nil)
+	if err != nil {
+		t.Fatalf("responsesBodyToEvents error = %v", err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("got %d events, want 3", len(events))
+	}
+	var terminal struct {
+		Type     string `json:"type"`
+		Response struct {
+			Status string `json:"status"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal(events[2], &terminal); err != nil {
+		t.Fatalf("terminal event is invalid JSON: %v", err)
+	}
+	if terminal.Type != "response.completed" || terminal.Response.Status != "completed" {
+		t.Errorf("empty-body terminal = %q with status %q, want response.completed with completed status", terminal.Type, terminal.Response.Status)
 	}
 }
