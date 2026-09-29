@@ -2,11 +2,14 @@ package selector
 
 import (
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
 	"key-router/db"
 	"key-router/model"
+
+	"gorm.io/gorm"
 )
 
 // recordResult helpers -----------------------------------------------------
@@ -50,6 +53,195 @@ func loadKey(t *testing.T, id int64) model.Key {
 		t.Fatal(err)
 	}
 	return k
+}
+
+func outcomeSnapshot(e *Engine, keyID int64) KeyOutcome {
+	e.outcomeMu.Lock()
+	defer e.outcomeMu.Unlock()
+	if outcome := e.outcomes[keyID]; outcome != nil {
+		return *outcome
+	}
+	return KeyOutcome{}
+}
+
+func assertLaterObservationWaitsForStatusAction(t *testing.T, e *Engine, keyID int64, firstStatus string, first, later func(), wantDuring func(KeyOutcome) bool) {
+	t.Helper()
+	statusActionStarted := make(chan struct{})
+	statusActionRelease := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(statusActionRelease) }) }
+	defer release()
+	const callbackName = "selector:test_pause_outcome_status_action"
+	var callbackOnce sync.Once
+	callback := db.GetDB().Callback().Update().After("gorm:commit_or_rollback_transaction")
+	if err := callback.Register(callbackName, func(tx *gorm.DB) {
+		updates, ok := tx.Statement.Dest.(map[string]interface{})
+		if !ok {
+			return
+		}
+		status, _ := updates["status"].(string)
+		if status != firstStatus {
+			return
+		}
+		callbackOnce.Do(func() {
+			close(statusActionStarted)
+			<-statusActionRelease
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		release()
+		if err := callback.Remove(callbackName); err != nil {
+			t.Errorf("remove test update callback: %v", err)
+		}
+	})
+
+	firstDone := make(chan struct{})
+	go func() {
+		first()
+		close(firstDone)
+	}()
+	select {
+	case <-statusActionStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first observation did not reach its status action")
+	}
+
+	laterStarted := make(chan struct{})
+	laterDone := make(chan struct{})
+	go func() {
+		close(laterStarted)
+		later()
+		close(laterDone)
+	}()
+	<-laterStarted
+	laterCompletedEarly := false
+	select {
+	case <-laterDone:
+		laterCompletedEarly = true
+	case <-time.After(50 * time.Millisecond):
+	}
+	gotDuring := outcomeSnapshot(e, keyID)
+	duringMatches := wantDuring(gotDuring)
+
+	release()
+	for name, done := range map[string]<-chan struct{}{"first": firstDone, "later": laterDone} {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s observation did not finish after releasing the prior status action", name)
+		}
+	}
+	if laterCompletedEarly {
+		t.Error("later observation completed before the prior status action")
+	}
+	if !duringMatches {
+		t.Errorf("outcome advanced before the prior status action completed: got %+v", gotDuring)
+	}
+}
+
+func TestConcurrentOutcomeStatusActionsFollowObservationOrder(t *testing.T) {
+	t.Run("success then failure", func(t *testing.T) {
+		e := newTestEngine(t)
+		key := mustKey(t, e, &model.Key{
+			ProviderID: 1, Status: model.KeyStatusRateLimited, DisabledReason: "http_5xx",
+		})
+		e.outcomeMu.Lock()
+		e.outcomes[key.ID] = &KeyOutcome{SuccessStreak: 1}
+		e.outcomeMu.Unlock()
+
+		assertLaterObservationWaitsForStatusAction(t, e, key.ID,
+			model.KeyStatusActive,
+			func() { e.RecordResult(key.ID, true, "", 0) },
+			func() { e.RecordResult(key.ID, false, "http_429", time.Hour) },
+			func(got KeyOutcome) bool { return reflect.DeepEqual(got, KeyOutcome{SuccessStreak: 2}) },
+		)
+		if got := outcomeSnapshot(e, key.ID); got.SuccessStreak != 0 || got.FailureStreak != 1 || got.LastReason != "http_429" {
+			t.Errorf("final outcome = %+v, want the later failure to reset the success streak", got)
+		}
+		if after := loadKey(t, key.ID); after.Status != model.KeyStatusRateLimited || after.DisabledReason != "http_429" {
+			t.Errorf("final key state = %s/%q, want rate_limited/http_429", after.Status, after.DisabledReason)
+		}
+	})
+
+	t.Run("failure then success", func(t *testing.T) {
+		e := newTestEngine(t)
+		key := mustKey(t, e, &model.Key{ProviderID: 1, Status: model.KeyStatusActive})
+
+		assertLaterObservationWaitsForStatusAction(t, e, key.ID,
+			model.KeyStatusRateLimited,
+			func() { e.RecordResult(key.ID, false, "http_5xx", time.Hour) },
+			func() { e.RecordResult(key.ID, true, "", 0) },
+			func(got KeyOutcome) bool {
+				return reflect.DeepEqual(got, KeyOutcome{FailureStreak: 1, LastReason: "http_5xx"})
+			},
+		)
+		if got := outcomeSnapshot(e, key.ID); got.SuccessStreak != 1 || got.FailureStreak != 0 || got.LastReason != "" {
+			t.Errorf("final outcome = %+v, want the later success to break the failure streak", got)
+		}
+		if after := loadKey(t, key.ID); after.Status != model.KeyStatusRateLimited || after.DisabledReason != "http_5xx" {
+			t.Errorf("final key state = %s/%q, want rate_limited/http_5xx after only one success", after.Status, after.DisabledReason)
+		}
+	})
+
+	t.Run("empty response then success", func(t *testing.T) {
+		e := newTestEngine(t)
+		provider := mustProvider(t, e, &model.Provider{
+			Name: "p1", Type: model.ProviderTypeOpenAI, BaseURL: "http://localhost:1",
+			FailoverEmptyEnabled: true, FailoverEmptyThreshold: 1, FailoverEmptyWindowSec: 60,
+		})
+		key := mustKey(t, e, &model.Key{ProviderID: provider.ID, Status: model.KeyStatusActive})
+
+		assertLaterObservationWaitsForStatusAction(t, e, key.ID,
+			model.KeyStatusRateLimited,
+			func() { e.RecordEmptyResponse(key.ID, provider.ID) },
+			func() { e.RecordResult(key.ID, true, "", 0) },
+			func(got KeyOutcome) bool {
+				return got.EmptyStreak == 1 && !got.LastEmptyAt.IsZero() && got.SuccessStreak == 0
+			},
+		)
+		if got := outcomeSnapshot(e, key.ID); got.SuccessStreak != 1 || got.EmptyStreak != 0 || !got.LastEmptyAt.IsZero() {
+			t.Errorf("final outcome = %+v, want the later success to reset the empty streak", got)
+		}
+		if after := loadKey(t, key.ID); after.Status != model.KeyStatusRateLimited || after.DisabledReason != model.ReasonEmptyResponse {
+			t.Errorf("final key state = %s/%q, want rate_limited/empty_response after one success", after.Status, after.DisabledReason)
+		}
+	})
+}
+
+func TestRecordEmptyResponseWindowUsesObservationTimeBeforeStatusLock(t *testing.T) {
+	e := newTestEngine(t)
+	provider := mustProvider(t, e, &model.Provider{
+		Name: "p1", Type: model.ProviderTypeOpenAI, BaseURL: "http://localhost:1",
+		FailoverEmptyEnabled: true, FailoverEmptyThreshold: 2, FailoverEmptyWindowSec: 1,
+	})
+	key := mustKey(t, e, &model.Key{ProviderID: provider.ID, Status: model.KeyStatusActive})
+
+	unlockStatus := e.lockKeyStatus(key.ID)
+	firstStarted := make(chan struct{})
+	firstDone := make(chan struct{})
+	go func() {
+		close(firstStarted)
+		e.RecordEmptyResponse(key.ID, provider.ID)
+		close(firstDone)
+	}()
+	<-firstStarted
+	time.Sleep(1100 * time.Millisecond)
+	unlockStatus()
+	select {
+	case <-firstDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first empty observation did not finish after releasing the status lock")
+	}
+
+	e.RecordEmptyResponse(key.ID, provider.ID)
+	if got := outcomeSnapshot(e, key.ID); got.EmptyStreak != 1 {
+		t.Errorf("empty streak = %d, want 1 because the lock wait exceeded the observation window", got.EmptyStreak)
+	}
+	if after := loadKey(t, key.ID); after.Status != model.KeyStatusActive {
+		t.Errorf("status = %q, want active because the two empty observations were outside the window", after.Status)
+	}
 }
 
 // TestRecordResultSingleFailureCoolsKey: the first failure must mark the
