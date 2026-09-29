@@ -325,7 +325,7 @@ func (e *Engine) RecordSuccess(keyID int64, tokens int64, costMicroUSD int64) {
 	e.WindowManager.IncrementAllWithCost(keyID, tokens, costMicroUSD)
 }
 
-// lockKeyStatus serializes each key's DB status write and cache update.
+// lockKeyStatus serializes each key's status writes and observation actions.
 func (e *Engine) lockKeyStatus(keyID int64) func() {
 	e.statusLocksMu.Lock()
 	lock := e.statusLocks[keyID]
@@ -345,7 +345,11 @@ func (e *Engine) lockKeyStatus(keyID int64) func() {
 func (e *Engine) MarkKeyDisabled(keyID int64, reason string) {
 	unlock := e.lockKeyStatus(keyID)
 	defer unlock()
+	e.markKeyDisabledLocked(keyID, reason)
+}
 
+// markKeyDisabledLocked requires the key's status lock to be held.
+func (e *Engine) markKeyDisabledLocked(keyID int64, reason string) {
 	res := db.GetDB().Model(&model.Key{}).
 		Where("id = ? AND status <> ?", keyID, model.KeyStatusDisabled).
 		Updates(map[string]interface{}{
@@ -393,7 +397,11 @@ func (e *Engine) MarkKeyDisabled(keyID int64, reason string) {
 func (e *Engine) MarkKeyActive(keyID int64) {
 	unlock := e.lockKeyStatus(keyID)
 	defer unlock()
+	e.markKeyActiveLocked(keyID)
+}
 
+// markKeyActiveLocked requires the key's status lock to be held.
+func (e *Engine) markKeyActiveLocked(keyID int64) {
 	res := db.GetDB().Model(&model.Key{}).
 		Where("id = ? AND (status <> ? OR (disabled_reason IS NOT NULL AND disabled_reason <> '') OR rate_limited_until IS NOT NULL) AND (status <> ? OR disabled_reason IN (?, ?, ?, ?)) AND (total_spend_limit IS NULL OR total_spend_limit = 0 OR total_spent < total_spend_limit) AND (rate_limited_until IS NULL OR rate_limited_until <= ?)",
 			keyID, model.KeyStatusActive, model.KeyStatusDisabled,
@@ -431,6 +439,9 @@ func (e *Engine) MarkKeyActive(keyID int64) {
 //     clearing the cooldown and the displayed reason. A single success
 //     never re-admits a cooled/disabled key.
 func (e *Engine) RecordResult(keyID int64, ok bool, reason string, cooldown time.Duration) {
+	unlockStatus := e.lockKeyStatus(keyID)
+	defer unlockStatus()
+
 	e.outcomeMu.Lock()
 	oc := e.outcomes[keyID]
 	if oc == nil {
@@ -456,7 +467,7 @@ func (e *Engine) RecordResult(keyID int64, ok bool, reason string, cooldown time
 		streak := oc.SuccessStreak
 		e.outcomeMu.Unlock()
 		if streak >= 2 {
-			e.MarkKeyActive(keyID)
+			e.markKeyActiveLocked(keyID)
 		}
 		return
 	}
@@ -475,9 +486,9 @@ func (e *Engine) RecordResult(keyID int64, ok bool, reason string, cooldown time
 
 	// Failover now: take the key out of rotation so the retry loop picks
 	// the next key instead of re-selecting this one.
-	e.failKey(keyID, reason, cooldown)
+	e.failKeyLocked(keyID, reason, cooldown)
 	if streak >= 2 && model.DisableClassReason(reason) {
-		e.MarkKeyDisabled(keyID, reason)
+		e.markKeyDisabledLocked(keyID, reason)
 	}
 }
 
@@ -521,6 +532,8 @@ func (e *Engine) RecordEmptyResponse(keyID, providerID int64) {
 
 	now := time.Now()
 	window := time.Duration(provider.FailoverEmptyWindowSec) * time.Second
+	unlockStatus := e.lockKeyStatus(keyID)
+	defer unlockStatus()
 
 	e.outcomeMu.Lock()
 	oc := e.outcomes[keyID]
@@ -547,9 +560,9 @@ func (e *Engine) RecordEmptyResponse(keyID, providerID int64) {
 	// consistent with the rest of the failure vocabulary. (The disable
 	// flavor is a deliberate operator choice; the cool flavor is the
 	// default and is fully recoverable by the next non-empty observation.)
-	e.failKey(keyID, model.ReasonEmptyResponse, 30*time.Second)
+	e.failKeyLocked(keyID, model.ReasonEmptyResponse, 30*time.Second)
 	if disable {
-		e.MarkKeyDisabled(keyID, model.ReasonEmptyResponse)
+		e.markKeyDisabledLocked(keyID, model.ReasonEmptyResponse)
 	}
 }
 
@@ -567,7 +580,11 @@ func (e *Engine) RecordEmptyResponse(keyID, providerID int64) {
 func (e *Engine) failKey(keyID int64, reason string, cooldown time.Duration) {
 	unlock := e.lockKeyStatus(keyID)
 	defer unlock()
+	e.failKeyLocked(keyID, reason, cooldown)
+}
 
+// failKeyLocked requires the key's status lock to be held.
+func (e *Engine) failKeyLocked(keyID int64, reason string, cooldown time.Duration) {
 	until := time.Now().Add(cooldown)
 	res := db.GetDB().Model(&model.Key{}).
 		Where("id = ? AND status <> ? AND (rate_limited_until IS NULL OR rate_limited_until <= ?) AND (total_spend_limit IS NULL OR total_spend_limit = 0 OR total_spent < total_spend_limit)",
@@ -628,6 +645,9 @@ func (e *Engine) notifyStatusChanged(keyID int64, status string) {
 // half-built failure or success streak (e.g. one prior auth failure must
 // not pre-dispose an edited key).
 func (e *Engine) ResetOutcome(keyID int64) {
+	unlockStatus := e.lockKeyStatus(keyID)
+	defer unlockStatus()
+
 	e.outcomeMu.Lock()
 	delete(e.outcomes, keyID)
 	e.outcomeMu.Unlock()
