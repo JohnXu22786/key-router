@@ -139,11 +139,56 @@ export const updateModelGroup = (id: number, data: Partial<ModelGroup>) => api.p
 export const deleteModelGroup = (id: number) => api.delete(`/model-groups/${id}`);
 
 // Routes
-export const getRoutes = () => api.get<Route[]>('/routes');
+export interface RouteOrderVersion {
+  timestamp: number;
+  client_id: string;
+  sequence: number;
+}
+
+let observedRouteOrderVersion: RouteOrderVersion | null = null;
+
+export function observeRouteOrderVersion(version: RouteOrderVersion) {
+  const current = observedRouteOrderVersion;
+  if (!current || version.timestamp > current.timestamp ||
+    (version.timestamp === current.timestamp && version.client_id > current.client_id) ||
+    (version.timestamp === current.timestamp && version.client_id === current.client_id && version.sequence > current.sequence)) {
+    observedRouteOrderVersion = version;
+  }
+}
+
+export function getObservedRouteOrderVersion() {
+  return observedRouteOrderVersion;
+}
+
+function observeRouteOrderVersionHeader(headers: Record<string, unknown> | undefined) {
+  const raw = headers?.['x-route-order-version'];
+  if (typeof raw !== 'string') return;
+  try {
+    const version = JSON.parse(raw) as RouteOrderVersion;
+    if (Number.isFinite(version.timestamp) && version.timestamp >= 0 &&
+      typeof version.client_id === 'string' && Number.isSafeInteger(version.sequence) && version.sequence >= 0) {
+      observeRouteOrderVersion(version);
+    }
+  } catch {
+    // Ignore malformed version headers; the server validates write versions.
+  }
+}
+
+export const getRoutes = () => api.get<Route[]>('/routes').then(response => {
+  observeRouteOrderVersionHeader(response.headers);
+  return response;
+});
 export const createRoute = (data: Partial<Route>) => api.post<Route>('/routes', data);
 export const updateRoute = (id: number, data: Partial<Route>) => api.put<Route>(`/routes/${id}`, data);
 export const deleteRoute = (id: number) => api.delete(`/routes/${id}`);
-export const reorderRoutes = (routes: { id: number; priority: number }[]) => api.post('/routes/reorder', { routes });
+export const reorderRoutes = (routes: { id: number; priority: number }[], order_version: RouteOrderVersion) =>
+  api.post<{ status: string }>('/routes/reorder', { routes, order_version }).then(response => {
+    observeRouteOrderVersionHeader(response.headers);
+    return response;
+  }).catch(error => {
+    observeRouteOrderVersionHeader((error as { response?: { headers?: Record<string, unknown> } })?.response?.headers);
+    throw error;
+  });
 
 // Pricing
 export const getPricings = () => api.get<Pricing[]>('/pricings');

@@ -8,9 +8,10 @@ import {
 } from '@ant-design/icons';
 import {
   getModelGroups, createModelGroup, updateModelGroup, deleteModelGroup,
-  getRoutes, createRoute, updateRoute, deleteRoute, reorderRoutes,
+  getRoutes, createRoute, updateRoute, deleteRoute,
   getProviders, ModelGroup, Route, Provider,
 } from '../api/client';
+import { persistRouteOrder, refreshRouteOrderIfIdle, routeOrderPersistence, subscribeRouteOrderCompletion } from '../api/routeOrder';
 import { jsonEqual } from '../api/events';
 import JsonEditor from '../components/JsonEditor';
 import { useDragSort } from '../hooks/useDragSort';
@@ -34,51 +35,142 @@ const Models: React.FC = () => {
   const [extraError, setExtraError] = useState('');
   const [groupForm] = Form.useForm();
   const [routeForm] = Form.useForm();
-  // Number of drag orders committed but not yet persisted: the background
-  // poll must not overwrite the local order with pre-persist server state.
-  // Captured at fetch START as well (with the persist generation), so a
-  // poll that raced a commit or a persist is discarded even if the persist
-  // settles before the poll response arrives.
-  const pendingPersistsRef = useRef(0);
-  const persistGenRef = useRef(0);
   const routesRef = useRef<Route[]>([]);
   routesRef.current = routes;
+  const routeFetchSequence = useRef(0);
+  const appliedRouteFetchSequence = useRef(0);
+  const routesNeedRefresh = useRef(false);
+  const droppedRouteOrders = useRef(new WeakMap<Route[], { appliedSequence: number; rejected: boolean }>());
+  const routeRefreshRetryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const routeRefreshRetryDelay = useRef(1000);
+  const routeRefreshFailureReported = useRef(false);
+  const routeRefreshActive = useRef(true);
+
+  const clearRouteRefreshRetry = () => {
+    if (routeRefreshRetryTimer.current !== null) clearTimeout(routeRefreshRetryTimer.current);
+    routeRefreshRetryTimer.current = null;
+    routeRefreshRetryDelay.current = 1000;
+    routeRefreshFailureReported.current = false;
+  };
+
+  const scheduleRouteRefreshRetry = () => {
+    if (!routeRefreshActive.current || routeRefreshRetryTimer.current !== null) return;
+    const delay = routeRefreshRetryDelay.current;
+    routeRefreshRetryDelay.current = Math.min(delay * 2, 30000);
+    routeRefreshRetryTimer.current = setTimeout(() => {
+      routeRefreshRetryTimer.current = null;
+      if (routeRefreshActive.current && routesNeedRefresh.current && routeOrderPersistence.pending === 0) requestRouteRefresh();
+    }, delay);
+  };
+
+  const onRouteRefreshFailure = () => {
+    if (!routeRefreshActive.current || !routesNeedRefresh.current) return;
+    if (!routeRefreshFailureReported.current) {
+      message.error('Failed to refresh route order; retrying');
+      routeRefreshFailureReported.current = true;
+    }
+    scheduleRouteRefreshRetry();
+  };
+
+  const refreshRoutes = () => {
+    const requestID = ++routeFetchSequence.current;
+    return refreshRouteOrderIfIdle(data => {
+      if (routeRefreshActive.current && requestID > appliedRouteFetchSequence.current) {
+        appliedRouteFetchSequence.current = requestID;
+        routesNeedRefresh.current = false;
+        clearRouteRefreshRetry();
+        setRoutes(data);
+      }
+    }, () => routeRefreshActive.current && requestID > appliedRouteFetchSequence.current);
+  };
+
+  const requestRouteRefresh = () => {
+    if (!routeRefreshActive.current) return;
+    routesNeedRefresh.current = true;
+    if (routeOrderPersistence.pending > 0) return;
+    if (routeRefreshRetryTimer.current !== null) {
+      clearTimeout(routeRefreshRetryTimer.current);
+      routeRefreshRetryTimer.current = null;
+    }
+    void refreshRoutes().catch(onRouteRefreshFailure);
+  };
 
   // Drag-reorder with live preview animation (routes within a model group).
   const drag = useDragSort<Route>(
     routes,
     (from, to) => routes[from]?.model_group_id === routes[to]?.model_group_id,
-    (next) => { setRoutes(next); persistOrder(next); },
+    (next) => {
+      const drop = droppedRouteOrders.current.get(next);
+      if (drop?.rejected || drop?.appliedSequence !== appliedRouteFetchSequence.current) return;
+      setRoutes(next);
+    },
+    (next) => {
+      const drop = { appliedSequence: appliedRouteFetchSequence.current, rejected: false };
+      droppedRouteOrders.current.set(next, drop);
+      void persistOrder(next).then(saved => {
+        if (!saved) drop.rejected = true;
+      });
+    },
   );
 
   const fetch = async () => {
+    const requestID = ++routeFetchSequence.current;
+    const routeGeneration = routeOrderPersistence.generation;
+    const wasPersisting = routeOrderPersistence.pending > 0;
     setLoading(true);
     try {
       const [g, r, p] = await Promise.all([getModelGroups(), getRoutes(), getProviders()]);
-      setGroups(g.data); setRoutes(r.data); setProviders(p.data);
+      setGroups(g.data); setProviders(p.data);
+      if (requestID > appliedRouteFetchSequence.current && !wasPersisting && routeOrderPersistence.pending === 0 &&
+        routeOrderPersistence.generation === routeGeneration) {
+        appliedRouteFetchSequence.current = requestID;
+        routesNeedRefresh.current = false;
+        clearRouteRefreshRetry();
+        setRoutes(r.data);
+      } else if (requestID > appliedRouteFetchSequence.current) {
+        requestRouteRefresh();
+      }
     } catch { message.error('Failed to load models'); }
     finally { setLoading(false); }
   };
 
+  useEffect(() => subscribeRouteOrderCompletion(() => {
+    if (routeOrderPersistence.pending === 0 && routesNeedRefresh.current) requestRouteRefresh();
+  }), []);
+
   useEffect(() => { fetch(); }, []);
+  useEffect(() => {
+    routeRefreshActive.current = true;
+    return () => {
+      routeRefreshActive.current = false;
+      clearRouteRefreshRetry();
+    };
+  }, []);
 
   // Poll for status changes (route/group state, key health). Keeps expanded
   // groups and scroll position — only row data updates, and only when it
   // changed (jsonEqual: an unchanged response must not re-render).
   useEffect(() => {
     const t = setInterval(() => {
+      const requestID = ++routeFetchSequence.current;
       // A fetch that raced a commit or a persist may carry pre-persist data:
       // skip routes unless no persist was pending at fetch start AND none is
       // pending now AND the persist generation is unchanged, or the poll
       // would revert the UI until the next one.
-      const wasPersisting = pendingPersistsRef.current > 0;
-      const gen = persistGenRef.current;
+      const wasPersisting = routeOrderPersistence.pending > 0;
+      const gen = routeOrderPersistence.generation;
       Promise.all([getModelGroups(), getRoutes(), getProviders()])
         .then(([g, r, p]) => {
           setGroups(prev => (jsonEqual(prev, g.data) ? prev : g.data));
           setProviders(prev => (jsonEqual(prev, p.data) ? prev : p.data));
-          if (!wasPersisting && pendingPersistsRef.current === 0 && gen === persistGenRef.current) {
+          if (requestID > appliedRouteFetchSequence.current && !wasPersisting && routeOrderPersistence.pending === 0 &&
+            gen === routeOrderPersistence.generation) {
+            appliedRouteFetchSequence.current = requestID;
+            routesNeedRefresh.current = false;
+            clearRouteRefreshRetry();
             setRoutes(prev => (jsonEqual(prev, r.data) ? prev : r.data));
+          } else if (requestID > appliedRouteFetchSequence.current) {
+            requestRouteRefresh();
           }
         })
         .catch(() => {});
@@ -129,25 +221,24 @@ const Models: React.FC = () => {
     } catch { message.error('Failed to delete route'); }
   };
 
-  const persistOrder = useCallback((ordered: Route[]) => {
-    // Persist IMMEDIATELY on drop — no debounce: an edit must be written
-    // the moment it happens, so a crash or a forced kill right after a drop
-    // cannot lose the new order. Each drop fires one request; the poll guard
-    // below keeps the refresh from overwriting the local order while the
-    // write is in flight.
-    pendingPersistsRef.current++;
+  const persistOrder = useCallback((ordered: Route[]): Promise<boolean> => {
+    // Submit each drop immediately; the server rejects late stale versions.
     const groupCounts: Record<number, number> = {};
     const payload = ordered.map(r => {
       const idx = groupCounts[r.model_group_id] ?? 0;
       groupCounts[r.model_group_id] = idx + 1;
       return { id: r.id, priority: idx };
     });
-    reorderRoutes(payload)
-      .catch(() => message.error('Failed to save order'))
-      .finally(() => {
-        pendingPersistsRef.current--;
-        persistGenRef.current++;
-      });
+    return persistRouteOrder(payload).then(saved => {
+      if (!saved || routesNeedRefresh.current) {
+        requestRouteRefresh();
+      }
+      return saved;
+    }).catch(() => {
+      message.error('Failed to save order');
+      requestRouteRefresh();
+      return false;
+    });
   }, []);
 
   const routeColumns = [

@@ -1,11 +1,13 @@
 package db
 
 import (
-	"key-router/model"
+	"encoding/json"
 	"log"
 	"os"
 	"path/filepath"
 	"slices"
+
+	"key-router/model"
 
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -86,6 +88,9 @@ func Init(dataDir string) error {
 
 	// Seed default settings if not exist
 	seedDefaults(db)
+	if err := migrateRouteOrderVersion(db); err != nil {
+		return err
+	}
 
 	DB = db
 	return nil
@@ -519,6 +524,23 @@ func seedDefaults(db *gorm.DB) {
 			}
 		}
 	}
+}
+
+// migrateRouteOrderVersion adds the internal high-water setting without touching route priorities.
+func migrateRouteOrderVersion(db *gorm.DB) error {
+	initialVersion, err := json.Marshal(model.RouteOrderVersion{})
+	if err != nil {
+		return err
+	}
+	return db.Transaction(func(tx *gorm.DB) error {
+		return tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "key"}},
+			DoNothing: true,
+		}).Create(&model.Setting{
+			Key:   model.SettingRouteOrderVersion,
+			Value: string(initialVersion),
+		}).Error
+	})
 }
 
 // GetSetting retrieves a setting value

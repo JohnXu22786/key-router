@@ -42,6 +42,75 @@ type Updater interface {
 	Apply(*update.UpdateInfo) error
 }
 
+const routeOrderVersionHeader = "X-Route-Order-Version"
+const maxRouteOrderFutureSkew = 365 * 24 * time.Hour
+
+type routeOrderVersion = model.RouteOrderVersion
+
+func validRouteOrderVersion(version routeOrderVersion) bool {
+	return version.Timestamp > 0 && !math.IsNaN(version.Timestamp) && !math.IsInf(version.Timestamp, 0) &&
+		version.ClientID != "" && len(version.ClientID) <= 128 && version.Sequence > 0
+}
+
+func routeOrderTimestampWithinFutureSkew(timestamp float64, now time.Time) bool {
+	return timestamp <= float64(now.Add(maxRouteOrderFutureSkew).UnixMilli())
+}
+
+func readRouteOrderVersion(q *gorm.DB) (routeOrderVersion, error) {
+	var setting model.Setting
+	if err := q.Where("key = ?", model.SettingRouteOrderVersion).First(&setting).Error; err != nil {
+		return routeOrderVersion{}, err
+	}
+	var version routeOrderVersion
+	if err := json.Unmarshal([]byte(setting.Value), &version); err != nil {
+		return routeOrderVersion{}, fmt.Errorf("decode route order version: %w", err)
+	}
+	if version != (routeOrderVersion{}) && !validRouteOrderVersion(version) {
+		return routeOrderVersion{}, fmt.Errorf("invalid stored route order version")
+	}
+	return version, nil
+}
+
+func newerRouteOrderVersion(candidate, current routeOrderVersion) bool {
+	if current == (routeOrderVersion{}) {
+		return true
+	}
+	if candidate.ClientID == current.ClientID {
+		return candidate.Sequence > current.Sequence
+	}
+	if candidate.Timestamp != current.Timestamp {
+		return candidate.Timestamp > current.Timestamp
+	}
+	if candidate.ClientID != current.ClientID {
+		return candidate.ClientID > current.ClientID
+	}
+	return candidate.Sequence > current.Sequence
+}
+
+func saveRouteOrderVersion(tx *gorm.DB, version routeOrderVersion) error {
+	value, err := json.Marshal(version)
+	if err != nil {
+		return err
+	}
+	result := tx.Model(&model.Setting{}).Where("key = ?", model.SettingRouteOrderVersion).Update("value", string(value))
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return fmt.Errorf("route order version setting is missing")
+	}
+	return nil
+}
+
+func setRouteOrderVersionHeader(c *gin.Context, version routeOrderVersion) {
+	value, err := json.Marshal(version)
+	if err != nil {
+		log.Printf("[admin] encode route order version: %v", err)
+		return
+	}
+	c.Header(routeOrderVersionHeader, string(value))
+}
+
 // AdminHandler handles management API endpoints
 type AdminHandler struct {
 	Engine        *selector.Engine
@@ -75,9 +144,10 @@ type AdminHandler struct {
 	// restartMu/restarting guard Restart against concurrent calls: only the
 	// first request may schedule the relaunch — two fresh instances would
 	// fight over the server port.
-	restartMu  sync.Mutex
-	restarting bool
-	reorderMu  sync.Mutex // Prevents a timed-out write from finishing after a newer reorder.
+	restartMu      sync.Mutex
+	restarting     bool
+	reorderMu      sync.Mutex // Serializes key reorder writes.
+	routeReorderMu sync.Mutex // Serializes route version comparison and commit.
 	// autoCheckInfo holds the most recent auto-check result (set by
 	// AutoCheck's callback; read by GetAutoCheckState).
 	autoCheckMu   sync.Mutex
@@ -784,16 +854,40 @@ func (h *AdminHandler) DeleteModelGroup(c *gin.Context) {
 // rows (g1:0, g2:0, g1:1, ...) — the UI renders each group's rows as a
 // contiguous block and relies on that when reordering by drag.
 func (h *AdminHandler) GetRoutes(c *gin.Context) {
+	tx := db.GetDB().WithContext(c.Request.Context()).Begin()
+	if tx.Error != nil {
+		log.Printf("[admin] GetRoutes begin error: %v", tx.Error)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load routes"})
+		return
+	}
+	orderVersion, err := readRouteOrderVersion(tx)
+	if err != nil {
+		tx.Rollback()
+		log.Printf("[admin] GetRoutes version error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load route order version"})
+		return
+	}
 	var routes []model.Route
-	query := db.GetDB().Preload("ModelGroup").Preload("Provider").Order("model_group_id ASC, priority ASC, id ASC")
+	query := tx.Preload("ModelGroup").Preload("Provider").Order("model_group_id ASC, priority ASC, id ASC")
 	if groupID := c.Query("model_group_id"); groupID != "" {
 		query = query.Where("model_group_id = ?", groupID)
 	}
 	if err := query.Find(&routes).Error; err != nil {
+		tx.Rollback()
 		log.Printf("[admin] GetRoutes error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load routes"})
 		return
 	}
+	if c.Request.Context().Err() != nil {
+		tx.Rollback()
+		return
+	}
+	if err := tx.Commit().Error; err != nil {
+		log.Printf("[admin] GetRoutes commit error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load routes"})
+		return
+	}
+	setRouteOrderVersionHeader(c, orderVersion)
 	c.JSON(http.StatusOK, routes)
 }
 
@@ -973,18 +1067,58 @@ func (h *AdminHandler) UpdateRoute(c *gin.Context) {
 
 // ReorderRoutes batch-updates route priorities based on visual ordering
 func (h *AdminHandler) ReorderRoutes(c *gin.Context) {
+	h.routeReorderMu.Lock()
+	defer h.routeReorderMu.Unlock()
+	if c.Request.Context().Err() != nil {
+		return
+	}
+
 	var req struct {
 		Routes []struct {
 			ID       int64 `json:"id"`
 			Priority int   `json:"priority"`
 		} `json:"routes"`
+		OrderVersion routeOrderVersion `json:"order_version"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if !validRouteOrderVersion(req.OrderVersion) || !routeOrderTimestampWithinFutureSkew(req.OrderVersion.Timestamp, time.Now()) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid route order version"})
+		return
+	}
+	if c.Request.Context().Err() != nil {
+		return
+	}
 
-	tx := db.GetDB().Begin()
+	tx := db.GetDB().WithContext(c.Request.Context()).Begin()
+	if tx.Error != nil {
+		log.Printf("[admin] ReorderRoutes begin error: %v", tx.Error)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "reorder failed"})
+		return
+	}
+	currentVersion, err := readRouteOrderVersion(tx)
+	if err != nil {
+		tx.Rollback()
+		log.Printf("[admin] ReorderRoutes version read error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "reorder failed"})
+		return
+	}
+	if !newerRouteOrderVersion(req.OrderVersion, currentVersion) {
+		tx.Rollback()
+		setRouteOrderVersionHeader(c, currentVersion)
+		c.JSON(http.StatusConflict, gin.H{"status": "stale"})
+		return
+	}
+	if c.Request.Context().Err() != nil {
+		tx.Rollback()
+		return
+	}
+	committedVersion := req.OrderVersion
+	if currentVersion.Timestamp > committedVersion.Timestamp {
+		committedVersion.Timestamp = currentVersion.Timestamp
+	}
 	for _, r := range req.Routes {
 		if err := tx.Model(&model.Route{}).Where("id = ?", r.ID).Update("priority", r.Priority).Error; err != nil {
 			tx.Rollback()
@@ -993,12 +1127,19 @@ func (h *AdminHandler) ReorderRoutes(c *gin.Context) {
 			return
 		}
 	}
+	if err := saveRouteOrderVersion(tx, committedVersion); err != nil {
+		tx.Rollback()
+		log.Printf("[admin] ReorderRoutes version save error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "reorder failed"})
+		return
+	}
 	if err := tx.Commit().Error; err != nil {
 		log.Printf("[admin] ReorderRoutes commit error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "reorder commit failed"})
 		return
 	}
 
+	setRouteOrderVersionHeader(c, committedVersion)
 	h.Engine.Refresh()
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
@@ -1165,6 +1306,9 @@ func (h *AdminHandler) GetSettings(c *gin.Context) {
 	}
 	result := make(map[string]string)
 	for _, s := range settings {
+		if s.Key == model.SettingRouteOrderVersion {
+			continue
+		}
 		result[s.Key] = s.Value
 	}
 	c.JSON(http.StatusOK, result)
@@ -1175,6 +1319,10 @@ func (h *AdminHandler) UpdateSettings(c *gin.Context) {
 	var settings map[string]string
 	if err := c.ShouldBindJSON(&settings); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if _, ok := settings[model.SettingRouteOrderVersion]; ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "internal route order version cannot be changed"})
 		return
 	}
 	// Validate known settings so a bad value can't brick startup

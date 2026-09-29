@@ -1,7 +1,8 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { Button, Modal, Form, Input, InputNumber, Select, Switch, message, Space, Typography, Popconfirm, Tag, Collapse, Table, Alert } from 'antd';
 import { PlusOutlined, EditOutlined, DeleteOutlined, HolderOutlined } from '@ant-design/icons';
-import { getRoutes, createRoute, updateRoute, deleteRoute, reorderRoutes, getProviders, getModelGroups, Route, Provider, ModelGroup } from '../api/client';
+import { getRoutes, createRoute, updateRoute, deleteRoute, getProviders, getModelGroups, Route, Provider, ModelGroup } from '../api/client';
+import { persistRouteOrder, refreshRouteOrderIfIdle, routeOrderPersistence, subscribeRouteOrderCompletion } from '../api/routeOrder';
 import JsonEditor from '../components/JsonEditor';
 
 const { Title, Text } = Typography;
@@ -21,17 +22,96 @@ const RoutesPage: React.FC = () => {
   // when a second drop or a background fetch lands before a re-render
   const routesRef = useRef<Route[]>([]);
   routesRef.current = routes;
+  const routeFetchSequence = useRef(0);
+  const appliedRouteFetchSequence = useRef(0);
+  const routesNeedRefresh = useRef(false);
+  const routeRefreshRetryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const routeRefreshRetryDelay = useRef(1000);
+  const routeRefreshFailureReported = useRef(false);
+  const routeRefreshActive = useRef(true);
+
+  const clearRouteRefreshRetry = () => {
+    if (routeRefreshRetryTimer.current !== null) clearTimeout(routeRefreshRetryTimer.current);
+    routeRefreshRetryTimer.current = null;
+    routeRefreshRetryDelay.current = 1000;
+    routeRefreshFailureReported.current = false;
+  };
+
+  const scheduleRouteRefreshRetry = () => {
+    if (!routeRefreshActive.current || routeRefreshRetryTimer.current !== null) return;
+    const delay = routeRefreshRetryDelay.current;
+    routeRefreshRetryDelay.current = Math.min(delay * 2, 30000);
+    routeRefreshRetryTimer.current = setTimeout(() => {
+      routeRefreshRetryTimer.current = null;
+      if (routeRefreshActive.current && routesNeedRefresh.current && routeOrderPersistence.pending === 0) requestRouteRefresh();
+    }, delay);
+  };
+
+  const onRouteRefreshFailure = () => {
+    if (!routeRefreshActive.current || !routesNeedRefresh.current) return;
+    if (!routeRefreshFailureReported.current) {
+      message.error('Failed to refresh route order; retrying');
+      routeRefreshFailureReported.current = true;
+    }
+    scheduleRouteRefreshRetry();
+  };
+
+  const refreshRoutes = () => {
+    const requestID = ++routeFetchSequence.current;
+    return refreshRouteOrderIfIdle(data => {
+      if (routeRefreshActive.current && requestID > appliedRouteFetchSequence.current) {
+        appliedRouteFetchSequence.current = requestID;
+        routesNeedRefresh.current = false;
+        clearRouteRefreshRetry();
+        setRoutes(data);
+      }
+    }, () => routeRefreshActive.current && requestID > appliedRouteFetchSequence.current);
+  };
+
+  const requestRouteRefresh = () => {
+    if (!routeRefreshActive.current) return;
+    routesNeedRefresh.current = true;
+    if (routeOrderPersistence.pending > 0) return;
+    if (routeRefreshRetryTimer.current !== null) {
+      clearTimeout(routeRefreshRetryTimer.current);
+      routeRefreshRetryTimer.current = null;
+    }
+    void refreshRoutes().catch(onRouteRefreshFailure);
+  };
 
   const fetch = async () => {
+    const requestID = ++routeFetchSequence.current;
+    const routeGeneration = routeOrderPersistence.generation;
+    const wasPersisting = routeOrderPersistence.pending > 0;
     setLoading(true);
     try {
       const [r, p, g] = await Promise.all([getRoutes(), getProviders(), getModelGroups()]);
-      setRoutes(r.data); setProviders(p.data); setGroups(g.data);
+      setProviders(p.data); setGroups(g.data);
+      if (requestID > appliedRouteFetchSequence.current && !wasPersisting && routeOrderPersistence.pending === 0 &&
+        routeOrderPersistence.generation === routeGeneration) {
+        appliedRouteFetchSequence.current = requestID;
+        routesNeedRefresh.current = false;
+        clearRouteRefreshRetry();
+        setRoutes(r.data);
+      } else if (requestID > appliedRouteFetchSequence.current) {
+        requestRouteRefresh();
+      }
     } catch { message.error('Failed to load routes'); }
     finally { setLoading(false); }
   };
 
+  useEffect(() => subscribeRouteOrderCompletion(() => {
+    if (routeOrderPersistence.pending === 0 && routesNeedRefresh.current) requestRouteRefresh();
+  }), []);
+
   useEffect(() => { fetch(); }, []);
+  useEffect(() => {
+    routeRefreshActive.current = true;
+    return () => {
+      routeRefreshActive.current = false;
+      clearRouteRefreshRetry();
+    };
+  }, []);
 
   const handleSave = async () => {
     try {
@@ -73,9 +153,7 @@ const RoutesPage: React.FC = () => {
   };
 
   const persistOrder = useCallback((ordered: Route[]) => {
-    // Persist IMMEDIATELY on drop — no debounce: an edit must be written
-    // the moment it happens, so a crash or a forced kill right after a drop
-    // cannot lose the new order.
+    // Submit each drop immediately; pagehide retries the latest pending version.
     // Priorities are PER-GROUP (0..n-1 within each model group): the
     // table mixes groups, so a global index would silently renumber every
     // other group's routes.
@@ -85,7 +163,14 @@ const RoutesPage: React.FC = () => {
       groupCounts[r.model_group_id] = idx + 1;
       return { id: r.id, priority: idx };
     });
-    reorderRoutes(payload).catch(() => message.error('Failed to save order'));
+    persistRouteOrder(payload).then(saved => {
+      if (!saved || routesNeedRefresh.current) {
+        requestRouteRefresh();
+      }
+    }).catch(() => {
+      message.error('Failed to save order');
+      requestRouteRefresh();
+    });
   }, []);
 
   // Drag handlers
