@@ -518,7 +518,12 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 					if err != nil {
 						log.Printf("[relay] failed to record consumption for key %d: %v", key.ID, err)
 					}
-					costMicro := int64(consumption.CostUSD * 1e6)
+					costMicro := int64(0)
+					if consumption != nil {
+						costMicro = int64(consumption.CostUSD * 1e6)
+					}
+					// Keep upstream health and token-window accounting independent
+					// from billing; a nil consumption has no resolved cost to apply.
 					if usage.TotalTokens > 0 {
 						h.Engine.RecordSuccess(key.ID, usage.TotalTokens, costMicro)
 					} else {
@@ -653,7 +658,12 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 				if err != nil {
 					log.Printf("[relay] failed to record consumption for key %d: %v", key.ID, err)
 				}
-				costMicro := int64(consumption.CostUSD * 1e6)
+				costMicro := int64(0)
+				if consumption != nil {
+					costMicro = int64(consumption.CostUSD * 1e6)
+				}
+				// Keep upstream health and token-window accounting independent
+				// from billing; a nil consumption has no resolved cost to apply.
 				h.Engine.RecordSuccess(key.ID, usage.TotalTokens, costMicro)
 				// Every successful request is one ordered observation toward
 				// the key's recovery streak (2 consecutive successes return

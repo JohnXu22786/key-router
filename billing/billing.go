@@ -2,6 +2,7 @@ package billing
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -128,33 +129,33 @@ func lookupPricing(modelName string) (*model.Pricing, error) {
 }
 
 // resolvePricing returns the effective pricing rule for priceModel: its exact
-// Pricing-table rule, else the "*" wildcard rule, else nil.
+// Pricing-table rule, else the "*" wildcard rule, else nil. It returns an
+// error when the exact lookup fails and no cached exact rule is available.
 //
 // A genuine query error is not a definitive absence. If the exact lookup
 // errors, only a cached exact rule can safely price the model: querying or
 // using a wildcard could override an exact rule whose status is unknown. Once
 // exact absence is definitive, the wildcard is queried. If that lookup errors,
 // the cached Calculator price remains the best available estimate.
-func resolvePricing(calc *Calculator, priceModel string) *model.Pricing {
+func resolvePricing(calc *Calculator, priceModel string) (*model.Pricing, error) {
 	exact, exactErr := lookupPricing(priceModel)
 	if exact != nil {
-		return exact
+		return exact, nil
 	}
 	if exactErr != nil {
 		if calc != nil {
 			if p := calc.getExactPricing(priceModel); p != nil {
 				log.Printf("[billing] exact pricing lookup failed for %q: %v; using cached exact price", priceModel, exactErr)
-				return p
+				return p, nil
 			}
 		}
-		log.Printf("[billing] exact pricing lookup failed for %q: %v; no cached exact price, skipping wildcard fallback", priceModel, exactErr)
-		return nil
+		return nil, exactErr
 	}
 
 	// Exact absence is definitive, so it is safe to use the "*" wildcard.
 	wildcard, wildcardErr := lookupPricing("*")
 	if wildcard != nil {
-		return wildcard
+		return wildcard, nil
 	}
 
 	// Neither lookup produced its rule. If one of them errored, the absence
@@ -163,11 +164,11 @@ func resolvePricing(calc *Calculator, priceModel string) *model.Pricing {
 		log.Printf("[billing] pricing lookup unavailable for %q (exact: %v, wildcard: %v); falling back to cached price", priceModel, exactErr, wildcardErr)
 		if calc != nil {
 			if p := calc.GetPricing(priceModel); p != nil {
-				return p
+				return p, nil
 			}
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 // RecordConsumption writes a consumption record to the database.
@@ -182,9 +183,10 @@ func resolvePricing(calc *Calculator, priceModel string) *model.Pricing {
 // route can carry its own per-1M rates — e.g. a cheap and a premium key for
 // the same model).
 // calc, when non-nil, is the in-memory pricing cache (the engine's
-// Calculator). It backs the Pricing-table lookup: if that query genuinely
-// errors, the cached price is used so a transient DB hiccup does not bill an
-// otherwise-priced request at $0.
+// Calculator). It backs the Pricing-table lookup: a cached exact price is
+// used if that query genuinely errors. If no cached exact price is available,
+// the indeterminate price is returned as an error without persisting a
+// zero-cost consumption.
 func RecordConsumption(keyID int64, modelName, priceModel, appName string, usage *model.TokenUsage, routePrice *model.Route, calc *Calculator) (*model.Consumption, error) {
 	// Truncate to the LOCAL hour: time.Truncate aligns to UTC hours, which
 	// misaligns buckets in non-whole-hour-offset zones (e.g. +05:30).
@@ -205,9 +207,16 @@ func RecordConsumption(keyID int64, modelName, priceModel, appName string, usage
 		} else {
 			// Keyed on priceModel (the upstream model actually served): the
 			// provider bills at that price even though the activity page
-			// shows the client-requested model name. nil means no rule (or a
-			// priced model the fallback could not resolve) — rates stay 0.
-			if p := resolvePricing(calc, priceModel); p != nil {
+			// shows the client-requested model name. A nil rule with no error
+			// is a definitive unpriced model; an exact lookup error without a
+			// cached exact price must not be recorded as zero-cost usage.
+			p, pricingErr := resolvePricing(calc, priceModel)
+			if pricingErr != nil {
+				return nil, fmt.Errorf("exact pricing unavailable for upstream model %q (client model %q; prompt=%d completion=%d total=%d cache_hit=%d cache_write=%d format=%q): %w",
+					priceModel, modelName, usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens,
+					usage.CacheHitTokens, usage.CacheWriteTokens, usage.Format, pricingErr)
+			}
+			if p != nil {
 				prompt, completion = p.PromptPer1M, p.CompletionPer1M
 				cacheRead, cacheWrite = p.CacheReadPer1M, p.CacheWritePer1M
 			}
