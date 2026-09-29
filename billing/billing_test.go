@@ -3,6 +3,7 @@ package billing
 import (
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -353,7 +354,7 @@ func TestRecordConsumptionExactPricingLookupErrorPrefersCachedExactPrice(t *test
 	}
 }
 
-func TestRecordConsumptionExactPricingLookupErrorSkipsWildcardWithoutCachedExact(t *testing.T) {
+func TestRecordConsumptionExactPricingLookupErrorDoesNotPersistUnpricedUsage(t *testing.T) {
 	key := setupBillingDB(t)
 	db.GetDB().Create(&model.Pricing{ModelName: "*", PromptPer1M: 4.0})
 	calc := NewCalculator()
@@ -383,18 +384,30 @@ func TestRecordConsumptionExactPricingLookupErrorSkipsWildcardWithoutCachedExact
 
 	usage := &model.TokenUsage{PromptTokens: 1_000_000, CompletionTokens: 0, TotalTokens: 1_000_000, Format: "openai"}
 	consumption, err := RecordConsumption(key.ID, "client-model", "upstream-real", "app", usage, nil, calc)
-	if err != nil {
-		t.Fatal(err)
+	if err == nil {
+		t.Fatal("RecordConsumption returned no error after an indeterminate exact pricing lookup")
+	}
+	if consumption != nil {
+		t.Fatalf("consumption = %+v, want nil when pricing is indeterminate", consumption)
 	}
 	if !injectedExactError {
 		t.Fatal("exact pricing lookup error injection did not fire")
+	}
+	for _, context := range []string{"upstream-real", "client-model", "prompt=1000000", "format=\"openai\""} {
+		if !strings.Contains(err.Error(), context) {
+			t.Errorf("pricing error %q does not include reconciliation context %q", err, context)
+		}
 	}
 	wildcard, err := lookupPricing("*")
 	if err != nil || wildcard == nil {
 		t.Fatalf("wildcard pricing lookup after exact lookup error = (%v, %v), want a successful rule", wildcard, err)
 	}
-	if consumption.CostUSD != 0 {
-		t.Fatalf("CostUSD = %v, want 0 when exact lookup errors and no exact price is cached", consumption.CostUSD)
+	var rows []model.Consumption
+	if err := db.GetDB().Where("key_id = ?", key.ID).Find(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("persisted consumption rows = %d, want 0 when exact pricing is indeterminate", len(rows))
 	}
 }
 
