@@ -1201,6 +1201,81 @@ func TestConvertAnthropicResponseToOpenAIThinkingMultipleBlocks(t *testing.T) {
 	}
 }
 
+func TestConvertAnthropicResponseToOpenAIFinishReasons(t *testing.T) {
+	tests := []struct {
+		name         string
+		stopReason   string
+		content      string
+		wantContent  string
+		wantFinish   string
+		wantToolCall bool
+	}{
+		{
+			name:        "context window exceeded",
+			stopReason:  "model_context_window_exceeded",
+			content:     `[{"type":"text","text":"truncated answer"}]`,
+			wantContent: "truncated answer",
+			wantFinish:  "length",
+		},
+		{
+			name:        "max tokens",
+			stopReason:  "max_tokens",
+			content:     `[{"type":"text","text":"max token answer"}]`,
+			wantContent: "max token answer",
+			wantFinish:  "length",
+		},
+		{
+			name:         "tool use",
+			stopReason:   "tool_use",
+			content:      `[{"type":"text","text":"calling tool"},{"type":"tool_use","id":"toolu_1","name":"search","input":{"q":"x"}}]`,
+			wantContent:  "calling tool",
+			wantFinish:   "tool_calls",
+			wantToolCall: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := fmt.Sprintf(`{"id":"msg_1","type":"message","model":"claude","content":%s,"stop_reason":%q,"usage":{"input_tokens":11,"output_tokens":7,"cache_creation_input_tokens":1,"cache_read_input_tokens":2}}`, tt.content, tt.stopReason)
+			out, err := ConvertAnthropicResponseToOpenAI([]byte(body), "claude")
+			if err != nil {
+				t.Fatalf("conversion failed: %v", err)
+			}
+
+			var response map[string]interface{}
+			if err := json.Unmarshal(out, &response); err != nil {
+				t.Fatalf("invalid JSON result: %v", err)
+			}
+			choices := response["choices"].([]interface{})
+			choice := choices[0].(map[string]interface{})
+			if choice["finish_reason"] != tt.wantFinish {
+				t.Errorf("finish_reason = %v, want %q", choice["finish_reason"], tt.wantFinish)
+			}
+			message := choice["message"].(map[string]interface{})
+			if message["content"] != tt.wantContent {
+				t.Errorf("content = %v, want %q", message["content"], tt.wantContent)
+			}
+
+			usage := response["usage"].(map[string]interface{})
+			if usage["prompt_tokens"] != float64(14) || usage["completion_tokens"] != float64(7) || usage["total_tokens"] != float64(21) {
+				t.Errorf("usage = %v, want prompt=14 completion=7 total=21", usage)
+			}
+			if tt.wantToolCall {
+				toolCalls := message["tool_calls"].([]interface{})
+				if len(toolCalls) != 1 {
+					t.Fatalf("tool_calls = %v, want one call", toolCalls)
+				}
+				function := toolCalls[0].(map[string]interface{})["function"].(map[string]interface{})
+				if function["name"] != "search" || function["arguments"] != `{"q":"x"}` {
+					t.Errorf("tool call function = %v, want search with q=x", function)
+				}
+			} else if _, exists := message["tool_calls"]; exists {
+				t.Errorf("message has unexpected tool_calls: %v", message["tool_calls"])
+			}
+		})
+	}
+}
+
 // TestForwardRequestDropsRefererAttribution guards the outbound privacy
 // contract for the Referer signal: the client's app-identity URL — which can
 // be a private LAN address or internal dashboard — is consumed locally for

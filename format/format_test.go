@@ -307,6 +307,40 @@ func TestOpenAIStreamConverter_ToolCalls(t *testing.T) {
 	})
 }
 
+func TestOpenAIStreamConverterFinishReasons(t *testing.T) {
+	tests := []struct {
+		stopReason string
+		want       string
+	}{
+		{stopReason: "model_context_window_exceeded", want: "length"},
+		{stopReason: "max_tokens", want: "length"},
+		{stopReason: "tool_use", want: "tool_calls"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.stopReason, func(t *testing.T) {
+			conv := NewOpenAIStreamConverter()
+			events, err := conv.Convert([]byte(fmt.Sprintf(`{"type":"message_delta","delta":{"stop_reason":%q},"usage":{"output_tokens":7}}`, tt.stopReason)))
+			if err != nil {
+				t.Fatalf("conversion failed: %v", err)
+			}
+			if len(events) != 1 {
+				t.Fatalf("converted events = %d, want 1", len(events))
+			}
+
+			var chunk map[string]interface{}
+			if err := json.Unmarshal(events[0], &chunk); err != nil {
+				t.Fatalf("invalid JSON result: %v", err)
+			}
+			choices := chunk["choices"].([]interface{})
+			choice := choices[0].(map[string]interface{})
+			if choice["finish_reason"] != tt.want {
+				t.Errorf("finish_reason = %v, want %q", choice["finish_reason"], tt.want)
+			}
+		})
+	}
+}
+
 func TestOpenAIToAnthropic_Complex(t *testing.T) {
 	t.Run("tool_calls and vision", func(t *testing.T) {
 		oaiReq := `{
