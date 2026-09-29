@@ -797,8 +797,12 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 
 	usage = &model.TokenUsage{}
 	// IMPORTANT: scan br, not resp.Body — br may hold peeked bytes
+	const (
+		maxSSEFrameBytes = 10 * 1024 * 1024
+		maxSSEFrameLines = 100_000
+	)
 	scanner := bufio.NewScanner(br)
-	scanner.Buffer(make([]byte, 1024*64), 10*1024*1024) // 64KB initial, 10MB max line
+	scanner.Buffer(make([]byte, 1024*64), maxSSEFrameBytes) // 64KB initial, 10MB max line
 
 	// Stateful converter for streams where the CLIENT speaks Anthropic and
 	// the upstream is OpenAI (synthesizes message_start / message_delta /
@@ -821,51 +825,122 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 	// don't append [DONE] after it (SDKs treat [DONE] as success)
 	sawErrorFrame := false
 
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		// Forward SSE non-data lines (e.g. Anthropic "event: message_start").
-		// They must be dropped whenever the stream is being converted: the
-		// event names leak the upstream's framing and strict SSE parsers
-		// break on them.
-		if !strings.HasPrefix(line, "data:") {
-			if format.NeedConvert(upstreamFormat, inputFormat) {
+	needConvert := format.NeedConvert(upstreamFormat, inputFormat)
+	var frameLines, dataLines []string
+	frameBytes := 0
+	writeSSEFrame := func(lines []string, skipData bool) error {
+		for _, frameLine := range lines {
+			if skipData && strings.HasPrefix(frameLine, "data:") {
 				continue
 			}
-			_, err := fmt.Fprintf(w, "%s\n", line)
-			if err != nil {
-				resp.Body.Close()
-				return usage, sawContent, err
+			if _, err := fmt.Fprintf(w, "%s\n", frameLine); err != nil {
+				return err
 			}
-			flusher.Flush()
+		}
+		_, err := fmt.Fprint(w, "\n")
+		return err
+	}
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line != "" {
+			if strings.HasPrefix(line, ":") {
+				if !needConvert {
+					if _, err := fmt.Fprintf(w, "%s\n", line); err != nil {
+						resp.Body.Close()
+						return usage, sawContent, err
+					}
+					flusher.Flush()
+				}
+				continue
+			}
+			lineBytes := len(line)
+			if len(frameLines) > 0 {
+				lineBytes++
+			}
+			if frameBytes+lineBytes > maxSSEFrameBytes || len(frameLines) >= maxSSEFrameLines {
+				resp.Body.Close()
+				WriteStreamError(w, inputFormat, "upstream SSE frame too large")
+				flusher.Flush()
+				return usage, sawContent, fmt.Errorf("upstream SSE frame exceeds the %d-byte or %d-line limit", maxSSEFrameBytes, maxSSEFrameLines)
+			}
+			frameBytes += lineBytes
+			frameLines = append(frameLines, line)
+			if strings.HasPrefix(line, "data:") {
+				data := strings.TrimPrefix(line, "data:")
+				if strings.HasPrefix(data, " ") {
+					data = data[1:]
+				}
+				dataLines = append(dataLines, data)
+			}
 			continue
 		}
 
-		// Handle "[DONE]" message (tolerate "data:[DONE]" without space)
-		if strings.TrimSpace(strings.TrimPrefix(line, "data:")) == "[DONE]" {
-			// Anthropic-format and Responses-format clients don't speak
-			// "[DONE]"; drop it when converting. The loop appends a [DONE]
-			// for OpenAI-format clients when converting from anthropic.
+		// An SSE event is complete only at its blank-line boundary.
+		rawLines := frameLines
+		frameLines = nil
+		frameDataLines := dataLines
+		dataLines = nil
+		frameBytes = 0
+		if len(rawLines) == 0 {
+			if !needConvert {
+				if _, err := fmt.Fprint(w, "\n"); err != nil {
+					resp.Body.Close()
+					return usage, sawContent, err
+				}
+				flusher.Flush()
+			}
+			continue
+		}
+		if len(frameDataLines) == 0 {
+			if !needConvert {
+				if err := writeSSEFrame(rawLines, false); err != nil {
+					resp.Body.Close()
+					return usage, sawContent, err
+				}
+				flusher.Flush()
+			}
+			continue
+		}
+
+		// SSE concatenates multiple data fields with a newline. Preserve the
+		// complete payload for parsing and conversion at the frame boundary.
+		jsonStr := strings.Join(frameDataLines, "\n")
+		if strings.TrimSpace(jsonStr) == "" {
+			if !needConvert {
+				if err := writeSSEFrame(rawLines, true); err != nil {
+					resp.Body.Close()
+					return usage, sawContent, err
+				}
+				flusher.Flush()
+			}
+			continue
+		}
+
+		// Handle the OpenAI [DONE] sentinel after assembling the full event.
+		if strings.TrimSpace(jsonStr) == "[DONE]" {
 			if inputFormat == "anthropic" || inputFormat == "responses" {
+				if !needConvert {
+					if err := writeSSEFrame(rawLines, true); err != nil {
+						resp.Body.Close()
+						return usage, sawContent, err
+					}
+					flusher.Flush()
+				}
 				continue
 			}
 			sawDone = true
-			_, err := fmt.Fprintf(w, "%s\n", line)
+			var err error
+			if needConvert {
+				_, err = fmt.Fprint(w, "data: [DONE]\n\n")
+			} else {
+				err = writeSSEFrame(rawLines, false)
+			}
 			if err != nil {
 				resp.Body.Close()
 				return usage, sawContent, err
 			}
 			flusher.Flush()
-			continue
-		}
-
-		// Extract JSON data (tolerate "data:{...}" without a space — some
-		// OpenAI-compatible gateways omit it)
-		jsonStr := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-
-		// Empty data frames are valid SSE keepalives — skip them, don't feed
-		// them to the converters (which would error and kill the stream)
-		if jsonStr == "" {
 			continue
 		}
 
@@ -918,7 +993,7 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 		var converted [][]byte
 		var err error
 
-		if format.NeedConvert(upstreamFormat, inputFormat) {
+		if needConvert {
 			switch {
 			case inputFormat == "responses" && upstreamFormat == "openai":
 				// Client speaks the Responses API, upstream is chat
@@ -958,16 +1033,22 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 			converted = [][]byte{[]byte(jsonStr)}
 		}
 
-		// Write converted chunk(s) to client FIRST: even on ErrSkipChunk the
-		// converter may have produced leading events (e.g. the synthesized
-		// message_start that accompanies a role-only first chunk).
-		for _, chunk := range converted {
-			out := append([]byte("data: "), chunk...)
-			out = append(out, '\n', '\n')
-			_, writeErr := w.Write(out)
-			if writeErr != nil {
+		// Write the original frame for same-format routes. Converted routes
+		// receive one output frame per converted event.
+		if !needConvert {
+			if writeErr := writeSSEFrame(rawLines, false); writeErr != nil {
 				resp.Body.Close()
 				return usage, sawContent, writeErr
+			}
+		} else {
+			for _, chunk := range converted {
+				out := append([]byte("data: "), chunk...)
+				out = append(out, '\n', '\n')
+				_, writeErr := w.Write(out)
+				if writeErr != nil {
+					resp.Body.Close()
+					return usage, sawContent, writeErr
+				}
 			}
 		}
 
@@ -994,6 +1075,12 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 		resp.Body.Close()
 		WriteStreamError(w, inputFormat, "upstream connection lost")
 		return usage, sawContent, scanErr
+	}
+	pendingFrame := len(frameLines) > 0
+	if pendingFrame {
+		resp.Body.Close()
+		WriteStreamError(w, inputFormat, "upstream stream ended before the SSE frame boundary")
+		return usage, sawContent, errors.New("upstream stream ended before the SSE frame boundary")
 	}
 
 	// If the upstream ended without a finish chunk (EOF), close the converted
@@ -1483,7 +1570,11 @@ func WriteStreamError(w http.ResponseWriter, inputFormat string, errMsg string) 
 		})
 	}
 	// Best-effort write; client may already be disconnected
-	fmt.Fprintf(w, "data: %s\n\n", string(errPayload))
+	if inputFormat == "anthropic" {
+		_ = writeAnthropicStreamEvent(w, errPayload)
+	} else {
+		fmt.Fprintf(w, "data: %s\n\n", string(errPayload))
+	}
 	flusher.Flush()
 }
 

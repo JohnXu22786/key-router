@@ -288,6 +288,402 @@ func TestStreamResponsePreservesIncompleteOutcome(t *testing.T) {
 	}
 }
 
+func TestStreamResponseAssemblesMultilineSSEDataFrames(t *testing.T) {
+	t.Run("converted frame", func(t *testing.T) {
+		upstream := "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\n" +
+			"data: \"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello\"},\"finish_reason\":null}]}\n\n" +
+			"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+			"data: [DONE]\n\n"
+		resp := &http.Response{
+			Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:   io.NopCloser(strings.NewReader(upstream)),
+		}
+		w := httptest.NewRecorder()
+
+		_, sawContent, err := StreamResponse(w, resp, "responses", "openai", "mock-model")
+		if err != nil {
+			t.Fatalf("StreamResponse error = %v, want nil", err)
+		}
+		if !sawContent {
+			t.Fatal("sawContent = false, want true for converted text")
+		}
+
+		eventTypes := make(map[string]bool)
+		for _, frame := range strings.Split(strings.TrimSpace(w.Body.String()), "\n\n") {
+			data := strings.TrimPrefix(frame, "data: ")
+			var event struct {
+				Type  string `json:"type"`
+				Delta string `json:"delta"`
+			}
+			if err := json.Unmarshal([]byte(data), &event); err != nil {
+				t.Fatalf("invalid converted event %q: %v", data, err)
+			}
+			eventTypes[event.Type] = true
+			if event.Type == "response.output_text.delta" && event.Delta != "hello" {
+				t.Errorf("text delta = %q, want hello", event.Delta)
+			}
+		}
+		if !eventTypes["response.output_text.delta"] || !eventTypes["response.completed"] {
+			t.Errorf("converted event types = %v, want output_text.delta and response.completed", eventTypes)
+		}
+		if strings.Contains(w.Body.String(), "[DONE]") {
+			t.Errorf("OpenAI [DONE] leaked into Responses stream: %s", w.Body.String())
+		}
+	})
+
+	t.Run("same format preserves frame and done sentinel", func(t *testing.T) {
+		upstream := "data: {\"choices\":[\n" +
+			"data: {\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}\n" +
+			"data: ]}\n\n" +
+			"data: [DONE]\n\n"
+		resp := &http.Response{
+			Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:   io.NopCloser(strings.NewReader(upstream)),
+		}
+		w := httptest.NewRecorder()
+
+		_, sawContent, err := StreamResponse(w, resp, "openai", "openai", "mock-model")
+		if err != nil {
+			t.Fatalf("StreamResponse error = %v, want nil", err)
+		}
+		if !sawContent {
+			t.Fatal("sawContent = false, want true for same-format text")
+		}
+		if got := w.Body.String(); got != upstream {
+			t.Errorf("same-format stream = %q, want original framed stream %q", got, upstream)
+		}
+	})
+}
+
+type flushRecordingResponseWriter struct {
+	*httptest.ResponseRecorder
+	flushSnapshots []string
+}
+
+func (w *flushRecordingResponseWriter) Flush() {
+	w.flushSnapshots = append(w.flushSnapshots, w.Body.String())
+	w.ResponseRecorder.Flush()
+}
+
+func TestStreamResponseFlushesSameFormatSSECommentHeartbeat(t *testing.T) {
+	const heartbeat = ": ping\n"
+	resp := &http.Response{
+		Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:   io.NopCloser(strings.NewReader(heartbeat)),
+	}
+	w := &flushRecordingResponseWriter{ResponseRecorder: httptest.NewRecorder()}
+
+	_, _, err := StreamResponse(w, resp, "responses", "responses", "mock-model")
+	if err != nil {
+		t.Fatalf("StreamResponse error = %v, want nil", err)
+	}
+	if got := w.Body.String(); got != heartbeat {
+		if !strings.HasPrefix(got, heartbeat) {
+			t.Errorf("heartbeat output = %q, want it to start with %q", got, heartbeat)
+		}
+	}
+	if len(w.flushSnapshots) == 0 || w.flushSnapshots[0] != heartbeat {
+		t.Errorf("first flush snapshot = %v, want %q before EOF termination", w.flushSnapshots, heartbeat)
+	}
+}
+
+func TestStreamResponseReportsUnterminatedErrorFrame(t *testing.T) {
+	cases := []struct {
+		name           string
+		inputFormat    string
+		upstreamFormat string
+		data           string
+		failureMarker  string
+	}{
+		{
+			name:           "native Responses failure",
+			inputFormat:    "responses",
+			upstreamFormat: "responses",
+			data:           `{"type":"response.failed","response":{"id":"resp_bad","status":"failed"}}`,
+			failureMarker:  "response.failed",
+		},
+		{
+			name:           "OpenAI error",
+			inputFormat:    "openai",
+			upstreamFormat: "openai",
+			data:           `{"error":{"message":"quota"}}`,
+			failureMarker:  "quota",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// The data line has no following blank line, so this SSE event is
+			// incomplete and must not be dispatched at EOF.
+			upstream := "data: " + tc.data + "\n"
+			resp := &http.Response{
+				Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:   io.NopCloser(strings.NewReader(upstream)),
+			}
+			w := httptest.NewRecorder()
+
+			_, sawContent, err := StreamResponse(w, resp, tc.inputFormat, tc.upstreamFormat, "mock-model")
+			if err == nil {
+				t.Fatal("StreamResponse error = nil, want upstream stream error")
+			}
+			if sawContent {
+				t.Error("sawContent = true, want false for undispatched incomplete event")
+			}
+			got := w.Body.String()
+			if !strings.Contains(got, "stream_error") {
+				t.Errorf("client-visible stream error missing: %s", got)
+			}
+			if strings.Contains(got, tc.failureMarker) {
+				t.Errorf("incomplete upstream error frame was dispatched: %s", got)
+			}
+			if strings.Contains(got, `"type":"response.completed"`) || strings.Contains(got, "[DONE]") {
+				t.Errorf("incomplete error frame was replaced with a success: %s", got)
+			}
+		})
+	}
+}
+
+func TestStreamResponseRejectsTruncatedConvertedErrorAfterContent(t *testing.T) {
+	upstream := "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n" +
+		"data: {\"error\":{\"message\":\"quota\"\n"
+	resp := &http.Response{
+		Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:   io.NopCloser(strings.NewReader(upstream)),
+	}
+	w := httptest.NewRecorder()
+
+	usage, sawContent, err := StreamResponse(w, resp, "responses", "openai", "mock-model")
+	if err == nil {
+		t.Fatal("StreamResponse error = nil, want upstream stream error")
+	}
+	if !sawContent {
+		t.Fatal("sawContent = false, want true for the completed content frame")
+	}
+	if usage == nil || usage.TotalTokens != 3 {
+		t.Fatalf("usage = %+v, want total tokens 3 from the completed frame", usage)
+	}
+	got := w.Body.String()
+	if !strings.Contains(got, "hello") {
+		t.Errorf("completed content frame was not forwarded: %s", got)
+	}
+	if !strings.Contains(got, "stream_error") {
+		t.Errorf("client-visible stream error missing: %s", got)
+	}
+	if strings.Contains(got, `"type":"response.completed"`) || strings.Contains(got, "[DONE]") {
+		t.Errorf("truncated error stream was terminated as success: %s", got)
+	}
+}
+
+func TestStreamResponseReportsUnterminatedContentFrame(t *testing.T) {
+	const completedHelloFrame = "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello\"},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n"
+	const pendingTail = `{"choices":[{"delta":{"content":"tail"},"finish_reason":null}]}`
+	cases := []struct {
+		name           string
+		inputFormat    string
+		upstreamFormat string
+	}{
+		{name: "same-format OpenAI", inputFormat: "openai", upstreamFormat: "openai"},
+		{name: "OpenAI to Responses", inputFormat: "responses", upstreamFormat: "openai"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := &http.Response{
+				Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:   io.NopCloser(strings.NewReader(completedHelloFrame + "data: " + pendingTail + "\n")),
+			}
+			w := httptest.NewRecorder()
+
+			usage, sawContent, err := StreamResponse(w, resp, tc.inputFormat, tc.upstreamFormat, "mock-model")
+			if err == nil {
+				t.Fatal("StreamResponse error = nil, want incomplete-frame error")
+			}
+			if !sawContent {
+				t.Error("sawContent = false, want true for completed hello frame")
+			}
+			if usage == nil || usage.TotalTokens != 3 {
+				t.Fatalf("usage = %+v, want total tokens 3 from completed frame", usage)
+			}
+			got := w.Body.String()
+			if !strings.Contains(got, "hello") {
+				t.Errorf("completed hello frame was not forwarded: %s", got)
+			}
+			if !strings.Contains(got, "stream_error") {
+				t.Errorf("client-visible stream error missing: %s", got)
+			}
+			if strings.Contains(got, `"tail"`) || strings.Contains(got, "[DONE]") || strings.Contains(got, `"type":"response.completed"`) {
+				t.Errorf("pending content was dispatched or stream completed as success: %s", got)
+			}
+		})
+	}
+}
+
+func TestStreamResponseReportsUnterminatedSameFormatErrorAfterContent(t *testing.T) {
+	const completedHelloFrame = "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello\"},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n"
+	upstream := completedHelloFrame + "data: {\"error\":{\"message\":\"quota\"}}\n"
+	resp := &http.Response{
+		Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:   io.NopCloser(strings.NewReader(upstream)),
+	}
+	w := httptest.NewRecorder()
+
+	usage, sawContent, err := StreamResponse(w, resp, "openai", "openai", "mock-model")
+	if err == nil {
+		t.Fatal("StreamResponse error = nil, want incomplete-frame error")
+	}
+	if !sawContent {
+		t.Fatal("sawContent = false, want true for completed hello frame")
+	}
+	if usage == nil || usage.TotalTokens != 3 {
+		t.Fatalf("usage = %+v, want total tokens 3 from completed frame", usage)
+	}
+	got := w.Body.String()
+	if !strings.Contains(got, "hello") || !strings.Contains(got, "stream_error") {
+		t.Errorf("completed content or client-visible error missing: %s", got)
+	}
+	if strings.Contains(got, "quota") || strings.Contains(got, "[DONE]") || strings.Contains(got, `"type":"response.completed"`) {
+		t.Errorf("pending error was dispatched or stream completed as success: %s", got)
+	}
+}
+
+func TestStreamResponseRejectsOversizedSSEFrame(t *testing.T) {
+	line := "data: " + strings.Repeat("x", 1<<20) + "\n"
+	var upstream strings.Builder
+	for i := 0; i < 11; i++ {
+		upstream.WriteString(line)
+	}
+	resp := &http.Response{
+		Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:   io.NopCloser(strings.NewReader(upstream.String())),
+	}
+	w := httptest.NewRecorder()
+
+	_, _, err := StreamResponse(w, resp, "openai", "openai", "mock-model")
+	if err == nil || !strings.Contains(err.Error(), "SSE frame exceeds") {
+		t.Fatalf("StreamResponse error = %v, want aggregate frame limit error", err)
+	}
+	if strings.Contains(w.Body.String(), "[DONE]") {
+		t.Errorf("oversized incomplete frame was terminated as success: %s", w.Body.String())
+	}
+}
+
+func TestWriteStreamErrorFraming(t *testing.T) {
+	const message = "upstream \"tail\" failed\nretry"
+	cases := []struct {
+		inputFormat string
+		prefix      string
+	}{
+		{inputFormat: "anthropic", prefix: "event: error\ndata: "},
+		{inputFormat: "openai", prefix: "data: "},
+		{inputFormat: "responses", prefix: "data: "},
+	}
+	for _, tc := range cases {
+		t.Run(tc.inputFormat, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			WriteStreamError(w, tc.inputFormat, message)
+			got := w.Body.String()
+			if !strings.HasPrefix(got, tc.prefix) || !strings.HasSuffix(got, "\n\n") {
+				t.Fatalf("error frame = %q, want prefix %q and blank-line boundary", got, tc.prefix)
+			}
+			var event struct {
+				Type    string `json:"type"`
+				Code    string `json:"code"`
+				Message string `json:"message"`
+				Error   struct {
+					Type    string `json:"type"`
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			data := strings.TrimSuffix(strings.TrimPrefix(got, tc.prefix), "\n\n")
+			if err := json.Unmarshal([]byte(data), &event); err != nil {
+				t.Fatalf("invalid error data %q: %v", data, err)
+			}
+			if tc.inputFormat == "responses" {
+				if event.Type != "error" || event.Code != "stream_error" || event.Message != message {
+					t.Errorf("Responses error = %+v, want unchanged top-level error payload", event)
+				}
+			} else {
+				if event.Error.Message != message {
+					t.Errorf("error message = %q, want %q", event.Error.Message, message)
+				}
+				if tc.inputFormat == "anthropic" && event.Type != "error" {
+					t.Errorf("Anthropic error type = %q, want error", event.Type)
+				}
+				if tc.inputFormat == "openai" && event.Error.Type != "stream_error" {
+					t.Errorf("OpenAI error type = %q, want stream_error", event.Error.Type)
+				}
+			}
+			if w.Header().Get("Content-Type") != "text/event-stream" || !w.Flushed {
+				t.Error("stream error was not flushed with SSE content type")
+			}
+		})
+	}
+}
+
+func TestStreamResponseReportsAnthropicSSEFrameFailure(t *testing.T) {
+	const helloFrame = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n"
+	const pendingTail = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"tail\"}}\n"
+	cases := []struct {
+		name        string
+		pending     string
+		wantError   string
+		wantMessage string
+	}{
+		{
+			name:        "pending content at EOF",
+			pending:     pendingTail,
+			wantError:   "ended before the SSE frame boundary",
+			wantMessage: "upstream stream ended before the SSE frame boundary",
+		},
+		{
+			name:        "aggregate frame overflow",
+			pending:     pendingTail + strings.Repeat("data: "+strings.Repeat("x", 1<<20)+"\n", 11),
+			wantError:   "SSE frame exceeds",
+			wantMessage: "upstream SSE frame too large",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := &http.Response{
+				Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:   io.NopCloser(strings.NewReader(helloFrame + tc.pending)),
+			}
+			w := httptest.NewRecorder()
+			_, sawContent, err := StreamResponse(w, resp, "anthropic", "anthropic", "mock-model")
+			if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("StreamResponse error = %v, want %s", err, tc.wantError)
+			}
+			if !sawContent {
+				t.Error("sawContent = false, want true for completed hello frame")
+			}
+			got := w.Body.String()
+			if !strings.HasPrefix(got, helloFrame) {
+				t.Fatalf("completed hello frame was not retained: %q", got)
+			}
+			errorFrame := strings.TrimPrefix(got, helloFrame)
+			lines := strings.Split(strings.TrimSuffix(errorFrame, "\n\n"), "\n")
+			if !strings.HasSuffix(errorFrame, "\n\n") || len(lines) != 2 || lines[0] != "event: error" || !strings.HasPrefix(lines[1], "data: ") {
+				t.Fatalf("client-visible named error frame missing: %q", errorFrame)
+			}
+			var event struct {
+				Type  string `json:"type"`
+				Error struct {
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(lines[1], "data: ")), &event); err != nil {
+				t.Fatalf("invalid Anthropic error payload: %v", err)
+			}
+			if event.Type != "error" || event.Error.Message != tc.wantMessage {
+				t.Errorf("Anthropic error = %+v, want named error with message %q", event, tc.wantMessage)
+			}
+			if strings.Contains(got, `"tail"`) || strings.Contains(got, "message_stop") || strings.Contains(got, "[DONE]") {
+				t.Errorf("pending tail was dispatched or stream completed as success: %q", got)
+			}
+		})
+	}
+}
+
 func TestStreamResponseDoesNotCompletePartialNativeResponsesStream(t *testing.T) {
 	const upstream = `event: response.created
 data: {"type":"response.created","response":{"id":"resp_real","object":"response","status":"in_progress","model":"mock-model","output":[]}}
