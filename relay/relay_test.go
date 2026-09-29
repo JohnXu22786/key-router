@@ -127,6 +127,75 @@ func TestStreamResponseSynthesizesResponsesRefusalFromFullChat(t *testing.T) {
 	}
 }
 
+func TestStreamResponseStreamsFullOpenAICompletionToAnthropic(t *testing.T) {
+	body := `{"id":"chatcmpl-1","object":"chat.completion","model":"m","choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"hello"}}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}`
+	resp := &http.Response{
+		Header: http.Header{"Content-Type": []string{"application/json"}},
+		Body:   io.NopCloser(strings.NewReader(body)),
+	}
+	w := httptest.NewRecorder()
+	usage, sawContent, err := StreamResponse(w, resp, "anthropic", "openai", "m")
+	if err != nil {
+		t.Fatalf("StreamResponse error = %v", err)
+	}
+	if !sawContent {
+		t.Fatal("sawContent = false, want true for full completion text")
+	}
+
+	var events []map[string]interface{}
+	for _, frame := range strings.Split(strings.TrimSpace(w.Body.String()), "\n\n") {
+		lines := strings.Split(frame, "\n")
+		if len(lines) != 2 || !strings.HasPrefix(lines[0], "event: ") || !strings.HasPrefix(lines[1], "data: ") {
+			t.Fatalf("invalid Anthropic SSE frame %q", frame)
+		}
+		eventName := strings.TrimPrefix(lines[0], "event: ")
+		data := strings.TrimPrefix(lines[1], "data: ")
+		var event map[string]interface{}
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			t.Fatalf("invalid event %q: %v", data, err)
+		}
+		if event["type"] != eventName {
+			t.Fatalf("SSE event name = %q, JSON type = %v", eventName, event["type"])
+		}
+		events = append(events, event)
+	}
+	var eventTypes []string
+	for _, event := range events {
+		typ, _ := event["type"].(string)
+		eventTypes = append(eventTypes, typ)
+	}
+	want := "message_start,content_block_start,content_block_delta,content_block_stop,message_delta,message_stop"
+	if strings.Join(eventTypes, ",") != want {
+		t.Fatalf("events = %v, want %s", eventTypes, want)
+	}
+
+	message := events[0]["message"].(map[string]interface{})
+	if content, ok := message["content"].([]interface{}); !ok || len(content) != 0 {
+		t.Errorf("message_start content = %v, want empty array", message["content"])
+	}
+	start := events[1]
+	block, _ := start["content_block"].(map[string]interface{})
+	if start["index"] != float64(0) || block["type"] != "text" || block["text"] != "" {
+		t.Errorf("content_block_start = %v, want empty text block at index 0", start)
+	}
+	delta := events[2]
+	deltaBody, _ := delta["delta"].(map[string]interface{})
+	if delta["index"] != float64(0) || deltaBody["type"] != "text_delta" || deltaBody["text"] != "hello" {
+		t.Errorf("content_block_delta = %v, want hello text_delta at index 0", delta)
+	}
+	if events[3]["index"] != float64(0) {
+		t.Errorf("content_block_stop = %v, want index 0", events[3])
+	}
+	messageDelta := events[4]
+	usageDelta, _ := messageDelta["usage"].(map[string]interface{})
+	if usageDelta["output_tokens"] != float64(1) {
+		t.Errorf("message_delta usage = %v, want output_tokens 1", usageDelta)
+	}
+	if usage == nil || usage.CompletionTokens != 1 {
+		t.Errorf("returned usage = %+v, want completion_tokens 1", usage)
+	}
+}
+
 // TestExtractAnthropicUsageCacheTokens guards usage consistency between the
 // non-stream Anthropic→OpenAI path and the streaming path: prompt_tokens
 // must INCLUDE cached tokens in both (regression: the non-stream path
