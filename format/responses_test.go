@@ -485,6 +485,66 @@ func TestResponsesRequestToChatCompletionStandaloneFunctionCall(t *testing.T) {
 	}
 }
 
+func TestResponsesRequestToChatCompletionParallelStandaloneFunctionCalls(t *testing.T) {
+	body := `{"model":"m","input":[
+		{"type":"function_call","id":"fc_1","call_id":"call_a","name":"lookup","arguments":"{\"key\":\"a\"}"},
+		{"type":"function_call","id":"fc_2","call_id":"call_b","name":"lookup","arguments":"{\"key\":\"b\"}"},
+		{"type":"function_call_output","call_id":"call_a","output":"result a"},
+		{"type":"function_call_output","call_id":"call_b","output":"result b"}
+	]}`
+	out, err := ResponsesRequestToChatCompletion([]byte(body), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req map[string]interface{}
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := req["messages"].([]interface{})
+	if len(msgs) != 4 {
+		t.Fatalf("messages = %v, want assistant + two tool outputs + trailing assistant", msgs)
+	}
+
+	asst, _ := msgs[0].(map[string]interface{})
+	if asst["role"] != "assistant" {
+		t.Fatalf("first message = %v, want assistant tool-call turn", msgs[0])
+	}
+	toolCalls, _ := asst["tool_calls"].([]interface{})
+	if len(toolCalls) != 2 {
+		t.Fatalf("tool_calls = %v, want both parallel calls in one assistant message", asst["tool_calls"])
+	}
+	for i, want := range []struct {
+		id       string
+		argument string
+	}{
+		{id: "call_a", argument: `{"key":"a"}`},
+		{id: "call_b", argument: `{"key":"b"}`},
+	} {
+		call, _ := toolCalls[i].(map[string]interface{})
+		fn, _ := call["function"].(map[string]interface{})
+		if call["id"] != want.id || fn["arguments"] != want.argument {
+			t.Errorf("tool_calls[%d] = %v, want call %s with arguments %s", i, call, want.id, want.argument)
+		}
+	}
+
+	for i, want := range []struct {
+		id      string
+		content string
+	}{
+		{id: "call_a", content: "result a"},
+		{id: "call_b", content: "result b"},
+	} {
+		tool, _ := msgs[i+1].(map[string]interface{})
+		if tool["role"] != "tool" || tool["tool_call_id"] != want.id || tool["content"] != want.content {
+			t.Errorf("messages[%d] = %v, want output for %s after assistant turn", i+1, tool, want.id)
+		}
+	}
+	pad, _ := msgs[3].(map[string]interface{})
+	if pad["role"] != "assistant" || pad["content"] != "" {
+		t.Errorf("trailing message = %v, want empty assistant pad", pad)
+	}
+}
+
 func TestResponsesRequestToAnthropicStandaloneFunctionCall(t *testing.T) {
 	body := `{"model":"m","input":[
 		{"type":"function_call","id":"fc_1","call_id":"call_7","name":"lookup","arguments":"{\"key\":\"value\"}"},
