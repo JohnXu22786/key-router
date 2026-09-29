@@ -854,7 +854,7 @@ func (c *AnthropicStreamConverter) Convert(chunk []byte, modelName string) ([][]
 		// text delta so strict clients have an open block. The text block
 		// takes the next free index (0 unless a tool block opened first).
 		if content, ok := safeString(delta, "content"); ok && content != "" {
-			if !c.textOpened {
+			if !c.textOpened && !c.textPending {
 				c.textBlockIdx = c.nextBlockIdx
 				c.nextBlockIdx++
 				if len(c.pendingStarts) > 0 || c.thinkingPending {
