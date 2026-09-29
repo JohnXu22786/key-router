@@ -82,6 +82,34 @@ func TestChatCompletionResponseToResponses(t *testing.T) {
 	}
 }
 
+func TestChatCompletionResponseToResponsesRefusal(t *testing.T) {
+	body := `{"id":"chatcmpl-refusal","model":"m","choices":[{"finish_reason":"stop","message":{"role":"assistant","refusal":"I cannot help with that request."}}]}`
+	out, err := ChatCompletionResponseToResponses([]byte(body), "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(out, &resp); err != nil {
+		t.Fatal(err)
+	}
+	output, ok := resp["output"].([]interface{})
+	if !ok || len(output) != 1 {
+		t.Fatalf("output = %v, want one refusal message", resp["output"])
+	}
+	message := output[0].(map[string]interface{})
+	if message["type"] != "message" {
+		t.Fatalf("output item = %v, want message", message)
+	}
+	content := message["content"].([]interface{})
+	if len(content) != 1 {
+		t.Fatalf("message content = %v, want one refusal part", content)
+	}
+	part := content[0].(map[string]interface{})
+	if part["type"] != "refusal" || part["refusal"] != "I cannot help with that request." {
+		t.Errorf("refusal part = %v", part)
+	}
+}
+
 func TestChatCompletionResponseToResponsesIncomplete(t *testing.T) {
 	body := `{"id":"c","choices":[{"finish_reason":"length","message":{"content":"cut off"}}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`
 	out, err := ChatCompletionResponseToResponses([]byte(body), "m")

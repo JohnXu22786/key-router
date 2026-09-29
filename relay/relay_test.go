@@ -86,6 +86,47 @@ func TestCompletionToStreamChunkDeltaForm(t *testing.T) {
 	}
 }
 
+func TestStreamResponseSynthesizesResponsesRefusalFromFullChat(t *testing.T) {
+	body := `{"id":"chatcmpl-refusal","object":"chat.completion","model":"m","choices":[{"finish_reason":"stop","message":{"role":"assistant","content":null,"refusal":"I cannot help with that request."}}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`
+	resp := &http.Response{
+		Header: http.Header{"Content-Type": []string{"application/json"}},
+		Body:   io.NopCloser(strings.NewReader(body)),
+	}
+	w := httptest.NewRecorder()
+	_, sawContent, err := StreamResponse(w, resp, "responses", "openai", "m")
+	if err != nil {
+		t.Fatalf("StreamResponse error = %v", err)
+	}
+	if !sawContent {
+		t.Fatal("sawContent = false, want true for refusal-only response")
+	}
+
+	var eventTypes []string
+	var completed map[string]interface{}
+	for _, frame := range strings.Split(strings.TrimSpace(w.Body.String()), "\n\n") {
+		data := strings.TrimPrefix(frame, "data: ")
+		var event map[string]interface{}
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			t.Fatalf("invalid event %q: %v", data, err)
+		}
+		typ, _ := event["type"].(string)
+		eventTypes = append(eventTypes, typ)
+		if typ == "response.completed" {
+			completed, _ = event["response"].(map[string]interface{})
+		}
+	}
+	want := "response.created,response.in_progress,response.output_item.added,response.content_part.added,response.refusal.delta,response.refusal.done,response.content_part.done,response.output_item.done,response.completed"
+	if strings.Join(eventTypes, ",") != want {
+		t.Fatalf("events = %v, want %s", eventTypes, want)
+	}
+	output := completed["output"].([]interface{})
+	content := output[0].(map[string]interface{})["content"].([]interface{})
+	part := content[0].(map[string]interface{})
+	if part["type"] != "refusal" || part["refusal"] != "I cannot help with that request." {
+		t.Errorf("completed refusal part = %v", part)
+	}
+}
+
 // TestExtractAnthropicUsageCacheTokens guards usage consistency between the
 // non-stream Anthropic→OpenAI path and the streaming path: prompt_tokens
 // must INCLUDE cached tokens in both (regression: the non-stream path
@@ -376,6 +417,29 @@ func TestConvertOpenAIResponseToAnthropicReasoning(t *testing.T) {
 	second := content[1].(map[string]interface{})
 	if second["type"] != "text" || second["text"] != "final answer" {
 		t.Errorf("second block = %v, want text block", second)
+	}
+}
+
+func TestConvertOpenAIResponseToAnthropicRefusal(t *testing.T) {
+	body := `{"id":"chatcmpl-refusal","model":"m","choices":[{"finish_reason":"stop","message":{"role":"assistant","refusal":"I cannot help with that request."}}]}`
+	out, err := ConvertOpenAIResponseToAnthropic([]byte(body))
+	if err != nil {
+		t.Fatalf("conversion failed: %v", err)
+	}
+	var anth map[string]interface{}
+	if err := json.Unmarshal(out, &anth); err != nil {
+		t.Fatalf("invalid JSON result: %v", err)
+	}
+	content, ok := anth["content"].([]interface{})
+	if !ok || len(content) != 1 {
+		t.Fatalf("content = %v, want one refusal text block", anth["content"])
+	}
+	block := content[0].(map[string]interface{})
+	if block["type"] != "text" || block["text"] != "I cannot help with that request." {
+		t.Errorf("refusal block = %v", block)
+	}
+	if anth["stop_reason"] != "end_turn" {
+		t.Errorf("stop_reason = %v, want end_turn for finish_reason stop", anth["stop_reason"])
 	}
 }
 
