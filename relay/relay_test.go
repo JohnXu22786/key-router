@@ -219,6 +219,69 @@ func TestStreamResponsePreservesIncompleteOutcome(t *testing.T) {
 	}
 }
 
+func TestStreamResponseDoesNotCompletePartialNativeResponsesStream(t *testing.T) {
+	const upstream = `event: response.created
+data: {"type":"response.created","response":{"id":"resp_real","object":"response","status":"in_progress","model":"mock-model","output":[]}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"msg_real","output_index":0,"content_index":0,"delta":"hello"}
+
+`
+	resp := &http.Response{
+		Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:   io.NopCloser(strings.NewReader(upstream)),
+	}
+	w := httptest.NewRecorder()
+
+	_, sawContent, err := StreamResponse(w, resp, "responses", "responses", "mock-model")
+	if err != nil {
+		t.Fatalf("StreamResponse error = %v, want nil", err)
+	}
+	if !sawContent {
+		t.Fatal("sawContent = false, want true for the text delta")
+	}
+	got := w.Body.String()
+	if !strings.Contains(got, `"id":"resp_real"`) {
+		t.Fatalf("real response ID was not forwarded: %s", got)
+	}
+	if !strings.Contains(got, `"delta":"hello"`) {
+		t.Fatalf("partial text delta was not forwarded: %s", got)
+	}
+	if strings.Contains(got, `"type":"response.completed"`) || strings.Contains(got, `"id":"resp_local"`) {
+		t.Fatalf("partial stream was turned into a fabricated empty success: %s", got)
+	}
+}
+
+func TestStreamResponseStillCompletesEmptyNativeResponsesStream(t *testing.T) {
+	resp := &http.Response{
+		Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:   io.NopCloser(strings.NewReader("")),
+	}
+	w := httptest.NewRecorder()
+
+	_, sawContent, err := StreamResponse(w, resp, "responses", "responses", "mock-model")
+	if err != nil {
+		t.Fatalf("StreamResponse error = %v, want nil", err)
+	}
+	if sawContent {
+		t.Fatal("sawContent = true, want false for an empty stream")
+	}
+	var event struct {
+		Type     string `json:"type"`
+		Response struct {
+			ID     string        `json:"id"`
+			Output []interface{} `json:"output"`
+		} `json:"response"`
+	}
+	frame := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(w.Body.String()), "data: "))
+	if err := json.Unmarshal([]byte(frame), &event); err != nil {
+		t.Fatalf("invalid synthesized event %q: %v", frame, err)
+	}
+	if event.Type != "response.completed" || event.Response.ID != "resp_local" || len(event.Response.Output) != 0 {
+		t.Fatalf("empty stream completion = %+v, want response.completed with resp_local and empty output", event)
+	}
+}
+
 func TestResponsesMessageContentDetection(t *testing.T) {
 	cases := []struct {
 		name string
