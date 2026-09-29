@@ -75,8 +75,27 @@ func ResponsesRequestToChatCompletion(body []byte, modelOverride string) ([]byte
 			})
 		}
 	case []interface{}:
-		for _, item := range in {
+		for i := 0; i < len(in); {
+			if itemMap, ok := safeMap(in[i]); ok && responsesInputItemType(itemMap) == "function_call" {
+				var toolCalls []interface{}
+				for i < len(in) {
+					callMap, ok := safeMap(in[i])
+					if !ok || responsesInputItemType(callMap) != "function_call" {
+						break
+					}
+					toolCalls = append(toolCalls, responsesFunctionCallToChat(callMap))
+					i++
+				}
+				messages = append(messages, map[string]interface{}{
+					"role":       "assistant",
+					"content":    "",
+					"tool_calls": toolCalls,
+				})
+				continue
+			}
+			item := in[i]
 			messages = append(messages, responsesInputItemToChat(item, &systemParts)...)
+			i++
 		}
 	}
 	// system/developer items may appear anywhere in the input — hoist them
