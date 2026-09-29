@@ -1668,7 +1668,7 @@ func ConvertAnthropicResponseToOpenAI(body []byte, model string) ([]byte, error)
 	// Map stop_reason → finish_reason (tool_use responses must not report "stop")
 	finishReason := "stop"
 	switch anthResp["stop_reason"] {
-	case "max_tokens":
+	case "max_tokens", "model_context_window_exceeded":
 		finishReason = "length"
 	case "tool_use":
 		finishReason = "tool_calls"
