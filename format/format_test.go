@@ -1657,7 +1657,9 @@ func TestAnthropicStreamConverterTextHeldForAscendingOrder(t *testing.T) {
 	if err != nil && err != ErrSkipChunk {
 		t.Fatal(err)
 	}
-	// text delta → block index 1, must be held (no start, no delta yet)
+	// Both text deltas share block index 1 and must be held (no start or
+	// delta emitted yet). Reassigning the index for the second chunk would
+	// leave its delta orphaned when the held text start is flushed.
 	evs, err := conv.Convert([]byte(`{"choices":[{"delta":{"content":"hello"}}]}`), "m")
 	if err != nil && err != ErrSkipChunk {
 		t.Fatal(err)
@@ -1669,27 +1671,61 @@ func TestAnthropicStreamConverterTextHeldForAscendingOrder(t *testing.T) {
 			t.Fatalf("text events emitted while tool start pending: %s", ev)
 		}
 	}
-	// tool 0 resolves → tool start(0), text start(1), text delta, tool delta
+	evs, err = conv.Convert([]byte(`{"choices":[{"delta":{"content":" world"}}]}`), "m")
+	if err != nil && err != ErrSkipChunk {
+		t.Fatal(err)
+	}
+	for _, ev := range evs {
+		var e map[string]interface{}
+		json.Unmarshal(ev, &e)
+		if e["type"] == "content_block_start" || e["type"] == "content_block_delta" {
+			t.Fatalf("text events emitted while tool start pending: %s", ev)
+		}
+	}
+	// tool 0 resolves → tool start(0), text start(1), both text deltas, tool delta
 	evs, err = conv.Convert([]byte(`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_0","function":{"name":"f0","arguments":"}"}}]}}]}`), "m")
 	if err != nil {
 		t.Fatal(err)
 	}
 	var order []string
+	var starts []int
+	var textDeltas []string
+	opened := make(map[int]bool)
 	for _, ev := range evs {
 		var e map[string]interface{}
 		json.Unmarshal(ev, &e)
 		switch e["type"] {
 		case "content_block_start":
 			cb := e["content_block"].(map[string]interface{})
+			idx := int(e["index"].(float64))
+			starts = append(starts, idx)
+			opened[idx] = true
 			order = append(order, "start:"+cb["type"].(string)+"@"+fmt.Sprintf("%v", e["index"]))
 		case "content_block_delta":
+			idx := int(e["index"].(float64))
+			if !opened[idx] {
+				t.Fatalf("delta emitted for unopened block %d: %s", idx, ev)
+			}
+			d := e["delta"].(map[string]interface{})
+			if d["type"] == "text_delta" {
+				if idx != 1 {
+					t.Fatalf("text delta index = %d, want 1: %s", idx, ev)
+				}
+				textDeltas = append(textDeltas, d["text"].(string))
+			}
 			order = append(order, "delta@"+fmt.Sprintf("%v", e["index"]))
 		}
+	}
+	if len(starts) != 2 || starts[0] != 0 || starts[1] != 1 {
+		t.Fatalf("start order = %v, want [0 1]", starts)
+	}
+	if len(textDeltas) != 2 || textDeltas[0] != "hello" || textDeltas[1] != " world" {
+		t.Fatalf("text deltas = %q, want [\"hello\" \" world\"]", textDeltas)
 	}
 	// starts must be ascending; each block's deltas follow its own start
 	// (the tool's buffered delta precedes the text start, which is valid —
 	// deltas may interleave across blocks, starts may not)
-	want := []string{"start:tool_use@0", "delta@0", "start:text@1", "delta@1", "delta@0"}
+	want := []string{"start:tool_use@0", "delta@0", "start:text@1", "delta@1", "delta@1", "delta@0"}
 	if strings.Join(order, ",") != strings.Join(want, ",") {
 		t.Fatalf("event order = %v, want %v", order, want)
 	}
