@@ -40,16 +40,23 @@ func Init(dataDir string) error {
 	sqlDB.SetMaxOpenConns(1)
 	sqlDB.SetMaxIdleConns(1)
 
-	// Run migrations
+	// Migrate legacy pricing before AutoMigrate can add the per-1M columns.
+	// That lets the migration distinguish a genuinely legacy-only schema from
+	// an upgraded database that already contains both pricing generations.
 	if err := db.AutoMigrate(
 		&model.Provider{},
 		&model.Key{},
 		&model.ModelGroup{},
 		&model.Route{},
 		&model.Consumption{},
-		&model.Pricing{},
 		&model.Setting{},
 	); err != nil {
+		return err
+	}
+	if err := migratePricingPer1KToPer1M(db); err != nil {
+		return err
+	}
+	if err := db.AutoMigrate(&model.Pricing{}); err != nil {
 		return err
 	}
 
@@ -61,16 +68,6 @@ func Init(dataDir string) error {
 	// rows (each (key, hour) still has at most one row then, so its UPDATEs
 	// cannot trip the new unique index).
 	if err := migrateConsumptionIndexPerModel(db); err != nil {
-		return err
-	}
-
-	// Migrate pricing from per-1K to per-1M rates. Older builds stored
-	// prompt_per1_k etc. (USD per 1,000 tokens); the new schema uses
-	// prompt_per1_m (USD per 1,000,000 tokens). AutoMigrate adds the new
-	// columns but leaves the old ones in place, so copy the values ×1000 and
-	// drop the old columns. Idempotent: once the old columns are gone this
-	// does nothing.
-	if err := migratePricingPer1KToPer1M(db); err != nil {
 		return err
 	}
 
@@ -94,67 +91,95 @@ func Init(dataDir string) error {
 	return nil
 }
 
-// migratePricingPer1KToPer1M converts legacy per-1K pricing rows to the
-// per-1M schema. SQLite cannot alter a column in place, so the migration is:
-// detect old column -> copy each value ×1000 into the new column -> drop the
-// old column. Runs inside one transaction; idempotent (old columns gone
-// => no-op on subsequent launches).
+// migratePricingPer1KToPer1M converts a legacy-only pricing schema before
+// AutoMigrate adds per-1M columns. If both generations already exist, their
+// provenance is ambiguous, so it preserves per-1M values and legacy source
+// columns for a possible separate repair. The legacy-only conversion and old
+// column removal run in one transaction; after success, later launches are
+// no-ops.
 func migratePricingPer1KToPer1M(db *gorm.DB) error {
-	hasColumn := func(conn *gorm.DB, col string) bool {
-		var n int
-		conn.Raw("SELECT COUNT(*) FROM pragma_table_info('pricings') WHERE name = ?", col).Scan(&n)
-		return n > 0
+	inspectColumns := func(conn *gorm.DB) (legacy, current []bool, hasLegacy, hasCurrent bool, err error) {
+		legacy = make([]bool, len(pricingPer1KColumns))
+		current = make([]bool, len(pricingPer1KColumns))
+		for i, pair := range pricingPer1KColumns {
+			for j, col := range pair {
+				var n int
+				if err := conn.Raw("SELECT COUNT(*) FROM pragma_table_info('pricings') WHERE name = ?", col).Scan(&n).Error; err != nil {
+					return nil, nil, false, false, err
+				}
+				present := n > 0
+				if j == 0 {
+					legacy[i] = present
+					hasLegacy = hasLegacy || present
+				} else {
+					current[i] = present
+					hasCurrent = hasCurrent || present
+				}
+			}
+		}
+		return legacy, current, hasLegacy, hasCurrent, nil
+	}
+	warnMixedSchema := func() {
+		log.Println("[db] WARNING: pricing table contains both per-1K and per-1M columns; preserving per-1M values and all legacy columns. Legacy-only values are unresolved and may require a separate repair.")
 	}
 
-	// Newer schema already in place (or table brand new): nothing to do.
-	if !hasColumn(db, pricingPer1KColumns[0][0]) {
+	_, _, hasLegacy, hasCurrent, err := inspectColumns(db)
+	if err != nil {
+		return err
+	}
+	if !hasLegacy {
 		return nil
 	}
-	if !hasColumn(db, pricingPer1KColumns[0][1]) {
-		// Shouldn't happen after AutoMigrate, but be safe.
-		return db.Exec("ALTER TABLE pricings ADD COLUMN " + pricingPer1KColumns[0][1] + " REAL DEFAULT 0").Error
+	if hasCurrent {
+		warnMixedSchema()
+		return nil
 	}
 
-	log.Println("[db] migrating pricing rates from per-1K to per-1M tokens")
-	tx := db.Begin()
-	if tx.Error != nil {
-		return tx.Error
-	}
-	defer func() {
-		if r := recover(); r != nil {
-			tx.Rollback()
-			panic(r)
+	converted := false
+	err = db.Transaction(func(tx *gorm.DB) error {
+		legacyColumns, currentColumns, hasLegacy, hasCurrent, err := inspectColumns(tx)
+		if err != nil {
+			return err
 		}
-	}()
+		if !hasLegacy {
+			return nil
+		}
+		if hasCurrent {
+			warnMixedSchema()
+			return nil
+		}
 
-	// Copy ×1000 into the new columns (per 1K → per 1M is ×1000).
-	for _, pair := range pricingPer1KColumns {
-		oldCol, newCol := pair[0], pair[1]
-		if !hasColumn(tx, newCol) {
-			if err := tx.Exec("ALTER TABLE pricings ADD COLUMN " + newCol + " REAL DEFAULT 0").Error; err != nil {
-				tx.Rollback()
+		converted = true
+		for i, pair := range pricingPer1KColumns {
+			if !legacyColumns[i] {
+				continue
+			}
+			oldCol, newCol := pair[0], pair[1]
+			if !currentColumns[i] {
+				if err := tx.Exec("ALTER TABLE pricings ADD COLUMN " + newCol + " REAL DEFAULT 0").Error; err != nil {
+					return err
+				}
+			}
+			if err := tx.Exec("UPDATE pricings SET " + newCol + " = " + oldCol + " * 1000").Error; err != nil {
 				return err
 			}
 		}
-		if err := tx.Exec("UPDATE pricings SET " + newCol + " = " + oldCol + " * 1000").Error; err != nil {
-			tx.Rollback()
-			return err
+		for i, pair := range pricingPer1KColumns {
+			if !legacyColumns[i] {
+				continue
+			}
+			if err := tx.Exec("ALTER TABLE pricings DROP COLUMN " + pair[0]).Error; err != nil {
+				return err
+			}
 		}
-	}
-
-	// Drop the old columns (SQLite supports DROP COLUMN since 3.35).
-	for _, pair := range pricingPer1KColumns {
-		oldCol := pair[0]
-		if err := tx.Exec("ALTER TABLE pricings DROP COLUMN " + oldCol).Error; err != nil {
-			tx.Rollback()
-			return err
-		}
-	}
-
-	if err := tx.Commit().Error; err != nil {
+		return nil
+	})
+	if err != nil {
 		return err
 	}
-	log.Println("[db] pricing migration complete (per-1K → per-1M)")
+	if converted {
+		log.Println("[db] pricing migration complete (per-1K → per-1M)")
+	}
 	return nil
 }
 
