@@ -793,6 +793,7 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 	sawStop := false
 	sawDelta := false
 	sawResponseTerminal := false
+	sawNativeResponseEvent := false
 	// A same-format stream may end with an error frame and no terminator —
 	// don't append [DONE] after it (SDKs treat [DONE] as success)
 	sawErrorFrame := false
@@ -860,6 +861,9 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 				case "message_delta":
 					sawDelta = true
 				}
+			}
+			if inputFormat == "responses" && strings.HasPrefix(ev.Type, "response.") {
+				sawNativeResponseEvent = true
 			}
 			// Native Responses terminal outcomes must not be upgraded by
 			// synthesized completion at clean EOF. The streaming error event
@@ -1024,10 +1028,11 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 			}
 		}
 		flusher.Flush()
-	} else if inputFormat == "responses" && !sawResponseTerminal && !sawErrorFrame && rsc == nil {
-		// A native Responses stream ends with response.completed; an
-		// upstream that drops the connection instead leaves the SDK waiting
-		// forever. Synthesize a minimal completion so clients can finish.
+	} else if inputFormat == "responses" && !sawNativeResponseEvent && !sawResponseTerminal && !sawErrorFrame && rsc == nil {
+		// Preserve the minimal completion for a truly empty native stream.
+		// Once a response event has been forwarded, clean EOF may represent a
+		// truncated response; completing it with empty output would discard
+		// partial content and report a false success.
 		completed, _ := json.Marshal(map[string]interface{}{
 			"type": "response.completed",
 			"response": map[string]interface{}{
