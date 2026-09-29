@@ -757,15 +757,38 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 				}
 			}
 			start := []byte("data: {\"type\":\"message_start\",\"message\":")
-			start = append(start, frame...)
-			start = append(start, []byte("}\n\n")...)
-			if _, err := w.Write(start); err != nil {
-				return usage, sawContent, err
+			if upstreamFormat == "openai" {
+				events, eventErr := anthropicFullMessageToStreamEvents(frame)
+				if eventErr != nil {
+					WriteStreamError(w, inputFormat, "failed to convert upstream response")
+					return usage, sawContent, fmt.Errorf("failed to convert upstream response: %w", eventErr)
+				}
+				for _, event := range events {
+					if err := writeAnthropicStreamEvent(w, event); err != nil {
+						return usage, sawContent, err
+					}
+				}
+			} else {
+				start = append(start, frame...)
+				start = append(start, []byte("}\n\n")...)
+				if _, err := w.Write(start); err != nil {
+					return usage, sawContent, err
+				}
 			}
-			delta := fmt.Sprintf(`data: {"type":"message_delta","delta":{"stop_reason":%q,"stop_sequence":null},"usage":{"output_tokens":%d}}`+"\n\n", stopReason, outputTokens)
-			stop := delta + `data: {"type":"message_stop"}` + "\n\n"
-			if _, err := w.Write([]byte(stop)); err != nil {
-				return usage, sawContent, err
+			delta := []byte(fmt.Sprintf(`{"type":"message_delta","delta":{"stop_reason":%q,"stop_sequence":null},"usage":{"output_tokens":%d}}`, stopReason, outputTokens))
+			messageStop := []byte(`{"type":"message_stop"}`)
+			if upstreamFormat == "openai" {
+				if err := writeAnthropicStreamEvent(w, delta); err != nil {
+					return usage, sawContent, err
+				}
+				if err := writeAnthropicStreamEvent(w, messageStop); err != nil {
+					return usage, sawContent, err
+				}
+			} else {
+				stop := "data: " + string(delta) + "\n\n" + "data: " + string(messageStop) + "\n\n"
+				if _, err := w.Write([]byte(stop)); err != nil {
+					return usage, sawContent, err
+				}
 			}
 		}
 		flusher.Flush()
@@ -1190,6 +1213,123 @@ func completionToStreamChunk(body []byte, modelName string) []byte {
 		return body
 	}
 	return out
+}
+
+func writeAnthropicStreamEvent(w io.Writer, data []byte) error {
+	var event struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(data, &event); err != nil {
+		return fmt.Errorf("invalid Anthropic stream event: %w", err)
+	}
+	if event.Type == "" {
+		return fmt.Errorf("Anthropic stream event has no type")
+	}
+	_, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.Type, data)
+	return err
+}
+
+func anthropicFullMessageToStreamEvents(frame []byte) ([][]byte, error) {
+	var message map[string]interface{}
+	if err := json.Unmarshal(frame, &message); err != nil {
+		return nil, fmt.Errorf("invalid Anthropic message: %w", err)
+	}
+	content, ok := message["content"].([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid Anthropic message content")
+	}
+	message["content"] = []interface{}{}
+
+	start, err := json.Marshal(map[string]interface{}{
+		"type":    "message_start",
+		"message": message,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal Anthropic message_start: %w", err)
+	}
+	events := [][]byte{start}
+	appendEvent := func(event map[string]interface{}) error {
+		encoded, err := json.Marshal(event)
+		if err != nil {
+			return err
+		}
+		events = append(events, encoded)
+		return nil
+	}
+
+	for index, part := range content {
+		block, ok := part.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("invalid Anthropic content block at index %d", index)
+		}
+		blockType, _ := block["type"].(string)
+		var startBlock map[string]interface{}
+		var delta map[string]interface{}
+		switch blockType {
+		case "text":
+			text, _ := block["text"].(string)
+			startBlock = map[string]interface{}{"type": "text", "text": ""}
+			delta = map[string]interface{}{"type": "text_delta", "text": text}
+		case "thinking":
+			thinking, _ := block["thinking"].(string)
+			signature, _ := block["signature"].(string)
+			startBlock = map[string]interface{}{
+				"type":      "thinking",
+				"thinking":  "",
+				"signature": signature,
+			}
+			delta = map[string]interface{}{"type": "thinking_delta", "thinking": thinking}
+		case "tool_use":
+			input := block["input"]
+			if input == nil {
+				input = map[string]interface{}{}
+			}
+			startBlock = map[string]interface{}{
+				"type":  "tool_use",
+				"id":    block["id"],
+				"name":  block["name"],
+				"input": map[string]interface{}{},
+			}
+			partialJSON, err := json.Marshal(input)
+			if err != nil {
+				return nil, fmt.Errorf("marshal tool input at content block %d: %w", index, err)
+			}
+			delta = map[string]interface{}{"type": "input_json_delta", "partial_json": string(partialJSON)}
+		default:
+			startBlock = block
+		}
+		if err := appendEvent(map[string]interface{}{
+			"type":          "content_block_start",
+			"index":         index,
+			"content_block": startBlock,
+		}); err != nil {
+			return nil, fmt.Errorf("marshal content_block_start at index %d: %w", index, err)
+		}
+		if delta != nil {
+			if err := appendEvent(map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": index,
+				"delta": delta,
+			}); err != nil {
+				return nil, fmt.Errorf("marshal content_block_delta at index %d: %w", index, err)
+			}
+		}
+		if blockType == "thinking" {
+			if signature, _ := block["signature"].(string); signature != "" {
+				if err := appendEvent(map[string]interface{}{
+					"type":  "content_block_delta",
+					"index": index,
+					"delta": map[string]interface{}{"type": "signature_delta", "signature": signature},
+				}); err != nil {
+					return nil, fmt.Errorf("marshal signature_delta at index %d: %w", index, err)
+				}
+			}
+		}
+		if err := appendEvent(map[string]interface{}{"type": "content_block_stop", "index": index}); err != nil {
+			return nil, fmt.Errorf("marshal content_block_stop at index %d: %w", index, err)
+		}
+	}
+	return events, nil
 }
 
 // extractStreamUsage tries to parse token usage from streaming events.
