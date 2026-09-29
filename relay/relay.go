@@ -631,10 +631,17 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 		// A 200 with a JSON error body (some gateways do this for
 		// context-length/model errors) must be surfaced as an error, not
 		// billed as a successful completion.
+		isFailedNativeResponse := false
+		if inputFormat == "responses" && upstreamFormat == "responses" {
+			var responseCheck map[string]interface{}
+			if json.Unmarshal(body, &responseCheck) == nil {
+				isFailedNativeResponse = responseCheck["object"] == "response" && responseCheck["status"] == "failed"
+			}
+		}
 		var errCheck struct {
 			Error json.RawMessage `json:"error"`
 		}
-		if json.Unmarshal(body, &errCheck) == nil && isErrorPayload(errCheck.Error) {
+		if json.Unmarshal(body, &errCheck) == nil && isErrorPayload(errCheck.Error) && !isFailedNativeResponse {
 			msg := "upstream stream error"
 			var inner struct {
 				Message string `json:"message"`
@@ -702,6 +709,9 @@ func StreamResponse(w http.ResponseWriter, resp *http.Response, inputFormat, ups
 				}
 			}
 			flusher.Flush()
+			if isFailedNativeResponse {
+				return usage, sawContent, errors.New("upstream stream error")
+			}
 			return usage, sawContent, nil
 		}
 

@@ -242,6 +242,87 @@ func TestStreamResponseSynthesizesResponsesRefusalFromFullChat(t *testing.T) {
 	}
 }
 
+func TestStreamResponsePreservesFailedNativeResponsesBody(t *testing.T) {
+	body := `{"id":"resp_failed","object":"response","status":"failed","error":{"code":"content_filter","message":"blocked","type":"server_error"},"output":[]}`
+	resp := &http.Response{
+		Header: http.Header{"Content-Type": []string{"application/json"}},
+		Body:   io.NopCloser(strings.NewReader(body)),
+	}
+	w := httptest.NewRecorder()
+
+	_, sawContent, err := StreamResponse(w, resp, "responses", "responses", "mock-model")
+	if err == nil {
+		t.Fatal("StreamResponse error = nil, want failed upstream response error")
+	}
+	if sawContent {
+		t.Fatal("sawContent = true, want false for failed response with empty output")
+	}
+
+	var eventTypes []string
+	var failed map[string]interface{}
+	for _, frame := range strings.Split(strings.TrimSpace(w.Body.String()), "\n\n") {
+		data := strings.TrimPrefix(frame, "data: ")
+		var event struct {
+			Type     string                 `json:"type"`
+			Response map[string]interface{} `json:"response"`
+		}
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			t.Fatalf("invalid event %q: %v", data, err)
+		}
+		eventTypes = append(eventTypes, event.Type)
+		if event.Type == "response.failed" {
+			failed = event.Response
+		}
+	}
+	if got := strings.Join(eventTypes, ","); got != "response.created,response.in_progress,response.failed" {
+		t.Fatalf("event types = %s, want response.created,response.in_progress,response.failed", got)
+	}
+	if failed == nil {
+		t.Fatal("response.failed event has no response object")
+	}
+	if failed["id"] != "resp_failed" || failed["status"] != "failed" {
+		t.Errorf("failed response identity/status = %v/%v, want resp_failed/failed", failed["id"], failed["status"])
+	}
+	errorObject, ok := failed["error"].(map[string]interface{})
+	if !ok || errorObject["code"] != "content_filter" || errorObject["message"] != "blocked" {
+		t.Errorf("failed response error = %v, want original error object", failed["error"])
+	}
+}
+
+func TestStreamResponseStillSurfacesGenericJSONErrorBody(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		inputFormat    string
+		upstreamFormat string
+		body           string
+	}{
+		{name: "Responses numeric status", inputFormat: "responses", upstreamFormat: "responses", body: `{"status":429,"error":{"message":"quota"}}`},
+		{name: "OpenAI numeric status", inputFormat: "openai", upstreamFormat: "openai", body: `{"status":429,"error":{"message":"quota"}}`},
+		{name: "Responses capitalized error", inputFormat: "responses", upstreamFormat: "responses", body: `{"status":429,"Error":{"message":"quota"}}`},
+		{name: "OpenAI capitalized error", inputFormat: "openai", upstreamFormat: "openai", body: `{"status":429,"Error":{"message":"quota"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := &http.Response{
+				Header: http.Header{"Content-Type": []string{"application/json"}},
+				Body:   io.NopCloser(strings.NewReader(tc.body)),
+			}
+			w := httptest.NewRecorder()
+
+			_, _, err := StreamResponse(w, resp, tc.inputFormat, tc.upstreamFormat, "mock-model")
+			if err == nil {
+				t.Fatal("StreamResponse error = nil, want generic upstream JSON error")
+			}
+			got := w.Body.String()
+			if !strings.Contains(got, "stream_error") || !strings.Contains(got, "quota") {
+				t.Errorf("client-visible stream error = %q, want stream_error with quota message", got)
+			}
+			if strings.Contains(got, `"type":"response.failed"`) || strings.Contains(got, "[DONE]") {
+				t.Errorf("generic gateway error was treated as a response terminal or success: %q", got)
+			}
+		})
+	}
+}
+
 func TestStreamResponseStreamsFullOpenAICompletionToAnthropic(t *testing.T) {
 	body := `{"id":"chatcmpl-1","object":"chat.completion","model":"m","choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"hello"}}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}`
 	resp := &http.Response{

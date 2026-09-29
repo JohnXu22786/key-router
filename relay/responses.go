@@ -346,10 +346,10 @@ func responsesID(prefix, seed string) string {
 
 // responsesBodyToEvents wraps a full Responses API response object (an
 // upstream that ignored stream:true) into lifecycle events, so stream
-// clients still get a consumable sequence (created → in_progress →
-// completed). The same completed object is stamped into all three events
-// (the created/in_progress status fields are informational; SDKs converge
-// on the last event). An empty body becomes an empty completion.
+// clients still get a consumable sequence (created → in_progress → terminal).
+// created/in_progress status fields are informational and SDKs converge on the
+// last event, whose type matches the response's terminal status. An empty body
+// becomes an empty completion.
 func responsesBodyToEvents(body []byte) ([][]byte, error) {
 	var obj map[string]interface{}
 	if len(bytes.TrimSpace(body)) == 0 {
@@ -368,8 +368,15 @@ func responsesBodyToEvents(body []byte) ([][]byte, error) {
 	}
 	created, _ := json.Marshal(map[string]interface{}{"type": "response.created", "response": obj})
 	inProgress, _ := json.Marshal(map[string]interface{}{"type": "response.in_progress", "response": obj})
-	completed, _ := json.Marshal(map[string]interface{}{"type": "response.completed", "response": obj})
-	return [][]byte{created, inProgress, completed}, nil
+	terminalType := "response.completed"
+	switch obj["status"] {
+	case "incomplete":
+		terminalType = "response.incomplete"
+	case "failed":
+		terminalType = "response.failed"
+	}
+	terminal, _ := json.Marshal(map[string]interface{}{"type": terminalType, "response": obj})
+	return [][]byte{created, inProgress, terminal}, nil
 }
 
 // responsesTextPart builds a message content part in the Responses shape.
