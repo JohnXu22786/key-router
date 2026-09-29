@@ -24,6 +24,7 @@ func ChatCompletionResponseToResponses(body []byte, modelName string) ([]byte, e
 			FinishReason string `json:"finish_reason"`
 			Message      *struct {
 				Content          interface{}   `json:"content"`
+				Refusal          string        `json:"refusal"`
 				ToolCalls        []interface{} `json:"tool_calls"`
 				ReasoningContent interface{}   `json:"reasoning_content"`
 			} `json:"message"`
@@ -77,6 +78,12 @@ func ChatCompletionResponseToResponses(body []byte, modelName string) ([]byte, e
 						}
 					}
 				}
+			}
+			if msg.Refusal != "" {
+				textParts = append(textParts, map[string]interface{}{
+					"type":    "refusal",
+					"refusal": msg.Refusal,
+				})
 			}
 			if len(textParts) > 0 {
 				output = append(output, map[string]interface{}{

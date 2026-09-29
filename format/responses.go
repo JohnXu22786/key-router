@@ -1036,10 +1036,12 @@ type responsesItem struct {
 	done   bool
 
 	// message item
-	partOpened bool
-	partIdx    int
-	parts      []map[string]interface{} // closed output_text parts
-	curText    string
+	partOpened    bool
+	refusalOpened bool
+	partIdx       int
+	parts         []map[string]interface{} // closed message content parts
+	curText       string
+	curRefusal    string
 
 	// function_call item
 	callID string
@@ -1210,6 +1212,9 @@ func (c *ResponsesStreamConverter) chatChunk(ev map[string]interface{}) ([][]byt
 		}
 		if content, ok := safeString(delta, "content"); ok && content != "" {
 			events = append(events, c.textDelta(content)...)
+		}
+		if refusal, ok := safeString(delta, "refusal"); ok && refusal != "" {
+			events = append(events, c.refusalDelta(refusal)...)
 		}
 		if tcs, ok := safeArr(delta, "tool_calls"); ok {
 			for _, tc := range tcs {
@@ -1580,6 +1585,9 @@ func (c *ResponsesStreamConverter) textDelta(content string) [][]byte {
 		c.msgItem = c.newItem("message")
 	}
 	var events [][]byte
+	if c.msgItem.refusalOpened {
+		events = append(events, c.closeMessagePart()...)
+	}
 	if !c.msgItem.partOpened {
 		c.msgItem.partOpened = true
 		events = append(events, c.outputItemAdded(c.msgItem)...)
@@ -1592,6 +1600,38 @@ func (c *ResponsesStreamConverter) textDelta(content string) [][]byte {
 		"output_index":  c.msgItem.outIdx,
 		"content_index": c.msgItem.partIdx,
 		"delta":         content,
+	})
+	return append(events, ev)
+}
+
+// refusalDelta accumulates chat refusal deltas in a Responses message item.
+func (c *ResponsesStreamConverter) refusalDelta(refusal string) [][]byte {
+	if c.msgItem == nil {
+		c.msgItem = c.newItem("message")
+	}
+	var events [][]byte
+	if c.msgItem.partOpened {
+		events = append(events, c.closeMessagePart()...)
+	}
+	if !c.msgItem.refusalOpened {
+		c.msgItem.refusalOpened = true
+		events = append(events, c.outputItemAdded(c.msgItem)...)
+		partAdded, _ := json.Marshal(map[string]interface{}{
+			"type":          "response.content_part.added",
+			"item_id":       c.msgItem.id,
+			"output_index":  c.msgItem.outIdx,
+			"content_index": c.msgItem.partIdx,
+			"part":          map[string]interface{}{"type": "refusal", "refusal": ""},
+		})
+		events = append(events, partAdded)
+	}
+	c.msgItem.curRefusal += refusal
+	ev, _ := json.Marshal(map[string]interface{}{
+		"type":          "response.refusal.delta",
+		"item_id":       c.msgItem.id,
+		"output_index":  c.msgItem.outIdx,
+		"content_index": c.msgItem.partIdx,
+		"delta":         refusal,
 	})
 	return append(events, ev)
 }
@@ -1734,13 +1774,40 @@ func (c *ResponsesStreamConverter) closeAll() [][]byte {
 	return events
 }
 
-// closeMessagePart closes the message item's open content part only
-// (output_text.done, content_part.done). The item stays open — in Anthropic
-// mode a message may carry several text blocks, and the item is closed at
-// message_stop.
+// closeMessagePart closes the message item's open text or refusal part. The
+// item stays open — in Anthropic mode a message may carry several text blocks.
 func (c *ResponsesStreamConverter) closeMessagePart() [][]byte {
 	it := c.msgItem
-	if it == nil || !it.partOpened {
+	if it == nil {
+		return nil
+	}
+	if it.refusalOpened {
+		it.refusalOpened = false
+		refusal := it.curRefusal
+		it.curRefusal = ""
+		it.parts = append(it.parts, map[string]interface{}{
+			"type":    "refusal",
+			"refusal": refusal,
+		})
+		idx := it.partIdx
+		it.partIdx++
+		done, _ := json.Marshal(map[string]interface{}{
+			"type":          "response.refusal.done",
+			"item_id":       it.id,
+			"output_index":  it.outIdx,
+			"content_index": idx,
+			"refusal":       refusal,
+		})
+		partDone, _ := json.Marshal(map[string]interface{}{
+			"type":          "response.content_part.done",
+			"item_id":       it.id,
+			"output_index":  it.outIdx,
+			"content_index": idx,
+			"part":          map[string]interface{}{"type": "refusal", "refusal": refusal},
+		})
+		return [][]byte{done, partDone}
+	}
+	if !it.partOpened {
 		return nil
 	}
 	it.partOpened = false
@@ -1899,6 +1966,12 @@ func (it *responsesItem) finalParts() []interface{} {
 	}
 	if it.partOpened && it.curText != "" {
 		parts = append(parts, outputTextPart(it.curText))
+	}
+	if it.refusalOpened && it.curRefusal != "" {
+		parts = append(parts, map[string]interface{}{
+			"type":    "refusal",
+			"refusal": it.curRefusal,
+		})
 	}
 	return parts
 }

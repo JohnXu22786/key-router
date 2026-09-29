@@ -1018,6 +1018,88 @@ func TestResponsesStreamConverterFromChatNoUsage(t *testing.T) {
 	}
 }
 
+func TestResponsesStreamConverterFromChatRefusal(t *testing.T) {
+	conv := NewResponsesStreamConverter("openai")
+	conv.SetModel("m")
+
+	evs, err := conv.Convert([]byte(`{"choices":[{"delta":{"refusal":"I cannot help "}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if types := eventTypes(t, evs); strings.Join(types, ",") != "response.created,response.in_progress,response.output_item.added,response.content_part.added,response.refusal.delta" {
+		t.Fatalf("first refusal events = %v", types)
+	}
+	evs, err = conv.Convert([]byte(`{"choices":[{"delta":{"refusal":"with that request."}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if types := eventTypes(t, evs); len(types) != 1 || types[0] != "response.refusal.delta" {
+		t.Fatalf("continued refusal events = %v", types)
+	}
+	evs, err = conv.Convert([]byte(`{"choices":[{"delta":{},"finish_reason":"stop"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if types := eventTypes(t, evs); strings.Join(types, ",") != "response.refusal.done,response.content_part.done,response.output_item.done" {
+		t.Fatalf("refusal close events = %v", types)
+	}
+
+	evs = conv.CloseStream()
+	if types := eventTypes(t, evs); len(types) != 1 || types[0] != "response.completed" {
+		t.Fatalf("completion events = %v", types)
+	}
+	completed := decodeEvents(t, evs)[0]["response"].(map[string]interface{})
+	output := completed["output"].([]interface{})
+	if len(output) != 1 {
+		t.Fatalf("completed output = %v, want one refusal message", output)
+	}
+	message := output[0].(map[string]interface{})
+	content := message["content"].([]interface{})
+	if len(content) != 1 {
+		t.Fatalf("completed message content = %v, want one refusal part", content)
+	}
+	part := content[0].(map[string]interface{})
+	if part["type"] != "refusal" || part["refusal"] != "I cannot help with that request." {
+		t.Errorf("completed refusal part = %v", part)
+	}
+}
+
+func TestResponsesStreamConverterFromChatRefusalThenText(t *testing.T) {
+	conv := NewResponsesStreamConverter("openai")
+	if _, err := conv.Convert([]byte(`{"choices":[{"delta":{"refusal":"No."}}]}`)); err != nil {
+		t.Fatal(err)
+	}
+	evs, err := conv.Convert([]byte(`{"choices":[{"delta":{"content":" Further text."}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "response.refusal.done,response.content_part.done,response.content_part.added,response.output_text.delta"
+	if types := eventTypes(t, evs); strings.Join(types, ",") != want {
+		t.Fatalf("text after refusal events = %v, want %s", types, want)
+	}
+	evs, err = conv.Convert([]byte(`{"choices":[{"delta":{},"finish_reason":"stop"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if types := eventTypes(t, evs); strings.Join(types, ",") != "response.output_text.done,response.content_part.done,response.output_item.done" {
+		t.Fatalf("text close events = %v", types)
+	}
+	completed := decodeEvents(t, conv.CloseStream())[0]["response"].(map[string]interface{})
+	output := completed["output"].([]interface{})
+	content := output[0].(map[string]interface{})["content"].([]interface{})
+	if len(content) != 2 {
+		t.Fatalf("completed content = %v, want refusal and text parts", content)
+	}
+	refusal := content[0].(map[string]interface{})
+	text := content[1].(map[string]interface{})
+	if refusal["type"] != "refusal" || refusal["refusal"] != "No." {
+		t.Errorf("first content part = %v, want refusal", refusal)
+	}
+	if text["type"] != "output_text" || text["text"] != " Further text." {
+		t.Errorf("second content part = %v, want output_text", text)
+	}
+}
+
 func TestResponsesStreamConverterFromChatError(t *testing.T) {
 	conv := NewResponsesStreamConverter("openai")
 	evs, err := conv.Convert([]byte(`{"error":{"message":"boom","type":"server_error"}}`))

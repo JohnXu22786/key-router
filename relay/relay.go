@@ -1089,7 +1089,7 @@ func IsErrorPayload(raw json.RawMessage) bool {
 }
 
 // completionToStreamChunk converts a full OpenAI completion object into a
-// single valid chat.completion.chunk frame (content, tool_calls and
+// single valid chat.completion.chunk frame (content, refusal, tool_calls and
 // finish_reason moved into the delta), for upstreams that ignored stream:true.
 func completionToStreamChunk(body []byte, modelName string) []byte {
 	var comp struct {
@@ -1098,12 +1098,14 @@ func completionToStreamChunk(body []byte, modelName string) []byte {
 			Message      *struct {
 				Content          interface{}   `json:"content"`
 				Role             string        `json:"role"`
+				Refusal          string        `json:"refusal"`
 				ToolCalls        []interface{} `json:"tool_calls"`
 				ReasoningContent interface{}   `json:"reasoning_content"`
 			} `json:"message"`
 			Delta *struct {
 				Content          string        `json:"content"`
 				Role             string        `json:"role"`
+				Refusal          string        `json:"refusal"`
 				ToolCalls        []interface{} `json:"tool_calls"`
 				ReasoningContent interface{}   `json:"reasoning_content"`
 			} `json:"delta"`
@@ -1117,6 +1119,7 @@ func completionToStreamChunk(body []byte, modelName string) []byte {
 	role := "assistant"
 	var toolCalls []interface{}
 	var reasoningContent interface{}
+	var refusal string
 	c := comp.Choices[0]
 	if c.Message != nil {
 		if s, ok := c.Message.Content.(string); ok {
@@ -1136,6 +1139,7 @@ func completionToStreamChunk(body []byte, modelName string) []byte {
 			role = c.Message.Role
 		}
 		toolCalls = c.Message.ToolCalls
+		refusal = c.Message.Refusal
 		// DeepSeek-style reasoning: keep it so streaming clients still see
 		// the model's thinking (e.g. opencode's reasoning_content interleave).
 		reasoningContent = c.Message.ReasoningContent
@@ -1146,6 +1150,7 @@ func completionToStreamChunk(body []byte, modelName string) []byte {
 			role = c.Delta.Role
 		}
 		toolCalls = c.Delta.ToolCalls
+		refusal = c.Delta.Refusal
 		reasoningContent = c.Delta.ReasoningContent
 	}
 
@@ -1158,6 +1163,9 @@ func completionToStreamChunk(body []byte, modelName string) []byte {
 	}
 	if reasoningContent != nil {
 		delta["reasoning_content"] = reasoningContent
+	}
+	if refusal != "" {
+		delta["refusal"] = refusal
 	}
 	chunk := map[string]interface{}{
 		"id":      "chatcmpl-local",
@@ -1536,6 +1544,12 @@ func ConvertOpenAIResponseToAnthropic(body []byte) ([]byte, error) {
 					"text": t,
 				})
 			}
+		}
+		if refusal, ok := msg["refusal"].(string); ok && refusal != "" {
+			content = append(content, map[string]interface{}{
+				"type": "text",
+				"text": refusal,
+			})
 		}
 		if len(thinkingParts) > 0 {
 			// thinking precedes text in Anthropic responses
