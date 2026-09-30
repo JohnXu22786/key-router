@@ -495,16 +495,17 @@ func (h *AdminHandler) CreateKey(c *gin.Context) {
 			return
 		}
 	}
-	var count int64
-	if err := db.GetDB().Model(&model.Provider{}).Where("id = ?", k.ProviderID).Count(&count).Error; err != nil {
+	var provider model.Provider
+	if err := db.GetDB().First(&provider, k.ProviderID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "provider not found"})
+			return
+		}
 		log.Printf("[admin] CreateKey provider check error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to validate provider"})
 		return
 	}
-	if count == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "provider not found"})
-		return
-	}
+	k.Provider = provider
 	// A new key must not tie with existing sort_orders (drag reorder assigns
 	// 0..n-1, so a fresh 0 would silently interleave by rowid and jump the
 	// new key to the top). Place it at the end of its provider's order.
@@ -521,7 +522,7 @@ func (h *AdminHandler) CreateKey(c *gin.Context) {
 			k.SortOrder = *maxSort + 1
 		}
 	}
-	if err := db.GetDB().Create(&k).Error; err != nil {
+	if err := db.GetDB().Omit("Provider").Create(&k).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -968,21 +969,28 @@ func (h *AdminHandler) CreateRoute(c *gin.Context) {
 	}
 	r.ID = 0 // client-supplied ids must not force rowids
 	// Validate references before inserting
-	var groupCount, providerCount int64
-	if err := db.GetDB().Model(&model.ModelGroup{}).Where("id = ?", r.ModelGroupID).Count(&groupCount).Error; err != nil {
+	var group model.ModelGroup
+	if err := db.GetDB().First(&group, r.ModelGroupID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "model_group_id and provider_id must reference existing records"})
+			return
+		}
 		log.Printf("[admin] CreateRoute group check error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to validate model group"})
 		return
 	}
-	if err := db.GetDB().Model(&model.Provider{}).Where("id = ?", r.ProviderID).Count(&providerCount).Error; err != nil {
+	var provider model.Provider
+	if err := db.GetDB().First(&provider, r.ProviderID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "model_group_id and provider_id must reference existing records"})
+			return
+		}
 		log.Printf("[admin] CreateRoute provider check error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to validate provider"})
 		return
 	}
-	if groupCount == 0 || providerCount == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "model_group_id and provider_id must reference existing records"})
-		return
-	}
+	r.ModelGroup = group
+	r.Provider = provider
 	// Default new routes to enabled unless the payload explicitly said false
 	if !enabledProvided {
 		r.Enabled = true
@@ -1027,7 +1035,7 @@ func (h *AdminHandler) CreateRoute(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if err := db.GetDB().Create(&r).Error; err != nil {
+	if err := db.GetDB().Omit("ModelGroup", "Provider").Create(&r).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -1050,21 +1058,28 @@ func (h *AdminHandler) UpdateRoute(c *gin.Context) {
 	r.ID = id
 	// Validate references (same as CreateRoute) so a route can't silently
 	// point at a missing provider/group and vanish from rotation on Refresh
-	var groupCount, providerCount int64
-	if err := db.GetDB().Model(&model.ModelGroup{}).Where("id = ?", r.ModelGroupID).Count(&groupCount).Error; err != nil {
+	var group model.ModelGroup
+	if err := db.GetDB().First(&group, r.ModelGroupID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "model_group_id and provider_id must reference existing records"})
+			return
+		}
 		log.Printf("[admin] UpdateRoute group check error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to validate model group"})
 		return
 	}
-	if err := db.GetDB().Model(&model.Provider{}).Where("id = ?", r.ProviderID).Count(&providerCount).Error; err != nil {
+	var provider model.Provider
+	if err := db.GetDB().First(&provider, r.ProviderID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "model_group_id and provider_id must reference existing records"})
+			return
+		}
 		log.Printf("[admin] UpdateRoute provider check error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to validate provider"})
 		return
 	}
-	if groupCount == 0 || providerCount == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "model_group_id and provider_id must reference existing records"})
-		return
-	}
+	r.ModelGroup = group
+	r.Provider = provider
 	// Bound weight so weightedOrder's int sum can't overflow and panic
 	if r.Weight < 1 || r.Weight > 1000000 {
 		r.Weight = 10
@@ -1087,7 +1102,7 @@ func (h *AdminHandler) UpdateRoute(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if err := db.GetDB().Save(&r).Error; err != nil {
+	if err := db.GetDB().Omit("ModelGroup", "Provider").Save(&r).Error; err != nil {
 		log.Printf("[admin] UpdateRoute save error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
