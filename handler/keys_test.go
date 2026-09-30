@@ -371,6 +371,188 @@ func jsonInt(v int64) string {
 	return string(b)
 }
 
+func TestUpdateKeyProviderMoveAppendsWithoutExplicitOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		orderField       string
+		emptyDestination bool
+		wantOrder        int64
+		wantNames        []string
+	}{
+		{name: "omitted order", wantOrder: 5, wantNames: []string{"first", "second", "moving"}},
+		{name: "null order", orderField: `,"sort_order":null`, wantOrder: 5, wantNames: []string{"first", "second", "moving"}},
+		{name: "empty destination", emptyDestination: true, wantOrder: 0, wantNames: []string{"moving"}},
+		{name: "explicit order", orderField: `,"sort_order":0`, wantOrder: 0, wantNames: []string{"moving", "first", "second"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := bootstrapKeys(t)
+			closeTestDB(t)
+
+			source := model.Provider{Name: "source", Type: "openai", BaseURL: "http://source"}
+			destination := model.Provider{Name: "destination", Type: "openai", BaseURL: "http://destination"}
+			for _, provider := range []*model.Provider{&source, &destination} {
+				if err := db.GetDB().Create(provider).Error; err != nil {
+					t.Fatal(err)
+				}
+			}
+			// An older ID and a source sort_order of 0 expose the priority tie.
+			moving := model.Key{ProviderID: source.ID, Name: "moving", KeyValue: "moving-key"}
+			first := model.Key{ProviderID: destination.ID, Name: "first", KeyValue: "first-key"}
+			second := model.Key{ProviderID: destination.ID, Name: "second", KeyValue: "second-key", SortOrder: 4}
+			keys := []*model.Key{&moving}
+			if !tc.emptyDestination {
+				keys = append(keys, &first, &second)
+			}
+			for _, key := range keys {
+				if err := db.GetDB().Create(key).Error; err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			payload := `{"provider_id":` + jsonInt(destination.ID) + tc.orderField + `}`
+			req := httptest.NewRequest("PUT", "/api/keys/"+jsonInt(moving.ID), strings.NewReader(payload))
+			req.Header.Set("Content-Type", "application/json")
+			req.Host = "localhost:9999"
+			rec := httptest.NewRecorder()
+			e.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("PUT /api/keys/%d status = %d: %s", moving.ID, rec.Code, rec.Body.String())
+			}
+
+			var updated model.Key
+			if err := json.Unmarshal(rec.Body.Bytes(), &updated); err != nil {
+				t.Fatal(err)
+			}
+			if updated.ProviderID != destination.ID || updated.SortOrder != tc.wantOrder {
+				t.Errorf("updated key provider/order = %d/%d, want %d/%d", updated.ProviderID, updated.SortOrder, destination.ID, tc.wantOrder)
+			}
+			if got := getNames(t, e); !slices.Equal(got, tc.wantNames) {
+				t.Errorf("GET /api/keys order = %v, want %v", got, tc.wantNames)
+			}
+		})
+	}
+}
+
+func TestUpdateKeyConcurrentProviderMovesPreservePriority(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		staleToSource bool
+		wantBefore    []string
+		wantAfter     []string
+		wantOrder     int64
+	}{
+		{name: "duplicate move", wantBefore: []string{"anchor", "first", "moving", "newcomer"}, wantAfter: []string{"anchor", "first", "moving", "newcomer"}, wantOrder: 1},
+		{name: "move back to source", staleToSource: true, wantBefore: []string{"anchor", "newcomer", "first", "moving"}, wantAfter: []string{"anchor", "newcomer", "moving", "first"}, wantOrder: 6},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := bootstrapKeys(t)
+			closeTestDB(t)
+
+			source := model.Provider{Name: "source", Type: "openai", BaseURL: "http://source"}
+			destination := model.Provider{Name: "destination", Type: "openai", BaseURL: "http://destination"}
+			for _, provider := range []*model.Provider{&source, &destination} {
+				if err := db.GetDB().Create(provider).Error; err != nil {
+					t.Fatal(err)
+				}
+			}
+			moving := model.Key{ProviderID: source.ID, Name: "moving", KeyValue: "moving-key"}
+			anchor := model.Key{ProviderID: source.ID, Name: "anchor", KeyValue: "anchor-key", SortOrder: 4}
+			first := model.Key{ProviderID: destination.ID, Name: "first", KeyValue: "first-key"}
+			for _, key := range []*model.Key{&moving, &anchor, &first} {
+				if err := db.GetDB().Create(key).Error; err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			// Pause a stale request after its initial provider read, before it writes.
+			pauseNext := make(chan struct{}, 1)
+			pauseNext <- struct{}{}
+			paused := make(chan struct{})
+			resume := make(chan struct{})
+			const callbackName = "test:pause-key-provider-check"
+			if err := db.GetDB().Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+				if tx.Statement.Table != "providers" {
+					return
+				}
+				select {
+				case <-pauseNext:
+					close(paused)
+					<-resume
+				default:
+				}
+			}); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := db.GetDB().Callback().Query().Remove(callbackName); err != nil {
+					t.Errorf("remove provider query callback: %v", err)
+				}
+			})
+			var releaseOnce sync.Once
+			release := func() { releaseOnce.Do(func() { close(resume) }) }
+			defer release()
+
+			move := func(providerID int64) *httptest.ResponseRecorder {
+				payload := `{"provider_id":` + jsonInt(providerID) + `}`
+				req := httptest.NewRequest("PUT", "/api/keys/"+jsonInt(moving.ID), strings.NewReader(payload))
+				req.Header.Set("Content-Type", "application/json")
+				req.Host = "localhost:9999"
+				rec := httptest.NewRecorder()
+				e.ServeHTTP(rec, req)
+				return rec
+			}
+			staleProviderID := destination.ID
+			createProviderID := destination.ID
+			if tc.staleToSource {
+				staleProviderID = source.ID
+				createProviderID = source.ID
+			}
+			staleDone := make(chan *httptest.ResponseRecorder, 1)
+			go func() { staleDone <- move(staleProviderID) }()
+			select {
+			case <-paused:
+			case <-time.After(5 * time.Second):
+				t.Fatal("stale request did not pause after reading its original provider")
+			}
+
+			if rec := move(destination.ID); rec.Code != http.StatusOK {
+				t.Fatalf("first completed move status = %d: %s", rec.Code, rec.Body.String())
+			}
+			create := httptest.NewRequest("POST", "/api/keys", strings.NewReader(`{"provider_id":`+jsonInt(createProviderID)+`,"name":"newcomer","key_value":"new-key"}`))
+			create.Header.Set("Content-Type", "application/json")
+			create.Host = "localhost:9999"
+			created := httptest.NewRecorder()
+			e.ServeHTTP(created, create)
+			if created.Code != http.StatusCreated {
+				t.Fatalf("create key status = %d: %s", created.Code, created.Body.String())
+			}
+			if got := getNames(t, e); !slices.Equal(got, tc.wantBefore) {
+				t.Fatalf("order before stale move = %v, want %v", got, tc.wantBefore)
+			}
+
+			release()
+			select {
+			case rec := <-staleDone:
+				if rec.Code != http.StatusOK {
+					t.Fatalf("stale move status = %d: %s", rec.Code, rec.Body.String())
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("stale move did not finish")
+			}
+			if got := getNames(t, e); !slices.Equal(got, tc.wantAfter) {
+				t.Errorf("order after stale move = %v, want %v", got, tc.wantAfter)
+			}
+			var updated model.Key
+			if err := db.GetDB().First(&updated, moving.ID).Error; err != nil {
+				t.Fatal(err)
+			}
+			if updated.ProviderID != staleProviderID || updated.SortOrder != tc.wantOrder {
+				t.Errorf("moved key provider/order = %d/%d, want %d/%d", updated.ProviderID, updated.SortOrder, staleProviderID, tc.wantOrder)
+			}
+		})
+	}
+}
+
 func TestUpdateKeyRejectsProviderMoveToDuplicateName(t *testing.T) {
 	e := bootstrapKeys(t)
 	closeTestDB(t)
