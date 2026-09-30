@@ -685,7 +685,38 @@ func (h *AdminHandler) UpdateKey(c *gin.Context) {
 		updates["DisabledReason"] = ""
 	}
 	if len(updates) > 0 {
-		if err := db.GetDB().Model(&model.Key{}).Where("id = ?", id).Updates(updates).Error; err != nil {
+		var err error
+		if hasNonNullField("provider_id") && !hasNonNullField("sort_order") {
+			// Append only when the key still needs moving at write time.
+			err = db.GetDB().Transaction(func(tx *gorm.DB) error {
+				var current struct{ ProviderID int64 }
+				if err := tx.Model(&model.Key{}).Where("id = ?", id).
+					Select("provider_id").Scan(&current).Error; err != nil {
+					return err
+				}
+				if current.ProviderID == k.ProviderID {
+					return tx.Model(&model.Key{}).Where("id = ?", id).Updates(updates).Error
+				}
+				var maxSort *int64
+				if err := tx.Model(&model.Key{}).
+					Where("provider_id = ? AND id <> ?", k.ProviderID, id).
+					Select("MAX(sort_order)").Scan(&maxSort).Error; err != nil {
+					return err
+				}
+				if maxSort != nil && *maxSort == math.MaxInt64 {
+					return errors.New("destination key order is full")
+				}
+				nextOrder := int64(0)
+				if maxSort != nil && *maxSort >= 0 {
+					nextOrder = *maxSort + 1
+				}
+				updates["SortOrder"] = nextOrder
+				return tx.Model(&model.Key{}).Where("id = ?", id).Updates(updates).Error
+			})
+		} else {
+			err = db.GetDB().Model(&model.Key{}).Where("id = ?", id).Updates(updates).Error
+		}
+		if err != nil {
 			log.Printf("[admin] UpdateKey update error: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
