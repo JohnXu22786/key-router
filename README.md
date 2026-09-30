@@ -161,7 +161,7 @@ The 5-hour, daily, weekly, and monthly windows each measure **one** of requests 
 
 ## Build from source
 
-Requires Go 1.26.5+ and Node 20.19+ (for the web UI build).
+Requires Go 1.26.5+ and Node 22.13+ (22.x), 24.x, or 26+ (for the web UI build).
 
 ```bash
 # Build the web UI first: web/dist is generated (not committed) and is
