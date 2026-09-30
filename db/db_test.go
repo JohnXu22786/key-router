@@ -1,6 +1,7 @@
 package db
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"slices"
@@ -12,6 +13,88 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
+
+func TestInitSeedsRouteOrderVersionWithoutChangingExistingPriorities(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	if err := Init(dataDir); err != nil {
+		t.Fatal(err)
+	}
+	closeDB := func() {
+		sqlDB, err := GetDB().DB()
+		if err == nil {
+			_ = sqlDB.Close()
+		}
+	}
+	t.Cleanup(closeDB)
+
+	provider := model.Provider{Name: "migration-provider", Type: "openai", BaseURL: "http://example.test"}
+	if err := GetDB().Create(&provider).Error; err != nil {
+		t.Fatal(err)
+	}
+	group := model.ModelGroup{GroupID: "migration-group", Name: "Migration Group", Enabled: true}
+	if err := GetDB().Create(&group).Error; err != nil {
+		t.Fatal(err)
+	}
+	route := model.Route{ModelGroupID: group.ID, ProviderID: provider.ID, TargetModel: "legacy", Priority: 42}
+	if err := GetDB().Create(&route).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := GetDB().Where("key = ?", model.SettingRouteOrderVersion).Delete(&model.Setting{}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	closeDB()
+	if err := Init(dataDir); err != nil {
+		t.Fatal(err)
+	}
+	var afterMigration model.Route
+	if err := GetDB().First(&afterMigration, route.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if afterMigration.Priority != route.Priority {
+		t.Fatalf("route priority after startup migration = %d, want %d", afterMigration.Priority, route.Priority)
+	}
+	var setting model.Setting
+	if err := GetDB().Where("key = ?", model.SettingRouteOrderVersion).First(&setting).Error; err != nil {
+		t.Fatal(err)
+	}
+	var initialVersion model.RouteOrderVersion
+	if err := json.Unmarshal([]byte(setting.Value), &initialVersion); err != nil {
+		t.Fatal(err)
+	}
+	if initialVersion != (model.RouteOrderVersion{}) {
+		t.Fatalf("initial route order version = %+v, want zero version", initialVersion)
+	}
+
+	committedVersion := model.RouteOrderVersion{Timestamp: 123, ClientID: "existing-client", Sequence: 7}
+	encodedVersion, err := json.Marshal(committedVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SetSetting(model.SettingRouteOrderVersion, string(encodedVersion)); err != nil {
+		t.Fatal(err)
+	}
+	closeDB()
+	if err := Init(dataDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := GetDB().First(&afterMigration, route.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if afterMigration.Priority != route.Priority {
+		t.Fatalf("route priority after repeat startup = %d, want %d", afterMigration.Priority, route.Priority)
+	}
+	if err := GetDB().Where("key = ?", model.SettingRouteOrderVersion).First(&setting).Error; err != nil {
+		t.Fatal(err)
+	}
+	var rerunVersion model.RouteOrderVersion
+	if err := json.Unmarshal([]byte(setting.Value), &rerunVersion); err != nil {
+		t.Fatal(err)
+	}
+	if rerunVersion != committedVersion {
+		t.Fatalf("version after repeat startup = %+v, want %+v", rerunVersion, committedVersion)
+	}
+}
 
 func pricingColumnExists(t *testing.T, dbc *gorm.DB, column string) bool {
 	t.Helper()

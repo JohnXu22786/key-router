@@ -284,12 +284,20 @@ type Setting struct {
 	Value string `gorm:"type:text" json:"value"`
 }
 
+// RouteOrderVersion orders route reorder requests across tabs and restarts.
+type RouteOrderVersion struct {
+	Timestamp float64 `json:"timestamp"`
+	ClientID  string  `json:"client_id"`
+	Sequence  uint64  `json:"sequence"`
+}
+
 // Predefined setting keys
 const (
-	SettingPort        = "server.port"
-	SettingAuthToken   = "server.auth_token"
-	SettingRetryTimes  = "server.retry_times"
-	SettingHealthCheck = "server.health_check_interval"
+	SettingPort              = "server.port"
+	SettingAuthToken         = "server.auth_token"
+	SettingRetryTimes        = "server.retry_times"
+	SettingHealthCheck       = "server.health_check_interval"
+	SettingRouteOrderVersion = "internal.route_order_version"
 	// SettingConsumptionModelSource marks that legacy consumption rows were
 	// migrated from the upstream target model to the client-requested model
 	// (the model group id). The value is "ingress"; its presence keeps the
