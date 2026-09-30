@@ -285,8 +285,14 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			// 2 consecutive identical observations (it would never recover
 			// on its own); a real rate limit only cools it. Read a bounded
 			// chunk of the body to classify.
-			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+			errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 			resp.Body.Close()
+			if readErr != nil {
+				log.Printf("[relay] failed to read upstream error for key %d: %v", key.ID, readErr)
+				writeRelayError(c, inputFormat, http.StatusBadGateway, "upstream_read_failed", "upstream_error",
+					"failed to read upstream response")
+				return
+			}
 			if health.QuotaExhaustedInBody(errBody) {
 				h.Engine.RecordResult(key.ID, false, model.ReasonInsufficientQuota, 30*time.Second)
 				log.Printf("[relay] key %d quota exhausted (429 + quota error, attempt %d/%d)", key.ID, attempt+1, maxRetries+1)
@@ -326,8 +332,14 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			// active → disable flap). Model/access problems cool the key
 			// down like the 403 path; genuine key-invalidity 401s disable
 			// after 2 consecutive identical observations.
-			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+			errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 			resp.Body.Close()
+			if readErr != nil {
+				log.Printf("[relay] failed to read upstream error for key %d: %v", key.ID, readErr)
+				writeRelayError(c, inputFormat, http.StatusBadGateway, "upstream_read_failed", "upstream_error",
+					"failed to read upstream response")
+				return
+			}
 			if health.ModelProblemInBody(errBody) {
 				h.Engine.RecordResult(key.ID, false, model.HTTPStatusReason(resp.StatusCode), 30*time.Second)
 				log.Printf("[relay] key %d unauthorized for the requested model (401, cooling 30s, attempt %d/%d)", key.ID, attempt+1, maxRetries+1)
@@ -370,7 +382,14 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			// over to the next key); any other 400 is a request/model
 			// problem — restore the body and pass it through untouched
 			// below.
-			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxRequestBody+1))
+			errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxRequestBody+1))
+			if readErr != nil {
+				resp.Body.Close()
+				log.Printf("[relay] failed to read upstream error for key %d: %v", key.ID, readErr)
+				writeRelayError(c, inputFormat, http.StatusBadGateway, "upstream_read_failed", "upstream_error",
+					"failed to read upstream response")
+				return
+			}
 			if len(errBody) > maxRequestBody {
 				errBody = errBody[:maxRequestBody]
 			}
@@ -402,13 +421,17 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 		// 3xx gets a 502 (a redirect the client can't follow without leaking
 		// the upstream URL), 4xx gets the upstream status.
 		if reqMeta.Stream && resp.StatusCode >= 300 {
-			// The upstream ANSWERED (client/model error, not a key problem —
-			// the same classification the health probe applies to 4xx/3xx):
-			// record a success observation so the key can build its recovery
-			// streak even when every request errors client-side.
-			h.Engine.RecordResult(key.ID, true, "", 0)
-			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxRequestBody+1))
+			errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxRequestBody+1))
 			resp.Body.Close()
+			if readErr != nil {
+				log.Printf("[relay] failed to read upstream error for key %d: %v", key.ID, readErr)
+				writeRelayError(c, inputFormat, http.StatusBadGateway, "upstream_read_failed", "upstream_error",
+					"failed to read upstream response")
+				return
+			}
+			// Non-key response errors are successful key-health observations,
+			// but only after the bounded error-body read succeeds.
+			h.Engine.RecordResult(key.ID, true, "", 0)
 			if len(errBody) > maxRequestBody {
 				errBody = errBody[:maxRequestBody]
 			}
