@@ -453,15 +453,26 @@ func (h *ChatHandler) handleRelay(c *gin.Context, inputFormat string) {
 			// Same format: de-frame SSE-framed error bodies so the SDK can
 			// parse the JSON (Azure-style gateways), then pass through.
 			trimmed := strings.TrimSpace(string(errBody))
-			if strings.HasPrefix(trimmed, "data:") {
-				firstFrame := trimmed
+			if strings.HasPrefix(trimmed, "data:") || strings.HasPrefix(trimmed, "event:") {
+				firstFrame := strings.ReplaceAll(trimmed, "\r\n", "\n")
 				if idx := strings.Index(firstFrame, "\n\n"); idx >= 0 {
 					firstFrame = firstFrame[:idx]
-				} else if idx := strings.Index(firstFrame, "\r\n\r\n"); idx >= 0 {
-					firstFrame = firstFrame[:idx]
 				}
-				if deframed := strings.TrimSpace(strings.TrimPrefix(firstFrame, "data:")); deframed != "" {
-					errBody = []byte(deframed)
+				var dataLines []string
+				for _, line := range strings.Split(firstFrame, "\n") {
+					line = strings.TrimSuffix(line, "\r")
+					if strings.HasPrefix(line, "data:") {
+						data := strings.TrimPrefix(line, "data:")
+						if strings.HasPrefix(data, " ") {
+							data = data[1:]
+						}
+						dataLines = append(dataLines, data)
+					}
+				}
+				if len(dataLines) > 0 {
+					if deframed := strings.TrimSpace(strings.Join(dataLines, "\n")); deframed != "" {
+						errBody = []byte(deframed)
+					}
 				}
 			}
 			c.Writer.Header().Set("Content-Type", "application/json")
