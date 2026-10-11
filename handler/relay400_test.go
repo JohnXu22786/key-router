@@ -110,6 +110,59 @@ func TestRelay400ModelProblemPassesThrough(t *testing.T) {
 	}
 }
 
+// TestRelay400StreamingEventPrefixedSSEBodyIsDeframed verifies that
+// event-prefixed SSE errors are returned to clients as plain JSON.
+func TestRelay400StreamingEventPrefixedSSEBodyIsDeframed(t *testing.T) {
+	const errorBody = `{"error":{"message":"bad model"}}`
+	_, e, _ := bootstrap400(t, "event: error\ndata: "+errorBody+"\n\n")
+
+	rec := sendRelay(e, `{"model":"mock-model","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("client status = %d, want 400", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Errorf("content type = %q, want application/json", got)
+	}
+	if got := rec.Body.String(); got != errorBody {
+		t.Errorf("client body = %q, want deframed JSON %q", got, errorBody)
+	}
+}
+
+func TestRelay400StreamingEventPrefixedSSEEmptyDataFieldIsDeframed(t *testing.T) {
+	const errorBody = `{"error":{"message":"bad model"}}`
+	_, e, _ := bootstrap400(t, "event: error\ndata:\ndata: "+errorBody+"\n\n")
+
+	rec := sendRelay(e, `{"model":"mock-model","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("client status = %d, want 400", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Errorf("content type = %q, want application/json", got)
+	}
+	if got := rec.Body.String(); got != errorBody {
+		t.Errorf("client body = %q, want deframed JSON %q", got, errorBody)
+	}
+}
+
+func TestRelay400StreamingEventPrefixedSSEMixedLineEndingsAreDeframed(t *testing.T) {
+	const errorBody = `{"error":{"message":"bad model"}}`
+	_, e, _ := bootstrap400(t, "event: error\ndata: "+errorBody+"\n\r\ndata: [DONE]\n\n")
+
+	rec := sendRelay(e, `{"model":"mock-model","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("client status = %d, want 400", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Errorf("content type = %q, want application/json", got)
+	}
+	if got := rec.Body.String(); got != errorBody {
+		t.Errorf("client body = %q, want deframed JSON %q", got, errorBody)
+	}
+}
+
 // TestRelay400KeyValidModelInvalidPassesThrough: a 400 whose body says the
 // KEY is valid but the MODEL is invalid must NOT mark the key auth_failed —
 // before the valence fix the "key ... invalid" chain classified it
